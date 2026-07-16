@@ -26,12 +26,18 @@ jobs:
 
   ios:
     name: Nova iOS (build + test on Simulator)
-    runs-on: macos-14
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: Nova
     steps:
       - uses: actions/checkout@v4
+
+      # Use the newest stable Xcode so it can read the project format emitted by
+      # the latest XcodeGen (an older Xcode fails with "Unable to read project").
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
       - name: Xcode version
         run: xcodebuild -version
