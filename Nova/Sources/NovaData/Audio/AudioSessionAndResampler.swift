@@ -10,7 +10,7 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
     public func activateConversationalHFP() async throws {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
             if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
                 try session.setPreferredInput(hfp)
