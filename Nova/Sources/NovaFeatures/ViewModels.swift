@@ -78,10 +78,11 @@ public final class ConversationViewModel {
 
     public func start() async {
         errorMessage = nil
-        await orchestrator.setTranscriptHandler { [weak self] text, role in
-            Task { @MainActor in
-                self?.transcriptLines.append("\(role.rawValue): \(text)")
-                self?.isAssistantSpeaking = role == .assistant
+        await orchestrator.setTranscriptHandler { text, role in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.transcriptLines.append("\(role.rawValue): \(text)")
+                self.isAssistantSpeaking = role == .assistant
             }
         }
         do {

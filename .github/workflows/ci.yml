@@ -26,43 +26,45 @@ jobs:
 
   ios:
     name: Nova iOS (build + test on Simulator)
-    runs-on: macos-latest
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: Nova
     steps:
       - uses: actions/checkout@v4
 
       - name: Xcode version
         run: xcodebuild -version
 
+      - name: Resolve package dependencies
+        run: xcodebuild -resolvePackageDependencies
+
       # Compile every module for iOS via SwiftPM. This is the check that could
       # never run on Windows: it validates the Swift ports (GA Realtime provider,
       # HFP audio, DAT adapters, token services) actually build for the device.
       - name: Build Swift package (iOS Simulator)
-        working-directory: Nova
         run: |
-          set -o pipefail
-          xcodebuild -list
           xcodebuild build \
             -scheme Nova-Package \
             -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO | xcpretty || xcodebuild build \
-            -scheme Nova-Package \
-            -destination 'generic/platform=iOS Simulator' \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Pick an available iOS Simulator
+      - name: Pick an available iPhone simulator
         id: sim
         run: |
-          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; ids=[x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x.get('isAvailable')]; print(ids[0] if ids else '')")
+          UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')
+          echo "Using simulator UDID: $UDID"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          echo "Using simulator: $UDID"
 
       - name: Run package tests (iOS Simulator)
-        working-directory: Nova
         run: |
-          set -o pipefail
           xcodebuild test \
             -scheme Nova-Package \
             -destination "id=${{ steps.sim.outputs.udid }}" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO
 
       # Generate the real iOS app project from the checked-in XcodeGen spec and
@@ -71,15 +73,14 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate app project
-        working-directory: Nova
         run: xcodegen generate
 
       - name: Build NovaApp (iOS Simulator, unsigned)
-        working-directory: Nova
         run: |
-          set -o pipefail
           xcodebuild build \
             -project NovaApp.xcodeproj \
             -scheme NovaApp \
             -destination 'generic/platform=iOS Simulator' \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
