@@ -82,7 +82,11 @@ final class WakeWordTests: XCTestCase {
         let orch = makeOrchestrator(provider: provider)
         try await orch.start()
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
-        _ = await waitUntil { await provider.createResponseCount > 0 || provider.analyzeCount > 0 }
+        _ = await waitUntil {
+            let created = await provider.createResponseCount
+            let analyzed = await provider.analyzeCount
+            return created > 0 || analyzed > 0
+        }
         let created = await provider.createResponseCount
         let analyzed = await provider.analyzeCount
         XCTAssertEqual(created, 0)
