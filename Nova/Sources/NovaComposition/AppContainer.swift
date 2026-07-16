@@ -17,7 +17,10 @@ public final class AppContainer {
     public let conversationVM: ConversationViewModel
     public let visionVM: VisionViewModel
 
-    public init(useFakeAI: Bool = false, useSilentMic: Bool = false) {
+    /// - Parameter useMockGlasses: when `true`, the wearable session runs an
+    ///   in-memory state machine (Simulator / no hardware). Set to `false` on a
+    ///   real device to register with Meta AI via the DAT SDK.
+    public init(useFakeAI: Bool = false, useSilentMic: Bool = false, useMockGlasses: Bool = true) {
         let metrics = InMemoryLatencyMetricsRecorder()
         self.metrics = metrics
 
@@ -49,7 +52,7 @@ public final class AppContainer {
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
 
-        let session = MetaDATWearableSession(useMock: true)
+        let session = MetaDATWearableSession(useMock: useMockGlasses)
         self.wearableSession = session
         let capture = MetaDATFrameCapture()
         self.frameCapture = capture
