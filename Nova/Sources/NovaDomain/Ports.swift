@@ -5,6 +5,8 @@ public protocol ConversationalAIProvider: Sendable {
     func connect(config: AISessionConfig) async throws
     func disconnect() async
     func appendAudio(_ pcm16_24k: Data) async
+    /// Explicitly ask the model to generate a reply to the committed input.
+    func createResponse() async
     func interrupt() async
     func analyze(image: CapturedFrame, prompt: String) async throws -> String
     var events: AsyncStream<AIConversationEvent> { get }

@@ -63,9 +63,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 "audio": [
                     "input": [
                         "format": ["type": "audio/pcm", "rate": 24000],
+                        // With a wake word required, the server still detects
+                        // turns and transcribes, but must NOT auto-reply — the
+                        // orchestrator decides whether "Nova" was addressed.
                         "turn_detection": config.enableServerVAD ? [
                             "type": "semantic_vad",
-                            "create_response": true
+                            "create_response": !config.requireWakeWord
                         ] : NSNull(),
                         "transcription": ["model": "whisper-1"]
                     ] as [String: Any],
@@ -98,6 +101,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "type": "input_audio_buffer.append",
             "audio": b64
         ])
+    }
+
+    public func createResponse() async {
+        guard connected else { return }
+        try? await sendJSON(["type": "response.create"])
     }
 
     public func interrupt() async {
@@ -201,6 +209,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             if let delta = json["delta"] as? String {
                 eventsContinuation?.yield(.inputTranscript(delta: delta))
             }
+        case "conversation.item.input_audio_transcription.completed":
+            let transcript = json["transcript"] as? String ?? ""
+            eventsContinuation?.yield(.inputTranscriptionCompleted(transcript: transcript))
         case "input_audio_buffer.speech_started":
             eventsContinuation?.yield(.speechStarted)
         case "input_audio_buffer.speech_stopped":
@@ -248,6 +259,9 @@ public actor FakeConversationalAIProvider: ConversationalAIProvider {
     public func connect(config: AISessionConfig) async throws {}
     public func disconnect() async { continuation?.finish() }
     public func appendAudio(_ pcm16_24k: Data) async {}
+    public func createResponse() async {
+        emitAssistant("(fake response)")
+    }
     public func interrupt() async {
         continuation?.yield(.responseEnded)
     }
@@ -259,5 +273,10 @@ public actor FakeConversationalAIProvider: ConversationalAIProvider {
         continuation?.yield(.responseStarted)
         continuation?.yield(.outputTranscript(delta: text))
         continuation?.yield(.responseEnded)
+    }
+
+    /// Simulate the server delivering a finished user transcription.
+    public func emitUserTranscript(_ transcript: String) {
+        continuation?.yield(.inputTranscriptionCompleted(transcript: transcript))
     }
 }

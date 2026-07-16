@@ -10,6 +10,9 @@ public actor ConversationOrchestrator {
     private let metrics: any LatencyMetricsRecorder
     private let memory: (any ConversationMemory)?
     private let toolRouter: ToolRouter?
+    // Supplies the current camera frame when a vision trigger ("what's this?")
+    // fires. Without it, vision triggers fall back to a spoken reply.
+    private let frameCapture: (any FrameCapture)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -17,6 +20,8 @@ public actor ConversationOrchestrator {
     private var assistantSpeaking = false
     private var inputTranscript = ""
     private var outputTranscript = ""
+    private var sessionConfig = AISessionConfig()
+    private var detector = WakeWordDetector()
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
 
@@ -27,7 +32,8 @@ public actor ConversationOrchestrator {
         resampler: any AudioResampling,
         metrics: any LatencyMetricsRecorder,
         memory: (any ConversationMemory)? = nil,
-        toolRouter: ToolRouter? = nil
+        toolRouter: ToolRouter? = nil,
+        frameCapture: (any FrameCapture)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -36,6 +42,7 @@ public actor ConversationOrchestrator {
         self.metrics = metrics
         self.memory = memory
         self.toolRouter = toolRouter
+        self.frameCapture = frameCapture
     }
 
     public func setTranscriptHandler(_ handler: (@Sendable (String, ConversationTurn.Role) -> Void)?) {
@@ -45,6 +52,8 @@ public actor ConversationOrchestrator {
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
         guard !isRunning else { return }
         isRunning = true
+        sessionConfig = config
+        detector = WakeWordDetector(wakeWord: config.wakeWord, visionPhrases: config.visionTriggerPhrases)
         try await ai.connect(config: config)
         try await ingress.start()
 
@@ -100,6 +109,8 @@ public actor ConversationOrchestrator {
         case .inputTranscript(let delta):
             inputTranscript += delta
             onTranscript?(delta, .user)
+        case .inputTranscriptionCompleted(let transcript):
+            await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
             outputTranscript += delta
             onTranscript?(delta, .assistant)
@@ -137,6 +148,32 @@ public actor ConversationOrchestrator {
             ))
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
+        }
+    }
+
+    /// Wake-word gate: with requireWakeWord on, the server transcribes but does
+    /// not auto-reply, so we decide here whether "Nova" was addressed and whether
+    /// to answer by voice or with a captured frame.
+    private func handleUserUtterance(_ transcript: String) async {
+        guard sessionConfig.requireWakeWord else { return }
+        switch detector.detect(transcript) {
+        case .ignore:
+            return
+        case .converse:
+            await ai.createResponse()
+        case .vision(let prompt):
+            guard let frameCapture else {
+                // No camera wired in this runtime — answer by voice instead.
+                await ai.createResponse()
+                return
+            }
+            do {
+                let frame = try await frameCapture.captureStill()
+                _ = try await askAboutFrame(frame, prompt: prompt)
+            } catch {
+                NovaLog.ai.error("vision trigger failed: \(String(describing: error), privacy: .public)")
+                await ai.createResponse()
+            }
         }
     }
 

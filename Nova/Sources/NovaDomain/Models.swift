@@ -23,24 +23,37 @@ public struct AISessionConfig: Sendable, Equatable {
     public var enableServerVAD: Bool
     public var idleTimeout: Duration
     public var hardTTL: Duration
+    /// Wake word that must precede a request before Nova responds.
+    public var wakeWord: String
+    /// When true, Nova only replies to utterances that contain the wake word.
+    public var requireWakeWord: Bool
+    /// Phrases (after the wake word) that route to the vision path.
+    public var visionTriggerPhrases: [String]
 
     public init(
-        instructions: String = "You are Nova, a concise wearable assistant. Prefer short spoken answers.",
+        instructions: String = "You are Nova, a concise wearable assistant. Prefer short spoken answers. The user addresses you by saying 'Nova'; do not repeat the wake word back.",
         voice: String = "marin",
         enableServerVAD: Bool = true,
         idleTimeout: Duration = .seconds(120),
-        hardTTL: Duration = .seconds(1800)
+        hardTTL: Duration = .seconds(1800),
+        wakeWord: String = "Nova",
+        requireWakeWord: Bool = true,
+        visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
     ) {
         self.instructions = instructions
         self.voice = voice
         self.enableServerVAD = enableServerVAD
         self.idleTimeout = idleTimeout
         self.hardTTL = hardTTL
+        self.wakeWord = wakeWord
+        self.requireWakeWord = requireWakeWord
+        self.visionTriggerPhrases = visionTriggerPhrases
     }
 }
 
 public enum AIConversationEvent: Sendable, Equatable {
     case inputTranscript(delta: String)
+    case inputTranscriptionCompleted(transcript: String)
     case outputTranscript(delta: String)
     case outputAudio(pcm16_24k: Data)
     case responseStarted

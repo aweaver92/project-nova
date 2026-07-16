@@ -49,6 +49,11 @@ public final class AppContainer {
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
 
+        let session = MetaDATWearableSession(useMock: true)
+        self.wearableSession = session
+        let capture = MetaDATFrameCapture()
+        self.frameCapture = capture
+
         let orchestrator = ConversationOrchestrator(
             ai: ai,
             ingress: ingress,
@@ -56,14 +61,10 @@ public final class AppContainer {
             resampler: resampler,
             metrics: metrics,
             memory: memory,
-            toolRouter: router
+            toolRouter: router,
+            frameCapture: capture
         )
         self.orchestrator = orchestrator
-
-        let session = MetaDATWearableSession(useMock: true)
-        self.wearableSession = session
-        let capture = MetaDATFrameCapture()
-        self.frameCapture = capture
 
         self.sessionVM = SessionViewModel(session: session)
         self.conversationVM = ConversationViewModel(orchestrator: orchestrator, metrics: metrics)

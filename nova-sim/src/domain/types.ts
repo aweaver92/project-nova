@@ -1,3 +1,5 @@
+import { DEFAULT_VISION_PHRASES } from "./wakeWord";
+
 export type LatencyMetric =
   | "t_mic_to_ws"
   | "t_ws_to_first_audio"
@@ -52,17 +54,28 @@ export interface AISessionConfig {
   instructions: string;
   voice: string;
   enableServerVAD: boolean;
+  /** Wake word that must precede a request before Nova responds. */
+  wakeWord: string;
+  /** When true, Nova only replies to utterances that contain the wake word. */
+  requireWakeWord: boolean;
+  /** Phrases (after the wake word) that route to the vision path. */
+  visionTriggerPhrases: string[];
 }
 
 export const defaultSessionConfig = (): AISessionConfig => ({
   instructions:
-    "You are Nova, a concise wearable assistant. Prefer short spoken answers.",
+    "You are Nova, a concise wearable assistant. Prefer short spoken answers. " +
+    "The user addresses you by saying 'Nova'; do not repeat the wake word back.",
   voice: "marin",
   enableServerVAD: true,
+  wakeWord: "Nova",
+  requireWakeWord: true,
+  visionTriggerPhrases: DEFAULT_VISION_PHRASES,
 });
 
 export type AIConversationEvent =
   | { type: "inputTranscript"; delta: string }
+  | { type: "inputTranscriptionCompleted"; transcript: string }
   | { type: "outputTranscript"; delta: string }
   | { type: "outputAudio"; pcm16_24k: Buffer }
   | { type: "responseStarted" }
@@ -108,6 +121,8 @@ export interface ConversationalAIProvider {
   connect(config: AISessionConfig): Promise<void>;
   disconnect(): Promise<void>;
   appendAudio(pcm16_24k: Buffer): Promise<void>;
+  /** Explicitly ask the model to generate a reply to the committed input. */
+  createResponse(): Promise<void>;
   interrupt(): Promise<void>;
   analyze(image: CapturedFrame, prompt: string): Promise<string>;
   onEvent(handler: (event: AIConversationEvent) => void): void;

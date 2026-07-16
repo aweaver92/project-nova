@@ -55,8 +55,15 @@ Options:
   --no-wav         Do not also record a WAV file
   --image PATH     JPEG/PNG for vision mode
   --prompt TEXT    Vision prompt
+  --scene PATH     Image treated as "what's in view"; used when you say
+                   "Nova, what's this?" during live/file/dry modes
   --mic NAME       Capture device name for live mode (see --list-mics)
   --list-mics      List capture devices, then exit (use a name with --mic)
+
+Wake word:
+  By default Nova only replies to utterances containing "Nova" (e.g.
+  "Nova, what's the weather?"). Saying "Nova, what's this?" captures the
+  --scene image and asks the model about it.
 `);
 }
 
@@ -173,6 +180,21 @@ async function main(): Promise<void> {
   const egress: AudioEgress =
     egresses.length === 1 ? egresses[0] : new TeeEgress(egresses);
 
+  // Optional "what's in view" source for the "Nova, what's this?" trigger.
+  const scenePath = arg("--scene");
+  const frameProvider =
+    scenePath && fs.existsSync(scenePath)
+      ? async () => ({
+          imageData: fs.readFileSync(scenePath),
+          mimeType: scenePath.toLowerCase().endsWith(".png")
+            ? "image/png"
+            : "image/jpeg",
+          capturedAt: Date.now(),
+          width: 0,
+          height: 0,
+        })
+      : undefined;
+
   const orch = new ConversationOrchestrator(
     ai,
     ingress,
@@ -181,7 +203,8 @@ async function main(): Promise<void> {
     memory,
     tools,
     (t, role) => process.stdout.write(`[${role}] ${t}`),
-    outSampleRate
+    outSampleRate,
+    frameProvider
   );
 
   console.log(`[nova-sim] mode=${mode} fake=${fake} duration=${seconds}s`);

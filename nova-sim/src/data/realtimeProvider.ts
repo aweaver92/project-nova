@@ -64,8 +64,14 @@ export class OpenAIRealtimeProvider implements ConversationalAIProvider {
             audio: {
               input: {
                 format: { type: "audio/pcm", rate: 24000 },
+                // When a wake word is required the server still detects turns
+                // and transcribes, but must NOT auto-reply — the orchestrator
+                // decides whether to respond after checking for "Nova".
                 turn_detection: config.enableServerVAD
-                  ? { type: "semantic_vad", create_response: true }
+                  ? {
+                      type: "semantic_vad",
+                      create_response: !config.requireWakeWord,
+                    }
                   : null,
                 transcription: { model: "whisper-1" },
               },
@@ -105,6 +111,11 @@ export class OpenAIRealtimeProvider implements ConversationalAIProvider {
         audio: pcm16_24k.toString("base64"),
       })
     );
+  }
+
+  async createResponse(): Promise<void> {
+    if (!this.connected || !this.ws) return;
+    this.ws.send(JSON.stringify({ type: "response.create" }));
   }
 
   async interrupt(): Promise<void> {
@@ -175,6 +186,12 @@ export class OpenAIRealtimeProvider implements ConversationalAIProvider {
       case "conversation.item.input_audio_transcription.delta":
         this.emit({ type: "inputTranscript", delta: String(json.delta ?? "") });
         break;
+      case "conversation.item.input_audio_transcription.completed":
+        this.emit({
+          type: "inputTranscriptionCompleted",
+          transcript: String(json.transcript ?? ""),
+        });
+        break;
       case "input_audio_buffer.speech_started":
         this.emit({ type: "speechStarted" });
         break;
@@ -232,6 +249,10 @@ export class FakeConversationalAIProvider implements ConversationalAIProvider {
 
   async appendAudio(_pcm16_24k: Buffer): Promise<void> {}
 
+  async createResponse(): Promise<void> {
+    this.emitAssistant("(fake response)");
+  }
+
   async interrupt(): Promise<void> {
     this.handler?.({ type: "responseEnded" });
   }
@@ -244,5 +265,10 @@ export class FakeConversationalAIProvider implements ConversationalAIProvider {
     this.handler?.({ type: "responseStarted" });
     this.handler?.({ type: "outputTranscript", delta: text });
     this.handler?.({ type: "responseEnded" });
+  }
+
+  /** Simulate the server delivering a finished user transcription. */
+  emitUserTranscript(transcript: string): void {
+    this.handler?.({ type: "inputTranscriptionCompleted", transcript });
   }
 }

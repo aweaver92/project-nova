@@ -6,6 +6,7 @@ import { FakeConversationalAIProvider } from "./data/realtimeProvider";
 import { ConversationOrchestrator } from "./domain/orchestrator";
 import { NullEgress, SilenceIngress, TeeEgress } from "./data/audioIo";
 import { defaultSessionConfig } from "./domain/types";
+import { WakeWordDetector } from "./domain/wakeWord";
 import type {
   AIConversationEvent,
   AISessionConfig,
@@ -45,16 +46,24 @@ class NoopIngress implements AudioIngress {
 class ScriptedProvider implements ConversationalAIProvider {
   private handler?: (event: AIConversationEvent) => void;
   interruptCount = 0;
+  createResponseCount = 0;
+  analyzeCount = 0;
+  lastAnalyzePrompt?: string;
   onEvent(handler: (event: AIConversationEvent) => void): void {
     this.handler = handler;
   }
   async connect(_config: AISessionConfig): Promise<void> {}
   async disconnect(): Promise<void> {}
   async appendAudio(_pcm16_24k: Buffer): Promise<void> {}
+  async createResponse(): Promise<void> {
+    this.createResponseCount += 1;
+  }
   async interrupt(): Promise<void> {
     this.interruptCount += 1;
   }
-  async analyze(_image: CapturedFrame, _prompt: string): Promise<string> {
+  async analyze(_image: CapturedFrame, prompt: string): Promise<string> {
+    this.analyzeCount += 1;
+    this.lastAnalyzePrompt = prompt;
     return "ok";
   }
   emit(event: AIConversationEvent): void {
@@ -121,6 +130,8 @@ async function run(): Promise<void> {
   await testTeeEgress();
   await testOutputSampleRate();
   await testBargeIn();
+  testWakeWordDetector();
+  await testWakeGating();
 
   console.log("nova-sim selftest passed");
 }
@@ -223,6 +234,134 @@ async function testBargeIn(): Promise<void> {
   assert.notStrictEqual(metrics.percentile("t_barge_in_cancel", 0.5), undefined);
 
   await orch.stop();
+}
+
+/** Detector classifies utterances into ignore / converse / vision. */
+function testWakeWordDetector(): void {
+  const d = new WakeWordDetector();
+
+  assert.strictEqual(d.detect("what's the weather today").kind, "ignore");
+  assert.strictEqual(d.detect("").kind, "ignore");
+
+  const converse = d.detect("Nova, what's the weather today?");
+  assert.strictEqual(converse.kind, "converse");
+  if (converse.kind === "converse") {
+    assert.ok(converse.command.includes("weather"));
+  }
+
+  // The headline vision phrase.
+  assert.strictEqual(d.detect("Nova, what's this?").kind, "vision");
+  // Variants + casing/punctuation robustness.
+  assert.strictEqual(d.detect("nova what am I looking at").kind, "vision");
+  assert.strictEqual(d.detect("NOVA... what is this!!").kind, "vision");
+
+  // Wake word required: "this" alone without Nova is ignored.
+  assert.strictEqual(d.detect("what's this").kind, "ignore");
+
+  // "novafy" must not count as the wake word (word-boundary check).
+  assert.strictEqual(d.detect("novafy this document").kind, "ignore");
+}
+
+/** Orchestrator only responds after the wake word, and routes vision triggers. */
+async function testWakeGating(): Promise<void> {
+  const config = defaultSessionConfig();
+
+  // 1) No wake word → no response.
+  {
+    const provider = new ScriptedProvider();
+    const orch = new ConversationOrchestrator(
+      provider,
+      new NoopIngress(),
+      new NullEgress(),
+      new LatencyMetricsRecorder()
+    );
+    await orch.start(config);
+    provider.emit({
+      type: "inputTranscriptionCompleted",
+      transcript: "what's the weather",
+    });
+    await tick();
+    assert.strictEqual(provider.createResponseCount, 0);
+    assert.strictEqual(provider.analyzeCount, 0);
+    await orch.stop();
+  }
+
+  // 2) "Nova ..." → a spoken response is requested.
+  {
+    const provider = new ScriptedProvider();
+    const orch = new ConversationOrchestrator(
+      provider,
+      new NoopIngress(),
+      new NullEgress(),
+      new LatencyMetricsRecorder()
+    );
+    await orch.start(config);
+    provider.emit({
+      type: "inputTranscriptionCompleted",
+      transcript: "Nova, what's the weather?",
+    });
+    await tick();
+    assert.strictEqual(provider.createResponseCount, 1);
+    assert.strictEqual(provider.analyzeCount, 0);
+    await orch.stop();
+  }
+
+  // 3) "Nova, what's this?" with a frame provider → vision path (analyze).
+  {
+    const provider = new ScriptedProvider();
+    let captured = 0;
+    const frameProvider = async (): Promise<CapturedFrame> => {
+      captured += 1;
+      return {
+        imageData: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+        mimeType: "image/jpeg",
+        capturedAt: Date.now(),
+        width: 1,
+        height: 1,
+      };
+    };
+    const orch = new ConversationOrchestrator(
+      provider,
+      new NoopIngress(),
+      new NullEgress(),
+      new LatencyMetricsRecorder(),
+      undefined,
+      undefined,
+      undefined,
+      8000,
+      frameProvider
+    );
+    await orch.start(config);
+    provider.emit({
+      type: "inputTranscriptionCompleted",
+      transcript: "Nova, what's this?",
+    });
+    await tick();
+    assert.strictEqual(captured, 1);
+    assert.strictEqual(provider.analyzeCount, 1);
+    assert.strictEqual(provider.createResponseCount, 0);
+    await orch.stop();
+  }
+
+  // 4) Vision trigger without a frame provider → falls back to a spoken reply.
+  {
+    const provider = new ScriptedProvider();
+    const orch = new ConversationOrchestrator(
+      provider,
+      new NoopIngress(),
+      new NullEgress(),
+      new LatencyMetricsRecorder()
+    );
+    await orch.start(config);
+    provider.emit({
+      type: "inputTranscriptionCompleted",
+      transcript: "Nova, what's this?",
+    });
+    await tick();
+    assert.strictEqual(provider.analyzeCount, 0);
+    assert.strictEqual(provider.createResponseCount, 1);
+    await orch.stop();
+  }
 }
 
 run().catch((e) => {
