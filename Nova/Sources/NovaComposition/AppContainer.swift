@@ -25,7 +25,12 @@ public final class AppContainer {
         self.metrics = metrics
 
         let tokenStore = KeychainTokenStore()
-        let tokenService = StubTokenService()
+        // Real credential path: if a standard OpenAI key is available (env or
+        // Info.plist), mint short-lived ephemeral secrets directly from OpenAI.
+        // Otherwise fall back to the stub (NOVA_OPENAI_STUB_TOKEN).
+        let tokenService: any TokenService = OpenAICredentials.apiKey()
+            .map { DirectOpenAITokenService(apiKey: $0) }
+            ?? StubTokenService()
         let resampler = PCMResampler()
         let coordinator = AudioSessionCoordinator()
 

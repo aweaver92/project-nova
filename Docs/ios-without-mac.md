@@ -118,6 +118,33 @@ When you say **"Nova, what's this?"**, the orchestrator calls `captureStill()`, 
 requests camera permission, starts a glasses `DeviceSession` + `Stream`, captures a JPEG,
 and hands it to the Realtime model.
 
+## Stage 5 — Realtime credentials (OpenAI key)
+
+For a private, single-user build there's no separate token backend:
+`DirectOpenAITokenService` mints a short-lived ephemeral secret
+(`POST /v1/realtime/client_secrets`) directly from OpenAI using your standard key, and
+only that `ek_...` secret is used for the WebSocket. The key is resolved from, in order:
+
+1. `NOVA_OPENAI_API_KEY` / `OPENAI_API_KEY` environment (Simulator / dev).
+2. The app's `OpenAIAPIKey` Info.plist value, fed from `OPENAI_API_KEY` in a build
+   config.
+
+To supply the key for a device build:
+
+```
+cp Nova/Config/Secrets.example.xcconfig Nova/Config/Secrets.xcconfig
+# edit Secrets.xcconfig → OPENAI_API_KEY = sk-...
+```
+
+`Config/Secrets.xcconfig` is git-ignored and optionally included by the committed
+`Config/Nova.xcconfig`. If no key is present the app falls back to `StubTokenService`
+(the `NOVA_OPENAI_STUB_TOKEN` path). CI never has a key, so it compiles the path without
+using it.
+
+> This bakes the standard key into the app bundle in plain text — fine for a private
+> sideloaded build, not for public distribution. For that, stand up a token backend and
+> point `HTTPTokenService` at it instead.
+
 ## Fallback route — Apple Developer Program + TestFlight
 
 If free provisioning proves too limiting (entitlements or the 7-day churn):

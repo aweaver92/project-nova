@@ -22,6 +22,77 @@ public struct StubTokenService: TokenService {
     }
 }
 
+/// Resolves a standard OpenAI API key for private/personal use, in priority order:
+/// 1. `NOVA_OPENAI_API_KEY` / `OPENAI_API_KEY` environment (Simulator / dev).
+/// 2. `OpenAIAPIKey` in the app's Info.plist (populated from a git-ignored
+///    `Secrets.xcconfig` at build time).
+public enum OpenAICredentials {
+    public static func apiKey(bundle: Bundle = .main) -> String? {
+        let env = ProcessInfo.processInfo.environment
+        if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"],
+           !key.isEmpty {
+            return key
+        }
+        if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String,
+           !key.isEmpty,
+           // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
+           !key.hasPrefix("$(") {
+            return key
+        }
+        return nil
+    }
+}
+
+/// Mints a GA Realtime ephemeral client secret directly from OpenAI using a
+/// standard API key — no separate backend required. Intended for private,
+/// single-user builds; the standard key lives on-device (Info.plist / Keychain),
+/// and only the short-lived `ek_...` secret is used for the WebSocket.
+public struct DirectOpenAITokenService: TokenService {
+    private let apiKey: String
+    private let model: String
+    private let endpoint: URL
+    private let session: URLSession
+
+    public init(
+        apiKey: String,
+        model: String = "gpt-realtime",
+        endpoint: URL = URL(string: "https://api.openai.com/v1/realtime/client_secrets")!,
+        session: URLSession = .shared
+    ) {
+        self.apiKey = apiKey
+        self.model = model
+        self.endpoint = endpoint
+        self.session = session
+    }
+
+    public func fetchRealtimeClientSecret() async throws -> EphemeralCredential {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["session": ["type": "realtime", "model": model]]
+        )
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NovaError.credentials("OpenAI client_secrets failed (HTTP \(code))")
+        }
+        struct Payload: Decodable {
+            let value: String?
+            let expires_at: TimeInterval?
+        }
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        guard let secret = payload.value, !secret.isEmpty else {
+            throw NovaError.credentials("OpenAI returned no client secret value")
+        }
+        let expiresAt = payload.expires_at.map { Date(timeIntervalSince1970: $0) }
+            ?? Date().addingTimeInterval(60)
+        return EphemeralCredential(token: secret, expiresAt: expiresAt)
+    }
+}
+
 /// Production-shaped HTTP token client. Point `baseURL` at your backend, which
 /// should mint a GA Realtime ephemeral secret via `POST /v1/realtime/client_secrets`
 /// and return it verbatim. The response shape mirrors OpenAI's GA endpoint:

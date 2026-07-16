@@ -55,6 +55,13 @@ targets:
           AppLinkURLScheme: "nova://"
           # "0" enables Developer Mode registration; replace with your Meta App ID for release.
           MetaAppID: "0"
+        # Standard OpenAI key for the direct ephemeral-secret path. Empty unless
+        # you provide Config/Secrets.xcconfig (git-ignored). See Config/Nova.xcconfig.
+        OpenAIAPIKey: "$(OPENAI_API_KEY)"
+    # Base build settings + optional git-ignored Secrets.xcconfig include.
+    configFiles:
+      Debug: Config/Nova.xcconfig
+      Release: Config/Nova.xcconfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.nova.app

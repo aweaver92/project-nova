@@ -1,0 +1,11 @@
+// Base build settings for NovaApp (committed).
+//
+// OPENAI_API_KEY feeds the OpenAIAPIKey Info.plist value, which
+// DirectOpenAITokenService reads to mint ephemeral Realtime secrets.
+// It is empty by default; put your real key in Config/Secrets.xcconfig
+// (git-ignored) which is optionally included below.
+OPENAI_API_KEY =
+
+// Optional, git-ignored. Copy Config/Secrets.example.xcconfig to
+// Config/Secrets.xcconfig and set OPENAI_API_KEY there for device builds.
+#include? "Secrets.xcconfig"
