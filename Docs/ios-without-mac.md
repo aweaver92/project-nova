@@ -100,13 +100,19 @@ The Meta Wearables Device Access Toolkit (`github.com/facebook/meta-wearables-da
 - `NovaApp` calls `Wearables.configure()` at launch and routes callbacks to
   `Wearables.shared.handleUrl(_:)`.
 
+Registration is wired too: `MetaDATWearableSession(useMock: false)` calls
+`Wearables.shared.startRegistration()` and mirrors `registrationStateStream()` into
+the session UI. The Register button in the app drives it.
+
 ### Runtime prerequisites (device only — CI just compiles this)
 
-1. Install the Meta AI companion app and enable **Developer Mode**
+1. In `NovaApp`, construct the container with all three flags `false`:
+   `AppContainer(useFakeAI: false, useSilentMic: false, useMockGlasses: false)`.
+2. Install the Meta AI companion app and enable **Developer Mode**
    (Settings → your glasses → Developer Mode).
-2. Register the app with Meta AI and grant **camera** permission when Nova deep-links
-   you there on first "Nova, what's this?".
-3. `MetaAppID` is `0` for Developer Mode; set a real Meta App ID for release.
+3. Tap **Register** — Nova deep-links to Meta AI to approve the app, then grant
+   **camera** permission on the first "Nova, what's this?".
+4. `MetaAppID` is `0` for Developer Mode; set a real Meta App ID for release.
 
 When you say **"Nova, what's this?"**, the orchestrator calls `captureStill()`, which
 requests camera permission, starts a glasses `DeviceSession` + `Stream`, captures a JPEG,
