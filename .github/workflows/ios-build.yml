@@ -1,0 +1,68 @@
+name: iOS Build
+
+# Compiles and unit-tests the Nova Swift package for iOS on a cloud macOS
+# runner. No Apple Developer account or code signing required — this only
+# builds for the iOS Simulator, so it is free and needs no secrets.
+#
+# This is the "no Mac needed" verification step: push to GitHub and the macOS
+# runner tells you whether the Swift code builds for iOS. Signed TestFlight
+# builds for a physical iPhone are a later step that does require the Apple
+# Developer Program ($99/yr).
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "Nova/**"
+      - ".github/workflows/ios-build.yml"
+  pull_request:
+    paths:
+      - "Nova/**"
+      - ".github/workflows/ios-build.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    name: Build & test (iOS Simulator)
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: Nova
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: List package schemes (diagnostic)
+        run: xcodebuild -list -workspace . 2>/dev/null || xcodebuild -list
+
+      - name: Resolve dependencies
+        run: xcodebuild -resolvePackageDependencies
+
+      - name: Pick an available iPhone simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')
+          echo "Using simulator UDID: $UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme NovaComposition \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipMacroValidation \
+            -skipPackagePluginValidation
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -scheme Nova-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation

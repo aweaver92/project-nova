@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant Glasses
+  participant iOS as Nova_iOS
+  participant Audio as AudioPipeline
+  participant AI as RealtimeProvider
+  participant OpenAI
+
+  Glasses->>iOS: HFP mic PCM 8kHz mono
+  iOS->>Audio: capture via AVAudioEngine
+  Audio->>Audio: resample 8k to 24k PCM16
+  Audio->>AI: append audio chunks
+  AI->>OpenAI: WebSocket input_audio_buffer.append
+  OpenAI-->>AI: audio delta plus transcripts
+  AI->>Audio: 24k PCM16 out
+  Audio->>Audio: resample 24k to 8k for HFP
+  Audio->>Glasses: HFP speaker 8kHz mono

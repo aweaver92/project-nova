@@ -1,0 +1,112 @@
+@startuml Nova_Core_Components
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+
+package "Features" {
+  class SessionViewModel {
+    +registrationState: RegistrationState
+    +sessionState: WearableSessionState
+    +register()
+    +startSession()
+    +endSession()
+  }
+  class ConversationViewModel {
+    +transcript: String
+    +isAssistantSpeaking: Bool
+    +startConversation()
+    +stopConversation()
+  }
+  class VisionViewModel {
+    +isCameraActive: Bool
+    +captureStill()
+    +askAboutView(prompt: String)
+  }
+}
+
+package "Domain" {
+  interface ConversationalAIProvider {
+    +connect(config)
+    +appendAudio(pcm16_24k)
+    +interrupt()
+    +analyze(image, prompt)
+    +events: AsyncStream
+  }
+  interface AudioIngress {
+    +start()
+    +stop()
+    +chunks: AsyncStream
+  }
+  interface AudioEgress {
+    +enqueue(pcm)
+    +flush()
+    +stop()
+  }
+  interface WearableSession {
+    +register()
+    +start()
+    +pause()
+    +resume()
+    +stop()
+    +state: AsyncStream
+  }
+  interface FrameCapture {
+    +captureStill()
+    +startBurst(config)
+    +stopBurst()
+  }
+  interface Tool {
+    +name: String
+    +invoke(args)
+  }
+  interface ConversationMemory {
+    +append(turn)
+    +summary()
+  }
+  class ConversationOrchestrator {
+    -ai: ConversationalAIProvider
+    -ingress: AudioIngress
+    -egress: AudioEgress
+    -metrics: LatencyMetricsRecorder
+    +start()
+    +stop()
+    +handleBargeIn()
+  }
+  class ToolRouter {
+    -tools: [Tool]
+    +dispatch(call)
+  }
+}
+
+package "Data" {
+  class OpenAIRealtimeProvider
+  class HFPGlassesAudioIngress
+  class HFPGlassesAudioEgress
+  class PCMResampler
+  class AudioSessionCoordinator
+  class MetaDATWearableSession
+  class MetaDATFrameCapture
+  class KeychainTokenStore
+  class StubTokenService
+  class InMemoryConversationMemory
+  class WeatherTool
+  class RemindersTool
+}
+
+SessionViewModel --> WearableSession
+ConversationViewModel --> ConversationOrchestrator
+VisionViewModel --> FrameCapture
+VisionViewModel --> ConversationOrchestrator
+ConversationOrchestrator --> ConversationalAIProvider
+ConversationOrchestrator --> AudioIngress
+ConversationOrchestrator --> AudioEgress
+ToolRouter --> Tool
+OpenAIRealtimeProvider ..|> ConversationalAIProvider
+HFPGlassesAudioIngress ..|> AudioIngress
+HFPGlassesAudioEgress ..|> AudioEgress
+MetaDATWearableSession ..|> WearableSession
+MetaDATFrameCapture ..|> FrameCapture
+InMemoryConversationMemory ..|> ConversationMemory
+WeatherTool ..|> Tool
+RemindersTool ..|> Tool
+
+@enduml

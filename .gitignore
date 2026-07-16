@@ -1,0 +1,26 @@
+# Secrets — never commit (belt-and-suspenders; subfolders also ignore these)
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.p12
+*.mobileprovision
+
+# Node
+node_modules/
+dist/
+
+# Generated audio
+**/samples/*.wav
+**/samples/*.pcm
+
+# Swift / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+
+# OS
+.DS_Store
+Thumbs.db
