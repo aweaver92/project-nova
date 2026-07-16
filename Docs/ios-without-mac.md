@@ -2,65 +2,104 @@
 
 Target device: iPhone 11 (supports iOS 17+, so the package's `.iOS(.v17)` floor is fine).
 Build machine: GitHub Actions macOS runners. Dev machine: this Windows PC.
+Chosen install route: **AltStore** (free, no Apple Developer Program).
 
 ## The pipeline
 
 ```mermaid
 flowchart LR
-    dev["Windows PC (author Swift)"] --> push["git push"]
+    dev["Windows PC (author Swift)"] --> push["git push / Run workflow"]
     push --> ci["GitHub Actions (macOS runner)"]
-    ci --> build["xcodegen + xcodebuild"]
-    build --> tf["TestFlight / .ipa"]
-    tf --> phone["iPhone 11"]
+    ci --> build["xcodegen + xcodebuild (unsigned)"]
+    build --> ipa["NovaApp.ipa artifact"]
+    ipa --> alt["AltStore (Windows PC)"]
+    alt --> phone["iPhone 11"]
 ```
 
 No Xcode project is committed. `Nova/project.yml` (XcodeGen) generates `NovaApp.xcodeproj`
 on the runner, so the app target is authored entirely from Windows.
 
-## Stage 1 — Compile + test (free, no accounts)
+## Stage 1 — Compile + test (free, every push)
 
-`.github/workflows/ci.yml` already does this on every push:
+`.github/workflows/ci.yml` runs on every push:
 - Builds every Swift module for the iOS Simulator (validates the ports that can't
   build on Windows).
 - Runs the package tests on a simulator.
-- Generates the app project and builds `NovaApp` unsigned.
+- Generates the app project and builds `NovaApp` unsigned for the simulator.
 
-This is the immediate win: it turns the "unverifiable on Windows" Swift into
-green/red CI signal.
+This turns the "unverifiable on Windows" Swift into green/red CI signal.
 
-## Stage 2 — Install on the iPhone 11 (needs signing)
+## Stage 2 — Produce an installable `.ipa` (free, on demand)
 
-Two routes. Pick based on budget vs. convenience.
+The same workflow builds an **unsigned device (arm64) `.ipa`** and uploads it as a
+build artifact — but only when you ask, to save macOS minutes:
 
-### Route A — Apple Developer Program + TestFlight (recommended)
+- **Manual:** GitHub → repo → **Actions** → **CI** → **Run workflow** (button).
+- **Or** push a version tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+When that run finishes, open it and download the **`NovaApp-unsigned-ipa`** artifact
+(a zip containing `NovaApp.ipa`). AltStore re-signs it at install time, so it does
+not need to be signed here.
+
+> Why gated: on a **private** repo, macOS runner minutes bill at **10x**, so the
+> free 2,000 min/month is effectively ~200 macOS minutes. Making the repo **public**
+> gives unlimited free Actions minutes if you'd rather build the `.ipa` on every push.
+
+## Stage 3 — Install with AltStore on Windows
+
+One-time setup:
+1. Install Apple's **iTunes** and **iCloud** — the versions downloaded directly from
+   apple.com, **not** the Microsoft Store versions (AltServer needs their components).
+2. Download **AltServer for Windows** from altstore.io and run it.
+3. Plug the iPhone 11 into the PC via USB, unlock it, and tap **Trust**.
+4. In the Windows tray: **AltServer → Install AltStore → [your iPhone]**. Sign in with
+   a free Apple ID (a "Personal Team" is created automatically). AltStore now lives on
+   the phone.
+5. On the iPhone: **Settings → General → VPN & Device Management** → trust your Apple ID
+   developer profile.
+
+Install/refresh Nova:
+6. Download `NovaApp.ipa` from the CI artifact (Stage 2) onto the phone or PC.
+7. Open **AltStore** on the phone → **My Apps** → **+** → pick `NovaApp.ipa`. AltStore
+   signs it with your Apple ID and installs it.
+8. Keep AltServer running on the PC and both devices on the same Wi‑Fi so AltStore can
+   auto-refresh the signature.
+
+## Free-provisioning limits (read before relying on this)
+
+Free Apple ID "Personal Team" signing is real but restricted:
+- **7-day expiry.** Apps stop launching after 7 days unless AltStore re-signs them
+  (automatic while AltServer runs and both devices share a network).
+- **3 sideloaded apps** installed at once; **10 App IDs / 7 days**.
+- **Limited entitlements.** Free provisioning grants only a small set of capabilities.
+
+### What this means for the Meta glasses
+- **Standard Bluetooth LE (CoreBluetooth)** and **Bluetooth audio (HFP)** do **not**
+  need a special entitlement, so the current audio path should work under AltStore.
+- **MFi / External Accessory** protocols and some background/accessory entitlements are
+  **not** available to free accounts. If the Meta Wearables Device Access Toolkit turns
+  out to require an MFi/External-Accessory entitlement, AltStore sideloading will hit a
+  wall and the Apple Developer Program ($99/yr) becomes necessary for on-device glasses
+  use. Standard-BLE / audio-route features are unaffected.
+
+Verify this early: install the app via AltStore and confirm the glasses connect over
+the standard audio route before investing further in the free path.
+
+## Stage 4 — The glasses integration (separate from the Mac question)
+
+- Enroll in the Meta developer program (free) and enable Developer Mode on the glasses
+  via the Meta AI app.
+- Add the Meta Wearables Device Access Toolkit iOS SPM packages to `project.yml` and
+  `Package.swift`, then implement the real `MetaDATWearableSession` / camera / HFP
+  adapters behind the ports already defined.
+- Until then, `AppContainer(useFakeAI:useSilentMic:)` and
+  `MetaDATWearableSession(useMock: true)` keep the app runnable.
+
+## Fallback route — Apple Developer Program + TestFlight
+
+If free provisioning proves too limiting (entitlements or the 7-day churn):
 - Cost: 99 USD/year.
-- CI signs the build and uploads to TestFlight via the App Store Connect API key
-  (stored as GitHub secrets); you install through the TestFlight app on the phone.
-- Builds last 90 days; no cables, no Mac, fully remote.
-- Requires adding a signing workflow with these secrets:
-  `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`,
-  `APP_STORE_CONNECT_KEY` (p8), plus a distribution cert + provisioning profile
-  (or use `fastlane match`).
-
-### Route B — AltStore (free, fiddly)
-- Cost: 0 (free Apple ID "Personal Team" provisioning).
-- CI produces an unsigned/dev `.ipa` artifact; AltStore on Windows (needs iTunes +
-  iCloud from Apple, not the Microsoft Store versions) signs and installs it.
-- Free provisioning expires every 7 days and is limited to 3 apps; AltStore
-  refreshes automatically while your PC and phone are on the same network.
-
-## Stage 3 — The glasses (separate from the Mac question)
-
-- Enroll in the Meta developer program (free) and enable Developer Mode on the
-  glasses via the Meta AI app.
-- Add the Meta Wearables Device Access Toolkit iOS SPM packages to `project.yml`
-  and `Package.swift`, then implement the real `MetaDATWearableSession` /
-  camera / HFP adapters behind the ports we already defined.
-- Until then, `AppContainer(useFakeAI:useSilentMic:)` and `MetaDATWearableSession(useMock: true)`
-  keep the app runnable.
-
-## First-push checklist
-1. Create an empty GitHub repo.
-2. `git remote add origin <url>` and push `main`.
-3. Watch the Actions tab; iterate on scheme/simulator names if the first run flags them.
-4. Decide Route A vs B for on-device install; wire the signing workflow.
+- CI signs the build and uploads to TestFlight via an App Store Connect API key stored
+  as GitHub secrets (`APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`,
+  `APP_STORE_CONNECT_KEY`); you install through the TestFlight app.
+- Builds last 90 days, no cables, no Mac, fully remote.
