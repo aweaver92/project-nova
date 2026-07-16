@@ -92,20 +92,20 @@ public actor MetaDATFrameCapture: FrameCapture {
         try session.start()
         try await waitForSessionStarted(session)
 
-        let config = StreamConfiguration(videoCodec: .raw, resolution: .low, frameRate: fps)
+        let config = StreamConfiguration(videoCodec: .raw, resolution: .low, frameRate: UInt(fps))
         guard let newStream = try session.addStream(config: config) else {
             throw NovaError.vision("Could not add camera stream (session not started)")
         }
 
-        listenerTokens.append(newStream.statePublisher.listen { [weak self] state in
+        listenerTokens.append(newStream.statePublisher.listen { [weak self] (state: StreamState) in
             let streaming = (state == .streaming)
             Task { await self?.setStreaming(streaming) }
         })
-        listenerTokens.append(newStream.photoDataPublisher.listen { [weak self] photo in
+        listenerTokens.append(newStream.photoDataPublisher.listen { [weak self] (photo: PhotoData) in
             let data = photo.data
             Task { await self?.deliverPhoto(data) }
         })
-        listenerTokens.append(newStream.videoFramePublisher.listen { [weak self] frame in
+        listenerTokens.append(newStream.videoFramePublisher.listen { [weak self] (frame: VideoFrame) in
             guard let image = frame.makeUIImage(),
                   let jpeg = image.jpegData(compressionQuality: 0.6) else { return }
             let width = Int(image.size.width)
