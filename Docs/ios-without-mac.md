@@ -85,15 +85,32 @@ Free Apple ID "Personal Team" signing is real but restricted:
 Verify this early: install the app via AltStore and confirm the glasses connect over
 the standard audio route before investing further in the free path.
 
-## Stage 4 — The glasses integration (separate from the Mac question)
+## Stage 4 — The glasses camera (wired)
 
-- Enroll in the Meta developer program (free) and enable Developer Mode on the glasses
-  via the Meta AI app.
-- Add the Meta Wearables Device Access Toolkit iOS SPM packages to `project.yml` and
-  `Package.swift`, then implement the real `MetaDATWearableSession` / camera / HFP
-  adapters behind the ports already defined.
-- Until then, `AppContainer(useFakeAI:useSilentMic:)` and
-  `MetaDATWearableSession(useMock: true)` keep the app runnable.
+The Meta Wearables Device Access Toolkit (`github.com/facebook/meta-wearables-dat-ios`,
+0.8.0) is now integrated:
+
+- `Package.swift` pulls `MWDATCore` + `MWDATCamera` into `NovaData`.
+- `MetaDATFrameCapture` (behind `#if canImport(MWDATCamera)`) opens a low-FPS glasses
+  stream and returns real stills via `capturePhoto` → `photoDataPublisher`. Off the SDK
+  (non-iOS builds) it falls back to a placeholder frame so the vision path still runs.
+- `project.yml` adds the SPM package to the app target and the required `Info.plist`
+  keys (`UISupportedExternalAccessoryProtocols` = `com.meta.ar.wearable`, background
+  modes, the `nova://` URL scheme, `fb-viewapp` query scheme, and the `MWDAT` dict).
+- `NovaApp` calls `Wearables.configure()` at launch and routes callbacks to
+  `Wearables.shared.handleUrl(_:)`.
+
+### Runtime prerequisites (device only — CI just compiles this)
+
+1. Install the Meta AI companion app and enable **Developer Mode**
+   (Settings → your glasses → Developer Mode).
+2. Register the app with Meta AI and grant **camera** permission when Nova deep-links
+   you there on first "Nova, what's this?".
+3. `MetaAppID` is `0` for Developer Mode; set a real Meta App ID for release.
+
+When you say **"Nova, what's this?"**, the orchestrator calls `captureStill()`, which
+requests camera permission, starts a glasses `DeviceSession` + `Stream`, captures a JPEG,
+and hands it to the Realtime model.
 
 ## Fallback route — Apple Developer Program + TestFlight
 

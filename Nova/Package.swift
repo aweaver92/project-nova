@@ -13,6 +13,12 @@ let package = Package(
         .library(name: "NovaFeatures", targets: ["NovaFeatures"]),
         .library(name: "NovaComposition", targets: ["NovaComposition"])
     ],
+    dependencies: [
+        // Meta Wearables Device Access Toolkit (binary XCFrameworks) — real
+        // glasses camera capture. NovaData compiles against it behind
+        // `#if canImport(MWDATCamera)`.
+        .package(url: "https://github.com/facebook/meta-wearables-dat-ios", exact: "0.8.0")
+    ],
     targets: [
         .target(
             name: "NovaCore",
@@ -25,7 +31,12 @@ let package = Package(
         ),
         .target(
             name: "NovaData",
-            dependencies: ["NovaCore", "NovaDomain"],
+            dependencies: [
+                "NovaCore",
+                "NovaDomain",
+                .product(name: "MWDATCore", package: "meta-wearables-dat-ios"),
+                .product(name: "MWDATCamera", package: "meta-wearables-dat-ios")
+            ],
             path: "Sources/NovaData"
         ),
         .target(
