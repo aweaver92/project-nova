@@ -108,7 +108,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
         buffer.frameLength = frameCount
         chunk.pcm.copyBytes(to: UnsafeMutableBufferPointer(start: buffer.int16ChannelData![0], count: Int(frameCount)))
-        player.scheduleBuffer(buffer)
+        player.scheduleBuffer(buffer, completionHandler: nil)
         if !player.isPlaying { player.play() }
     }
 
