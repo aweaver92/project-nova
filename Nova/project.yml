@@ -1,0 +1,37 @@
+# XcodeGen spec — generates NovaApp.xcodeproj on any Mac (incl. CI) from this
+# checked-in definition, so the iOS app target can be authored entirely on
+# Windows. Run `xcodegen generate` in this folder (Nova/) to produce the project.
+name: NovaApp
+
+options:
+  bundleIdPrefix: ai.nova
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  Nova:
+    path: .
+
+targets:
+  NovaApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      - package: Nova
+        product: NovaComposition
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.nova.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.10"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # Required privacy strings for glasses mic/camera over Bluetooth.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Nova streams your voice to the AI assistant."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Nova uses your glasses camera to answer questions about what you see."
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Nova connects to your Meta glasses over Bluetooth for audio and camera."

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  nova-sim:
+    name: nova-sim harness (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nova-sim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Self-test
+        run: npm test
+
+  ios:
+    name: Nova iOS (build + test on Simulator)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      # Compile every module for iOS via SwiftPM. This is the check that could
+      # never run on Windows: it validates the Swift ports (GA Realtime provider,
+      # HFP audio, DAT adapters, token services) actually build for the device.
+      - name: Build Swift package (iOS Simulator)
+        working-directory: Nova
+        run: |
+          set -o pipefail
+          xcodebuild -list
+          xcodebuild build \
+            -scheme Nova-Package \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO | xcpretty || xcodebuild build \
+            -scheme Nova-Package \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Pick an available iOS Simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; ids=[x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x.get('isAvailable')]; print(ids[0] if ids else '')")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "Using simulator: $UDID"
+
+      - name: Run package tests (iOS Simulator)
+        working-directory: Nova
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme Nova-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Generate the real iOS app project from the checked-in XcodeGen spec and
+      # build it unsigned. Proves the NovaApp target (SwiftUI entry + DI) compiles.
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate app project
+        working-directory: Nova
+        run: xcodegen generate
+
+      - name: Build NovaApp (iOS Simulator, unsigned)
+        working-directory: Nova
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project NovaApp.xcodeproj \
+            -scheme NovaApp \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
