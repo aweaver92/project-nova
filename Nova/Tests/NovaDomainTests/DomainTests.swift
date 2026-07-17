@@ -136,9 +136,9 @@ final class WakeWordTests: XCTestCase {
         let provider = MockProvider()
         let listener = MockWakeWordListener()
         let orch = makeOrchestrator(provider: provider, wakeWordListener: listener)
-        // Default config has useLocalWakeWord = true, so with a listener wired the
-        // cloud stream must stay closed until the wake word fires locally.
-        try await orch.start()
+        // With local gating enabled and a listener wired, the cloud stream must
+        // stay closed until the wake word fires locally.
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: true))
         let idleConnects = await provider.connectCount
         XCTAssertEqual(idleConnects, 0)
         let idleStreaming = await orch.isStreaming
@@ -158,7 +158,7 @@ final class WakeWordTests: XCTestCase {
         let provider = MockProvider()
         let listener = MockWakeWordListener()
         let orch = makeOrchestrator(provider: provider, wakeWordListener: listener)
-        try await orch.start(config: AISessionConfig(streamIdleTimeout: .milliseconds(200)))
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: true, streamIdleTimeout: .milliseconds(200)))
         listener.fire()
         let connected = await waitUntil { await provider.connectCount == 1 }
         XCTAssertTrue(connected)

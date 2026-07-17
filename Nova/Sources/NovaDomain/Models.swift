@@ -35,6 +35,11 @@ public struct AISessionConfig: Sendable, Equatable {
     /// When true (and a `WakeWordListening` is wired), Nova stays disconnected
     /// from the cloud and listens for the wake word on-device, only opening the
     /// Realtime stream after "Nova" is heard. Saves battery, data, and tokens.
+    ///
+    /// Off by default: it gates *all* transcription behind on-device Apple Speech
+    /// recognizing "Nova", which is not yet validated against the glasses' 8 kHz
+    /// HFP mic. With it off, Nova streams immediately and the server transcribes,
+    /// while `requireWakeWord` still keeps replies gated to "Nova".
     public var useLocalWakeWord: Bool
     /// After engaging via the local wake word, tear the cloud stream back down
     /// once there has been no conversational activity for this long.
@@ -51,7 +56,7 @@ public struct AISessionConfig: Sendable, Equatable {
         wakeWord: String = "Nova",
         requireWakeWord: Bool = true,
         wakeWordGraceWindow: Duration = .seconds(10),
-        useLocalWakeWord: Bool = true,
+        useLocalWakeWord: Bool = false,
         streamIdleTimeout: Duration = .seconds(20),
         visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
     ) {

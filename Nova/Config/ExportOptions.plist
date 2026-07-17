@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Used by scripts/build-ipa.sh when SIGNED=1 and by the "signed" CI path.
+
+  method options:
+    development     - install on registered dev devices (needs a dev cert + profile)
+    ad-hoc          - install on registered devices, no App Store (needs dist cert)
+    app-store       - upload to App Store Connect / TestFlight
+    enterprise      - in-house distribution (Apple Enterprise Program)
+
+  Fill in YOUR_TEAM_ID (Apple Developer Team ID, e.g. AB12CD34EF). With
+  signingStyle=automatic Xcode will pick a matching profile from your keychain.
+-->
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>development</string>
+    <key>teamID</key>
+    <string>YOUR_TEAM_ID</string>
+    <key>signingStyle</key>
+    <string>automatic</string>
+    <key>stripSwiftSymbols</key>
+    <true/>
+    <key>compileBitcode</key>
+    <false/>
+    <key>uploadSymbols</key>
+    <true/>
+    <key>destination</key>
+    <string>export</string>
+</dict>
+</plist>
