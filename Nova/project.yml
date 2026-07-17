@@ -40,6 +40,9 @@ targets:
         UISupportedExternalAccessoryProtocols:
           - com.meta.ar.wearable
         UIBackgroundModes:
+          # `audio` keeps the mic/HFP session alive when the phone is locked or
+          # pocketed, so wake-word listening continues hands-free.
+          - audio
           - bluetooth-central
           - external-accessory
         # Lets the SDK detect and open the Meta AI companion app.

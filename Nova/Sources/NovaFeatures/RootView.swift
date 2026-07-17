@@ -62,6 +62,14 @@ public struct RootView: View {
                 }
             }
             .navigationTitle("Nova")
+            // Auto-start listening when Nova opens so you can pocket the phone
+            // and use the wake word hands-free (the `audio` background mode keeps
+            // the glasses mic session alive while the screen is locked).
+            .task {
+                if !conversation.isRunning {
+                    await conversation.start()
+                }
+            }
         }
     }
 }
