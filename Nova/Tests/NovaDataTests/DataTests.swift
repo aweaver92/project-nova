@@ -182,7 +182,8 @@ final class VoiceRecordingTests: XCTestCase {
 
         // 1 second of audio total.
         for _ in 0..<5 { await recorder.append(chunk(ms: 200)) }
-        let saved = try XCTUnwrap(await recorder.stop())
+        let stopped = await recorder.stop()
+        let saved = try XCTUnwrap(stopped)
 
         // Duration derives from sample count: 8000 samples / 8000 Hz ≈ 1s.
         XCTAssertEqual(saved.duration, 1.0, accuracy: 0.05)
@@ -230,7 +231,8 @@ final class VoiceRecordingTests: XCTestCase {
 
         try await recorder.start()
         await recorder.append(chunk(ms: 500))
-        let saved = try XCTUnwrap(await recorder.stop())
+        let stopped = await recorder.stop()
+        let saved = try XCTUnwrap(stopped)
         let url = dir.appendingPathComponent(saved.fileName)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
 
