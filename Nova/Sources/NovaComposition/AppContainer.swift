@@ -74,6 +74,7 @@ public final class AppContainer {
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
         var tools: [any Tool] = [
+            WebSearchTool(),
             WeatherTool(),
             CreateReminderTool(),
             ListCalendarEventsTool(),

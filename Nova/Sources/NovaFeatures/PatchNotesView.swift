@@ -51,8 +51,13 @@ public extension PatchNote {
         PatchNote(
             version: "0.3.0",
             date: "Jul 17, 2026",
-            summary: "Redesigned companion UI. Nova now complements Meta AI instead of replacing it.",
+            summary: "Real-time web search and a redesigned companion UI. Nova now complements Meta AI instead of replacing it.",
             entries: [
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Nova can now search the live web for current facts, news, prices, and more — grounding answers in real results instead of guessing.",
+                    testable: true
+                ),
                 PatchNoteEntry(
                     kind: .improvement,
                     text: "Refreshed home screen: a clear connection-status panel, a one-tap listening control, and chat-style transcripts.",
