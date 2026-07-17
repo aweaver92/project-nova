@@ -13,7 +13,9 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private var running = false
 
-    public let chunks: AsyncStream<AudioChunk>
+    // Recreated on every `start()` so the mic feed can be torn down and brought
+    // back within a single app run (e.g. switching agents reconnects the stream).
+    public private(set) var chunks: AsyncStream<AudioChunk>
 
     public init(coordinator: AudioSessionCoordinator) {
         self.coordinator = coordinator
@@ -24,6 +26,18 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
 
     public func start() async throws {
         running = true
+        // A fresh stream per engage. `stop()` finishes the previous continuation,
+        // and yielding into a finished continuation silently drops audio — which
+        // previously killed transcription for good after the first teardown
+        // (e.g. the first agent switch). Rebuild it before the tap emits.
+        lock.lock()
+        let previous = continuation
+        var cont: AsyncStream<AudioChunk>.Continuation?
+        chunks = AsyncStream { cont = $0 }
+        continuation = cont
+        lock.unlock()
+        previous?.finish()
+
         try await coordinator.activateConversationalHFP()
         try installTapAndStartEngine()
         registerObservers()
@@ -156,12 +170,19 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         await coordinator.deactivate()
-        continuation?.finish()
+        lock.lock()
+        let sink = continuation
+        continuation = nil
+        lock.unlock()
+        sink?.finish()
     }
 
     private func emit(_ data: Data, capturedAt: ContinuousClock.Instant) {
         guard !data.isEmpty else { return }
-        continuation?.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
+        lock.lock()
+        let sink = continuation
+        lock.unlock()
+        sink?.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
     }
 
     private static func int16Data(from buffer: AVAudioPCMBuffer) -> Data {
