@@ -96,6 +96,25 @@ jobs:
       # to conserve macOS minutes (private-repo macOS time bills at 10x).
       # AltStore re-signs the .ipa with your free Apple ID at install time, so we
       # build unsigned for a real device (arm64) and just zip the .app into an .ipa.
+
+      # Bake the OpenAI key into the build so the sideloaded app can mint Realtime
+      # secrets. The key comes from the OPENAI_API_KEY repo/Actions secret (never
+      # committed). Without it the .ipa installs but Realtime fails at runtime.
+      # NOTE: this embeds the key in plaintext in the .ipa's Info.plist — fine for
+      # a private single-user build, but anyone who can download the artifact can
+      # read it. Keep the repo private and rotate the key if it leaks.
+      - name: Inject OpenAI key (private build)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            printf 'OPENAI_API_KEY = %s\n' "$OPENAI_API_KEY" > Config/Secrets.xcconfig
+            echo "Wrote Config/Secrets.xcconfig from the OPENAI_API_KEY secret."
+          else
+            echo "::warning::No OPENAI_API_KEY secret set — the .ipa will build without an embedded key and Realtime will fail at runtime. Add it under Settings → Secrets and variables → Actions."
+          fi
+
       - name: Build unsigned device app (arm64)
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
