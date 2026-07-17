@@ -406,11 +406,14 @@ final class CodingSessionPinTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = UserDefaultsSettingsStore(defaults: defaults)
-        XCTAssertNil(await store.codingSessionId())
+        let initial = await store.codingSessionId()
+        XCTAssertNil(initial)
         await store.setCodingSessionId("  agent-123  ")
-        XCTAssertEqual(await store.codingSessionId(), "agent-123")
+        let pinned = await store.codingSessionId()
+        XCTAssertEqual(pinned, "agent-123")
         await store.setCodingSessionId("")
-        XCTAssertNil(await store.codingSessionId())
+        let cleared = await store.codingSessionId()
+        XCTAssertNil(cleared)
     }
 
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
@@ -426,7 +429,8 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertTrue(payload.contains("returned-99"))
         let used = await bridge.lastSessionId
         XCTAssertEqual(used, "pinned-1")
-        XCTAssertEqual(await store.codingSessionId(), "returned-99")
+        let updated = await store.codingSessionId()
+        XCTAssertEqual(updated, "returned-99")
     }
 }
 
