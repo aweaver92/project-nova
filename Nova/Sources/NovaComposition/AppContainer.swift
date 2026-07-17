@@ -11,11 +11,14 @@ public final class AppContainer {
     public let wearableSession: MetaDATWearableSession
     public let frameCapture: MetaDATFrameCapture
     public let memory: any ConversationMemory
+    public let facts: FileFactStore
+    public let notes: FileNoteStore
     public let toolRouter: ToolRouter
     public let orchestrator: ConversationOrchestrator
     public let sessionVM: SessionViewModel
     public let conversationVM: ConversationViewModel
     public let visionVM: VisionViewModel
+    public let notesVM: NotesViewModel
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
     ///   in-memory state machine (Simulator / no hardware). Set to `false` on a
@@ -61,7 +64,28 @@ public final class AppContainer {
         let memory: any ConversationMemory = FileConversationMemory()
         self.memory = memory
 
-        let tools: [any Tool] = [WeatherTool(), RemindersTool(), HomeAssistantTool()]
+        // Durable personalization + notes stores.
+        let factStore = FileFactStore()
+        self.facts = factStore
+        let noteStore = FileNoteStore()
+        self.notes = noteStore
+
+        // Tools advertised to the model. Home Assistant is enabled only when a
+        // base URL + token are provided (env or Info.plist).
+        let ha = HomeAssistantConfig.load()
+        var tools: [any Tool] = [
+            WeatherTool(),
+            CreateReminderTool(),
+            ListCalendarEventsTool(),
+            CreateCalendarEventTool(),
+            RememberFactTool(store: factStore),
+            RecallFactsTool(store: factStore),
+            ForgetFactTool(store: factStore),
+            SaveNoteTool(store: noteStore),
+            ListNotesTool(store: noteStore),
+            BriefingTool()
+        ]
+        tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
 
@@ -79,12 +103,14 @@ public final class AppContainer {
             memory: memory,
             toolRouter: router,
             frameCapture: capture,
-            wakeWordListener: wakeWordListener
+            wakeWordListener: wakeWordListener,
+            profileProvider: { await factStore.summary() }
         )
         self.orchestrator = orchestrator
 
         self.sessionVM = SessionViewModel(session: session)
         self.conversationVM = ConversationViewModel(orchestrator: orchestrator, metrics: metrics)
+        self.notesVM = NotesViewModel(store: noteStore)
 
         let bandwidth = FrameCaptureBandwidthBridge(capture: capture)
         self.visionVM = VisionViewModel(

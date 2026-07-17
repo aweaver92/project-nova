@@ -64,33 +64,51 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         // GA Realtime session shape: session.type, output_modalities, and audio
         // config nested under audio.input / audio.output (24 kHz PCM both ways).
-        let sessionUpdate: [String: Any] = [
-            "type": "session.update",
-            "session": [
-                "type": "realtime",
-                "model": model,
-                "output_modalities": ["audio"],
-                "instructions": config.instructions,
+        var sessionDict: [String: Any] = [
+            "type": "realtime",
+            "model": model,
+            "output_modalities": ["audio"],
+            "instructions": config.instructions,
                 "audio": [
                     "input": [
                         "format": ["type": "audio/pcm", "rate": 24000],
+                        // Server-side noise reduction runs before VAD + the model.
+                        // `near_field` suits the close-talking glasses mic and
+                        // improves turn detection and perceived input quality.
+                        "noise_reduction": ["type": "near_field"],
                         // With a wake word required, the server still detects
-                        // turns and transcribes, but must NOT auto-reply — the
-                        // orchestrator decides whether "Nova" was addressed.
-                        "turn_detection": config.enableServerVAD ? [
-                            "type": "semantic_vad",
-                            "create_response": !config.requireWakeWord
-                        ] : NSNull(),
-                        "transcription": ["model": "whisper-1"]
-                    ] as [String: Any],
-                    "output": [
-                        "format": ["type": "audio/pcm", "rate": 24000],
-                        "voice": config.voice
-                    ] as [String: Any]
+                    // turns and transcribes, but must NOT auto-reply — the
+                    // orchestrator decides whether "Nova" was addressed.
+                    "turn_detection": config.enableServerVAD ? [
+                        "type": "semantic_vad",
+                        "create_response": !config.requireWakeWord
+                    ] : NSNull(),
+                    "transcription": ["model": "whisper-1"]
+                ] as [String: Any],
+                "output": [
+                    "format": ["type": "audio/pcm", "rate": 24000],
+                    "voice": config.voice
                 ] as [String: Any]
             ] as [String: Any]
         ]
-        try await sendJSON(sessionUpdate)
+
+        // Advertise tools so the model can emit function calls the orchestrator
+        // dispatches through ToolRouter.
+        if !config.toolDefinitions.isEmpty {
+            sessionDict["tools"] = config.toolDefinitions.map { def -> [String: Any] in
+                let params = (try? JSONSerialization.jsonObject(with: Data(def.parametersJSON.utf8))) as? [String: Any]
+                    ?? ["type": "object", "properties": [:]]
+                return [
+                    "type": "function",
+                    "name": def.name,
+                    "description": def.description,
+                    "parameters": params
+                ]
+            }
+            sessionDict["tool_choice"] = "auto"
+        }
+
+        try await sendJSON(["type": "session.update", "session": sessionDict])
 
         receiveTask = Task { await self.receiveLoop() }
         NovaLog.ai.info("Realtime connected")
@@ -120,6 +138,20 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
     public func createResponse() async {
         guard connected else { return }
+        try? await sendJSON(["type": "response.create"])
+    }
+
+    public func sendToolOutput(callId: String, outputJSON: String) async {
+        guard connected else { return }
+        try? await sendJSON([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "function_call_output",
+                "call_id": callId,
+                "output": outputJSON
+            ]
+        ])
+        // Let the model incorporate the tool result into its spoken reply.
         try? await sendJSON(["type": "response.create"])
     }
 

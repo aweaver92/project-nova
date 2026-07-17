@@ -29,7 +29,8 @@ struct NovaApp: App {
             RootView(
                 session: container.sessionVM,
                 conversation: container.conversationVM,
-                vision: container.visionVM
+                vision: container.visionVM,
+                notes: container.notesVM
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.

@@ -17,6 +17,13 @@ public actor ToolRouter {
         Array(tools.keys).sorted()
     }
 
+    /// Definitions advertised to the model so it can emit function calls.
+    public func definitions() -> [ToolDefinition] {
+        tools.values
+            .map { ToolDefinition(name: $0.name, description: $0.description, parametersJSON: $0.parametersJSON) }
+            .sorted { $0.name < $1.name }
+    }
+
     public func dispatch(_ request: ToolCallRequest) async -> ToolCallResult {
         guard let tool = tools[request.name] else {
             return ToolCallResult(

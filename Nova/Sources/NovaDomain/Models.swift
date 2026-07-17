@@ -44,11 +44,17 @@ public struct AISessionConfig: Sendable, Equatable {
     /// After engaging via the local wake word, tear the cloud stream back down
     /// once there has been no conversational activity for this long.
     public var streamIdleTimeout: Duration
+    /// Tools/functions advertised to the model for this session.
+    public var toolDefinitions: [ToolDefinition]
     /// Phrases (after the wake word) that route to the vision path.
     public var visionTriggerPhrases: [String]
 
     public init(
-        instructions: String = "You are Nova, a concise wearable assistant. Prefer short spoken answers. The user addresses you by saying 'Nova'; do not repeat the wake word back.",
+        instructions: String = """
+        You are Nova, a concise wearable voice assistant on smart glasses. Prefer short, spoken-friendly answers. The user addresses you by saying 'Nova'; never repeat the wake word back.
+        Use your tools when relevant instead of guessing: weather, creating reminders, reading/creating calendar events, controlling smart-home devices (Home Assistant), remembering durable facts about the user, saving/reading notes, and a daily briefing. Prefer ISO8601 for any dates/times you pass to tools.
+        Support these modes when asked: 'study mode' (quiz the user, use spaced repetition), 'brainstorm mode' (rapid ideation), and coding/math help (be precise and step-by-step). Keep replies brief unless asked to elaborate.
+        """,
         voice: String = "marin",
         enableServerVAD: Bool = true,
         idleTimeout: Duration = .seconds(120),
@@ -58,6 +64,7 @@ public struct AISessionConfig: Sendable, Equatable {
         wakeWordGraceWindow: Duration = .seconds(10),
         useLocalWakeWord: Bool = false,
         streamIdleTimeout: Duration = .seconds(20),
+        toolDefinitions: [ToolDefinition] = [],
         visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
     ) {
         self.instructions = instructions
@@ -70,6 +77,7 @@ public struct AISessionConfig: Sendable, Equatable {
         self.wakeWordGraceWindow = wakeWordGraceWindow
         self.useLocalWakeWord = useLocalWakeWord
         self.streamIdleTimeout = streamIdleTimeout
+        self.toolDefinitions = toolDefinitions
         self.visionTriggerPhrases = visionTriggerPhrases
     }
 }
@@ -136,6 +144,31 @@ public struct ConversationTurn: Sendable, Equatable, Identifiable, Codable {
         self.role = role
         self.text = text
         self.at = at
+    }
+}
+
+public struct Note: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public let text: String
+    public let at: Date
+
+    public init(id: UUID = UUID(), text: String, at: Date = Date()) {
+        self.id = id
+        self.text = text
+        self.at = at
+    }
+}
+
+/// A tool advertised to the model: name, description, and a JSON Schema for args.
+public struct ToolDefinition: Sendable, Equatable {
+    public let name: String
+    public let description: String
+    public let parametersJSON: String
+
+    public init(name: String, description: String, parametersJSON: String) {
+        self.name = name
+        self.description = description
+        self.parametersJSON = parametersJSON
     }
 }
 

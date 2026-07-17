@@ -9,7 +9,14 @@ public protocol ConversationalAIProvider: Sendable {
     func createResponse() async
     func interrupt() async
     func analyze(image: CapturedFrame, prompt: String) async throws -> String
+    /// Return a tool/function-call result to the model and let it continue the reply.
+    func sendToolOutput(callId: String, outputJSON: String) async
     var events: AsyncStream<AIConversationEvent> { get }
+}
+
+public extension ConversationalAIProvider {
+    // Default keeps older conformers (fakes/mocks) source-compatible.
+    func sendToolOutput(callId: String, outputJSON: String) async {}
 }
 
 public protocol AudioIngress: Sendable {
@@ -67,12 +74,28 @@ public protocol ConversationMemory: Sendable {
     func clear() async
 }
 
+/// Durable voice-note storage the UI can list/export and tools can append to.
+public protocol NoteStoring: Sendable {
+    @discardableResult
+    func save(_ text: String) async -> Note
+    func all() async -> [Note]
+    func clear() async
+}
+
 public protocol Tool: Sendable {
     var name: String { get }
     var description: String { get }
     /// When true, UI/orchestrator must confirm before side effects.
     var requiresConfirmation: Bool { get }
+    /// JSON Schema describing the tool's arguments, advertised to the model so it
+    /// can emit well-formed function calls.
+    var parametersJSON: String { get }
     func invoke(argumentsJSON: String) async throws -> String
+}
+
+public extension Tool {
+    /// Default: a no-argument object schema.
+    var parametersJSON: String { #"{"type":"object","properties":{},"additionalProperties":false}"# }
 }
 
 public protocol AudioSessionCoordinating: Sendable {

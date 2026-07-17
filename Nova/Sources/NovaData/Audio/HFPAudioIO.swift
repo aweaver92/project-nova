@@ -32,6 +32,17 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
 
     private func installTapAndStartEngine() throws {
         let input = engine.inputNode
+        // Enable the Voice-Processing I/O unit (AEC + noise suppression + AGC).
+        // Must be toggled while the engine is stopped; guard against redundant
+        // re-enables on route-change/interruption recovery.
+        if !input.isVoiceProcessingEnabled {
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                NovaLog.audio.info("Voice processing (AEC/NS/AGC) enabled")
+            } catch {
+                NovaLog.audio.warning("Voice processing unavailable: \(String(describing: error), privacy: .public)")
+            }
+        }
         input.removeTap(onBus: 0)
         let format = input.inputFormat(forBus: 0)
         // Install tap; convert to 8 kHz mono PCM16 if hardware differs.

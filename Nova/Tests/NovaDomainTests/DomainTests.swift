@@ -177,6 +177,60 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testToolDefinitionsAdvertisedAndOutputReturned() async throws {
+        let provider = MockProvider()
+        let router = ToolRouter(tools: [EchoTool()])
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            toolRouter: router
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        // Tools are advertised to the provider on connect.
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+        let defs = await provider.lastToolDefinitions
+        XCTAssertEqual(defs.first?.name, "echo")
+        XCTAssertTrue(defs.first?.parametersJSON.contains("text") ?? false)
+
+        // A tool call is dispatched and its result returned to the model.
+        await provider.emit(.toolCall(id: "call_1", name: "echo", argumentsJSON: #"{"text":"hi"}"#))
+        let returned = await waitUntil { await provider.toolOutputCount == 1 }
+        XCTAssertTrue(returned)
+        let outputs = await provider.toolOutputs
+        XCTAssertEqual(outputs.first?.callId, "call_1")
+        XCTAssertTrue(outputs.first?.output.contains("hi") ?? false)
+        await orch.stop()
+    }
+
+    func testToolRouterDefinitionsSortedWithSchema() async {
+        let router = ToolRouter(tools: [EchoTool()])
+        let defs = await router.definitions()
+        XCTAssertEqual(defs.map(\.name), ["echo"])
+        XCTAssertTrue(defs.first?.description.isEmpty == false)
+    }
+
+    func testProfileFactsInjectedIntoInstructions() async throws {
+        let provider = MockProvider()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            profileProvider: { "- User's dog is named Cooper" }
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+        let instructions = await provider.lastInstructions
+        XCTAssertTrue(instructions.contains("Cooper"))
+        await orch.stop()
+    }
+
     func testMemorySummaryInjectedIntoInstructions() async throws {
         let provider = MockProvider()
         let memory = InMemoryConversationMemory()
@@ -285,6 +339,9 @@ private actor MockProvider: ConversationalAIProvider {
     private(set) var connectCount = 0
     private(set) var disconnectCount = 0
     private(set) var lastInstructions = ""
+    private(set) var lastToolDefinitions: [ToolDefinition] = []
+    private(set) var toolOutputs: [(callId: String, output: String)] = []
+    var toolOutputCount: Int { toolOutputs.count }
 
     init() {
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -295,6 +352,7 @@ private actor MockProvider: ConversationalAIProvider {
     func connect(config: AISessionConfig) async throws {
         connectCount += 1
         lastInstructions = config.instructions
+        lastToolDefinitions = config.toolDefinitions
     }
     func disconnect() async { disconnectCount += 1; continuation.finish() }
     func appendAudio(_ pcm16_24k: Data) async {}
@@ -304,7 +362,24 @@ private actor MockProvider: ConversationalAIProvider {
         analyzeCount += 1
         return "ok"
     }
+    func sendToolOutput(callId: String, outputJSON: String) async {
+        toolOutputs.append((callId, outputJSON))
+    }
     func emit(_ event: AIConversationEvent) { continuation.yield(event) }
+}
+
+private struct EchoTool: Tool {
+    let name = "echo"
+    let description = "Echo the provided text back."
+    let requiresConfirmation = false
+    var parametersJSON: String {
+        #"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}"#
+    }
+    func invoke(argumentsJSON: String) async throws -> String {
+        struct A: Decodable { let text: String }
+        let a = try JSONDecoder().decode(A.self, from: Data(argumentsJSON.utf8))
+        return #"{"echo":"\#(a.text)"}"#
+    }
 }
 
 private actor MockFrameCapture: FrameCapture {

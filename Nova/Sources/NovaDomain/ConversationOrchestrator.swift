@@ -16,6 +16,8 @@ public actor ConversationOrchestrator {
     // Optional on-device wake-word listener. When present and enabled, the cloud
     // stream stays closed until the wake word is heard locally.
     private let wakeWordListener: (any WakeWordListening)?
+    // Supplies durable user facts to inject into each session's instructions.
+    private let profileProvider: (@Sendable () async -> String)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -46,7 +48,8 @@ public actor ConversationOrchestrator {
         memory: (any ConversationMemory)? = nil,
         toolRouter: ToolRouter? = nil,
         frameCapture: (any FrameCapture)? = nil,
-        wakeWordListener: (any WakeWordListening)? = nil
+        wakeWordListener: (any WakeWordListening)? = nil,
+        profileProvider: (@Sendable () async -> String)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -57,6 +60,7 @@ public actor ConversationOrchestrator {
         self.toolRouter = toolRouter
         self.frameCapture = frameCapture
         self.wakeWordListener = wakeWordListener
+        self.profileProvider = profileProvider
     }
 
     /// True while the cloud Realtime stream is open (as opposed to idle on-device
@@ -146,13 +150,23 @@ public actor ConversationOrchestrator {
 
     private func beginStreaming(_ config: AISessionConfig) async throws {
         guard !streaming else { return }
-        // Prime the session with recent memory so Nova has cross-session context.
+        // Prime the session with durable facts + recent memory for continuity.
         var effective = config
+        if let profileProvider {
+            let facts = await profileProvider()
+            if !facts.isEmpty {
+                effective.instructions += "\n\nWhat you know about the user:\n\(facts)"
+            }
+        }
         if let memory {
             let summary = await memory.summary()
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
             }
+        }
+        // Advertise available tools so the model can call them.
+        if let toolRouter {
+            effective.toolDefinitions = await toolRouter.definitions()
         }
         try await ai.connect(config: effective)
         try await ingress.start()
@@ -285,6 +299,8 @@ public actor ConversationOrchestrator {
                 role: .system,
                 text: "tool:\(name) → \(result.payloadJSON)"
             ))
+            // Return the result so the model can speak an answer that uses it.
+            await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
         case .reconnected:

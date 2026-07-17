@@ -64,6 +64,10 @@ export class OpenAIRealtimeProvider implements ConversationalAIProvider {
             audio: {
               input: {
                 format: { type: "audio/pcm", rate: 24000 },
+                // Server-side noise reduction runs before VAD + the model;
+                // near_field suits a close-talking mic and improves turn
+                // detection and perceived input quality.
+                noise_reduction: { type: "near_field" },
                 // When a wake word is required the server still detects turns
                 // and transcribes, but must NOT auto-reply — the orchestrator
                 // decides whether to respond after checking for "Nova".

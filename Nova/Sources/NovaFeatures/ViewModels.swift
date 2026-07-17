@@ -181,6 +181,33 @@ public final class VisionViewModel {
     }
 }
 
+@MainActor
+@Observable
+public final class NotesViewModel {
+    public private(set) var notes: [Note] = []
+    private let store: any NoteStoring
+
+    public init(store: any NoteStoring) {
+        self.store = store
+    }
+
+    public func load() async {
+        notes = await store.all().sorted { $0.at > $1.at }
+    }
+
+    public func clear() async {
+        await store.clear()
+        notes = []
+    }
+
+    /// Plain-text rendering for the share sheet / export.
+    public var exportText: String {
+        notes
+            .map { "\($0.at.formatted(date: .abbreviated, time: .shortened))\n\($0.text)" }
+            .joined(separator: "\n\n")
+    }
+}
+
 /// Thin bridge so Features does not import NovaData types directly for the hold API.
 public protocol MetaDATBandwidthBridge: Sendable {
     func holdVideoForAudio(_ hold: Bool) async
