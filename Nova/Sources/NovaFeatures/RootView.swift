@@ -14,6 +14,8 @@ public struct RootView: View {
     @Bindable var workspaces: WorkspacesViewModel
     @Bindable var skills: SkillsViewModel
     @Bindable var knowledge: KnowledgeViewModel
+    @Bindable var agents: AgentsViewModel
+    @Bindable var settings: SettingsViewModel
 
     public init(
         session: SessionViewModel,
@@ -23,7 +25,9 @@ public struct RootView: View {
         recording: RecordingViewModel,
         workspaces: WorkspacesViewModel,
         skills: SkillsViewModel,
-        knowledge: KnowledgeViewModel
+        knowledge: KnowledgeViewModel,
+        agents: AgentsViewModel,
+        settings: SettingsViewModel
     ) {
         self.session = session
         self.conversation = conversation
@@ -33,6 +37,8 @@ public struct RootView: View {
         self.workspaces = workspaces
         self.skills = skills
         self.knowledge = knowledge
+        self.agents = agents
+        self.settings = settings
     }
 
     public var body: some View {
@@ -43,20 +49,20 @@ public struct RootView: View {
             WorkspacesView(workspaces: workspaces)
                 .tabItem { Label("Workspaces", systemImage: "square.stack.3d.up") }
 
+            AgentsView(agents: agents)
+                .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
+
             SkillsView(skills: skills)
                 .tabItem { Label("Skills", systemImage: "wand.and.stars") }
 
-            KnowledgeView(knowledge: knowledge)
-                .tabItem { Label("Knowledge", systemImage: "books.vertical") }
-
-            NotesView(notes: notes)
-                .tabItem { Label("Notes", systemImage: "note.text") }
+            LibraryView(notes: notes, knowledge: knowledge)
+                .tabItem { Label("Library", systemImage: "books.vertical") }
 
             RecordingsView(recording: recording)
                 .tabItem { Label("Recordings", systemImage: "waveform.circle") }
 
-            PatchNotesView()
-                .tabItem { Label("Patch Notes", systemImage: "sparkles") }
+            SettingsView(settings: settings)
+                .tabItem { Label("Settings", systemImage: "gearshape") }
         }
     }
 
@@ -80,6 +86,7 @@ public struct RootView: View {
             .task {
                 await recording.load()
                 await workspaces.load()
+                await agents.load()
                 if !conversation.isRunning {
                     await conversation.start()
                 }
@@ -101,6 +108,9 @@ public struct RootView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
                     .accessibilityLabel("Nova")
+                Label("Talking to \(agents.activeName)", systemImage: "person.wave.2")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Label("Workspace: \(workspaces.activeName)", systemImage: "square.stack.3d.up")
                     .font(.caption)
                     .foregroundStyle(.secondary)

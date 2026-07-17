@@ -260,6 +260,13 @@ function testWakeWordDetector(): void {
 
   // "novafy" must not count as the wake word (word-boundary check).
   assert.strictEqual(d.detect("novafy this document").kind, "ignore");
+
+  // "Nova, stop" and close variants stand Nova down.
+  assert.strictEqual(d.detect("Nova, stop").kind, "stop");
+  assert.strictEqual(d.detect("Nova stop talking").kind, "stop");
+  assert.strictEqual(d.detect("NOVA... never mind!").kind, "stop");
+  // But "stop <something>" is a real command, not a stand-down.
+  assert.strictEqual(d.detect("Nova, stop the recording").kind, "converse");
 }
 
 /** Orchestrator only responds after the wake word, and routes vision triggers. */

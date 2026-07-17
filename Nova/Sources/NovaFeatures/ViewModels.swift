@@ -397,13 +397,16 @@ public final class SkillsViewModel {
     public private(set) var skills: [Skill] = []
 
     private let store: any SkillStoring
+    private let scheduler: (any SkillScheduling)?
 
-    public init(store: any SkillStoring) {
+    public init(store: any SkillStoring, scheduler: (any SkillScheduling)? = nil) {
         self.store = store
+        self.scheduler = scheduler
     }
 
     public func load() async {
         skills = await store.all()
+        await scheduler?.sync(skills)
     }
 
     @discardableResult
@@ -422,6 +425,128 @@ public final class SkillsViewModel {
         let ids = offsets.map { skills[$0].id }
         for id in ids { await store.delete(id: id) }
         await load()
+    }
+
+    /// Pretty-printed JSON for sharing/backing up a skill.
+    public func exportJSON(_ skill: Skill) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(skill),
+              let json = String(data: data, encoding: .utf8) else { return "" }
+        return json
+    }
+
+    /// Imports a skill from JSON, giving it a fresh identity so it never
+    /// overwrites an existing one. Returns false on malformed input.
+    @discardableResult
+    public func importJSON(_ json: String) async -> Bool {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = json.data(using: .utf8),
+              let decoded = try? decoder.decode(Skill.self, from: data) else { return false }
+        let copy = Skill(
+            name: decoded.name,
+            triggerPhrases: decoded.triggerPhrases,
+            steps: decoded.steps,
+            workspaceId: nil,
+            schedule: decoded.schedule
+        )
+        await save(copy)
+        return true
+    }
+}
+
+@MainActor
+@Observable
+public final class SettingsViewModel {
+    public private(set) var spokenFollowUps: Bool = false
+
+    private let store: any SettingsStoring
+
+    public init(store: any SettingsStoring) {
+        self.store = store
+    }
+
+    public func load() async {
+        spokenFollowUps = await store.spokenFollowUps()
+    }
+
+    public func setSpokenFollowUps(_ enabled: Bool) async {
+        spokenFollowUps = enabled
+        await store.setSpokenFollowUps(enabled)
+    }
+}
+
+@MainActor
+@Observable
+public final class AgentsViewModel {
+    public private(set) var agents: [Agent] = []
+    public private(set) var activeAgent: Agent?
+    /// Nova Bridge connection fields (editable in the Agents tab).
+    public var bridgeBaseURL: String = ""
+    public var bridgeToken: String = ""
+
+    private let store: any AgentStoring
+    private let settings: any SettingsStoring
+    private let orchestrator: ConversationOrchestrator
+
+    public init(
+        store: any AgentStoring,
+        settings: any SettingsStoring,
+        orchestrator: ConversationOrchestrator
+    ) {
+        self.store = store
+        self.settings = settings
+        self.orchestrator = orchestrator
+        // Reflect voice-driven switches ("Nova, let me talk to Claude") live.
+        Task { [weak self] in
+            await orchestrator.setAgentChangeHandler { agent in
+                Task { @MainActor [weak self] in self?.activeAgent = agent }
+            }
+        }
+    }
+
+    public var activeName: String { activeAgent?.name ?? "Nova" }
+
+    /// Available OpenAI Realtime voices for the picker.
+    public var voices: [RealtimeVoice] { RealtimeVoice.allCases }
+
+    public func load() async {
+        agents = await store.all()
+        activeAgent = await store.active()
+        bridgeBaseURL = await settings.bridgeBaseURL() ?? ""
+        bridgeToken = await settings.bridgeToken() ?? ""
+    }
+
+    /// Make an agent active now (reconnects with its voice if a session is live).
+    public func activate(_ agent: Agent) async {
+        await orchestrator.setActiveAgentFromUI(agent.id)
+        await load()
+    }
+
+    @discardableResult
+    public func save(_ agent: Agent) async -> Agent {
+        let saved = await store.upsert(agent)
+        await load()
+        return saved
+    }
+
+    public func delete(_ agent: Agent) async {
+        guard !agent.isMaster else { return }
+        await store.delete(id: agent.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let targets = offsets.map { agents[$0] }.filter { !$0.isMaster }
+        for agent in targets { await store.delete(id: agent.id) }
+        await load()
+    }
+
+    public func saveBridge() async {
+        await settings.setBridgeBaseURL(bridgeBaseURL)
+        await settings.setBridgeToken(bridgeToken)
     }
 }
 

@@ -24,6 +24,12 @@ public final class AppContainer {
     public let workspaces: FileWorkspaceStore
     public let skillStore: FileSkillStore
     public let bookmarks: FileBookmarkStore
+    public let digestStore: FileMemoryDigestStore
+    public let settings: UserDefaultsSettingsStore
+    public let agentStore: FileAgentStore
+    public let workouts: FileWorkoutStore
+    public let bridge: NovaBridgeClient
+    public let skillScheduler: SkillScheduler
     public let toolRouter: ToolRouter
     public let orchestrator: ConversationOrchestrator
     public let sessionVM: SessionViewModel
@@ -34,6 +40,8 @@ public final class AppContainer {
     public let workspacesVM: WorkspacesViewModel
     public let skillsVM: SkillsViewModel
     public let knowledgeVM: KnowledgeViewModel
+    public let agentsVM: AgentsViewModel
+    public let settingsVM: SettingsViewModel
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
     ///   in-memory state machine (Simulator / no hardware). Set to `false` on a
@@ -106,6 +114,34 @@ public final class AppContainer {
             memory: memory
         )
 
+        // Phase 2: long-term memory digest + compaction, settings, scheduling.
+        let digestStore = FileMemoryDigestStore()
+        self.digestStore = digestStore
+        let memoryCompactor = MemoryCompactor(
+            memory: memory,
+            digestStore: digestStore,
+            summarizer: OpenAIMemorySummarizer()
+        )
+        let settingsStore = UserDefaultsSettingsStore()
+        self.settings = settingsStore
+        let scheduler = SkillScheduler()
+        self.skillScheduler = scheduler
+
+        // Multi-agent roster (Nova master + specialists), the trainer's workout
+        // log, and the Nova Bridge that backs Claude's coding tools.
+        let agentStore = FileAgentStore()
+        self.agentStore = agentStore
+        let workoutStore = FileWorkoutStore()
+        self.workouts = workoutStore
+        let bridge = NovaBridgeClient(configProvider: {
+            if let urlString = await settingsStore.bridgeBaseURL(),
+               let url = URL(string: urlString) {
+                return (url, await settingsStore.bridgeToken())
+            }
+            return NovaBridgeConfig.fallback()
+        })
+        self.bridge = bridge
+
         // App-layer callbacks skills/drafting need (opening links, local timers).
         var openURL: SkillRunner.URLOpener?
         var startTimer: SkillRunner.TimerStarter?
@@ -133,7 +169,18 @@ public final class AppContainer {
         }
         #endif
 
-        let skillRunner = SkillRunner(notes: noteStore, openURL: openURL, startTimer: startTimer)
+        // Webhook step caller: any 2xx counts as success.
+        let callWebhook: SkillRunner.WebhookCaller = { request in
+            guard let (_, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse else { return false }
+            return (200..<300).contains(http.statusCode)
+        }
+        let skillRunner = SkillRunner(
+            notes: noteStore,
+            openURL: openURL,
+            startTimer: startTimer,
+            callWebhook: callWebhook
+        )
 
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
@@ -157,9 +204,19 @@ public final class AppContainer {
             SearchKnowledgeTool(search: knowledgeSearch),
             BookmarkConversationTool(store: bookmarkStore, workspaceId: { await workspaceStore.active()?.id }),
             SetWorkspaceTool(store: workspaceStore),
-            DraftMessageTool(notes: noteStore, openURL: openURL)
+            DraftMessageTool(notes: noteStore, openURL: openURL),
+            // Claude's programming tools (Claude Code + Cursor via the Nova Bridge).
+            RunClaudeCodeTool(bridge: bridge),
+            PushToCursorTool(bridge: bridge),
+            ListCursorSessionsTool(bridge: bridge),
+            // Max's workout tools.
+            StartWorkoutSessionTool(store: workoutStore),
+            LogWorkoutSetTool(store: workoutStore),
+            EndWorkoutSessionTool(store: workoutStore),
+            WorkoutHistoryTool(store: workoutStore)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
+        tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
 
@@ -204,7 +261,20 @@ public final class AppContainer {
             skillRunner: skillRunner,
             skillsProvider: { await skillStore.all() },
             bookmarkStore: bookmarkStore,
-            followUpSuggester: FollowUpSuggester()
+            followUpSuggester: FollowUpSuggester(),
+            digestStore: digestStore,
+            memoryCompactor: memoryCompactor,
+            spokenFollowUps: { await settingsStore.spokenFollowUps() },
+            agentsProvider: { await agentStore.all() },
+            activeAgentProvider: { await agentStore.active() },
+            persistActiveAgent: { id in await agentStore.setActive(id: id) },
+            agentContextProvider: { agent in
+                // Prime trainer-like agents with recent workout history.
+                if agent.toolNames?.contains("workout_history") == true {
+                    return await workoutStore.summary(limit: 8)
+                }
+                return ""
+            }
         )
         self.orchestrator = orchestrator
 
@@ -212,8 +282,10 @@ public final class AppContainer {
         self.conversationVM = ConversationViewModel(orchestrator: orchestrator, metrics: metrics)
         self.notesVM = NotesViewModel(store: noteStore)
         self.workspacesVM = WorkspacesViewModel(store: workspaceStore)
-        self.skillsVM = SkillsViewModel(store: skillStore)
+        self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
+        self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, orchestrator: orchestrator)
+        self.settingsVM = SettingsViewModel(store: settingsStore)
         // Starting a recording ensures the mic loop is live (no-op if already
         // running) so button-initiated captures record even when idle.
         self.recordingVM = RecordingViewModel(

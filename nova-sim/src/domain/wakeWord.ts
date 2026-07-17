@@ -9,7 +9,10 @@
 export type WakeIntent =
   | { kind: "ignore" }
   | { kind: "converse"; command: string }
-  | { kind: "vision"; prompt: string };
+  | { kind: "vision"; prompt: string }
+  // "Nova, stop": halt any in-progress speech and stop treating follow-ups as
+  // addressed to Nova until the wake word is spoken again.
+  | { kind: "stop" };
 
 export const DEFAULT_VISION_PHRASES = [
   "what's this",
@@ -24,6 +27,29 @@ export const DEFAULT_VISION_PHRASES = [
 ];
 
 const DEFAULT_VISION_PROMPT = "What am I looking at? Be concise.";
+
+/**
+ * Exact commands (after the wake word / normalization) that mean "stop and
+ * stand down". Matched exactly so requests like "stop the recording" still
+ * route to the model/tools instead of being swallowed here.
+ */
+const STOP_COMMANDS = new Set([
+  "stop",
+  "stop talking",
+  "stop it",
+  "stop listening",
+  "be quiet",
+  "quiet",
+  "shush",
+  "hush",
+  "shut up",
+  "never mind",
+  "nevermind",
+  "thats enough",
+  "that is enough",
+  "thats all",
+  "that is all",
+]);
 
 /** lowercase, drop apostrophes ("what's" → "whats"), punctuation → space. */
 function normalize(s: string): string {
@@ -65,6 +91,9 @@ export class WakeWordDetector {
 
   private classify(command: string, full: string): WakeIntent {
     const haystack = command.length ? command : full;
+    if (STOP_COMMANDS.has(haystack)) {
+      return { kind: "stop" };
+    }
     if (this.visionPhrases.some((p) => haystack.includes(p))) {
       return {
         kind: "vision",

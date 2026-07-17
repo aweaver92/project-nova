@@ -2,56 +2,82 @@ import Foundation
 import NovaCore
 import NovaDomain
 
-/// Keyword-ranked search across the user's notes, bookmarks, facts, and recent
-/// conversation. Phase 1 uses simple term-overlap scoring with a recency
-/// tie-break; on-device embeddings are a future upgrade.
+/// Search across the user's notes, bookmarks, facts, and recent conversation.
+/// Ranking blends keyword term-overlap with an optional on-device semantic
+/// (embedding) score so relevant items surface even without exact keyword
+/// overlap. Falls back to pure keyword ranking when embeddings are unavailable.
 public struct KnowledgeSearch: KnowledgeSearching {
     private let notes: any NoteStoring
     private let bookmarks: any BookmarkStoring
     private let facts: FileFactStore
     private let memory: any ConversationMemory
+    private let useSemantic: Bool
+
+    /// Above this cosine (mapped to [0,1]) an item is included even with no
+    /// keyword overlap; the bonus above the 0.5 baseline is weighted in.
+    private let semanticThreshold = 0.62
+    private let semanticWeight = 4.0
 
     public init(
         notes: any NoteStoring,
         bookmarks: any BookmarkStoring,
         facts: FileFactStore,
-        memory: any ConversationMemory
+        memory: any ConversationMemory,
+        useSemantic: Bool = true
     ) {
         self.notes = notes
         self.bookmarks = bookmarks
         self.facts = facts
         self.memory = memory
+        self.useSemantic = useSemantic
+    }
+
+    private struct Candidate {
+        let hit: KnowledgeHit
+        let text: String
+        let weight: Double
     }
 
     public func search(_ query: String, limit: Int = 8) async -> [KnowledgeHit] {
         let terms = Self.tokenize(query)
         guard !terms.isEmpty else { return [] }
 
-        var scored: [(hit: KnowledgeHit, score: Double)] = []
-
+        var candidates: [Candidate] = []
         for note in await notes.all() {
-            let s = Self.score(text: note.text, terms: terms)
-            if s > 0 {
-                scored.append((KnowledgeHit(source: .note, title: Self.titleLine(note.text), snippet: Self.snippet(note.text, terms: terms), date: note.updatedAt), s))
-            }
+            candidates.append(Candidate(
+                hit: KnowledgeHit(source: .note, title: Self.titleLine(note.text), snippet: Self.snippet(note.text, terms: terms), date: note.updatedAt),
+                text: note.text, weight: 1.0))
         }
         for bm in await bookmarks.all() {
-            let s = Self.score(text: bm.title + " " + bm.text, terms: terms)
-            if s > 0 {
-                scored.append((KnowledgeHit(source: .bookmark, title: bm.title, snippet: Self.snippet(bm.text, terms: terms), date: bm.createdAt), s))
-            }
+            candidates.append(Candidate(
+                hit: KnowledgeHit(source: .bookmark, title: bm.title, snippet: Self.snippet(bm.text, terms: terms), date: bm.createdAt),
+                text: bm.title + " " + bm.text, weight: 1.0))
         }
         for fact in await facts.all() {
-            let s = Self.score(text: fact, terms: terms)
-            if s > 0 {
-                scored.append((KnowledgeHit(source: .fact, title: "Fact", snippet: fact, date: .distantPast), s * 1.1))
-            }
+            candidates.append(Candidate(
+                hit: KnowledgeHit(source: .fact, title: "Fact", snippet: fact, date: .distantPast),
+                text: fact, weight: 1.1))
         }
         for turn in await memory.recent(limit: 200) {
-            let s = Self.score(text: turn.text, terms: terms)
-            if s > 0 {
-                scored.append((KnowledgeHit(source: .conversation, title: turn.role.rawValue.capitalized, snippet: Self.snippet(turn.text, terms: terms), date: turn.at), s))
+            candidates.append(Candidate(
+                hit: KnowledgeHit(source: .conversation, title: turn.role.rawValue.capitalized, snippet: Self.snippet(turn.text, terms: terms), date: turn.at),
+                text: turn.text, weight: 1.0))
+        }
+
+        // Build the embedding scorer locally (not stored — it wraps a class).
+        let scorer: EmbeddingScorer? = useSemantic ? EmbeddingScorer() : nil
+        let semanticOn = scorer?.isAvailable ?? false
+
+        var scored: [(hit: KnowledgeHit, score: Double)] = []
+        for candidate in candidates {
+            let keyword = Self.score(text: candidate.text, terms: terms) * candidate.weight
+            var combined = keyword
+            var include = keyword > 0
+            if semanticOn, let sim = scorer?.similarity(query, candidate.text) {
+                combined += max(0, sim - 0.5) * semanticWeight
+                if sim >= semanticThreshold { include = true }
             }
+            if include { scored.append((candidate.hit, combined)) }
         }
 
         return scored

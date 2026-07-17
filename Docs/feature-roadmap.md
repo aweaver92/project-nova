@@ -30,18 +30,21 @@ spoken follow-ups.
 
 ---
 
-## Phase 2 — Proactivity & smarter memory ⬜
+## Phase 2 — Proactivity & smarter memory ✅ (shipped)
 
 Make Nova feel less like a command line and more like an assistant that
-remembers and anticipates.
+remembers and anticipates. All on-device (plus the existing Responses API for
+summarization); no new infrastructure.
 
-| ID | Item | Scope / approach | Depends on | Acceptance |
-|----|------|------------------|-----------|------------|
-| P2.1 | Memory compaction / summarization | Periodically summarize old turns into a durable per-workspace "memory digest" so context survives beyond the rolling window without bloating the prompt | Phase 1 scoped memory | "What did we decide last week?" answered from a digest, not raw turns |
-| P2.2 | Semantic knowledge search | Add on-device embeddings (Core ML / `NLEmbedding`) as a ranking layer over the current keyword search; keep keyword as fallback | `KnowledgeSearch` | Finds relevant notes even without exact keyword overlap |
-| P2.3 | Scheduled & proactive skills | Time/location triggers for skills (e.g. "every weekday 8am run my Commute skill") via local notifications / `UNCalendarNotificationTrigger`; opt-in | Skills core | A skill fires on schedule and speaks a summary when opened |
-| P2.4 | Spoken follow-ups (toggle) | Optionally have Nova offer 1 follow-up out loud instead of only chips; default off to avoid chattiness | Follow-up suggester | Setting toggles spoken vs. chip suggestions |
-| P2.5 | Skill import/export & sharing | Encode a skill as shareable JSON (share sheet / deep link) so skills can be backed up or shared | Skills store | Export a skill, re-import on a fresh install, it runs |
+| ID | Item | What shipped |
+|----|------|--------------|
+| P2.1 | Memory compaction / summarization | `FileMemoryDigestStore` (per-workspace durable digest + coverage watermark), `OpenAIMemorySummarizer` (Responses API), `MemoryCompactor` (folds older turns once a threshold is reached). Digest is injected as "Long-term memory for this workspace" ahead of the recent window; compaction runs in the background at session start so it never blocks the live conversation. |
+| P2.2 | Semantic knowledge search | `EmbeddingScorer` (Apple `NLEmbedding` mean word vectors, cosine → [0,1]); `KnowledgeSearch` now blends keyword + semantic scores across all sources and falls back to pure keyword when embeddings are unavailable or the query is out-of-vocabulary. |
+| P2.3 | Scheduled & proactive skills | `SkillSchedule` (daily or per-weekday time), `SkillScheduler` (repeating `UNCalendarNotificationTrigger`, opt-in permission, namespaced identifiers), `NotificationCoordinator` runs the tapped skill via `orchestrator.runSkill` (deterministic steps always run; spoken confirmation when the stream is open). Schedule editor added to the Skill editor. |
+| P2.4 | Spoken follow-ups (toggle) | `UserDefaultsSettingsStore` + Settings tab toggle (default off). When on, Nova offers one suggestion out loud after a reply, with a one-shot guard so the offer never loops. Chips still appear either way. |
+| P2.5 | Skill import/export & sharing | `SkillsViewModel.exportJSON` (ShareLink in the editor) / `importJSON` (paste sheet in the Skills tab). Imported skills get a fresh identity so they never overwrite existing ones. |
+
+**Tests:** `Phase2DataTests` (digest store scoping/persistence, compactor threshold & coverage advance, embedding cosine, settings round-trip, skill Codable incl. schedule) and `Phase2DomainTests` (schedule next-fire/trigger components, `runSkill` with/without stream, spoken-follow-up single-offer guard, digest injection).
 
 ---
 
@@ -61,16 +64,18 @@ today. Everything in Phases 1–2 is intentionally on-device.
 
 ---
 
-## Phase 4 — Actions & integrations ⬜
+## Phase 4 — Actions & integrations 🟡 (mostly shipped)
 
 Broaden what Nova can *do*, within iOS limits.
 
-| ID | Item | Scope / approach | Notes |
-|----|------|------------------|-------|
-| P4.1 | Automated send (where allowed) | Investigate Shortcuts automations / `INSendMessageIntent` for permitted auto-send paths; keep compose-sheet fallback | iOS restricts silent send; may stay assistive |
-| P4.2 | Home Assistant expansion | Scenes, sensor queries, area/device discovery beyond the current on/off tool | Existing `HomeAssistantTool` |
-| P4.3 | Richer drafting | Templates, tone control, and reminder/calendar round-trips from drafts | `draft_message` |
-| P4.4 | More first-party skill steps | HTTP webhook step, conditional step, delay step for richer macros | `SkillStep` enum |
+| ID | Item | Status / what shipped |
+|----|------|-----------------------|
+| P4.1 | Automated send (where allowed) | ⛔ deferred / assistive-only — iOS blocks silent send from a sideloaded app without special entitlements; the compose-sheet path (`draft_message` email/text) remains the supported flow. Revisit via Shortcuts automations if the app gains a full provisioning profile. |
+| P4.2 | Home Assistant expansion | ✅ `HomeAssistantStateTool` (`home_assistant_state`) reads any entity's state + friendly name + unit for questions like "is the front door locked?"; scenes already work via the existing `home_assistant` tool (`domain:"scene"`). |
+| P4.3 | Richer drafting | ✅ `draft_message` now supports a `todo` with a `dueISO` and a new `event` type (title/start/duration → calendar), giving reminder/calendar round-trips from drafts alongside email/text/note. |
+| P4.4 | More first-party skill steps | ✅ Added `.webhook` (GET/POST/PUT with optional JSON/text body) and `.delay` (capped wait between steps) skill steps, executed by `SkillRunner` (injectable HTTP caller + sleeper) with editor UI. Conditional/branching steps deferred (the flat step model doesn't branch cleanly yet). |
+
+**Tests:** `Phase4DataTests` — webhook request shaping + failure, capped delay, draft email/event-validation/note routing, HA state summarization.
 
 ---
 
@@ -95,14 +100,14 @@ See [`ios-without-a-mac.md`](ios-without-a-mac.md) and the risk notes in
 
 - **Reliability:** keep the reconnect/backoff + audio-interruption handling green as features grow.
 - **Cost control:** the Responses-API calls (web search, follow-ups) add spend; add metering + a per-feature on/off setting.
-- **Tab consolidation:** the app now has 7 tabs (Assistant, Workspaces, Skills, Knowledge, Notes, Recordings, Patch Notes). Consider merging Notes + Knowledge into a single "Library" tab to reduce the iOS "More" overflow.
+- **Tab consolidation:** ✅ done — merged Notes + Knowledge into a single **Library** tab (browse notes/bookmarks; unified search) and moved **Patch Notes** under **Settings → About**. The app is now 6 tabs (Assistant, Workspaces, Skills, Library, Recordings, Settings).
 - **Testing:** extend the unit suite as stores/tools evolve; add UI smoke tests once the tab set stabilizes.
 
 ---
 
 ## Suggested sequencing
 
-1. **Phase 2** next — pure on-device, high daily value, no new infrastructure.
-2. **Phase 4** in parallel where cheap (extra skill steps, HA expansion).
+1. ~~**Phase 2**~~ ✅ done — pure on-device, high daily value, no new infrastructure.
+2. ~~**Phase 4**~~ 🟡 mostly done — webhook/delay skill steps, HA state queries, richer drafting. Only P4.1 (silent send) remains, blocked by iOS/sideload limits.
 3. **Phase 5** whenever Meta registration unblocks (external dependency).
 4. **Phase 3** last / when a backend is justified — it's the biggest lift.

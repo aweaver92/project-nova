@@ -147,6 +147,105 @@ public protocol SkillRunning: Sendable {
     func run(_ skill: Skill) async -> SkillRunResult
 }
 
+/// Durable per-workspace long-term memory digest (compacted history).
+public protocol MemoryDigestStoring: Sendable {
+    func digest(workspaceId: UUID?) async -> String
+    func setDigest(_ text: String, coveredThrough: Date, workspaceId: UUID?) async
+    /// Timestamp of the newest turn already folded into the digest.
+    func coveredThrough(workspaceId: UUID?) async -> Date?
+}
+
+/// Compresses conversation turns into a running digest.
+public protocol MemorySummarizing: Sendable {
+    func summarize(previousDigest: String, turns: [ConversationTurn]) async -> String
+}
+
+/// Compacts a workspace's older turns into its digest when enough have accrued.
+public protocol MemoryCompacting: Sendable {
+    func compactIfNeeded(workspaceId: UUID?) async
+}
+
+/// User preferences that affect assistant behavior.
+public protocol SettingsStoring: Sendable {
+    func spokenFollowUps() async -> Bool
+    func setSpokenFollowUps(_ enabled: Bool) async
+    /// Nova Bridge base URL (e.g. "http://mac.local:8787") used by Claude's
+    /// Claude Code / Cursor tools. `nil`/empty = not configured.
+    func bridgeBaseURL() async -> String?
+    func setBridgeBaseURL(_ value: String?) async
+    /// Shared secret sent as a bearer token to the Nova Bridge.
+    func bridgeToken() async -> String?
+    func setBridgeToken(_ value: String?) async
+}
+
+public extension SettingsStoring {
+    // Defaults so older conformers/mocks compile without the bridge accessors.
+    func bridgeBaseURL() async -> String? { nil }
+    func setBridgeBaseURL(_ value: String?) async {}
+    func bridgeToken() async -> String? { nil }
+    func setBridgeToken(_ value: String?) async {}
+}
+
+/// User-managed roster of agents plus the currently-active selection. There is
+/// always exactly one master (Nova) which can never be deleted.
+public protocol AgentStoring: Sendable {
+    func all() async -> [Agent]
+    @discardableResult
+    func upsert(_ agent: Agent) async -> Agent
+    func delete(id: UUID) async
+    /// The currently-active agent (never nil; falls back to the master).
+    func active() async -> Agent
+    func setActive(id: UUID) async
+    /// The master agent (Nova).
+    func master() async -> Agent
+    /// Make the master the active agent again.
+    func resetToMaster() async
+}
+
+/// Durable workout history + an optional in-progress session for the trainer
+/// agent to coach against and log into.
+public protocol WorkoutStoring: Sendable {
+    func history(limit: Int) async -> [WorkoutSession]
+    /// The in-progress session, if any.
+    func activeSession() async -> WorkoutSession?
+    @discardableResult
+    func startSession(title: String) async -> WorkoutSession
+    /// Append a set to the active session, starting one if none is in progress.
+    @discardableResult
+    func logSet(_ set: WorkoutSet) async -> WorkoutSession
+    /// Finish the active session (no-op if none). Returns the ended session.
+    @discardableResult
+    func endSession(notes: String?) async -> WorkoutSession?
+    /// Human-readable recent-history summary for injecting into Max's context.
+    func summary(limit: Int) async -> String
+}
+
+/// Result of a Nova Bridge call. `payloadJSON` is passed straight back to the
+/// model as the tool output.
+public struct BridgeResult: Sendable, Equatable {
+    public let ok: Bool
+    public let payloadJSON: String
+    public init(ok: Bool, payloadJSON: String) {
+        self.ok = ok
+        self.payloadJSON = payloadJSON
+    }
+}
+
+/// Bridge to the user's dev machine: runs Claude Code and pushes commands to
+/// active Cursor sessions. Backed by a small "Nova Bridge" HTTP service the user
+/// runs locally; unconfigured instances return a clear, actionable message.
+public protocol AgentBridging: Sendable {
+    func isConfigured() async -> Bool
+    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult
+    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult
+    func listCursorSessions() async -> BridgeResult
+}
+
+/// Registers/cancels proactive local notifications for scheduled skills.
+public protocol SkillScheduling: Sendable {
+    func sync(_ skills: [Skill]) async
+}
+
 public protocol Tool: Sendable {
     var name: String { get }
     var description: String { get }

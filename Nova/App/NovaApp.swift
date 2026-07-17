@@ -12,7 +12,21 @@ struct NovaApp: App {
     /// For Simulator / no-hardware runs, set all three back to `true`.
     private let container = AppContainer(useFakeAI: false, useSilentMic: false, useMockGlasses: false)
 
+    #if canImport(UserNotifications)
+    /// Runs scheduled skills when their notification fires/is tapped.
+    private let notifications: NotificationCoordinator
+    #endif
+
     init() {
+        #if canImport(UserNotifications)
+        let coordinator = NotificationCoordinator(
+            orchestrator: container.orchestrator,
+            skillStore: container.skillStore
+        )
+        self.notifications = coordinator
+        coordinator.install()
+        #endif
+
         #if canImport(MWDATCore)
         // Initialize the Meta Wearables Device Access Toolkit once at launch so
         // the glasses camera can be reached from MetaDATFrameCapture.
@@ -34,7 +48,9 @@ struct NovaApp: App {
                 recording: container.recordingVM,
                 workspaces: container.workspacesVM,
                 skills: container.skillsVM,
-                knowledge: container.knowledgeVM
+                knowledge: container.knowledgeVM,
+                agents: container.agentsVM,
+                settings: container.settingsVM
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.

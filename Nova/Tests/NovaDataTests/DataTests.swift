@@ -308,3 +308,63 @@ final class FileConversationMemoryTests: XCTestCase {
         XCTAssertTrue(recent.isEmpty)
     }
 }
+
+final class FileAgentStoreTests: XCTestCase {
+    private func tempURL() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("agents-\(UUID().uuidString).json")
+    }
+
+    func testSeedsBuiltInsWithMasterActive() async {
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = FileAgentStore(url: url)
+
+        let all = await store.all()
+        XCTAssertTrue(all.contains { $0.name == "Nova" && $0.isMaster })
+        XCTAssertTrue(all.contains { $0.name == "Claude" })
+        XCTAssertTrue(all.contains { $0.name == "Max" })
+        // Master is listed first and is the default active agent.
+        XCTAssertEqual(all.first?.isMaster, true)
+        let active = await store.active()
+        XCTAssertTrue(active.isMaster)
+    }
+
+    func testActiveSelectionPersistsAndMasterUndeletable() async {
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = FileAgentStore(url: url)
+        let claude = await store.all().first { $0.name == "Claude" }!
+        let master = await store.master()
+
+        await store.setActive(id: claude.id)
+        // Reload from the same file: the selection survived.
+        let reloaded = FileAgentStore(url: url)
+        let active = await reloaded.active()
+        XCTAssertEqual(active.id, claude.id)
+
+        // Deleting the master is a no-op; deleting a specialist works.
+        await reloaded.delete(id: master.id)
+        XCTAssertTrue(await reloaded.all().contains { $0.isMaster })
+        await reloaded.delete(id: claude.id)
+        XCTAssertFalse(await reloaded.all().contains { $0.id == claude.id })
+        // Removing the active agent falls back to the master.
+        let activeAfter = await reloaded.active()
+        XCTAssertTrue(activeAfter.isMaster)
+    }
+}
+
+final class NovaBridgeClientTests: XCTestCase {
+    func testUnconfiguredReturnsActionableError() async {
+        let bridge = NovaBridgeClient(configProvider: { (nil, nil) })
+        let configured = await bridge.isConfigured()
+        XCTAssertFalse(configured)
+
+        let result = await bridge.runClaudeCode(prompt: "build it", workingDirectory: nil)
+        XCTAssertFalse(result.ok)
+        XCTAssertTrue(result.payloadJSON.contains("bridge_not_configured"))
+
+        let cursor = await bridge.pushToCursor(command: "open file", sessionId: nil)
+        XCTAssertFalse(cursor.ok)
+        XCTAssertTrue(cursor.payloadJSON.contains("bridge_not_configured"))
+    }
+}

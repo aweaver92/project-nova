@@ -192,6 +192,8 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         case note           // text = note body
         case openURL        // url = deep link (spotify:, https://, ...)
         case timer          // seconds = countdown (fires a local notification)
+        case webhook        // url = endpoint, httpMethod = GET/POST, text = optional body
+        case delay          // seconds = pause before the next step runs
         case say            // text = phrase for Nova to speak
         case freeform       // text = natural-language instruction for the model
     }
@@ -203,6 +205,8 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
     public var durationMinutes: Int?
     public var url: String?
     public var seconds: Int?
+    /// HTTP method for `.webhook` steps (defaults to GET when nil).
+    public var httpMethod: String?
 
     public init(
         id: UUID = UUID(),
@@ -211,7 +215,8 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         dateISO: String? = nil,
         durationMinutes: Int? = nil,
         url: String? = nil,
-        seconds: Int? = nil
+        seconds: Int? = nil,
+        httpMethod: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -220,6 +225,48 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         self.durationMinutes = durationMinutes
         self.url = url
         self.seconds = seconds
+        self.httpMethod = httpMethod
+    }
+}
+
+/// An optional recurring schedule for a skill. When set, the app registers a
+/// repeating local notification so the skill can run proactively (opt-in).
+public struct SkillSchedule: Sendable, Codable, Equatable {
+    public var hour: Int
+    public var minute: Int
+    /// Weekdays (1 = Sunday … 7 = Saturday). `nil` or empty = every day.
+    public var weekdays: [Int]?
+
+    public init(hour: Int, minute: Int, weekdays: [Int]? = nil) {
+        self.hour = min(max(hour, 0), 23)
+        self.minute = min(max(minute, 0), 59)
+        self.weekdays = weekdays
+    }
+
+    /// `DateComponents` for repeating calendar notification triggers — one per
+    /// selected weekday, or a single daily time when no weekdays are chosen.
+    public var triggerComponents: [DateComponents] {
+        let days = (weekdays ?? []).filter { (1...7).contains($0) }
+        if days.isEmpty {
+            var c = DateComponents()
+            c.hour = hour
+            c.minute = minute
+            return [c]
+        }
+        return days.map { day in
+            var c = DateComponents()
+            c.hour = hour
+            c.minute = minute
+            c.weekday = day
+            return c
+        }
+    }
+
+    /// Next time this schedule would fire after `date` (pure, for tests/preview).
+    public func nextFireDate(after date: Date, calendar: Calendar = .current) -> Date? {
+        triggerComponents
+            .compactMap { calendar.nextDate(after: date, matching: $0, matchingPolicy: .nextTime) }
+            .min()
     }
 }
 
@@ -231,6 +278,8 @@ public struct Skill: Sendable, Identifiable, Codable, Equatable {
     public var steps: [SkillStep]
     /// Optional workspace scoping; nil = available in every workspace.
     public var workspaceId: UUID?
+    /// Optional recurring schedule for proactive runs.
+    public var schedule: SkillSchedule?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -240,6 +289,7 @@ public struct Skill: Sendable, Identifiable, Codable, Equatable {
         triggerPhrases: [String] = [],
         steps: [SkillStep] = [],
         workspaceId: UUID? = nil,
+        schedule: SkillSchedule? = nil,
         createdAt: Date = Date(),
         updatedAt: Date? = nil
     ) {
@@ -248,6 +298,7 @@ public struct Skill: Sendable, Identifiable, Codable, Equatable {
         self.triggerPhrases = triggerPhrases
         self.steps = steps
         self.workspaceId = workspaceId
+        self.schedule = schedule
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
     }
@@ -446,4 +497,257 @@ public struct StreamBandwidthPolicy: Sendable, Equatable {
         self.liveLookFPS = liveLookFPS
         self.maxBurstFrames = maxBurstFrames
     }
+}
+
+// MARK: - Agents (multi-agent: Nova master + specialist sub-agents)
+
+/// The OpenAI Realtime voices Nova can assign to an agent. Stored on `Agent` as a
+/// plain string so future voices work without a model change; this enum just
+/// drives the picker + provides friendly labels.
+public enum RealtimeVoice: String, CaseIterable, Sendable, Codable {
+    case marin, cedar, ash, verse, sage, ballad, alloy, coral, echo, shimmer
+
+    public var displayName: String {
+        switch self {
+        case .marin: return "Marin (warm, neutral)"
+        case .cedar: return "Cedar (deep, male)"
+        case .ash: return "Ash (energetic, male)"
+        case .verse: return "Verse (bright, male)"
+        case .sage: return "Sage (calm)"
+        case .ballad: return "Ballad (smooth)"
+        case .alloy: return "Alloy (neutral)"
+        case .coral: return "Coral (friendly)"
+        case .echo: return "Echo (male)"
+        case .shimmer: return "Shimmer (soft)"
+        }
+    }
+}
+
+/// A conversational persona the user can talk to. Nova is the master agent; the
+/// others are specialists the user switches to by voice ("Nova, let me talk to
+/// Claude"). Each agent has its own voice, front-loaded personality, an optional
+/// allowlist of tools it can use, and (via the orchestrator) its own scoped
+/// conversation memory.
+public struct Agent: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// Display name and the word the user says to address this agent ("Claude").
+    public var name: String
+    /// The spoken wake word for this agent (defaults to `name`).
+    public var wakeWord: String
+    /// OpenAI Realtime voice id (see `RealtimeVoice`).
+    public var voice: String
+    /// Short description of what this specialist does ("programming assistant").
+    public var role: String
+    /// Front-loaded personality/system prompt injected ahead of the base rules.
+    public var personality: String
+    /// Tool names advertised to this agent. `nil` = every registered tool.
+    public var toolNames: [String]?
+    /// True for Nova only. The master can never be deleted and is the fallback.
+    public let isMaster: Bool
+    /// True for seeded agents (protected from deletion in the UI).
+    public let builtIn: Bool
+    /// When false, the agent is hidden from switching + the roster prompt.
+    public var enabled: Bool
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        wakeWord: String? = nil,
+        voice: String,
+        role: String,
+        personality: String,
+        toolNames: [String]? = nil,
+        isMaster: Bool = false,
+        builtIn: Bool = false,
+        enabled: Bool = true,
+        createdAt: Date = Date(),
+        updatedAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.wakeWord = (wakeWord?.isEmpty == false ? wakeWord! : name)
+        self.voice = voice
+        self.role = role
+        self.personality = personality
+        self.toolNames = toolNames
+        self.isMaster = isMaster
+        self.builtIn = builtIn
+        self.enabled = enabled
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, wakeWord, voice, role, personality, toolNames, isMaster, builtIn, enabled, createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        wakeWord = try c.decodeIfPresent(String.self, forKey: .wakeWord) ?? name
+        voice = try c.decode(String.self, forKey: .voice)
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? ""
+        personality = try c.decodeIfPresent(String.self, forKey: .personality) ?? ""
+        toolNames = try c.decodeIfPresent([String].self, forKey: .toolNames)
+        isMaster = try c.decodeIfPresent(Bool.self, forKey: .isMaster) ?? false
+        builtIn = try c.decodeIfPresent(Bool.self, forKey: .builtIn) ?? false
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        let created = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        createdAt = created
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? created
+    }
+}
+
+public extension Agent {
+    /// Stable ids so the master + built-ins keep their identity across launches
+    /// (seeds are matched/merged by id, and the master id is a well-known value).
+    enum SeedID {
+        public static let nova = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+        public static let claude = UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!
+        public static let max = UUID(uuidString: "00000000-0000-0000-0000-0000000000A3")!
+        public static let sage = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
+        public static let remy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A5")!
+        public static let scholar = UUID(uuidString: "00000000-0000-0000-0000-0000000000A6")!
+    }
+
+    /// Common tools most specialists should be able to reach.
+    static let commonToolNames: [String] = [
+        "web_search", "remember_fact", "recall_facts",
+        "save_note", "list_notes", "create_reminder"
+    ]
+
+    /// The roster seeded on first launch. Nova is the master; the rest are
+    /// specialists with their own voice + front-loaded personality.
+    static func builtInAgents() -> [Agent] {
+        [
+            Agent(
+                id: SeedID.nova,
+                name: "Nova",
+                voice: RealtimeVoice.marin.rawValue,
+                role: "the master voice assistant",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents and can hand off to them when the user asks. You are warm, concise, and proactive.",
+                toolNames: nil,
+                isMaster: true,
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.claude,
+                name: "Claude",
+                voice: RealtimeVoice.cedar.rawValue,
+                role: "a senior programming assistant",
+                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You explain trade-offs briefly, write clean code, and are careful and explicit about anything destructive. You can run Claude Code and push commands to the user's active Cursor sessions using your tools; confirm what you did in one short sentence. Keep spoken answers concise and offer to go deeper on request.",
+                toolNames: [
+                    "run_claude_code", "push_to_cursor", "list_cursor_sessions",
+                    "web_search", "search_knowledge", "save_note", "list_notes",
+                    "remember_fact", "recall_facts"
+                ],
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.max,
+                name: "Max",
+                voice: RealtimeVoice.ash.rawValue,
+                role: "a personal trainer and strength coach",
+                personality: "You are Max, an upbeat, motivating personal trainer. You know the user's past workouts and use them to progress training safely. During an active workout session you coach set-by-set: call cues, count tempo, suggest weights and rest, and log each set with your tools. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy.",
+                toolNames: [
+                    "start_workout_session", "log_workout_set", "end_workout_session",
+                    "workout_history", "remember_fact", "recall_facts",
+                    "web_search", "create_reminder", "save_note"
+                ],
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.sage,
+                name: "Sage",
+                voice: RealtimeVoice.sage.rawValue,
+                role: "a wellness and mindfulness coach",
+                personality: "You are Sage, a calm, grounded wellness and mindfulness coach. You guide breathing, meditation, journaling, and healthy habits with a gentle, unhurried tone. You never give medical diagnoses; you encourage professional care when appropriate.",
+                toolNames: Agent.commonToolNames + ["search_knowledge", "daily_briefing"],
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.remy,
+                name: "Remy",
+                voice: RealtimeVoice.ballad.rawValue,
+                role: "a chef and nutrition assistant",
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. You suggest recipes from what the user has on hand, scale portions, and give clear step-by-step cooking guidance suited to hands-free use. Keep steps short so they're easy to follow while cooking.",
+                toolNames: Agent.commonToolNames,
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.scholar,
+                name: "Scholar",
+                voice: RealtimeVoice.verse.rawValue,
+                role: "a patient tutor",
+                personality: "You are Scholar, a patient, encouraging tutor. You teach with the Socratic method, check understanding, and can run study/quiz sessions with spaced repetition. Explain step-by-step and adapt to the user's level.",
+                toolNames: Agent.commonToolNames + ["search_knowledge"],
+                builtIn: true
+            ),
+        ]
+    }
+}
+
+// MARK: - Workouts (backing the personal-trainer agent's context + coaching)
+
+/// A single logged set within a workout session.
+public struct WorkoutSet: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var exercise: String
+    public var reps: Int?
+    /// Weight in pounds.
+    public var weight: Double?
+    /// Duration in seconds (for cardio / timed holds).
+    public var durationSeconds: Int?
+    public var notes: String?
+    public var at: Date
+
+    public init(
+        id: UUID = UUID(),
+        exercise: String,
+        reps: Int? = nil,
+        weight: Double? = nil,
+        durationSeconds: Int? = nil,
+        notes: String? = nil,
+        at: Date = Date()
+    ) {
+        self.id = id
+        self.exercise = exercise
+        self.reps = reps
+        self.weight = weight
+        self.durationSeconds = durationSeconds
+        self.notes = notes
+        self.at = at
+    }
+}
+
+/// A workout session (a training block). `endedAt == nil` means it's in progress,
+/// which is what lets Max coach and log sets live.
+public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var title: String
+    public var startedAt: Date
+    public var endedAt: Date?
+    public var sets: [WorkoutSet]
+    public var notes: String?
+
+    public init(
+        id: UUID = UUID(),
+        title: String = "Workout",
+        startedAt: Date = Date(),
+        endedAt: Date? = nil,
+        sets: [WorkoutSet] = [],
+        notes: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.sets = sets
+        self.notes = notes
+    }
+
+    public var isActive: Bool { endedAt == nil }
 }

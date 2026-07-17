@@ -153,38 +153,10 @@ public struct PatchNotesView: View {
         self.installedVersion = installedVersion
     }
 
+    /// Standalone wrapper (its own navigation container) for use as a tab.
     public var body: some View {
         NavigationStack {
-            List {
-                ForEach(notes) { note in
-                    Section {
-                        if let summary = note.summary {
-                            Text(summary)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(note.entries) { entry in
-                            PatchNoteRow(entry: entry)
-                        }
-                    } header: {
-                        HStack {
-                            Text("Version \(note.version)")
-                            Spacer()
-                            Text(note.date).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Patch Notes")
-            .navigationBarTitleDisplayMode(.inline)
-            .safeAreaInset(edge: .bottom) {
-                Text("Installed: v\(installedVersion)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(.ultraThinMaterial)
-            }
+            PatchNotesContent(notes: notes, installedVersion: installedVersion)
         }
     }
 
@@ -196,6 +168,52 @@ public struct PatchNotesView: View {
             return "\(short) (\(build))"
         }
         return short
+    }
+}
+
+/// The patch-notes list without a navigation container, so it can be pushed
+/// from another stack (e.g. Settings → About).
+public struct PatchNotesContent: View {
+    private let notes: [PatchNote]
+    private let installedVersion: String
+
+    public init(notes: [PatchNote] = PatchNote.all,
+                installedVersion: String = PatchNotesView.bundleVersion()) {
+        self.notes = notes
+        self.installedVersion = installedVersion
+    }
+
+    public var body: some View {
+        List {
+            ForEach(notes) { note in
+                Section {
+                    if let summary = note.summary {
+                        Text(summary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(note.entries) { entry in
+                        PatchNoteRow(entry: entry)
+                    }
+                } header: {
+                    HStack {
+                        Text("Version \(note.version)")
+                        Spacer()
+                        Text(note.date).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Patch Notes")
+        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom) {
+            Text("Installed: v\(installedVersion)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial)
+        }
     }
 }
 

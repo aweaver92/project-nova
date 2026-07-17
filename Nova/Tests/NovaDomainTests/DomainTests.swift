@@ -77,6 +77,27 @@ final class WakeWordTests: XCTestCase {
         XCTAssertEqual(d.detect("novafy this document"), .ignore)
     }
 
+    func testStopCommandDetection() {
+        let d = WakeWordDetector()
+
+        // "Nova, stop" and close variants map to .stop.
+        XCTAssertEqual(d.detect("Nova, stop"), .stop)
+        XCTAssertEqual(d.detect("Nova stop talking"), .stop)
+        XCTAssertEqual(d.detect("nova, be quiet"), .stop)
+        XCTAssertEqual(d.detect("NOVA... never mind!"), .stop)
+        XCTAssertEqual(d.detectAssumingAddressed("stop"), .stop)
+        XCTAssertEqual(d.detectAssumingAddressed("that's enough"), .stop)
+
+        // A bare "stop" without the wake word is still ignored by strict detect.
+        XCTAssertEqual(d.detect("stop"), .ignore)
+
+        // "stop <something>" is a real command (e.g. the recording tool), not a
+        // stand-down, so it must NOT be swallowed as .stop.
+        if case .converse = d.detect("Nova, stop the recording") {} else {
+            XCTFail("expected converse for 'stop the recording'")
+        }
+    }
+
     func testDetectAssumingAddressedSkipsWakeWord() {
         let d = WakeWordDetector()
         // No wake word, but treated as addressed (listening mode).
@@ -136,6 +157,85 @@ final class WakeWordTests: XCTestCase {
         await provider.emit(.inputTranscriptionCompleted(transcript: "what time is it"))
         let answered = await waitUntil { await provider.createResponseCount == 1 }
         XCTAssertTrue(answered)
+        await orch.stop()
+    }
+
+    func testStopCommandInterruptsAndSuspendsListening() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start()
+
+        // Engage, then have the assistant start speaking.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, tell me a long story"))
+        let engaged = await waitUntil { await provider.createResponseCount == 1 }
+        XCTAssertTrue(engaged)
+        await provider.emit(.responseStarted)
+
+        // "Nova, stop": interrupts speech and does NOT produce a reply.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, stop"))
+        let interrupted = await waitUntil { await provider.interruptCount == 1 }
+        XCTAssertTrue(interrupted)
+        // Simulate the cancelled response completing (server sends response.done).
+        await provider.emit(.responseEnded)
+
+        // A bare follow-up is now ignored — listening was suspended by the stop,
+        // even though a reply just "ended" (which would normally reopen it).
+        await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
+        _ = await waitUntil { await provider.createResponseCount > 1 }
+        let afterFollowUp = await provider.createResponseCount
+        XCTAssertEqual(afterFollowUp, 1, "stop must suspend the grace window")
+
+        // Re-addressing Nova by name resumes normal conversation.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, what's the weather"))
+        let resumed = await waitUntil { await provider.createResponseCount == 2 }
+        XCTAssertTrue(resumed)
+        await orch.stop()
+    }
+
+    func testAgentSwitchingReconnectsWithNewVoiceAndOnlyMasterCanSwitch() async throws {
+        let provider = MockProvider()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let max = Agent(name: "Max", voice: "ash", role: "trainer", personality: "You are Max.")
+        let roster = [nova, claude, max]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start()
+
+        // Starts as the master Nova → marin voice.
+        let startedAsNova = await waitUntil { await provider.lastVoice == "marin" }
+        XCTAssertTrue(startedAsNova)
+
+        // "Nova, let me talk to Claude" reconnects with Claude's voice.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let switchedToClaude = await waitUntil { await provider.lastVoice == "cedar" }
+        XCTAssertTrue(switchedToClaude)
+        let active1 = await orch.currentAgent
+        XCTAssertEqual(active1?.name, "Claude")
+
+        // A command WITHOUT the master word cannot switch specialists.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "let me talk to Max"))
+        _ = await waitUntil(timeout: 1) { await orch.currentAgent?.name == "Max" }
+        let active2 = await orch.currentAgent
+        XCTAssertEqual(active2?.name, "Claude", "only Nova can switch specialists")
+
+        // "Nova, end the conversation" returns to the master.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, end the conversation"))
+        let backToNova = await waitUntil { await provider.lastVoice == "marin" }
+        XCTAssertTrue(backToNova)
+        let active3 = await orch.currentAgent
+        XCTAssertEqual(active3?.name, "Nova")
+
         await orch.stop()
     }
 
@@ -357,10 +457,12 @@ private actor MockProvider: ConversationalAIProvider {
     let events: AsyncStream<AIConversationEvent>
     private let continuation: AsyncStream<AIConversationEvent>.Continuation
     private(set) var createResponseCount = 0
+    private(set) var interruptCount = 0
     private(set) var analyzeCount = 0
     private(set) var connectCount = 0
     private(set) var disconnectCount = 0
     private(set) var lastInstructions = ""
+    private(set) var lastVoice = ""
     private(set) var lastToolDefinitions: [ToolDefinition] = []
     private(set) var toolOutputs: [(callId: String, output: String)] = []
     var toolOutputCount: Int { toolOutputs.count }
@@ -374,12 +476,16 @@ private actor MockProvider: ConversationalAIProvider {
     func connect(config: AISessionConfig) async throws {
         connectCount += 1
         lastInstructions = config.instructions
+        lastVoice = config.voice
         lastToolDefinitions = config.toolDefinitions
     }
-    func disconnect() async { disconnectCount += 1; continuation.finish() }
+    // Mirrors the real provider: the events stream is long-lived and survives
+    // reconnects (disconnect does NOT finish it), so agent switching can tear the
+    // stream down and reopen it while the orchestrator keeps its single consumer.
+    func disconnect() async { disconnectCount += 1 }
     func appendAudio(_ pcm16_24k: Data) async {}
     func createResponse() async { createResponseCount += 1 }
-    func interrupt() async {}
+    func interrupt() async { interruptCount += 1 }
     func analyze(image: CapturedFrame, prompt: String) async throws -> String {
         analyzeCount += 1
         return "ok"
@@ -444,4 +550,47 @@ private actor MockEgress: AudioEgress {
     func enqueue(_ chunk: AudioChunk) async {}
     func flush() async {}
     func stop() async {}
+}
+
+/// Thread-safe holder for the persisted active-agent id in tests.
+private actor ActiveAgentBox {
+    private var id: UUID
+    init(id: UUID) { self.id = id }
+    func get() -> UUID { id }
+    func set(_ value: UUID) { id = value }
+}
+
+final class AgentDirectorTests: XCTestCase {
+    private func makeDirector() -> (AgentDirector, [Agent]) {
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "")
+        let max = Agent(name: "Max", voice: "ash", role: "trainer", personality: "")
+        let roster = [nova, claude, max]
+        return (AgentDirector(master: nova, agents: roster), roster)
+    }
+
+    func testSwitchRequiresMasterAndKnownAgent() {
+        let (director, roster) = makeDirector()
+        let claudeId = roster[1].id
+
+        XCTAssertEqual(director.control(for: "Nova, let me talk to Claude"), .switchTo(agentId: claudeId))
+        XCTAssertEqual(director.control(for: "nova switch to claude"), .switchTo(agentId: claudeId))
+        // Casing / punctuation robustness.
+        XCTAssertEqual(director.control(for: "NOVA... let me speak with Claude!"), .switchTo(agentId: claudeId))
+
+        // Without the master word, no switch (only Nova can switch).
+        XCTAssertEqual(director.control(for: "let me talk to Claude"), .none)
+        // Unknown specialist → no switch.
+        XCTAssertEqual(director.control(for: "Nova, let me talk to Batman"), .none)
+        // No trigger phrase → not a switch.
+        XCTAssertEqual(director.control(for: "Nova, what did Claude say"), .none)
+    }
+
+    func testEndConversationDetected() {
+        let (director, _) = makeDirector()
+        XCTAssertEqual(director.control(for: "Nova, end the conversation"), .endConversation)
+        XCTAssertEqual(director.control(for: "Nova, go back to Nova"), .endConversation)
+        // Requires the master word.
+        XCTAssertEqual(director.control(for: "end the conversation"), .none)
+    }
 }

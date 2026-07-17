@@ -131,3 +131,65 @@ public struct HomeAssistantTool: Tool {
         return #"{"ok":true,"domain":"\#(args.domain)","service":"\#(args.service)"}"#
     }
 }
+
+/// Reads the current state (and friendly name/attributes) of a Home Assistant
+/// entity — e.g. "is the garage door open?", "what's the thermostat set to?".
+public struct HomeAssistantStateTool: Tool {
+    public let name = "home_assistant_state"
+    public let description = "Query the current state of a Home Assistant entity (e.g. a sensor, light, lock, or thermostat) by entity_id. Use to answer questions about the smart home."
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"entityId":{"type":"string","description":"Target entity_id, e.g. 'lock.front_door' or 'sensor.living_room_temperature'"}},"required":["entityId"],"additionalProperties":false}
+    """
+    public let baseURL: URL?
+    public let token: String?
+    private let session: URLSession
+
+    public init(baseURL: URL? = nil, token: String? = nil, session: URLSession = .shared) {
+        self.baseURL = baseURL
+        self.token = token
+        self.session = session
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let entityId: String }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        guard let baseURL, let token else {
+            throw NovaError.tool("Home Assistant not configured")
+        }
+        var request = URLRequest(url: baseURL.appending(path: "api/states/\(args.entityId)"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw NovaError.tool("Home Assistant call failed")
+        }
+        if http.statusCode == 404 {
+            return #"{"ok":false,"error":"entity_not_found","entityId":"\#(args.entityId)"}"#
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw NovaError.tool("Home Assistant call failed")
+        }
+        return Self.summarize(data: data, entityId: args.entityId)
+    }
+
+    /// Reduces HA's verbose state payload to state + friendly name + unit.
+    static func summarize(data: Data, entityId: String) -> String {
+        struct State: Decodable {
+            let state: String
+            struct Attributes: Decodable {
+                let friendly_name: String?
+                let unit_of_measurement: String?
+            }
+            let attributes: Attributes?
+        }
+        guard let decoded = try? JSONDecoder().decode(State.self, from: data) else {
+            return #"{"ok":false,"error":"bad_response","entityId":"\#(entityId)"}"#
+        }
+        var payload: [String: Any] = ["ok": true, "entityId": entityId, "state": decoded.state]
+        if let name = decoded.attributes?.friendly_name { payload["name"] = name }
+        if let unit = decoded.attributes?.unit_of_measurement { payload["unit"] = unit }
+        let out = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) }
+        return out ?? #"{"ok":false,"error":"encode_failed"}"#
+    }
+}

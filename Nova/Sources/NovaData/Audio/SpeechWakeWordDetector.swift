@@ -99,7 +99,10 @@ public final class SpeechWakeWordDetector: WakeWordListening, @unchecked Sendabl
             guard let self else { return }
             if let result {
                 let text = result.bestTranscription.formattedString
-                if self.detector.detect(text) != .ignore {
+                let intent = self.detector.detect(text)
+                // A bare "Nova, stop" should never wake an idle session — it only
+                // means something while Nova is already engaged/speaking.
+                if intent != .ignore, intent != .stop {
                     self.detectionsCont.yield(())
                     self.restart()
                     return

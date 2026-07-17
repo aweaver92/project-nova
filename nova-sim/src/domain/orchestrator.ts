@@ -83,6 +83,19 @@ export class ConversationOrchestrator {
   }
 
   /**
+   * Handle "Nova, stop": cancel any in-progress speech and stay silent. The
+   * next turn must re-address Nova by name (this simulator gates every turn on
+   * the wake word, so no extra "suspended" bookkeeping is needed here).
+   */
+  private async handleStopCommand(): Promise<void> {
+    if (this.assistantSpeaking) {
+      await this.bargeIn();
+    } else {
+      await this.egress.flush();
+    }
+  }
+
+  /**
    * Wake-word gate: with requireWakeWord on, the server transcribes but does
    * not auto-reply, so we decide here whether "Nova" was addressed and whether
    * to answer by voice or with a captured frame.
@@ -92,6 +105,10 @@ export class ConversationOrchestrator {
     const intent = this.detector?.detect(transcript) ?? { kind: "ignore" as const };
     switch (intent.kind) {
       case "ignore":
+        return;
+      case "stop":
+        // "Nova, stop": halt any in-progress speech and stay silent.
+        await this.handleStopCommand();
         return;
       case "converse":
         await this.ai.createResponse();

@@ -147,24 +147,39 @@ public struct SetWorkspaceTool: Tool {
 /// to-do/doc into a reminder/note. Auto-send is intentionally not supported (iOS).
 public struct DraftMessageTool: Tool {
     public let name = "draft_message"
-    public let description = "Draft an email or text message and open a prefilled composer for the user to review and send, or capture a to-do/doc as a reminder or note. Does not auto-send."
+    public let description = "Draft an email or text (opens a prefilled composer to review and send), or capture a to-do as a reminder (optionally with a due time), a calendar event, or a note. Does not auto-send."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"type":{"type":"string","enum":["email","text","todo","note"],"description":"What kind of draft"},"to":{"type":"string","description":"Recipient email or phone (email/text only)"},"subject":{"type":"string","description":"Email subject"},"body":{"type":"string","description":"The message/note/todo content"}},"required":["type","body"],"additionalProperties":false}
+    {"type":"object","properties":{"type":{"type":"string","enum":["email","text","todo","event","note"],"description":"What kind of draft"},"to":{"type":"string","description":"Recipient email or phone (email/text only)"},"subject":{"type":"string","description":"Email subject or event title"},"body":{"type":"string","description":"The message/note/todo content"},"dueISO":{"type":"string","description":"ISO8601 due time for a todo (optional)"},"startISO":{"type":"string","description":"ISO8601 start time for an event"},"durationMinutes":{"type":"integer","description":"Event length in minutes (optional, default 60)"}},"required":["type","body"],"additionalProperties":false}
     """
 
     private let notes: any NoteStoring
     private let reminderTool: CreateReminderTool
+    private let calendarTool: CreateCalendarEventTool
     private let openURL: SkillRunner.URLOpener?
 
-    public init(notes: any NoteStoring, openURL: SkillRunner.URLOpener? = nil, reminderTool: CreateReminderTool = CreateReminderTool()) {
+    public init(
+        notes: any NoteStoring,
+        openURL: SkillRunner.URLOpener? = nil,
+        reminderTool: CreateReminderTool = CreateReminderTool(),
+        calendarTool: CreateCalendarEventTool = CreateCalendarEventTool()
+    ) {
         self.notes = notes
         self.openURL = openURL
         self.reminderTool = reminderTool
+        self.calendarTool = calendarTool
     }
 
     public func invoke(argumentsJSON: String) async throws -> String {
-        struct Args: Decodable { let type: String; let to: String?; let subject: String?; let body: String }
+        struct Args: Decodable {
+            let type: String
+            let to: String?
+            let subject: String?
+            let body: String
+            let dueISO: String?
+            let startISO: String?
+            let durationMinutes: Int?
+        }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
 
         switch args.type {
@@ -186,9 +201,28 @@ public struct DraftMessageTool: Tool {
             }
             return #"{"ok":true,"drafted":"text"}"#
         case "todo":
-            let json = #"{"title":"\#(jsonEscape(args.body))"}"#
+            var payload: [String: Any] = ["title": args.body]
+            if let due = args.dueISO { payload["dueISO8601"] = due }
+            let json = (try? JSONSerialization.data(withJSONObject: payload))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? #"{"title":"\#(jsonEscape(args.body))"}"#
             _ = try? await reminderTool.invoke(argumentsJSON: json)
             return #"{"ok":true,"drafted":"todo"}"#
+        case "event":
+            guard let start = args.startISO else {
+                return #"{"ok":false,"error":"missing_start_time"}"#
+            }
+            var payload: [String: Any] = [
+                "title": args.subject ?? args.body,
+                "startISO8601": start,
+                "durationMinutes": args.durationMinutes ?? 60
+            ]
+            if args.subject != nil { payload["notes"] = args.body }
+            let json = (try? JSONSerialization.data(withJSONObject: payload))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            guard (try? await calendarTool.invoke(argumentsJSON: json)) != nil else {
+                return #"{"ok":false,"error":"calendar_unavailable"}"#
+            }
+            return #"{"ok":true,"drafted":"event"}"#
         default: // note / doc
             await notes.save(args.body)
             return #"{"ok":true,"drafted":"note"}"#

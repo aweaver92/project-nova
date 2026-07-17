@@ -18,8 +18,17 @@ public actor ToolRouter {
     }
 
     /// Definitions advertised to the model so it can emit function calls.
-    public func definitions() -> [ToolDefinition] {
-        tools.values
+    /// - Parameter allowlist: when non-nil, only tools whose names are in the list
+    ///   are advertised (used to scope a specialist agent to its own toolset).
+    public func definitions(allowlist: [String]? = nil) -> [ToolDefinition] {
+        let selected: [any Tool]
+        if let allowlist {
+            let names = Set(allowlist)
+            selected = tools.values.filter { names.contains($0.name) }
+        } else {
+            selected = Array(tools.values)
+        }
+        return selected
             .map { ToolDefinition(name: $0.name, description: $0.description, parametersJSON: $0.parametersJSON) }
             .sorted { $0.name < $1.name }
     }

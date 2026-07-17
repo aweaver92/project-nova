@@ -34,6 +34,21 @@ public actor ConversationOrchestrator {
     private let bookmarkStore: (any BookmarkStoring)?
     // Generates follow-up suggestions after each reply.
     private let followUpSuggester: (any FollowUpSuggesting)?
+    // Durable long-term memory digest injected for continuity.
+    private let digestStore: (any MemoryDigestStoring)?
+    // Compacts older turns into the digest opportunistically in the background.
+    private let memoryCompactor: (any MemoryCompacting)?
+    // When true, Nova also offers one follow-up out loud (default off).
+    private let spokenFollowUps: (@Sendable () async -> Bool)?
+    // Supplies the agent roster (master Nova + specialists) for switching.
+    private let agentsProvider: (@Sendable () async -> [Agent])?
+    // Supplies the initially-active agent (persisted selection).
+    private let activeAgentProvider: (@Sendable () async -> Agent?)?
+    // Persists a newly-activated agent so the selection survives relaunch.
+    private let persistActiveAgent: (@Sendable (UUID) async -> Void)?
+    // Supplies extra front-loaded context for a specific agent (e.g. the trainer's
+    // recent workout history). Injected into that agent's session instructions.
+    private let agentContextProvider: (@Sendable (Agent) async -> String)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -46,15 +61,32 @@ public actor ConversationOrchestrator {
     private var outputTranscript = ""
     private var sessionConfig = AISessionConfig()
     private var detector = WakeWordDetector()
+    // Master-only detector used to recognize a plain "Nova, …" address while a
+    // sub-agent is active (so the user can always reach the master).
+    private var masterDetector: WakeWordDetector?
+    // Parses master switch/end commands. Nil until the roster is loaded in start().
+    private var agentDirector: AgentDirector?
+    // Full roster + the currently-active agent (nil = single-agent legacy mode).
+    private var agents: [Agent] = []
+    private var activeAgent: Agent?
+    // Notifies the UI when the active agent changes (switch/end/hand-off).
+    private var onAgentChanged: (@Sendable (Agent) -> Void)?
     // Timestamp of the last conversational engagement (wake word heard or a reply
     // completed by either side). Drives the listening-mode grace window.
     private var lastEngagement: ContinuousClock.Instant?
+    // Set by "Nova, stop": suppresses the listening-mode grace window so that
+    // follow-ups are ignored until the wake word is explicitly spoken again.
+    // Cleared as soon as an utterance actually contains the wake word.
+    private var listeningSuspended = false
     // Timestamp of the last conversational activity while streaming. Drives the
     // idle teardown that returns us to on-device wake-word listening.
     private var lastActivity: ContinuousClock.Instant = .now
     // Latest completed user/assistant text, for bookmarks and follow-up suggestions.
     private var lastUserText = ""
     private var lastAssistantText = ""
+    // One-shot guard so a spoken follow-up offer doesn't itself trigger another
+    // round of follow-up generation (which would loop).
+    private var skipFollowUpOnce = false
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
@@ -76,7 +108,14 @@ public actor ConversationOrchestrator {
         skillRunner: (any SkillRunning)? = nil,
         skillsProvider: (@Sendable () async -> [Skill])? = nil,
         bookmarkStore: (any BookmarkStoring)? = nil,
-        followUpSuggester: (any FollowUpSuggesting)? = nil
+        followUpSuggester: (any FollowUpSuggesting)? = nil,
+        digestStore: (any MemoryDigestStoring)? = nil,
+        memoryCompactor: (any MemoryCompacting)? = nil,
+        spokenFollowUps: (@Sendable () async -> Bool)? = nil,
+        agentsProvider: (@Sendable () async -> [Agent])? = nil,
+        activeAgentProvider: (@Sendable () async -> Agent?)? = nil,
+        persistActiveAgent: (@Sendable (UUID) async -> Void)? = nil,
+        agentContextProvider: (@Sendable (Agent) async -> String)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -95,7 +134,22 @@ public actor ConversationOrchestrator {
         self.skillsProvider = skillsProvider
         self.bookmarkStore = bookmarkStore
         self.followUpSuggester = followUpSuggester
+        self.digestStore = digestStore
+        self.memoryCompactor = memoryCompactor
+        self.spokenFollowUps = spokenFollowUps
+        self.agentsProvider = agentsProvider
+        self.activeAgentProvider = activeAgentProvider
+        self.persistActiveAgent = persistActiveAgent
+        self.agentContextProvider = agentContextProvider
     }
+
+    /// Register a handler notified whenever the active agent changes.
+    public func setAgentChangeHandler(_ handler: (@Sendable (Agent) -> Void)?) {
+        onAgentChanged = handler
+    }
+
+    /// The currently-active agent, if the multi-agent roster is wired.
+    public var currentAgent: Agent? { activeAgent }
 
     /// True while the cloud Realtime stream is open (as opposed to idle on-device
     /// wake-word listening). Exposed for diagnostics/tests.
@@ -121,7 +175,10 @@ public actor ConversationOrchestrator {
         isRunning = true
         sessionConfig = config
         lastEngagement = nil
-        detector = WakeWordDetector(wakeWord: config.wakeWord, visionPhrases: config.visionTriggerPhrases)
+        listeningSuspended = false
+        await loadAgentRoster()
+        let activeWake = activeAgent?.wakeWord ?? config.wakeWord
+        detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
 
         // Single, long-lived consumer of provider events. It must outlive
         // individual engage/disengage cycles because the provider's event stream
@@ -155,6 +212,132 @@ public actor ConversationOrchestrator {
         await teardownStreaming()
         eventTask?.cancel()
         eventTask = nil
+        // Ending the session returns control to the master for next time.
+        if let master = masterAgent, activeAgent?.id != master.id {
+            activeAgent = master
+            await persistActiveAgent?(master.id)
+            onAgentChanged?(master)
+        }
+    }
+
+    // MARK: - Agents (master Nova + specialist sub-agents)
+
+    private var masterAgent: Agent? {
+        agents.first(where: { $0.isMaster }) ?? agents.first
+    }
+
+    private func loadAgentRoster() async {
+        if let agentsProvider {
+            agents = await agentsProvider()
+        }
+        guard !agents.isEmpty else {
+            activeAgent = nil
+            agentDirector = nil
+            masterDetector = nil
+            return
+        }
+        let master = masterAgent
+        activeAgent = (await activeAgentProvider?()) ?? master
+        if let master {
+            agentDirector = AgentDirector(master: master, agents: agents)
+            masterDetector = WakeWordDetector(
+                wakeWord: master.wakeWord,
+                visionPhrases: sessionConfig.visionTriggerPhrases
+            )
+        }
+    }
+
+    /// Memory scope: each specialist keeps its own conversation window (keyed by
+    /// its id); the master falls back to the active workspace.
+    private func memoryScopeId() async -> UUID? {
+        if let agent = activeAgent, !agent.isMaster { return agent.id }
+        return await currentWorkspaceId()
+    }
+
+    /// Switch the active agent, reconnecting the stream so the new voice + persona
+    /// + scoped context + toolset take effect. Optionally speaks a short hand-off
+    /// in the new voice, or answers a pending master command as `actOnText`.
+    private func switchAgent(toId id: UUID, greet: Bool, actOnText: String? = nil) async {
+        guard let target = agents.first(where: { $0.id == id }) ?? masterAgent else { return }
+        let alreadyActive = activeAgent?.id == target.id
+        activeAgent = target
+        detector = WakeWordDetector(
+            wakeWord: target.wakeWord,
+            visionPhrases: sessionConfig.visionTriggerPhrases
+        )
+        await persistActiveAgent?(target.id)
+        onAgentChanged?(target)
+        NovaLog.session.info("Active agent → \(target.name, privacy: .public)")
+
+        // Reconnect so the voice/instructions actually change (voice is fixed for
+        // the life of a Realtime connection).
+        if streaming {
+            await teardownStreaming()
+            do {
+                try await beginStreaming(sessionConfig)
+            } catch {
+                NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
+                return
+            }
+        } else {
+            // Not currently streaming (e.g. UI toggle while idle): selection is
+            // persisted and will apply on the next engagement.
+            return
+        }
+
+        lastEngagement = .now
+        listeningSuspended = false
+
+        if let actOnText, !actOnText.isEmpty {
+            await ai.sendUserText(actOnText)
+        } else if greet {
+            let intro: String
+            if target.isMaster {
+                intro = "[System: The user has returned to you, Nova, the master assistant. Welcome them back in one short sentence and ask how you can help.]"
+            } else if alreadyActive {
+                intro = "[System: You are \(target.name). Briefly let the user know you're here and ready.]"
+            } else {
+                intro = "[System: You are now the active specialist, \(target.name) — \(target.role). Greet the user in one short sentence, in character, and invite their request.]"
+            }
+            await ai.sendUserText(intro)
+        }
+    }
+
+    /// UI-initiated activation (tapping an agent in the Agents tab).
+    public func setActiveAgentFromUI(_ id: UUID) async {
+        if agents.isEmpty { await loadAgentRoster() }
+        await switchAgent(toId: id, greet: streaming)
+    }
+
+    /// Best-effort command text to re-ask after a hand-off back to the master.
+    static func commandText(for intent: WakeIntent, fallback: String) -> String {
+        switch intent {
+        case .converse(let command):
+            return command.isEmpty ? fallback : command
+        case .vision(let prompt):
+            return prompt
+        case .stop, .ignore:
+            return fallback
+        }
+    }
+
+    /// Compose an agent's session instructions: front-load the persona, then the
+    /// shared base rules (tool usage, accuracy, English), then a roster note.
+    static func composeInstructions(base: String, agent: Agent, roster: [Agent]) -> String {
+        if agent.isMaster {
+            var s = base
+            let others = roster.filter { !$0.isMaster && $0.enabled }
+            if !others.isEmpty {
+                let list = others.map { "\($0.name) (\($0.role))" }.joined(separator: "; ")
+                let example = others.first?.name ?? "Claude"
+                s += "\n\nYou are the master assistant and lead a team of specialists: \(list). The user can hand off to one by saying, for example, \"Nova, let me talk to \(example)\". Only you can switch specialists. If the user asks for one of these specialties, offer to hand off."
+            }
+            return s
+        }
+        var s = "You are \(agent.name), \(agent.role). \(agent.personality)\n\n"
+        s += "The user addresses you as \"\(agent.wakeWord)\". You are a specialist working under Nova, the master assistant. If the user says \"Nova\", control returns to Nova; stay in character as \(agent.name) otherwise. Keep answers concise and spoken-friendly.\n\n"
+        s += base
+        return s
     }
 
     // MARK: - Local wake-word listening (idle state)
@@ -197,15 +380,35 @@ public actor ConversationOrchestrator {
         guard !streaming else { return }
         // Prime the session with durable facts + recent memory for continuity.
         var effective = config
+        // Active-agent persona + voice: the persona is front-loaded ahead of the
+        // base rules, and the voice determines who the user hears.
+        if let agent = activeAgent {
+            effective.voice = agent.voice.isEmpty ? config.voice : agent.voice
+            effective.instructions = Self.composeInstructions(
+                base: config.instructions,
+                agent: agent,
+                roster: agents
+            )
+        }
         if let profileProvider {
             let facts = await profileProvider()
             if !facts.isEmpty {
                 effective.instructions += "\n\nWhat you know about the user:\n\(facts)"
             }
         }
+        // Memory is scoped per-agent (so each specialist has its own window);
+        // the master falls back to the active workspace.
+        let scopeId = await memoryScopeId()
+        // Durable long-term digest first (older, compacted context)…
+        if let digestStore {
+            let digest = await digestStore.digest(workspaceId: scopeId)
+            if !digest.isEmpty {
+                effective.instructions += "\n\nLong-term memory for this context:\n\(digest)"
+            }
+        }
+        // …then the recent rolling window.
         if let memory {
-            let wsid = await currentWorkspaceId()
-            let summary = await memory.summary(workspaceId: wsid)
+            let summary = await memory.summary(workspaceId: scopeId)
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
             }
@@ -217,9 +420,16 @@ public actor ConversationOrchestrator {
                 effective.instructions += "\n\n\(ctx)"
             }
         }
-        // Advertise available tools so the model can call them.
+        // Agent-specific extra context (e.g. the trainer's recent workouts).
+        if let agent = activeAgent, let agentContextProvider {
+            let ctx = await agentContextProvider(agent)
+            if !ctx.isEmpty {
+                effective.instructions += "\n\n\(ctx)"
+            }
+        }
+        // Advertise available tools, scoped to the active agent's allowlist.
         if let toolRouter {
-            effective.toolDefinitions = await toolRouter.definitions()
+            effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
         }
         try await ai.connect(config: effective)
         try await ingress.start()
@@ -247,6 +457,12 @@ public actor ConversationOrchestrator {
         }
 
         startIdleMonitorIfNeeded()
+
+        // Opportunistically compact older turns into the durable digest, off the
+        // hot path so it never blocks the live conversation.
+        if let memoryCompactor {
+            Task { await memoryCompactor.compactIfNeeded(workspaceId: scopeId) }
+        }
     }
 
     private func teardownStreaming() async {
@@ -332,10 +548,18 @@ public actor ConversationOrchestrator {
             outputTranscript = ""
         case .responseEnded:
             assistantSpeaking = false
+            // If a "Nova, stop" just landed, this is the cancelled response
+            // completing. Don't reopen the listening window or emit follow-ups —
+            // stay stood down until the wake word is heard again.
+            if listeningSuspended {
+                outputTranscript = ""
+                inputTranscript = ""
+                break
+            }
             // A reply just completed — keep the listening window open so the user
             // can follow up without repeating the wake word.
             lastEngagement = .now
-            let wsid = await currentWorkspaceId()
+            let wsid = await memoryScopeId()
             if !outputTranscript.isEmpty {
                 lastAssistantText = outputTranscript
                 await memory?.append(ConversationTurn(role: .assistant, text: outputTranscript, workspaceId: wsid))
@@ -388,17 +612,84 @@ public actor ConversationOrchestrator {
     private func handleUserUtterance(_ transcript: String) async {
         guard sessionConfig.requireWakeWord else { return }
 
-        var intent = detector.detect(transcript)
-        if case .ignore = intent, isWithinGraceWindow() {
-            intent = detector.detectAssumingAddressed(transcript)
+        // 0) Master control channel — only "Nova, …" can switch/end specialists.
+        if let director = agentDirector {
+            switch director.control(for: transcript) {
+            case .switchTo(let id):
+                await switchAgent(toId: id, greet: true)
+                return
+            case .endConversation:
+                if let master = masterAgent {
+                    await switchAgent(toId: master.id, greet: true)
+                }
+                return
+            case .none:
+                break
+            }
+        }
+
+        // 1) While a specialist is active, a plain "Nova, …" address always
+        //    reaches the master: hand back to Nova and answer as Nova. ("Nova,
+        //    stop" is treated as stop, not a hand-off.)
+        if let master = masterAgent, let active = activeAgent, !active.isMaster,
+           let masterDetector {
+            let masterIntent = masterDetector.detect(transcript)
+            if masterIntent != .ignore {
+                if case .stop = masterIntent {
+                    await handleStopCommand()
+                    return
+                }
+                listeningSuspended = false
+                let command = Self.commandText(for: masterIntent, fallback: transcript)
+                await switchAgent(toId: master.id, greet: false, actOnText: command)
+                return
+            }
+        }
+
+        // 2) Strict pass: did the utterance actually contain the active wake word?
+        let strict = detector.detect(transcript)
+        var intent = strict
+        if case .ignore = strict {
+            // No wake word. Honor listening mode only if a "Nova, stop" hasn't
+            // suspended it — otherwise follow-ups must re-address the agent by name.
+            if !listeningSuspended, isWithinGraceWindow() {
+                intent = detector.detectAssumingAddressed(transcript)
+            }
+        } else {
+            // The wake word was spoken explicitly — resume normal listening.
+            listeningSuspended = false
         }
         if case .ignore = intent { return }
+
+        // "Nova, stop": halt speech and stand down until re-addressed by name.
+        if case .stop = intent {
+            await handleStopCommand()
+            return
+        }
 
         // Addressed: (re)open the listening window and act on the intent.
         lastEngagement = .now
         // A saved skill or bookmark request takes precedence over a plain reply.
         if await handleSkillOrBookmark(transcript) { return }
         await act(on: intent)
+    }
+
+    /// Handle "Nova, stop": cancel any in-progress speech and suspend the
+    /// listening-mode grace window so subsequent utterances are ignored until the
+    /// wake word is spoken again. Nova stays silent (no reply).
+    private func handleStopCommand() async {
+        listeningSuspended = true
+        lastEngagement = nil
+        if assistantSpeaking {
+            await handleBargeIn()
+        } else {
+            await egress.flush()
+        }
+        // Drop partial transcripts so a half-formed turn can't leak into memory
+        // or a follow-up when the cancelled response completes.
+        inputTranscript = ""
+        outputTranscript = ""
+        NovaLog.session.info("Stop command: speech halted; wake word required to resume")
     }
 
     /// Deterministic routing for bookmark requests and skill trigger phrases.
@@ -449,14 +740,36 @@ public actor ConversationOrchestrator {
 
     /// Fire-and-forget follow-up suggestion generation after a reply completes.
     private func requestFollowUps() async {
-        guard let followUpSuggester,
-              let callback = onSuggestions,
-              !lastAssistantText.isEmpty else { return }
+        // Skip the response that a spoken offer itself produced (avoids a loop).
+        if skipFollowUpOnce { skipFollowUpOnce = false; return }
+        guard let followUpSuggester, !lastAssistantText.isEmpty else { return }
         let user = lastUserText
         let assistant = lastAssistantText
-        Task {
+        let callback = onSuggestions
+        let spokenProvider = spokenFollowUps
+        Task { [weak self] in
             let suggestions = await followUpSuggester.suggestions(userText: user, assistantText: assistant)
-            if !suggestions.isEmpty { callback(suggestions) }
+            guard !suggestions.isEmpty else { return }
+            callback?(suggestions)
+            if let spokenProvider, await spokenProvider() {
+                await self?.speakFollowUp(suggestions[0])
+            }
+        }
+    }
+
+    private func speakFollowUp(_ suggestion: String) async {
+        guard streaming else { return }
+        skipFollowUpOnce = true
+        await ai.sendUserText("[System note: offer this as a quick suggestion to the user in one short spoken sentence, then stop: \"\(suggestion)\"]")
+    }
+
+    /// Run a skill directly (e.g. from a scheduled notification). Deterministic
+    /// steps always run; a spoken confirmation is added when the stream is open.
+    public func runSkill(_ skill: Skill) async {
+        guard let skillRunner else { return }
+        let result = await skillRunner.run(skill)
+        if streaming {
+            await confirmSkill(skill, result)
         }
     }
 
@@ -477,7 +790,8 @@ public actor ConversationOrchestrator {
     }
 
     private func isWithinGraceWindow() -> Bool {
-        guard sessionConfig.wakeWordGraceWindow > .zero,
+        guard !listeningSuspended,
+              sessionConfig.wakeWordGraceWindow > .zero,
               let last = lastEngagement else { return false }
         return ContinuousClock.Instant.now - last <= sessionConfig.wakeWordGraceWindow
     }
@@ -486,6 +800,10 @@ public actor ConversationOrchestrator {
         switch intent {
         case .ignore:
             return
+        case .stop:
+            // Normally intercepted in handleUserUtterance; handled here too so the
+            // switch stays exhaustive and correct if act(on:) is called directly.
+            await handleStopCommand()
         case .converse:
             await ai.createResponse()
         case .vision(let prompt):
