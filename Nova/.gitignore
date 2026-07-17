@@ -8,3 +8,7 @@ App/Info.plist
 DerivedData/
 .env
 Secrets.xcconfig
+# Sideload artifacts — the .ipa is downloaded into App/ for easy sideloading,
+# but never committed (large binary, rebuilt by CI).
+*.ipa
+Payload/
