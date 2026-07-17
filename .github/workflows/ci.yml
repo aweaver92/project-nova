@@ -1,19 +1,52 @@
 name: CI
 
-# Trigger design keeps expensive macOS minutes in check (private-repo macOS
-# bills at 10x). Previously `push:` + `pull_request:` both fired for a branch
-# with an open PR, paying for TWO macOS runs per push. Now `push` only runs on
-# `main` and tags, while everyday branch work is covered once via `pull_request`.
+# Budget notes (private-repo macOS bills at 10x, so 2,000 free min ≈ ~200 macOS
+# min/month). To keep macOS minutes low:
+#   * concurrency cancels superseded runs on the same ref
+#   * a cheap Linux "changes" job gates the macOS jobs to iOS-only edits
+#   * the macOS test job runs on PRs only (not on every push to main)
+#   * the .ipa job does ONE compile (device build) instead of four
 on:
   push:
     branches: [main]
     tags: ["*"]
+    paths-ignore: ["**/*.md", "Docs/**"]
   pull_request:
+    paths-ignore: ["**/*.md", "Docs/**"]
   workflow_dispatch:
 
+# A rapid series of pushes to the same branch cancels the older, still-running
+# jobs instead of paying for all of them. Never cancel a manual .ipa dispatch.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 jobs:
+  changes:
+    name: Detect changed areas (Linux)
+    runs-on: ubuntu-latest
+    outputs:
+      ios: ${{ steps.filter.outputs.ios }}
+      bridge: ${{ steps.filter.outputs.bridge }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ios:
+              - 'Nova/**'
+            bridge:
+              - 'nova-bridge/**'
+              - 'nova-sim/**'
+
   nova-sim:
     name: nova-sim harness (Linux)
+    needs: changes
+    # Free Linux minutes — run whenever the bridge/sim changed, or on demand.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,47 +63,36 @@ jobs:
       - name: Self-test
         run: npm test
 
-  ios:
+  ios-test:
     name: Nova iOS (build + test on Simulator)
+    needs: changes
+    # The expensive one. Only run when iOS code changed AND we're on a PR — a
+    # merge to main is already covered by the PR that produced it, so we don't
+    # pay a second time on push. (Direct pushes to main skip this; open a PR to
+    # get Swift CI, or trust the .ipa dispatch to catch breaks.)
+    if: >-
+      needs.changes.outputs.ios == 'true' &&
+      github.event_name == 'pull_request'
     runs-on: macos-latest
     defaults:
       run:
         working-directory: Nova
     steps:
       - uses: actions/checkout@v4
-
-      # Use the newest stable Xcode so it can read the project format emitted by
-      # the latest XcodeGen (an older Xcode fails with "Unable to read project").
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
-
-      - name: Xcode version
-        run: xcodebuild -version
-
       - name: Resolve package dependencies
         run: xcodebuild -resolvePackageDependencies
-
-      # Compile every module for iOS via SwiftPM. This is the check that could
-      # never run on Windows: it validates the Swift ports (GA Realtime provider,
-      # HFP audio, DAT adapters, token services) actually build for the device.
-      - name: Build Swift package (iOS Simulator)
-        run: |
-          xcodebuild build \
-            -scheme Nova-Package \
-            -destination 'generic/platform=iOS Simulator' \
-            -skipMacroValidation \
-            -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO
-
       - name: Pick an available iPhone simulator
         id: sim
         run: |
           UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')
           echo "Using simulator UDID: $UDID"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-
-      - name: Run package tests (iOS Simulator)
+      # `test` compiles every module and runs the suite in a single pass, so we
+      # no longer need separate "build package" / "build app" compile steps.
+      - name: Build + test (iOS Simulator)
         run: |
           xcodebuild test \
             -scheme Nova-Package \
@@ -79,38 +101,31 @@ jobs:
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO
 
-      # Generate the real iOS app project from the checked-in XcodeGen spec and
-      # build it unsigned. Proves the NovaApp target (SwiftUI entry + DI) compiles.
+  ios-ipa:
+    name: Nova iOS (unsigned .ipa)
+    # AltStore installable build. Manual dispatch or a version tag only.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: Nova
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Resolve package dependencies
+        run: xcodebuild -resolvePackageDependencies
       - name: Install XcodeGen
         run: brew install xcodegen
-
       - name: Generate app project
         run: xcodegen generate
 
-      - name: Build NovaApp (iOS Simulator, unsigned)
-        run: |
-          xcodebuild build \
-            -project NovaApp.xcodeproj \
-            -scheme NovaApp \
-            -destination 'generic/platform=iOS Simulator' \
-            -skipMacroValidation \
-            -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-
-      # ---- AltStore installable build (unsigned .ipa) ----
-      # Only runs on a manual "Run workflow" (workflow_dispatch) or a version tag,
-      # to conserve macOS minutes (private-repo macOS time bills at 10x).
-      # AltStore re-signs the .ipa with your free Apple ID at install time, so we
-      # build unsigned for a real device (arm64) and just zip the .app into an .ipa.
-
-      # Bake the OpenAI key into the build so the sideloaded app can mint Realtime
-      # secrets. The key comes from the OPENAI_API_KEY repo/Actions secret (never
-      # committed). Without it the .ipa installs but Realtime fails at runtime.
-      # NOTE: this embeds the key in plaintext in the .ipa's Info.plist — fine for
-      # a private single-user build, but anyone who can download the artifact can
-      # read it. Keep the repo private and rotate the key if it leaks.
+      # Bake the OpenAI key in from the OPENAI_API_KEY Actions secret (never
+      # committed). NOTE: this embeds the key in plaintext in the .ipa's
+      # Info.plist — anyone who can download the artifact can read it. Keep the
+      # repo private (or drop the key + rotate) and rotate if it leaks.
       - name: Inject OpenAI key (private build)
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -121,8 +136,10 @@ jobs:
             echo "::warning::No OPENAI_API_KEY secret set — the .ipa will build without an embedded key and Realtime will fail at runtime. Add it under Settings → Secrets and variables → Actions."
           fi
 
+      # Single compile: build the real device app unsigned; AltStore re-signs at
+      # install time. This replaces the old sim-build + test + sim-app + device
+      # sequence (~4 compiles) with one.
       - name: Build unsigned device app (arm64)
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           xcodebuild build \
             -project NovaApp.xcodeproj \
@@ -135,7 +152,6 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Package unsigned .ipa
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           APP="build/Build/Products/Release-iphoneos/NovaApp.app"
           if [ ! -d "$APP" ]; then
@@ -150,9 +166,9 @@ jobs:
           ls -lh NovaApp.ipa
 
       - name: Upload .ipa artifact
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: NovaApp-unsigned-ipa
           path: Nova/NovaApp.ipa
           if-no-files-found: error
+          retention-days: 14
