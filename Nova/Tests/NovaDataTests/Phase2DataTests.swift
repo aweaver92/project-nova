@@ -136,6 +136,10 @@ final class SettingsStoreTests: XCTestCase {
         let reloaded = UserDefaultsSettingsStore(defaults: defaults)
         let persisted = await reloaded.spokenFollowUps()
         XCTAssertTrue(persisted)
+
+        await store.setCodingSessionId(" sess-1 ")
+        XCTAssertEqual(await store.codingSessionId(), "sess-1")
+        XCTAssertEqual(await reloaded.codingSessionId(), "sess-1")
     }
 }
 

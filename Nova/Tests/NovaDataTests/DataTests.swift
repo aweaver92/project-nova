@@ -402,7 +402,7 @@ final class NovaBridgeClientTests: XCTestCase {
 
 final class CodingSessionPinTests: XCTestCase {
     func testCodingSessionIdRoundTrip() async {
-        let suite = "nova.tests.codingPin.\(UUID().uuidString)"
+        let suite = "nova.test.codingPin.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = UserDefaultsSettingsStore(defaults: defaults)
@@ -417,20 +417,32 @@ final class CodingSessionPinTests: XCTestCase {
     }
 
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
-        let suite = "nova.tests.codingPinTool.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let store = UserDefaultsSettingsStore(defaults: defaults)
-        await store.setCodingSessionId("pinned-1")
-
+        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1")
         let bridge = PinCapturingBridge()
-        let tool = PushToCursorTool(bridge: bridge, settings: store)
+        let tool = PushToCursorTool(bridge: bridge, settings: settings)
         let payload = try await tool.invoke(argumentsJSON: #"{"command":"fix"}"#)
         XCTAssertTrue(payload.contains("returned-99"))
         let used = await bridge.lastSessionId
         XCTAssertEqual(used, "pinned-1")
-        let updated = await store.codingSessionId()
+        let updated = await settings.codingSessionId()
         XCTAssertEqual(updated, "returned-99")
+    }
+}
+
+/// Minimal settings double that only implements the coding-session pin.
+private actor FakeCodingSettingsStore: SettingsStoring {
+    private var pinned: String?
+
+    init(codingSessionId: String?) {
+        self.pinned = codingSessionId
+    }
+
+    func spokenFollowUps() async -> Bool { false }
+    func setSpokenFollowUps(_ enabled: Bool) async {}
+    func codingSessionId() async -> String? { pinned }
+    func setCodingSessionId(_ value: String?) async {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        pinned = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 }
 

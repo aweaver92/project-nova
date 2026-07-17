@@ -28,28 +28,33 @@ public actor LocalTimerService: TimerScheduling {
         )
 
         #if canImport(UserNotifications)
-        let center = UNUserNotificationCenter.current()
-        let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
-        guard granted else { return nil }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = "Timer finished"
-        content.sound = .default
-        content.userInfo = [
-            "timerId": id.uuidString,
-            "timerLabel": title
-        ]
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(secs), repeats: false)
-        let request = UNNotificationRequest(
-            identifier: Self.identifier(for: id),
-            content: content,
-            trigger: trigger
-        )
-        do {
-            try await center.add(request)
-        } catch {
-            NovaLog.session.error("Timer schedule failed: \(String(describing: error), privacy: .public)")
-            return nil
+        // XCTest / SPM test hosts often have no app bundle proxy; calling
+        // UNUserNotificationCenter.current() then traps. Keep an in-memory timer.
+        if Bundle.main.bundleIdentifier != nil {
+            let center = UNUserNotificationCenter.current()
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            if granted {
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = "Timer finished"
+                content.sound = .default
+                content.userInfo = [
+                    "timerId": id.uuidString,
+                    "timerLabel": title
+                ]
+                let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(secs), repeats: false)
+                let request = UNNotificationRequest(
+                    identifier: Self.identifier(for: id),
+                    content: content,
+                    trigger: trigger
+                )
+                do {
+                    try await center.add(request)
+                } catch {
+                    NovaLog.session.error("Timer schedule failed: \(String(describing: error), privacy: .public)")
+                    return nil
+                }
+            }
         }
         #endif
 
@@ -75,8 +80,10 @@ public actor LocalTimerService: TimerScheduling {
         guard !targets.isEmpty else { return false }
 
         #if canImport(UserNotifications)
-        let ids = targets.map { Self.identifier(for: $0) }
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
+        if Bundle.main.bundleIdentifier != nil {
+            let ids = targets.map { Self.identifier(for: $0) }
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
+        }
         #endif
 
         for tid in targets { active.removeValue(forKey: tid) }

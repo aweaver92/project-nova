@@ -15,47 +15,43 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         self.defaults = defaults
     }
 
-    public func spokenFollowUps() -> Bool {
+    public func spokenFollowUps() async -> Bool {
         defaults.bool(forKey: Keys.spokenFollowUps)
     }
 
-    public func setSpokenFollowUps(_ enabled: Bool) {
+    public func setSpokenFollowUps(_ enabled: Bool) async {
         defaults.set(enabled, forKey: Keys.spokenFollowUps)
     }
 
-    public func bridgeBaseURL() -> String? {
+    public func bridgeBaseURL() async -> String? {
         normalized(defaults.string(forKey: Keys.bridgeBaseURL))
     }
 
-    public func setBridgeBaseURL(_ value: String?) {
-        if let value = normalized(value) {
-            defaults.set(value, forKey: Keys.bridgeBaseURL)
-        } else {
-            defaults.removeObject(forKey: Keys.bridgeBaseURL)
-        }
+    public func setBridgeBaseURL(_ value: String?) async {
+        setOptionalString(normalized(value), forKey: Keys.bridgeBaseURL)
     }
 
-    public func bridgeToken() -> String? {
+    public func bridgeToken() async -> String? {
         normalized(defaults.string(forKey: Keys.bridgeToken))
     }
 
-    public func setBridgeToken(_ value: String?) {
-        if let value = normalized(value) {
-            defaults.set(value, forKey: Keys.bridgeToken)
-        } else {
-            defaults.removeObject(forKey: Keys.bridgeToken)
-        }
+    public func setBridgeToken(_ value: String?) async {
+        setOptionalString(normalized(value), forKey: Keys.bridgeToken)
     }
 
-    public func codingSessionId() -> String? {
+    public func codingSessionId() async -> String? {
         normalized(defaults.string(forKey: Keys.codingSessionId))
     }
 
-    public func setCodingSessionId(_ value: String?) {
-        if let value = normalized(value) {
-            defaults.set(value, forKey: Keys.codingSessionId)
+    public func setCodingSessionId(_ value: String?) async {
+        setOptionalString(normalized(value), forKey: Keys.codingSessionId)
+    }
+
+    private func setOptionalString(_ value: String?, forKey key: String) {
+        if let value {
+            defaults.set(value, forKey: key)
         } else {
-            defaults.removeObject(forKey: Keys.codingSessionId)
+            defaults.removeObject(forKey: key)
         }
     }
 
