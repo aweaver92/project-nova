@@ -49,6 +49,28 @@ public extension PatchNote {
     /// The changelog. Newest first — add a new entry at the top for each build.
     static let all: [PatchNote] = [
         PatchNote(
+            version: "0.4.0",
+            date: "Jul 17, 2026",
+            summary: "Voice recording: capture memos hands-free and save them to your iPhone.",
+            entries: [
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Say “Nova, begin voice recording” to start a voice memo, and “Nova, stop recording” to save it — completely hands-free.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "New Begin/Stop voice recording button on the Assistant tab with a live recording timer.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "New Recordings tab: recordings are saved to this iPhone and can be shared or exported to the Files app.",
+                    testable: true
+                ),
+            ]
+        ),
+        PatchNote(
             version: "0.3.0",
             date: "Jul 17, 2026",
             summary: "Real-time web search and a redesigned companion UI. Nova now complements Meta AI instead of replacing it.",

@@ -3,6 +3,12 @@ import NovaCore
 import NovaData
 import NovaDomain
 import NovaFeatures
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
 
 /// Composition root — construct once in the app entry point.
 @MainActor
@@ -13,12 +19,21 @@ public final class AppContainer {
     public let memory: any ConversationMemory
     public let facts: FileFactStore
     public let notes: FileNoteStore
+    public let recordings: FileRecordingStore
+    public let voiceRecorder: StreamingVoiceRecorder
+    public let workspaces: FileWorkspaceStore
+    public let skillStore: FileSkillStore
+    public let bookmarks: FileBookmarkStore
     public let toolRouter: ToolRouter
     public let orchestrator: ConversationOrchestrator
     public let sessionVM: SessionViewModel
     public let conversationVM: ConversationViewModel
     public let visionVM: VisionViewModel
     public let notesVM: NotesViewModel
+    public let recordingVM: RecordingViewModel
+    public let workspacesVM: WorkspacesViewModel
+    public let skillsVM: SkillsViewModel
+    public let knowledgeVM: KnowledgeViewModel
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
     ///   in-memory state machine (Simulator / no hardware). Set to `false` on a
@@ -70,6 +85,56 @@ public final class AppContainer {
         let noteStore = FileNoteStore()
         self.notes = noteStore
 
+        // Voice-memo recording: files saved under Documents/Recordings and fed by
+        // the mic tee in the orchestrator.
+        let recordingStore = FileRecordingStore()
+        self.recordings = recordingStore
+        let recorder = StreamingVoiceRecorder(store: recordingStore)
+        self.voiceRecorder = recorder
+
+        // Phase 1: workspaces, skills, bookmarks, and personal-knowledge search.
+        let workspaceStore = FileWorkspaceStore()
+        self.workspaces = workspaceStore
+        let skillStore = FileSkillStore()
+        self.skillStore = skillStore
+        let bookmarkStore = FileBookmarkStore()
+        self.bookmarks = bookmarkStore
+        let knowledgeSearch = KnowledgeSearch(
+            notes: noteStore,
+            bookmarks: bookmarkStore,
+            facts: factStore,
+            memory: memory
+        )
+
+        // App-layer callbacks skills/drafting need (opening links, local timers).
+        var openURL: SkillRunner.URLOpener?
+        var startTimer: SkillRunner.TimerStarter?
+        #if canImport(UIKit)
+        openURL = { url in
+            await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                Task { @MainActor in
+                    UIApplication.shared.open(url, options: [:]) { cont.resume(returning: $0) }
+                }
+            }
+        }
+        #endif
+        #if canImport(UserNotifications)
+        startTimer = { seconds, label in
+            let center = UNUserNotificationCenter.current()
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            guard granted else { return false }
+            let content = UNMutableNotificationContent()
+            content.title = label
+            content.body = "Timer finished"
+            content.sound = .default
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(seconds), repeats: false)
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
+            do { try await center.add(request); return true } catch { return false }
+        }
+        #endif
+
+        let skillRunner = SkillRunner(notes: noteStore, openURL: openURL, startTimer: startTimer)
+
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
@@ -84,11 +149,38 @@ public final class AppContainer {
             ForgetFactTool(store: factStore),
             SaveNoteTool(store: noteStore),
             ListNotesTool(store: noteStore),
-            BriefingTool()
+            StartVoiceRecordingTool(recorder: recorder),
+            StopVoiceRecordingTool(recorder: recorder),
+            ListRecordingsTool(store: recordingStore),
+            BriefingTool(),
+            RunSkillTool(skills: { await skillStore.all() }, runner: skillRunner),
+            SearchKnowledgeTool(search: knowledgeSearch),
+            BookmarkConversationTool(store: bookmarkStore, workspaceId: { await workspaceStore.active()?.id }),
+            SetWorkspaceTool(store: workspaceStore),
+            DraftMessageTool(notes: noteStore, openURL: openURL)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
+
+        // Injected each session: active-workspace context + skill catalog.
+        let contextProvider: @Sendable () async -> String = {
+            var parts: [String] = []
+            if let ws = await workspaceStore.active() {
+                var line = "Active workspace: \(ws.name)."
+                if !ws.contextNotes.isEmpty { line += " Context: \(ws.contextNotes)" }
+                parts.append(line)
+            }
+            let skills = await skillStore.all()
+            if !skills.isEmpty {
+                let list = skills.map { skill -> String in
+                    let triggers = skill.triggerPhrases.joined(separator: ", ")
+                    return triggers.isEmpty ? skill.name : "\(skill.name) (say: \(triggers))"
+                }.joined(separator: "; ")
+                parts.append("The user's saved skills you can run with the run_skill tool: \(list).")
+            }
+            return parts.joined(separator: "\n")
+        }
 
         let session = MetaDATWearableSession(useMock: useMockGlasses)
         self.wearableSession = session
@@ -105,13 +197,30 @@ public final class AppContainer {
             toolRouter: router,
             frameCapture: capture,
             wakeWordListener: wakeWordListener,
-            profileProvider: { await factStore.summary() }
+            profileProvider: { await factStore.summary() },
+            voiceRecorder: recorder,
+            contextProvider: contextProvider,
+            activeWorkspaceId: { await workspaceStore.active()?.id },
+            skillRunner: skillRunner,
+            skillsProvider: { await skillStore.all() },
+            bookmarkStore: bookmarkStore,
+            followUpSuggester: FollowUpSuggester()
         )
         self.orchestrator = orchestrator
 
         self.sessionVM = SessionViewModel(session: session)
         self.conversationVM = ConversationViewModel(orchestrator: orchestrator, metrics: metrics)
         self.notesVM = NotesViewModel(store: noteStore)
+        self.workspacesVM = WorkspacesViewModel(store: workspaceStore)
+        self.skillsVM = SkillsViewModel(store: skillStore)
+        self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
+        // Starting a recording ensures the mic loop is live (no-op if already
+        // running) so button-initiated captures record even when idle.
+        self.recordingVM = RecordingViewModel(
+            recorder: recorder,
+            store: recordingStore,
+            ensureAudioActive: { try? await orchestrator.start() }
+        )
 
         let bandwidth = FrameCaptureBandwidthBridge(capture: capture)
         self.visionVM = VisionViewModel(

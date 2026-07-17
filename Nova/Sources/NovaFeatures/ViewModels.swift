@@ -67,6 +67,8 @@ public final class ConversationViewModel {
     public private(set) var isAssistantSpeaking = false
     public private(set) var errorMessage: String?
     public private(set) var latencyHint: String = ""
+    /// Tappable follow-up suggestions from the last exchange.
+    public private(set) var suggestions: [String] = []
 
     private let orchestrator: ConversationOrchestrator
     private let metrics: InMemoryLatencyMetricsRecorder
@@ -89,6 +91,11 @@ public final class ConversationViewModel {
                 self.isAssistantSpeaking = role == .assistant
             }
         }
+        await orchestrator.setSuggestionsHandler { items in
+            Task { @MainActor [weak self] in
+                self?.suggestions = items
+            }
+        }
         do {
             try await orchestrator.start()
             isRunning = true
@@ -102,9 +109,17 @@ public final class ConversationViewModel {
         if currentTranscriptRole == role, let last = transcriptLines.last {
             transcriptLines[transcriptLines.count - 1] = last + text
         } else {
+            // A fresh user turn invalidates the previous reply's suggestions.
+            if role == .user { suggestions = [] }
             transcriptLines.append("\(role.rawValue): \(text)")
             currentTranscriptRole = role
         }
+    }
+
+    /// Continue the conversation from a tapped follow-up suggestion.
+    public func sendSuggestion(_ text: String) async {
+        suggestions = []
+        await orchestrator.sendUserText(text)
     }
 
     public func stop() async {
@@ -233,7 +248,224 @@ public final class NotesViewModel {
     }
 }
 
+@MainActor
+@Observable
+public final class RecordingViewModel {
+    public private(set) var isRecording = false
+    public private(set) var recordings: [VoiceRecording] = []
+    public private(set) var errorMessage: String?
+    /// Wall-clock start of the in-progress recording, for a live elapsed timer.
+    public private(set) var startedAt: Date?
+
+    private let recorder: any VoiceRecorder
+    private let store: any RecordingStoring
+    // Ensures the mic pipeline is live so a recording started from the button
+    // actually captures audio even if the conversation isn't already running.
+    private let ensureAudioActive: @Sendable () async -> Void
+    private var directoryURL: URL?
+    private var tasks: [Task<Void, Never>] = []
+
+    public init(
+        recorder: any VoiceRecorder,
+        store: any RecordingStoring,
+        ensureAudioActive: @escaping @Sendable () async -> Void
+    ) {
+        self.recorder = recorder
+        self.store = store
+        self.ensureAudioActive = ensureAudioActive
+        tasks.append(Task { await self.observeState() })
+    }
+
+    private func observeState() async {
+        for await state in recorder.state {
+            switch state {
+            case .idle:
+                isRecording = false
+                startedAt = nil
+                // A recording just finished (possibly triggered by voice) — refresh.
+                await load()
+            case .recording(let at):
+                isRecording = true
+                startedAt = at
+            }
+        }
+    }
+
+    public func load() async {
+        if directoryURL == nil {
+            directoryURL = await store.directory()
+        }
+        recordings = await store.all().sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func toggle() async {
+        if isRecording { await stop() } else { await start() }
+    }
+
+    public func start() async {
+        errorMessage = nil
+        await ensureAudioActive()
+        do {
+            try await recorder.start()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func stop() async {
+        _ = await recorder.stop()
+    }
+
+    public func delete(_ recording: VoiceRecording) async {
+        await store.delete(id: recording.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { recordings[$0].id }
+        for id in ids { await store.delete(id: id) }
+        await load()
+    }
+
+    public func clear() async {
+        await store.clear()
+        recordings = []
+    }
+
+    /// Absolute file URL for a recording, for playback / share / export.
+    public func fileURL(for recording: VoiceRecording) -> URL? {
+        directoryURL?.appendingPathComponent(recording.fileName)
+    }
+}
+
 /// Thin bridge so Features does not import NovaData types directly for the hold API.
 public protocol MetaDATBandwidthBridge: Sendable {
     func holdVideoForAudio(_ hold: Bool) async
+}
+
+@MainActor
+@Observable
+public final class WorkspacesViewModel {
+    public private(set) var workspaces: [Workspace] = []
+    public private(set) var active: Workspace?
+
+    private let store: any WorkspaceStoring
+
+    public init(store: any WorkspaceStoring) {
+        self.store = store
+    }
+
+    public var activeName: String { active?.name ?? "Default" }
+
+    public func load() async {
+        workspaces = await store.all()
+        active = await store.active()
+    }
+
+    @discardableResult
+    public func create(name: String, contextNotes: String = "") async -> Workspace {
+        let ws = await store.create(name: name, contextNotes: contextNotes)
+        await load()
+        return ws
+    }
+
+    public func update(_ workspace: Workspace) async {
+        await store.update(workspace)
+        await load()
+    }
+
+    public func setActive(_ workspace: Workspace) async {
+        await store.setActive(id: workspace.id)
+        await load()
+    }
+
+    public func delete(_ workspace: Workspace) async {
+        await store.delete(id: workspace.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { workspaces[$0].id }
+        for id in ids { await store.delete(id: id) }
+        await load()
+    }
+}
+
+@MainActor
+@Observable
+public final class SkillsViewModel {
+    public private(set) var skills: [Skill] = []
+
+    private let store: any SkillStoring
+
+    public init(store: any SkillStoring) {
+        self.store = store
+    }
+
+    public func load() async {
+        skills = await store.all()
+    }
+
+    @discardableResult
+    public func save(_ skill: Skill) async -> Skill {
+        let saved = await store.upsert(skill)
+        await load()
+        return saved
+    }
+
+    public func delete(_ skill: Skill) async {
+        await store.delete(id: skill.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { skills[$0].id }
+        for id in ids { await store.delete(id: id) }
+        await load()
+    }
+}
+
+@MainActor
+@Observable
+public final class KnowledgeViewModel {
+    public private(set) var bookmarks: [Bookmark] = []
+    public private(set) var results: [KnowledgeHit] = []
+    public private(set) var isSearching = false
+    public var query: String = ""
+
+    private let bookmarkStore: any BookmarkStoring
+    private let search: any KnowledgeSearching
+
+    public init(bookmarkStore: any BookmarkStoring, search: any KnowledgeSearching) {
+        self.bookmarkStore = bookmarkStore
+        self.search = search
+    }
+
+    public func load() async {
+        bookmarks = await bookmarkStore.all()
+    }
+
+    public func runSearch() async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { results = []; return }
+        isSearching = true
+        results = await search.search(trimmed, limit: 12)
+        isSearching = false
+    }
+
+    public func clearSearch() {
+        query = ""
+        results = []
+    }
+
+    public func delete(_ bookmark: Bookmark) async {
+        await bookmarkStore.delete(id: bookmark.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { bookmarks[$0].id }
+        for id in ids { await bookmarkStore.delete(id: id) }
+        await load()
+    }
 }

@@ -18,6 +18,22 @@ public actor ConversationOrchestrator {
     private let wakeWordListener: (any WakeWordListening)?
     // Supplies durable user facts to inject into each session's instructions.
     private let profileProvider: (@Sendable () async -> String)?
+    // Optional voice-memo recorder. When present, the raw mic feed is teed to it
+    // so "Nova, begin voice recording" (or the UI button) captures to a file
+    // without opening a second, contending audio session.
+    private let voiceRecorder: (any VoiceRecorder)?
+    // Supplies active-workspace context + skill catalog to inject into instructions.
+    private let contextProvider: (@Sendable () async -> String)?
+    // Supplies the active workspace id used to scope/tag memory.
+    private let activeWorkspaceId: (@Sendable () async -> UUID?)?
+    // Runs a matched skill's steps (deterministic locally, freeform to the model).
+    private let skillRunner: (any SkillRunning)?
+    // Supplies the current skill catalog for trigger-phrase matching.
+    private let skillsProvider: (@Sendable () async -> [Skill])?
+    // Saves bookmarked exchanges to the knowledge base.
+    private let bookmarkStore: (any BookmarkStoring)?
+    // Generates follow-up suggestions after each reply.
+    private let followUpSuggester: (any FollowUpSuggesting)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -36,8 +52,12 @@ public actor ConversationOrchestrator {
     // Timestamp of the last conversational activity while streaming. Drives the
     // idle teardown that returns us to on-device wake-word listening.
     private var lastActivity: ContinuousClock.Instant = .now
+    // Latest completed user/assistant text, for bookmarks and follow-up suggestions.
+    private var lastUserText = ""
+    private var lastAssistantText = ""
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
+    private var onSuggestions: (@Sendable ([String]) -> Void)?
 
     public init(
         ai: any ConversationalAIProvider,
@@ -49,7 +69,14 @@ public actor ConversationOrchestrator {
         toolRouter: ToolRouter? = nil,
         frameCapture: (any FrameCapture)? = nil,
         wakeWordListener: (any WakeWordListening)? = nil,
-        profileProvider: (@Sendable () async -> String)? = nil
+        profileProvider: (@Sendable () async -> String)? = nil,
+        voiceRecorder: (any VoiceRecorder)? = nil,
+        contextProvider: (@Sendable () async -> String)? = nil,
+        activeWorkspaceId: (@Sendable () async -> UUID?)? = nil,
+        skillRunner: (any SkillRunning)? = nil,
+        skillsProvider: (@Sendable () async -> [Skill])? = nil,
+        bookmarkStore: (any BookmarkStoring)? = nil,
+        followUpSuggester: (any FollowUpSuggesting)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -61,6 +88,13 @@ public actor ConversationOrchestrator {
         self.frameCapture = frameCapture
         self.wakeWordListener = wakeWordListener
         self.profileProvider = profileProvider
+        self.voiceRecorder = voiceRecorder
+        self.contextProvider = contextProvider
+        self.activeWorkspaceId = activeWorkspaceId
+        self.skillRunner = skillRunner
+        self.skillsProvider = skillsProvider
+        self.bookmarkStore = bookmarkStore
+        self.followUpSuggester = followUpSuggester
     }
 
     /// True while the cloud Realtime stream is open (as opposed to idle on-device
@@ -69,6 +103,17 @@ public actor ConversationOrchestrator {
 
     public func setTranscriptHandler(_ handler: (@Sendable (String, ConversationTurn.Role) -> Void)?) {
         onTranscript = handler
+    }
+
+    public func setSuggestionsHandler(_ handler: (@Sendable ([String]) -> Void)?) {
+        onSuggestions = handler
+    }
+
+    /// Inject a user-authored text turn (e.g. a tapped follow-up suggestion) and
+    /// let the model reply. No-op while the cloud stream is closed.
+    public func sendUserText(_ text: String) async {
+        guard streaming else { return }
+        await ai.sendUserText(text)
     }
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
@@ -159,9 +204,17 @@ public actor ConversationOrchestrator {
             }
         }
         if let memory {
-            let summary = await memory.summary()
+            let wsid = await currentWorkspaceId()
+            let summary = await memory.summary(workspaceId: wsid)
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
+            }
+        }
+        // Active workspace context + available skills catalog.
+        if let contextProvider {
+            let ctx = await contextProvider()
+            if !ctx.isEmpty {
+                effective.instructions += "\n\n\(ctx)"
             }
         }
         // Advertise available tools so the model can call them.
@@ -177,6 +230,11 @@ public actor ConversationOrchestrator {
             guard let self else { return }
             for await chunk in await self.ingress.chunks {
                 let t0 = chunk.capturedAt
+                // Tee the untouched mic feed to the voice recorder first (no-op
+                // while idle) so a saved memo matches what the glasses heard.
+                if let voiceRecorder = self.voiceRecorder {
+                    await voiceRecorder.append(chunk)
+                }
                 let pcm24: Data
                 if chunk.sampleRate == 24_000 {
                     pcm24 = chunk.pcm
@@ -277,13 +335,17 @@ public actor ConversationOrchestrator {
             // A reply just completed — keep the listening window open so the user
             // can follow up without repeating the wake word.
             lastEngagement = .now
+            let wsid = await currentWorkspaceId()
             if !outputTranscript.isEmpty {
-                await memory?.append(ConversationTurn(role: .assistant, text: outputTranscript))
+                lastAssistantText = outputTranscript
+                await memory?.append(ConversationTurn(role: .assistant, text: outputTranscript, workspaceId: wsid))
             }
             if !inputTranscript.isEmpty {
-                await memory?.append(ConversationTurn(role: .user, text: inputTranscript))
+                lastUserText = inputTranscript
+                await memory?.append(ConversationTurn(role: .user, text: inputTranscript, workspaceId: wsid))
                 inputTranscript = ""
             }
+            await requestFollowUps()
         case .speechStarted:
             // Anchor the grace window at the start of the user's turn. If we were
             // already inside the listening window, the user beginning a new turn
@@ -334,7 +396,84 @@ public actor ConversationOrchestrator {
 
         // Addressed: (re)open the listening window and act on the intent.
         lastEngagement = .now
+        // A saved skill or bookmark request takes precedence over a plain reply.
+        if await handleSkillOrBookmark(transcript) { return }
         await act(on: intent)
+    }
+
+    /// Deterministic routing for bookmark requests and skill trigger phrases.
+    /// Returns true if it consumed the utterance.
+    private func handleSkillOrBookmark(_ transcript: String) async -> Bool {
+        if let bookmarkStore, Self.isBookmarkRequest(transcript) {
+            if !lastAssistantText.isEmpty {
+                let title = String(lastAssistantText.prefix(60))
+                await bookmarkStore.save(Bookmark(
+                    title: title,
+                    text: lastAssistantText,
+                    workspaceId: await currentWorkspaceId()
+                ))
+                await ai.sendUserText("[System note: I just saved your last answer to your bookmarks.] Briefly confirm to the user that it's bookmarked.")
+            } else {
+                await ai.createResponse()
+            }
+            return true
+        }
+
+        if let skillRunner, let skillsProvider {
+            let skills = await skillsProvider()
+            if let skill = SkillMatcher.match(
+                transcript: transcript,
+                skills: skills,
+                workspaceId: await currentWorkspaceId()
+            ) {
+                let result = await skillRunner.run(skill)
+                await confirmSkill(skill, result)
+                return true
+            }
+        }
+        return false
+    }
+
+    private func confirmSkill(_ skill: Skill, _ result: SkillRunResult) async {
+        var parts: [String] = []
+        if !result.summaryLines.isEmpty {
+            parts.append("I \(result.summaryLines.joined(separator: ", ")).")
+        }
+        parts.append(contentsOf: result.sayLines)
+        if !result.freeform.isEmpty {
+            parts.append("Then: \(result.freeform.joined(separator: "; ")).")
+        }
+        let body = parts.joined(separator: " ")
+        await ai.sendUserText("[System note: The '\(skill.name)' skill just ran. \(body)] Briefly confirm what you did to the user and carry out any 'Then:' instructions using your tools.")
+    }
+
+    /// Fire-and-forget follow-up suggestion generation after a reply completes.
+    private func requestFollowUps() async {
+        guard let followUpSuggester,
+              let callback = onSuggestions,
+              !lastAssistantText.isEmpty else { return }
+        let user = lastUserText
+        let assistant = lastAssistantText
+        Task {
+            let suggestions = await followUpSuggester.suggestions(userText: user, assistantText: assistant)
+            if !suggestions.isEmpty { callback(suggestions) }
+        }
+    }
+
+    private static func isBookmarkRequest(_ transcript: String) -> Bool {
+        let t = transcript.lowercased()
+        return t.contains("bookmark this")
+            || t.contains("bookmark that")
+            || t.contains("save that explanation")
+            || t.contains("save the last explanation")
+            || t.contains("save that answer")
+            || t.contains("save this to my bookmarks")
+            || t.contains("add that to my bookmarks")
+    }
+
+    private func currentWorkspaceId() async -> UUID? {
+        guard let activeWorkspaceId else { return nil }
+        return await activeWorkspaceId()
     }
 
     private func isWithinGraceWindow() -> Bool {

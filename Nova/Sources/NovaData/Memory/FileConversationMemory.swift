@@ -34,8 +34,20 @@ public actor FileConversationMemory: ConversationMemory {
         Array(turns.suffix(limit))
     }
 
+    public func recent(workspaceId: UUID?, limit: Int) async -> [ConversationTurn] {
+        guard let workspaceId else { return Array(turns.suffix(limit)) }
+        return Array(turns.filter { $0.workspaceId == workspaceId }.suffix(limit))
+    }
+
     public func summary() async -> String {
         turns.suffix(summaryTurns)
+            .map { "\($0.role.rawValue): \($0.text)" }
+            .joined(separator: "\n")
+    }
+
+    public func summary(workspaceId: UUID?) async -> String {
+        let scoped = workspaceId == nil ? turns : turns.filter { $0.workspaceId == workspaceId }
+        return scoped.suffix(summaryTurns)
             .map { "\($0.role.rawValue): \($0.text)" }
             .joined(separator: "\n")
     }

@@ -33,7 +33,11 @@ targets:
       path: App/Info.plist
       properties:
         UILaunchScreen: {}
-        NSMicrophoneUsageDescription: "Nova streams your voice to the AI assistant."
+        # Expose Documents/ (where voice recordings are saved) in the Files app so
+        # users can play, share, and manage their recordings on the iPhone.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSMicrophoneUsageDescription: "Nova streams your voice to the AI assistant and saves voice recordings you start."
         NSSpeechRecognitionUsageDescription: "Nova listens on-device for the wake word 'Nova' so it only streams to the cloud when you address it."
         NSCameraUsageDescription: "Nova uses your glasses camera to answer questions about what you see."
         NSRemindersFullAccessUsageDescription: "Nova creates and reads reminders when you ask it to."
@@ -77,8 +81,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.nova.app
-        MARKETING_VERSION: "0.2.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "0.4.0"
+        CURRENT_PROJECT_VERSION: "4"
         TARGETED_DEVICE_FAMILY: "1"
         SWIFT_VERSION: "5.10"
         # App icon lives in App/Assets.xcassets/AppIcon.appiconset (1024x1024, opaque).

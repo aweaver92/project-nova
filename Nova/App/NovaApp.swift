@@ -30,7 +30,11 @@ struct NovaApp: App {
                 session: container.sessionVM,
                 conversation: container.conversationVM,
                 vision: container.visionVM,
-                notes: container.notesVM
+                notes: container.notesVM,
+                recording: container.recordingVM,
+                workspaces: container.workspacesVM,
+                skills: container.skillsVM,
+                knowledge: container.knowledgeVM
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.

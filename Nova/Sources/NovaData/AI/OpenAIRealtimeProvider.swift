@@ -155,6 +155,19 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         try? await sendJSON(["type": "response.create"])
     }
 
+    public func sendUserText(_ text: String) async {
+        guard connected else { return }
+        try? await sendJSON([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": text]]
+            ]
+        ])
+        try? await sendJSON(["type": "response.create"])
+    }
+
     public func interrupt() async {
         // Only cancel when a response is actually streaming; otherwise the server
         // rejects with "Cancellation failed: no active response found".

@@ -152,6 +152,124 @@ final class NoteStoreTests: XCTestCase {
     }
 }
 
+final class VoiceRecordingTests: XCTestCase {
+    private func tempDir() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("nova-recordings-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    /// 200 ms of 8 kHz mono PCM16 = 1600 samples = 3200 bytes.
+    private func chunk(ms: Int, sampleRate: Int = 8_000) -> AudioChunk {
+        let samples = sampleRate * ms / 1000
+        let data = [Int16](repeating: 1234, count: samples)
+            .withUnsafeBufferPointer { Data(buffer: $0) }
+        return AudioChunk(pcm: data, sampleRate: sampleRate)
+    }
+
+    func testRecordWritesValidWavAndPersistsMetadata() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = FileRecordingStore(directory: dir)
+        let recorder = StreamingVoiceRecorder(store: store)
+
+        var isRec = await recorder.isRecording()
+        XCTAssertFalse(isRec)
+
+        try await recorder.start()
+        isRec = await recorder.isRecording()
+        XCTAssertTrue(isRec)
+
+        // 1 second of audio total.
+        for _ in 0..<5 { await recorder.append(chunk(ms: 200)) }
+        let saved = try XCTUnwrap(await recorder.stop())
+
+        // Duration derives from sample count: 8000 samples / 8000 Hz ≈ 1s.
+        XCTAssertEqual(saved.duration, 1.0, accuracy: 0.05)
+        XCTAssertEqual(saved.sampleRate, 8_000)
+        XCTAssertEqual(saved.byteCount, 16_000)
+
+        // File exists on disk with a canonical 44-byte WAV header + payload.
+        let url = dir.appendingPathComponent(saved.fileName)
+        let fileData = try Data(contentsOf: url)
+        XCTAssertEqual(fileData.count, 44 + 16_000)
+        XCTAssertEqual(Array(fileData.prefix(4)), Array("RIFF".utf8))
+        XCTAssertEqual(Array(fileData[8..<12]), Array("WAVE".utf8))
+        // data chunk size (little-endian) at offset 40 == payload bytes.
+        let dataSize = fileData[40..<44].reversed().reduce(0) { ($0 << 8) | UInt32($1) }
+        XCTAssertEqual(Int(dataSize), 16_000)
+
+        // Metadata survives a fresh store instance.
+        let reloaded = FileRecordingStore(directory: dir)
+        let all = await reloaded.all()
+        XCTAssertEqual(all.count, 1)
+        XCTAssertEqual(all.first?.fileName, saved.fileName)
+    }
+
+    func testAppendIgnoresMismatchedSampleRate() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = FileRecordingStore(directory: dir)
+        let recorder = StreamingVoiceRecorder(store: store)
+
+        try await recorder.start()
+        // 24 kHz chunk must be dropped (recorder captures the 8 kHz mic feed).
+        await recorder.append(chunk(ms: 200, sampleRate: 24_000))
+        let saved = await recorder.stop()
+        // Nothing valid captured → empty recording discarded.
+        XCTAssertNil(saved)
+        let all = await store.all()
+        XCTAssertTrue(all.isEmpty)
+    }
+
+    func testDeleteRemovesFileAndMetadata() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = FileRecordingStore(directory: dir)
+        let recorder = StreamingVoiceRecorder(store: store)
+
+        try await recorder.start()
+        await recorder.append(chunk(ms: 500))
+        let saved = try XCTUnwrap(await recorder.stop())
+        let url = dir.appendingPathComponent(saved.fileName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        await store.delete(id: saved.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        let all = await store.all()
+        XCTAssertTrue(all.isEmpty)
+    }
+
+    func testStartStopToolsDriveRecorder() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = FileRecordingStore(directory: dir)
+        let recorder = StreamingVoiceRecorder(store: store)
+
+        let startTool = StartVoiceRecordingTool(recorder: recorder)
+        let stopTool = StopVoiceRecordingTool(recorder: recorder)
+
+        // Stopping when idle reports not_recording.
+        let idleStop = try await stopTool.invoke(argumentsJSON: "{}")
+        XCTAssertTrue(idleStop.contains("not_recording"))
+
+        let started = try await startTool.invoke(argumentsJSON: "{}")
+        XCTAssertTrue(started.contains("\"recording\":true"))
+        let isRec = await recorder.isRecording()
+        XCTAssertTrue(isRec)
+
+        // Starting again is idempotent.
+        let again = try await startTool.invoke(argumentsJSON: "{}")
+        XCTAssertTrue(again.contains("already_recording"))
+
+        await recorder.append(chunk(ms: 500))
+        let stopped = try await stopTool.invoke(argumentsJSON: "{}")
+        XCTAssertTrue(stopped.contains("\"saved\":true"))
+        let all = await store.all()
+        XCTAssertEqual(all.count, 1)
+    }
+}
+
 final class FileConversationMemoryTests: XCTestCase {
     private func tempURL() -> URL {
         FileManager.default.temporaryDirectory

@@ -10,17 +10,29 @@ public struct RootView: View {
     // replacement. Keep this wired so the feature can be re-enabled easily.
     @Bindable var vision: VisionViewModel
     @Bindable var notes: NotesViewModel
+    @Bindable var recording: RecordingViewModel
+    @Bindable var workspaces: WorkspacesViewModel
+    @Bindable var skills: SkillsViewModel
+    @Bindable var knowledge: KnowledgeViewModel
 
     public init(
         session: SessionViewModel,
         conversation: ConversationViewModel,
         vision: VisionViewModel,
-        notes: NotesViewModel
+        notes: NotesViewModel,
+        recording: RecordingViewModel,
+        workspaces: WorkspacesViewModel,
+        skills: SkillsViewModel,
+        knowledge: KnowledgeViewModel
     ) {
         self.session = session
         self.conversation = conversation
         self.vision = vision
         self.notes = notes
+        self.recording = recording
+        self.workspaces = workspaces
+        self.skills = skills
+        self.knowledge = knowledge
     }
 
     public var body: some View {
@@ -28,8 +40,20 @@ public struct RootView: View {
             assistantTab
                 .tabItem { Label("Assistant", systemImage: "waveform") }
 
+            WorkspacesView(workspaces: workspaces)
+                .tabItem { Label("Workspaces", systemImage: "square.stack.3d.up") }
+
+            SkillsView(skills: skills)
+                .tabItem { Label("Skills", systemImage: "wand.and.stars") }
+
+            KnowledgeView(knowledge: knowledge)
+                .tabItem { Label("Knowledge", systemImage: "books.vertical") }
+
             NotesView(notes: notes)
                 .tabItem { Label("Notes", systemImage: "note.text") }
+
+            RecordingsView(recording: recording)
+                .tabItem { Label("Recordings", systemImage: "waveform.circle") }
 
             PatchNotesView()
                 .tabItem { Label("Patch Notes", systemImage: "sparkles") }
@@ -44,6 +68,8 @@ public struct RootView: View {
                 statusSection
                 glassesSection
                 conversationSection
+                suggestionsSection
+                recordingSection
             }
             .listSectionSpacing(.compact)
             .navigationTitle("Nova")
@@ -52,6 +78,8 @@ public struct RootView: View {
             // and use the wake word hands-free (the `audio` background mode keeps
             // the glasses mic session alive while the screen is locked).
             .task {
+                await recording.load()
+                await workspaces.load()
                 if !conversation.isRunning {
                     await conversation.start()
                 }
@@ -65,15 +93,49 @@ public struct RootView: View {
         Section {
             // Logo asset ships in the app bundle (App/Assets.xcassets),
             // so it resolves against Bundle.main from this package view.
-            Image("logo")
-                .resizable()
-                .scaledToFit()
-                .frame(maxHeight: 200)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .accessibilityLabel("Nova")
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
+            VStack(spacing: 4) {
+                Image("logo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 200)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .accessibilityLabel("Nova")
+                Label("Workspace: \(workspaces.activeName)", systemImage: "square.stack.3d.up")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        }
+    }
+
+    @ViewBuilder
+    private var suggestionsSection: some View {
+        if !conversation.suggestions.isEmpty {
+            Section("Suggested follow-ups") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(conversation.suggestions, id: \.self) { suggestion in
+                            Button {
+                                Task { await conversation.sendSuggestion(suggestion) }
+                            } label: {
+                                Text(suggestion)
+                                    .font(.footnote)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        Color.accentColor.opacity(0.15),
+                                        in: Capsule()
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+            }
         }
     }
 
@@ -177,6 +239,54 @@ public struct RootView: View {
                 Text(conversation.latencyHint).font(.caption2)
             }
         }
+    }
+
+    private var recordingSection: some View {
+        Section {
+            Button {
+                Task { await recording.toggle() }
+            } label: {
+                Label(
+                    recording.isRecording ? "Stop voice recording" : "Begin voice recording",
+                    systemImage: recording.isRecording ? "stop.circle.fill" : "record.circle"
+                )
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .tint(recording.isRecording ? .red : .accentColor)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+
+            if recording.isRecording, let startedAt = recording.startedAt {
+                TimelineView(.periodic(from: startedAt, by: 1)) { context in
+                    Label(
+                        "Recording… \(Self.elapsed(from: startedAt, to: context.date))",
+                        systemImage: "waveform"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                }
+                .frame(maxWidth: .infinity)
+                .listRowSeparator(.hidden)
+            }
+
+            if let error = recording.errorMessage {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        } header: {
+            Text("Voice recording")
+        } footer: {
+            Text("Say “Nova, begin voice recording” or tap the button. Recordings are saved to this iPhone — find them in the Recordings tab or the Files app.")
+                .font(.caption2)
+        }
+    }
+
+    /// mm:ss elapsed between two dates, for the live recording timer.
+    static func elapsed(from start: Date, to now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
     // MARK: - Transcript rendering
