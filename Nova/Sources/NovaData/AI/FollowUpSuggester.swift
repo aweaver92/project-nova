@@ -83,10 +83,9 @@ public struct FollowUpSuggester: FollowUpSuggesting {
     }
 
     private static func sanitize(_ items: [String]) -> [String] {
-        items
+        let cleaned = items
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"' \t")) }
             .filter { !$0.isEmpty }
-            .prefix(3)
-            .map(String.init)
+        return Array(cleaned.prefix(3))
     }
 }

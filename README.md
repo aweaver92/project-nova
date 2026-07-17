@@ -14,6 +14,7 @@ Same domain contracts on both sides. Validate conversation quality in `nova-sim`
 ## Documentation
 
 - [Roadmap & milestones](Docs/roadmap.md)
+- [Feature rollout roadmap (phases)](Docs/feature-roadmap.md)
 - [ADRs](Docs/adr/)
 - [Voice pipeline](Docs/architecture/voice-pipeline.md)
 - [Dual-track map](Docs/architecture/dual-track.md)

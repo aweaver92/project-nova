@@ -73,7 +73,7 @@ public struct KnowledgeSearch: KnowledgeSearching {
     static func tokenize(_ s: String) -> [String] {
         s.lowercased()
             .split { !($0.isLetter || $0.isNumber) }
-            .map(String.init)
+            .map { String($0) }
             .filter { $0.count > 1 && !stopwords.contains($0) }
     }
 
