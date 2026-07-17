@@ -344,9 +344,11 @@ final class FileAgentStoreTests: XCTestCase {
 
         // Deleting the master is a no-op; deleting a specialist works.
         await reloaded.delete(id: master.id)
-        XCTAssertTrue(await reloaded.all().contains { $0.isMaster })
+        let afterMasterDelete = await reloaded.all()
+        XCTAssertTrue(afterMasterDelete.contains { $0.isMaster })
         await reloaded.delete(id: claude.id)
-        XCTAssertFalse(await reloaded.all().contains { $0.id == claude.id })
+        let afterClaudeDelete = await reloaded.all()
+        XCTAssertFalse(afterClaudeDelete.contains { $0.id == claude.id })
         // Removing the active agent falls back to the master.
         let activeAfter = await reloaded.active()
         XCTAssertTrue(activeAfter.isMaster)

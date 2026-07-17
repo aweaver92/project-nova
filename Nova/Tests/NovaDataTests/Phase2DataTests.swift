@@ -19,8 +19,10 @@ final class MemoryDigestStoreTests: XCTestCase {
         let wsB = UUID()
         let store = FileMemoryDigestStore(url: url)
 
-        XCTAssertEqual(await store.digest(workspaceId: wsA), "")
-        XCTAssertNil(await store.coveredThrough(workspaceId: wsA))
+        let emptyDigest = await store.digest(workspaceId: wsA)
+        XCTAssertEqual(emptyDigest, "")
+        let noCoverage = await store.coveredThrough(workspaceId: wsA)
+        XCTAssertNil(noCoverage)
 
         let date = Date(timeIntervalSince1970: 1_700_000_000)
         await store.setDigest("A digest", coveredThrough: date, workspaceId: wsA)
@@ -28,11 +30,15 @@ final class MemoryDigestStoreTests: XCTestCase {
 
         // Scoped correctly and survives a reload.
         let reloaded = FileMemoryDigestStore(url: url)
-        XCTAssertEqual(await reloaded.digest(workspaceId: wsA), "A digest")
-        XCTAssertEqual(await reloaded.digest(workspaceId: wsB), "B digest")
-        XCTAssertEqual(await reloaded.coveredThrough(workspaceId: wsA), date)
+        let digestA = await reloaded.digest(workspaceId: wsA)
+        XCTAssertEqual(digestA, "A digest")
+        let digestB = await reloaded.digest(workspaceId: wsB)
+        XCTAssertEqual(digestB, "B digest")
+        let coverageA = await reloaded.coveredThrough(workspaceId: wsA)
+        XCTAssertEqual(coverageA, date)
         // Unknown workspace is empty.
-        XCTAssertEqual(await reloaded.digest(workspaceId: UUID()), "")
+        let unknown = await reloaded.digest(workspaceId: UUID())
+        XCTAssertEqual(unknown, "")
     }
 }
 
@@ -49,8 +55,10 @@ final class MemoryCompactorTests: XCTestCase {
         let compactor = MemoryCompactor(memory: memory, digestStore: digestStore, summarizer: summarizer, threshold: 5)
 
         await compactor.compactIfNeeded(workspaceId: nil)
-        XCTAssertEqual(await summarizer.calls, 0)
-        XCTAssertEqual(await digestStore.digest(workspaceId: nil), "")
+        let calls = await summarizer.calls
+        XCTAssertEqual(calls, 0)
+        let digest = await digestStore.digest(workspaceId: nil)
+        XCTAssertEqual(digest, "")
     }
 
     func testCompactsWhenThresholdMetAndAdvancesCoverage() async {
@@ -65,13 +73,17 @@ final class MemoryCompactorTests: XCTestCase {
         let compactor = MemoryCompactor(memory: memory, digestStore: digestStore, summarizer: summarizer, threshold: 3)
 
         await compactor.compactIfNeeded(workspaceId: nil)
-        XCTAssertEqual(await summarizer.calls, 1)
-        XCTAssertEqual(await digestStore.digest(workspaceId: nil), "digest#1")
-        XCTAssertEqual(await digestStore.coveredThrough(workspaceId: nil), last)
+        let calls1 = await summarizer.calls
+        XCTAssertEqual(calls1, 1)
+        let digest1 = await digestStore.digest(workspaceId: nil)
+        XCTAssertEqual(digest1, "digest#1")
+        let coverage = await digestStore.coveredThrough(workspaceId: nil)
+        XCTAssertEqual(coverage, last)
 
         // No new turns → no second compaction.
         await compactor.compactIfNeeded(workspaceId: nil)
-        XCTAssertEqual(await summarizer.calls, 1)
+        let calls2 = await summarizer.calls
+        XCTAssertEqual(calls2, 1)
     }
 }
 
@@ -113,14 +125,17 @@ final class SettingsStoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let store = UserDefaultsSettingsStore(defaults: defaults)
-        XCTAssertFalse(await store.spokenFollowUps())
+        let initial = await store.spokenFollowUps()
+        XCTAssertFalse(initial)
 
         await store.setSpokenFollowUps(true)
-        XCTAssertTrue(await store.spokenFollowUps())
+        let afterSet = await store.spokenFollowUps()
+        XCTAssertTrue(afterSet)
 
         // A fresh store over the same suite reads the persisted value.
         let reloaded = UserDefaultsSettingsStore(defaults: defaults)
-        XCTAssertTrue(await reloaded.spokenFollowUps())
+        let persisted = await reloaded.spokenFollowUps()
+        XCTAssertTrue(persisted)
     }
 }
 
