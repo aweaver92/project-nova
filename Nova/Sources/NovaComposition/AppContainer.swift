@@ -10,7 +10,7 @@ public final class AppContainer {
     public let metrics: InMemoryLatencyMetricsRecorder
     public let wearableSession: MetaDATWearableSession
     public let frameCapture: MetaDATFrameCapture
-    public let memory: InMemoryConversationMemory
+    public let memory: any ConversationMemory
     public let toolRouter: ToolRouter
     public let orchestrator: ConversationOrchestrator
     public let sessionVM: SessionViewModel
@@ -50,7 +50,15 @@ public final class AppContainer {
             : HFPGlassesAudioIngress(coordinator: coordinator)
         let egress: any AudioEgress = HFPGlassesAudioEgress()
 
-        let memory = InMemoryConversationMemory()
+        // On-device wake-word gating: only wire the Speech listener for real
+        // device audio; a silent-mic (Simulator) build streams directly instead.
+        let wakeWordListener: (any WakeWordListening)? = useSilentMic
+            ? nil
+            : SpeechWakeWordDetector()
+
+        // File-backed memory persists conversation context across launches and
+        // is injected into each session by the orchestrator.
+        let memory: any ConversationMemory = FileConversationMemory()
         self.memory = memory
 
         let tools: [any Tool] = [WeatherTool(), RemindersTool(), HomeAssistantTool()]
@@ -70,7 +78,8 @@ public final class AppContainer {
             metrics: metrics,
             memory: memory,
             toolRouter: router,
-            frameCapture: capture
+            frameCapture: capture,
+            wakeWordListener: wakeWordListener
         )
         self.orchestrator = orchestrator
 

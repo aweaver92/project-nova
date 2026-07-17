@@ -15,6 +15,20 @@ public struct RootView: View {
     public var body: some View {
         NavigationStack {
             List {
+                Section {
+                    // Logo asset ships in the app bundle (App/Assets.xcassets),
+                    // so it resolves against Bundle.main from this package view.
+                    Image("logo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity)
+                        .frame(maxHeight: 160)
+                        .padding(.vertical, 8)
+                        .accessibilityLabel("Nova — AI Assistant for Meta Glasses")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                }
+
                 Section("Glasses session") {
                     LabeledContent("Registration", value: session.registrationState.rawValue)
                     LabeledContent("Session", value: session.sessionState.rawValue)
@@ -62,6 +76,7 @@ public struct RootView: View {
                 }
             }
             .navigationTitle("Nova")
+            .navigationBarTitleDisplayMode(.inline)
             // Auto-start listening when Nova opens so you can pocket the phone
             // and use the wake word hands-free (the `audio` background mode keeps
             // the glasses mic session alive while the screen is locked).

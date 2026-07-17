@@ -132,6 +132,65 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testLocalWakeWordDefersConnectUntilDetected() async throws {
+        let provider = MockProvider()
+        let listener = MockWakeWordListener()
+        let orch = makeOrchestrator(provider: provider, wakeWordListener: listener)
+        // Default config has useLocalWakeWord = true, so with a listener wired the
+        // cloud stream must stay closed until the wake word fires locally.
+        try await orch.start()
+        let idleConnects = await provider.connectCount
+        XCTAssertEqual(idleConnects, 0)
+        let idleStreaming = await orch.isStreaming
+        XCTAssertFalse(idleStreaming)
+        XCTAssertTrue(listener.isStarted())
+
+        listener.fire()
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+        let streaming = await orch.isStreaming
+        XCTAssertTrue(streaming)
+        XCTAssertFalse(listener.isStarted())
+        await orch.stop()
+    }
+
+    func testStreamDisengagesToLocalListeningAfterIdle() async throws {
+        let provider = MockProvider()
+        let listener = MockWakeWordListener()
+        let orch = makeOrchestrator(provider: provider, wakeWordListener: listener)
+        try await orch.start(config: AISessionConfig(streamIdleTimeout: .milliseconds(200)))
+        listener.fire()
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+
+        // No conversational activity → idle monitor tears the stream down and
+        // returns to on-device wake-word listening.
+        let disengaged = await waitUntil(timeout: 4) {
+            let streaming = await orch.isStreaming
+            return streaming == false
+        }
+        XCTAssertTrue(disengaged)
+        let restarted = await waitUntil { listener.isStarted() }
+        XCTAssertTrue(restarted)
+        let disconnects = await provider.disconnectCount
+        XCTAssertGreaterThanOrEqual(disconnects, 1)
+        await orch.stop()
+    }
+
+    func testMemorySummaryInjectedIntoInstructions() async throws {
+        let provider = MockProvider()
+        let memory = InMemoryConversationMemory()
+        await memory.append(ConversationTurn(role: .user, text: "my name is Sam"))
+        let orch = makeOrchestrator(provider: provider, memory: memory)
+        // Direct-stream mode so we connect immediately with the injected summary.
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+        let instructions = await provider.lastInstructions
+        XCTAssertTrue(instructions.contains("my name is Sam"))
+        await orch.stop()
+    }
+
     func testOrchestratorIgnoresWithoutWakeWord() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
@@ -192,7 +251,9 @@ final class WakeWordTests: XCTestCase {
 
     private func makeOrchestrator(
         provider: MockProvider,
-        frameCapture: (any FrameCapture)? = nil
+        frameCapture: (any FrameCapture)? = nil,
+        memory: (any ConversationMemory)? = nil,
+        wakeWordListener: (any WakeWordListening)? = nil
     ) -> ConversationOrchestrator {
         ConversationOrchestrator(
             ai: provider,
@@ -200,7 +261,9 @@ final class WakeWordTests: XCTestCase {
             egress: MockEgress(),
             resampler: PassThroughResampler(),
             metrics: InMemoryLatencyMetricsRecorder(),
-            frameCapture: frameCapture
+            memory: memory,
+            frameCapture: frameCapture,
+            wakeWordListener: wakeWordListener
         )
     }
 
@@ -219,6 +282,9 @@ private actor MockProvider: ConversationalAIProvider {
     private let continuation: AsyncStream<AIConversationEvent>.Continuation
     private(set) var createResponseCount = 0
     private(set) var analyzeCount = 0
+    private(set) var connectCount = 0
+    private(set) var disconnectCount = 0
+    private(set) var lastInstructions = ""
 
     init() {
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -226,8 +292,11 @@ private actor MockProvider: ConversationalAIProvider {
         continuation = cont
     }
 
-    func connect(config: AISessionConfig) async throws {}
-    func disconnect() async { continuation.finish() }
+    func connect(config: AISessionConfig) async throws {
+        connectCount += 1
+        lastInstructions = config.instructions
+    }
+    func disconnect() async { disconnectCount += 1; continuation.finish() }
     func appendAudio(_ pcm16_24k: Data) async {}
     func createResponse() async { createResponseCount += 1 }
     func interrupt() async {}
@@ -254,6 +323,24 @@ private struct MockIngress: AudioIngress {
     var chunks: AsyncStream<AudioChunk> { AsyncStream { $0.finish() } }
     func start() async throws {}
     func stop() async {}
+}
+
+private final class MockWakeWordListener: WakeWordListening, @unchecked Sendable {
+    let detections: AsyncStream<Void>
+    private let cont: AsyncStream<Void>.Continuation
+    private let lock = NSLock()
+    private var _started = false
+
+    init() {
+        var c: AsyncStream<Void>.Continuation!
+        detections = AsyncStream { c = $0 }
+        cont = c
+    }
+
+    func start() async throws { lock.lock(); _started = true; lock.unlock() }
+    func stop() async { lock.lock(); _started = false; lock.unlock() }
+    func isStarted() -> Bool { lock.lock(); defer { lock.unlock() }; return _started }
+    func fire() { cont.yield(()) }
 }
 
 private actor MockEgress: AudioEgress {

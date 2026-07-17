@@ -21,6 +21,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     private var responseActive = false
     private let model: String
     private let metrics: (any LatencyMetricsRecorder)?
+    // Retained so a dropped socket can be transparently re-established with the
+    // same session shape.
+    private var lastConfig: AISessionConfig?
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 5
 
     public init(
         tokenService: any TokenService,
@@ -40,6 +45,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func connect(config: AISessionConfig) async throws {
+        lastConfig = config
+        reconnectAttempts = 0
+        try await openSocket(config: config)
+    }
+
+    private func openSocket(config: AISessionConfig) async throws {
         let credential = try await resolveCredential()
         let session = URLSession(configuration: .default)
         self.session = session
@@ -88,10 +99,14 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     public func disconnect() async {
         connected = false
         responseActive = false
+        // Explicit teardown: don't attempt to auto-reconnect after this.
+        lastConfig = nil
         receiveTask?.cancel()
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
-        eventsContinuation?.finish()
+        // Deliberately do NOT finish `events`: the orchestrator keeps a single,
+        // long-lived consumer across engage/disengage cycles (wake-word gating)
+        // and reconnects. The stream ends when this provider is deallocated.
     }
 
     public func appendAudio(_ pcm16_24k: Data) async {
@@ -172,17 +187,40 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 }
             } catch {
                 if connected {
-                    eventsContinuation?.yield(.error(message: String(describing: error)))
-                    await reconnectSoft()
+                    await reconnect()
                 }
                 break
             }
         }
     }
 
-    private func reconnectSoft() async {
-        NovaLog.ai.warning("Realtime socket dropped; client should reconnect via orchestrator restart")
+    /// Re-establish a dropped socket with exponential backoff. Refreshes the
+    /// ephemeral credential if it expired, re-sends `session.update`, and resumes
+    /// the receive loop, emitting `.reconnected` on success or `.error` if the
+    /// attempts are exhausted.
+    private func reconnect() async {
+        guard let config = lastConfig else { connected = false; return }
         connected = false
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
+
+        while reconnectAttempts < maxReconnectAttempts {
+            reconnectAttempts += 1
+            let delay = min(pow(2.0, Double(reconnectAttempts - 1)), 16)
+            NovaLog.ai.warning("Realtime dropped; reconnect attempt \(self.reconnectAttempts) in \(delay)s")
+            try? await Task.sleep(for: .seconds(delay))
+            if Task.isCancelled || lastConfig == nil { return }
+            do {
+                try await openSocket(config: config)
+                reconnectAttempts = 0
+                eventsContinuation?.yield(.reconnected)
+                NovaLog.ai.info("Realtime reconnected")
+                return
+            } catch {
+                NovaLog.ai.error("Reconnect failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        eventsContinuation?.yield(.error(message: "Realtime disconnected (reconnect attempts exhausted)"))
     }
 
     private func handleMessage(_ text: String) async {

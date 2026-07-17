@@ -44,3 +44,40 @@ final class PCMResamplerTests: XCTestCase {
         XCTAssertTrue(json.contains("Austin"))
     }
 }
+
+final class FileConversationMemoryTests: XCTestCase {
+    private func tempURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("nova-memtest-\(UUID().uuidString).json")
+    }
+
+    func testPersistsAcrossInstances() async throws {
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let first = FileConversationMemory(url: url)
+        await first.append(ConversationTurn(role: .user, text: "remember milk"))
+        await first.append(ConversationTurn(role: .assistant, text: "noted"))
+
+        // A fresh instance must reload the persisted turns from disk.
+        let second = FileConversationMemory(url: url)
+        let summary = await second.summary()
+        XCTAssertTrue(summary.contains("remember milk"))
+        XCTAssertTrue(summary.contains("noted"))
+        let recent = await second.recent(limit: 10)
+        XCTAssertEqual(recent.count, 2)
+    }
+
+    func testClearRemovesPersistedTurns() async throws {
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let memory = FileConversationMemory(url: url)
+        await memory.append(ConversationTurn(role: .user, text: "temp"))
+        await memory.clear()
+
+        let reloaded = FileConversationMemory(url: url)
+        let recent = await reloaded.recent(limit: 10)
+        XCTAssertTrue(recent.isEmpty)
+    }
+}

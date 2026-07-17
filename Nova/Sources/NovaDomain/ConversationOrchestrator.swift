@@ -13,10 +13,16 @@ public actor ConversationOrchestrator {
     // Supplies the current camera frame when a vision trigger ("what's this?")
     // fires. Without it, vision triggers fall back to a spoken reply.
     private let frameCapture: (any FrameCapture)?
+    // Optional on-device wake-word listener. When present and enabled, the cloud
+    // stream stays closed until the wake word is heard locally.
+    private let wakeWordListener: (any WakeWordListening)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
+    private var detectionTask: Task<Void, Never>?
+    private var idleTask: Task<Void, Never>?
     private var isRunning = false
+    private var streaming = false
     private var assistantSpeaking = false
     private var inputTranscript = ""
     private var outputTranscript = ""
@@ -25,6 +31,9 @@ public actor ConversationOrchestrator {
     // Timestamp of the last conversational engagement (wake word heard or a reply
     // completed by either side). Drives the listening-mode grace window.
     private var lastEngagement: ContinuousClock.Instant?
+    // Timestamp of the last conversational activity while streaming. Drives the
+    // idle teardown that returns us to on-device wake-word listening.
+    private var lastActivity: ContinuousClock.Instant = .now
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
 
@@ -36,7 +45,8 @@ public actor ConversationOrchestrator {
         metrics: any LatencyMetricsRecorder,
         memory: (any ConversationMemory)? = nil,
         toolRouter: ToolRouter? = nil,
-        frameCapture: (any FrameCapture)? = nil
+        frameCapture: (any FrameCapture)? = nil,
+        wakeWordListener: (any WakeWordListening)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -46,7 +56,12 @@ public actor ConversationOrchestrator {
         self.memory = memory
         self.toolRouter = toolRouter
         self.frameCapture = frameCapture
+        self.wakeWordListener = wakeWordListener
     }
+
+    /// True while the cloud Realtime stream is open (as opposed to idle on-device
+    /// wake-word listening). Exposed for diagnostics/tests.
+    public var isStreaming: Bool { streaming }
 
     public func setTranscriptHandler(_ handler: (@Sendable (String, ConversationTurn.Role) -> Void)?) {
         onTranscript = handler
@@ -58,15 +73,91 @@ public actor ConversationOrchestrator {
         sessionConfig = config
         lastEngagement = nil
         detector = WakeWordDetector(wakeWord: config.wakeWord, visionPhrases: config.visionTriggerPhrases)
-        try await ai.connect(config: config)
-        try await ingress.start()
 
+        // Single, long-lived consumer of provider events. It must outlive
+        // individual engage/disengage cycles because the provider's event stream
+        // supports only one consumer and persists across reconnects.
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.ai.events {
                 await self.handle(event)
             }
         }
+
+        // On-device wake-word gating: stay off the cloud until "Nova" is heard.
+        // Falls back to always-on streaming if no listener is wired or if the
+        // local listener fails to start.
+        if config.useLocalWakeWord, let listener = wakeWordListener {
+            do {
+                try await beginLocalListening(listener)
+                return
+            } catch {
+                NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+            }
+        }
+        try await beginStreaming(config)
+    }
+
+    public func stop() async {
+        isRunning = false
+        detectionTask?.cancel()
+        detectionTask = nil
+        await wakeWordListener?.stop()
+        await teardownStreaming()
+        eventTask?.cancel()
+        eventTask = nil
+    }
+
+    // MARK: - Local wake-word listening (idle state)
+
+    private func beginLocalListening(_ listener: any WakeWordListening) async throws {
+        if streaming { await teardownStreaming() }
+        try await listener.start()
+        NovaLog.session.info("Local wake-word listening (cloud stream closed)")
+        detectionTask = Task { [weak self] in
+            guard let self else { return }
+            for await _ in listener.detections {
+                await self.onWakeWordDetected()
+            }
+        }
+    }
+
+    private func onWakeWordDetected() async {
+        guard isRunning, !streaming else { return }
+        NovaLog.session.info("Wake word detected on-device; opening stream")
+        detectionTask?.cancel()
+        detectionTask = nil
+        await wakeWordListener?.stop()
+        // Already invoked locally, so the cloud session should reply to the
+        // command that follows without requiring the wake word again.
+        var engaged = sessionConfig
+        engaged.requireWakeWord = false
+        do {
+            try await beginStreaming(engaged)
+        } catch {
+            NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
+            if let listener = wakeWordListener, isRunning {
+                try? await beginLocalListening(listener)
+            }
+        }
+    }
+
+    // MARK: - Streaming (engaged state)
+
+    private func beginStreaming(_ config: AISessionConfig) async throws {
+        guard !streaming else { return }
+        // Prime the session with recent memory so Nova has cross-session context.
+        var effective = config
+        if let memory {
+            let summary = await memory.summary()
+            if !summary.isEmpty {
+                effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
+            }
+        }
+        try await ai.connect(config: effective)
+        try await ingress.start()
+        streaming = true
+        lastActivity = .now
 
         ingressTask = Task { [weak self] in
             guard let self else { return }
@@ -82,18 +173,48 @@ public actor ConversationOrchestrator {
                 await self.metrics.mark(.micToWS, startedAt: t0)
             }
         }
+
+        startIdleMonitorIfNeeded()
     }
 
-    public func stop() async {
-        isRunning = false
-        eventTask?.cancel()
+    private func teardownStreaming() async {
+        // Note: the long-lived `eventTask` intentionally survives teardown so the
+        // provider's single-consumer event stream stays connected across reconnects.
         ingressTask?.cancel()
-        eventTask = nil
+        idleTask?.cancel()
         ingressTask = nil
+        idleTask = nil
         await ingress.stop()
         await egress.stop()
         await ai.disconnect()
         assistantSpeaking = false
+        streaming = false
+    }
+
+    /// Only relevant in wake-word-gated mode: after `streamIdleTimeout` of silence
+    /// close the cloud stream and drop back to on-device listening.
+    private func startIdleMonitorIfNeeded() {
+        guard sessionConfig.useLocalWakeWord,
+              wakeWordListener != nil,
+              sessionConfig.streamIdleTimeout > .zero else { return }
+        idleTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                if await self.disengageIfIdle() { break }
+            }
+        }
+    }
+
+    private func disengageIfIdle() async -> Bool {
+        guard streaming, !assistantSpeaking else { return false }
+        guard ContinuousClock.Instant.now - lastActivity >= sessionConfig.streamIdleTimeout else { return false }
+        NovaLog.session.info("Idle timeout; closing stream, back to wake-word listening")
+        await teardownStreaming()
+        if let listener = wakeWordListener, isRunning {
+            try? await beginLocalListening(listener)
+        }
+        return true
     }
 
     public func askAboutFrame(_ frame: CapturedFrame, prompt: String) async throws -> String {
@@ -109,6 +230,17 @@ public actor ConversationOrchestrator {
     }
 
     private func handle(_ event: AIConversationEvent) async {
+        // Any inbound conversational signal keeps the stream engaged (resets the
+        // idle-teardown countdown in wake-word-gated mode).
+        switch event {
+        case .inputTranscript, .inputTranscriptionCompleted, .outputTranscript,
+             .outputAudio, .responseStarted, .responseEnded, .speechStarted,
+             .speechStopped, .reconnected:
+            lastActivity = .now
+        case .toolCall, .error:
+            break
+        }
+
         switch event {
         case .inputTranscript(let delta):
             inputTranscript += delta
@@ -155,6 +287,8 @@ public actor ConversationOrchestrator {
             ))
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
+        case .reconnected:
+            NovaLog.session.info("AI stream reconnected")
         }
     }
 

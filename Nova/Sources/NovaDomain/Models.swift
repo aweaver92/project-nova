@@ -32,6 +32,13 @@ public struct AISessionConfig: Sendable, Equatable {
     /// as addressed to Nova without repeating the wake word. Set to `.zero` to
     /// require the wake word on every turn.
     public var wakeWordGraceWindow: Duration
+    /// When true (and a `WakeWordListening` is wired), Nova stays disconnected
+    /// from the cloud and listens for the wake word on-device, only opening the
+    /// Realtime stream after "Nova" is heard. Saves battery, data, and tokens.
+    public var useLocalWakeWord: Bool
+    /// After engaging via the local wake word, tear the cloud stream back down
+    /// once there has been no conversational activity for this long.
+    public var streamIdleTimeout: Duration
     /// Phrases (after the wake word) that route to the vision path.
     public var visionTriggerPhrases: [String]
 
@@ -44,6 +51,8 @@ public struct AISessionConfig: Sendable, Equatable {
         wakeWord: String = "Nova",
         requireWakeWord: Bool = true,
         wakeWordGraceWindow: Duration = .seconds(10),
+        useLocalWakeWord: Bool = true,
+        streamIdleTimeout: Duration = .seconds(20),
         visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
     ) {
         self.instructions = instructions
@@ -54,6 +63,8 @@ public struct AISessionConfig: Sendable, Equatable {
         self.wakeWord = wakeWord
         self.requireWakeWord = requireWakeWord
         self.wakeWordGraceWindow = wakeWordGraceWindow
+        self.useLocalWakeWord = useLocalWakeWord
+        self.streamIdleTimeout = streamIdleTimeout
         self.visionTriggerPhrases = visionTriggerPhrases
     }
 }
@@ -69,6 +80,8 @@ public enum AIConversationEvent: Sendable, Equatable {
     case speechStopped
     case toolCall(id: String, name: String, argumentsJSON: String)
     case error(message: String)
+    /// The provider transparently re-established a dropped connection.
+    case reconnected
 }
 
 public struct AudioChunk: Sendable, Equatable {
@@ -101,13 +114,13 @@ public struct CapturedFrame: Sendable, Equatable {
     public var age: TimeInterval { Date().timeIntervalSince(capturedAt) }
 }
 
-public struct ConversationTurn: Sendable, Equatable, Identifiable {
+public struct ConversationTurn: Sendable, Equatable, Identifiable, Codable {
     public let id: UUID
     public let role: Role
     public let text: String
     public let at: Date
 
-    public enum Role: String, Sendable {
+    public enum Role: String, Sendable, Codable {
         case user
         case assistant
         case system

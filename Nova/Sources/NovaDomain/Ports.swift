@@ -24,6 +24,16 @@ public protocol AudioEgress: Sendable {
     func stop() async
 }
 
+/// On-device wake-word listener. While active it owns the microphone and emits a
+/// value each time the wake word is heard locally, so the orchestrator can avoid
+/// streaming to the cloud until Nova is actually addressed. Stopping releases the
+/// mic so the streaming ingress can take over.
+public protocol WakeWordListening: Sendable {
+    var detections: AsyncStream<Void> { get }
+    func start() async throws
+    func stop() async
+}
+
 public protocol WearableSession: Sendable {
     var state: AsyncStream<WearableSessionState> { get }
     var registration: AsyncStream<RegistrationState> { get }

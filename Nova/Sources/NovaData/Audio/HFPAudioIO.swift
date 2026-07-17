@@ -10,6 +10,8 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private var continuation: AsyncStream<AudioChunk>.Continuation?
     private let lock = NSLock()
+    private var observers: [NSObjectProtocol] = []
+    private var running = false
 
     public let chunks: AsyncStream<AudioChunk>
 
@@ -21,8 +23,16 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
 
     public func start() async throws {
+        running = true
         try await coordinator.activateConversationalHFP()
+        try installTapAndStartEngine()
+        registerObservers()
+        NovaLog.audio.info("HFP ingress started")
+    }
+
+    private func installTapAndStartEngine() throws {
         let input = engine.inputNode
+        input.removeTap(onBus: 0)
         let format = input.inputFormat(forBus: 0)
         // Install tap; convert to 8 kHz mono PCM16 if hardware differs.
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 8_000, channels: 1, interleaved: true)!
@@ -54,11 +64,84 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
             }
         }
 
+        engine.prepare()
         try engine.start()
-        NovaLog.audio.info("HFP ingress started")
+    }
+
+    // MARK: - Resilience: interruptions & route changes
+
+    private func registerObservers() {
+        let center = NotificationCenter.default
+        let interruption = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil, queue: nil
+        ) { [weak self] note in
+            self?.handleInterruption(note)
+        }
+        let routeChange = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil, queue: nil
+        ) { [weak self] note in
+            self?.handleRouteChange(note)
+        }
+        lock.lock()
+        observers = [interruption, routeChange]
+        lock.unlock()
+    }
+
+    private func handleInterruption(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            NovaLog.audio.info("Audio interruption began; pausing engine")
+            engine.stop()
+        case .ended:
+            let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+            guard options.contains(.shouldResume) else { return }
+            NovaLog.audio.info("Audio interruption ended; resuming engine")
+            recover()
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleRouteChange(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+        switch reason {
+        case .oldDeviceUnavailable, .newDeviceAvailable, .categoryChange, .override:
+            NovaLog.audio.info("Audio route changed (reason \(raw)); re-selecting HFP input")
+            recover()
+        default:
+            break
+        }
+    }
+
+    /// Reactivate the HFP session and restart the capture tap after an
+    /// interruption or route change.
+    private func recover() {
+        Task { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); let alive = self.running; self.lock.unlock()
+            guard alive else { return }
+            do {
+                try await self.coordinator.activateConversationalHFP()
+                try self.installTapAndStartEngine()
+            } catch {
+                NovaLog.audio.error("HFP recovery failed: \(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     public func stop() async {
+        running = false
+        lock.lock()
+        let toRemove = observers
+        observers = []
+        lock.unlock()
+        toRemove.forEach { NotificationCenter.default.removeObserver($0) }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         await coordinator.deactivate()
