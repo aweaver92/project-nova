@@ -28,9 +28,9 @@ public actor LocalTimerService: TimerScheduling {
         )
 
         #if canImport(UserNotifications)
-        // XCTest / SPM test hosts often have no app bundle proxy; calling
-        // UNUserNotificationCenter.current() then traps. Keep an in-memory timer.
-        if Bundle.main.bundleIdentifier != nil {
+        // XCTest / SPM hosts under Xcode's Agents directory trap on
+        // UNUserNotificationCenter.current(). Prefer in-memory timers there.
+        if Self.notificationsAvailable {
             let center = UNUserNotificationCenter.current()
             let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
             if granted {
@@ -80,7 +80,7 @@ public actor LocalTimerService: TimerScheduling {
         guard !targets.isEmpty else { return false }
 
         #if canImport(UserNotifications)
-        if Bundle.main.bundleIdentifier != nil {
+        if Self.notificationsAvailable {
             let ids = targets.map { Self.identifier(for: $0) }
             UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
         }
@@ -104,4 +104,16 @@ public actor LocalTimerService: TimerScheduling {
     public static func identifier(for id: UUID) -> String {
         "\(identifierPrefix)\(id.uuidString)"
     }
+
+    #if canImport(UserNotifications)
+    private static var notificationsAvailable: Bool {
+        guard let bundleId = Bundle.main.bundleIdentifier, !bundleId.isEmpty else { return false }
+        let path = Bundle.main.bundleURL.path
+        // xcodebuild SwiftPM tests run inside Xcode's Agents bundle.
+        if path.contains("/Xcode/Agents") { return false }
+        if path.lowercased().contains("xctest") { return false }
+        _ = bundleId
+        return true
+    }
+    #endif
 }
