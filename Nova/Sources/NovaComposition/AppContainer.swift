@@ -6,9 +6,6 @@ import NovaFeatures
 #if canImport(UIKit)
 import UIKit
 #endif
-#if canImport(UserNotifications)
-import UserNotifications
-#endif
 
 /// Composition root — construct once in the app entry point.
 @MainActor
@@ -155,6 +152,11 @@ public final class AppContainer {
         self.agentStore = agentStore
         let workoutStore = FileWorkoutStore()
         self.workouts = workoutStore
+        let workoutPlanStore = FileWorkoutPlanStore()
+        let pantryStore = FilePantryStore()
+        let wellnessStore = FileWellnessStore()
+        let studyStore = FileStudyDeckStore()
+        let timerService = LocalTimerService()
         let bridge = NovaBridgeClient(configProvider: {
             if let urlString = await settingsStore.bridgeBaseURL(),
                let url = URL(string: urlString) {
@@ -166,7 +168,6 @@ public final class AppContainer {
 
         // App-layer callbacks skills/drafting need (opening links, local timers).
         var openURL: SkillRunner.URLOpener?
-        var startTimer: SkillRunner.TimerStarter?
         #if canImport(UIKit)
         openURL = { url in
             await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
@@ -176,20 +177,10 @@ public final class AppContainer {
             }
         }
         #endif
-        #if canImport(UserNotifications)
-        startTimer = { seconds, label in
-            let center = UNUserNotificationCenter.current()
-            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
-            guard granted else { return false }
-            let content = UNMutableNotificationContent()
-            content.title = label
-            content.body = "Timer finished"
-            content.sound = .default
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(seconds), repeats: false)
-            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
-            do { try await center.add(request); return true } catch { return false }
+        // Shared TimerService backs both SkillRunner `.timer` steps and agent tools.
+        let startTimer: SkillRunner.TimerStarter = { seconds, label in
+            (await timerService.schedule(seconds: seconds, label: label)) != nil
         }
-        #endif
 
         // Webhook step caller: any 2xx counts as success.
         let callWebhook: SkillRunner.WebhookCaller = { request in
@@ -259,15 +250,36 @@ public final class AppContainer {
             BookmarkConversationTool(store: bookmarkStore, workspaceId: { await workspaceStore.active()?.id }),
             SetWorkspaceTool(store: workspaceStore),
             DraftMessageTool(notes: noteStore, openURL: openURL),
+            // Shared capability-pack primitives.
+            SetTimerTool(timers: timerService),
+            CancelTimerTool(timers: timerService),
+            ListTimersTool(timers: timerService),
+            PlayMusicTool(openURL: openURL, haBaseURL: ha?.baseURL, haToken: ha?.token),
+            OpenURLTool(openURL: openURL),
             // Claude's programming tools (Claude Code + Cursor via the Nova Bridge).
             RunClaudeCodeTool(bridge: bridge),
             PushToCursorTool(bridge: bridge),
             ListCursorSessionsTool(bridge: bridge),
-            // Max's workout tools.
+            // Max's workout + plan tools.
             StartWorkoutSessionTool(store: workoutStore),
             LogWorkoutSetTool(store: workoutStore),
             EndWorkoutSessionTool(store: workoutStore),
-            WorkoutHistoryTool(store: workoutStore)
+            WorkoutHistoryTool(store: workoutStore),
+            SaveWorkoutPlanTool(store: workoutPlanStore),
+            ListWorkoutPlansTool(store: workoutPlanStore),
+            StartWorkoutFromPlanTool(plans: workoutPlanStore, workouts: workoutStore),
+            // Remy's pantry tools.
+            AddPantryItemTool(store: pantryStore),
+            ListPantryTool(store: pantryStore),
+            RemovePantryItemTool(store: pantryStore),
+            // Sage's wellness tools.
+            LogWellnessCheckinTool(store: wellnessStore),
+            WellnessHistoryTool(store: wellnessStore),
+            // Scholar's study tools.
+            AddStudyCardTool(store: studyStore),
+            ListStudyDecksTool(store: studyStore),
+            StartQuizTool(store: studyStore),
+            GradeCardTool(store: studyStore)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
@@ -321,11 +333,30 @@ public final class AppContainer {
             activeAgentProvider: { await agentStore.active() },
             persistActiveAgent: { id in await agentStore.setActive(id: id) },
             agentContextProvider: { agent in
-                // Prime trainer-like agents with recent workout history.
-                if agent.toolNames?.contains("workout_history") == true {
-                    return await workoutStore.summary(limit: 8)
+                var parts: [String] = []
+                let names = agent.toolNames ?? []
+                // Prime trainer-like agents with recent workout history + plans.
+                if names.contains("workout_history") {
+                    let s = await workoutStore.summary(limit: 8)
+                    if !s.isEmpty { parts.append(s) }
                 }
-                return ""
+                if names.contains("list_workout_plans") {
+                    let s = await workoutPlanStore.summary(limit: 8)
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("list_pantry") {
+                    let s = await pantryStore.summary()
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("wellness_history") {
+                    let s = await wellnessStore.summary(limit: 5)
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("start_quiz") || names.contains("list_study_decks") {
+                    let s = await studyStore.summary(dueLimit: 8)
+                    if !s.isEmpty { parts.append(s) }
+                }
+                return parts.joined(separator: "\n")
             }
         )
         self.orchestrator = orchestrator

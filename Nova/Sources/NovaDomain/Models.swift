@@ -681,6 +681,10 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 }
 
 public extension Agent {
+    /// Bump when built-in allowlists / personas change so existing installs
+    /// refresh seeded specialists without wiping user-created agents.
+    static let seedCapabilitiesVersion = 2
+
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
     enum SeedID {
@@ -698,6 +702,11 @@ public extension Agent {
         "save_note", "list_notes", "create_reminder"
     ]
 
+    /// Shared spoken-timer + music primitives used by several specialists.
+    static let timerMusicToolNames: [String] = [
+        "set_timer", "cancel_timer", "list_timers", "play_music", "open_url"
+    ]
+
     /// The roster seeded on first launch. Nova is the master; the rest are
     /// specialists with their own voice + front-loaded personality.
     static func builtInAgents() -> [Agent] {
@@ -707,7 +716,7 @@ public extension Agent {
                 name: "Nova",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "the master voice assistant",
-                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents and can hand off to them when the user asks. You are warm, concise, and proactive.",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for wellness, Remy for cooking, Scholar for tutoring) and should offer to hand off when the user's request clearly matches a specialist — e.g. “Want Max to run this workout?” — rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
                 builtIn: true
@@ -717,11 +726,12 @@ public extension Agent {
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Use run_claude_code to make edits, run commands, and investigate the codebase, and push_to_cursor / list_cursor_sessions to drive their active Cursor sessions. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
+                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Prefer run_claude_code for repo edits and investigation on their machine; use push_to_cursor / list_cursor_sessions to drive Cursor agents. Use start_meeting / end_meeting for spoken standups you later turn into notes or tickets. Use draft_message or create_reminder for follow-ups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
                 toolNames: [
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
                     "web_search", "search_knowledge", "save_note", "list_notes",
-                    "remember_fact", "recall_facts"
+                    "remember_fact", "recall_facts", "create_reminder", "draft_message",
+                    "start_meeting", "end_meeting", "bookmark_conversation"
                 ],
                 builtIn: true
             ),
@@ -730,11 +740,14 @@ public extension Agent {
                 name: "Max",
                 voice: RealtimeVoice.ash.rawValue,
                 role: "a personal trainer and strength coach",
-                personality: "You are Max, an upbeat, motivating personal trainer. You know the user's past workouts and use them to progress training safely. During an active workout session you coach set-by-set: call cues, count tempo, suggest weights and rest, and log each set with your tools. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy.",
+                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy.",
                 toolNames: [
                     "start_workout_session", "log_workout_set", "end_workout_session",
-                    "workout_history", "remember_fact", "recall_facts",
-                    "web_search", "create_reminder", "save_note"
+                    "workout_history", "save_workout_plan", "list_workout_plans",
+                    "start_workout_from_plan",
+                    "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
+                    "remember_fact", "recall_facts", "web_search", "create_reminder",
+                    "save_note", "list_notes", "search_knowledge", "home_assistant"
                 ],
                 builtIn: true
             ),
@@ -743,8 +756,13 @@ public extension Agent {
                 name: "Sage",
                 voice: RealtimeVoice.sage.rawValue,
                 role: "a wellness and mindfulness coach",
-                personality: "You are Sage, a calm, grounded wellness and mindfulness coach. You guide breathing, meditation, journaling, and healthy habits with a gentle, unhurried tone. You never give medical diagnoses; you encourage professional care when appropriate.",
-                toolNames: Agent.commonToolNames + ["search_knowledge", "daily_briefing"],
+                personality: "You are Sage, a calm, grounded wellness and mindfulness coach. You guide breathing, meditation, journaling, and healthy habits with a gentle, unhurried tone. Use set_timer for breath rounds and body scans, daily_briefing / weather / calendar for check-ins, log_wellness_checkin for mood, and home_assistant to soften lights when helpful. You never give medical diagnoses; encourage professional care and offer to hand back to Nova for medical questions.",
+                toolNames: Agent.commonToolNames + [
+                    "search_knowledge", "daily_briefing", "weather", "list_calendar_events",
+                    "set_timer", "cancel_timer", "list_timers",
+                    "log_wellness_checkin", "wellness_history",
+                    "home_assistant", "home_assistant_state"
+                ],
                 builtIn: true
             ),
             Agent(
@@ -752,8 +770,12 @@ public extension Agent {
                 name: "Remy",
                 voice: RealtimeVoice.ballad.rawValue,
                 role: "a chef and nutrition assistant",
-                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. You suggest recipes from what the user has on hand, scale portions, and give clear step-by-step cooking guidance suited to hands-free use. Keep steps short so they're easy to follow while cooking.",
-                toolNames: Agent.commonToolNames,
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Suggest recipes from the pantry (list_pantry / add_pantry_item) and what the user sees (remember_visual for fridge/labels). Use set_timer for cook times and announce when they fire. Keep steps short for hands-free cooking; ask before assuming pantry stock. Optional play_music while cooking.",
+                toolNames: Agent.commonToolNames + [
+                    "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
+                    "remember_visual", "add_pantry_item", "list_pantry", "remove_pantry_item",
+                    "search_knowledge", "web_search"
+                ],
                 builtIn: true
             ),
             Agent(
@@ -761,9 +783,36 @@ public extension Agent {
                 name: "Scholar",
                 voice: RealtimeVoice.verse.rawValue,
                 role: "a patient tutor",
-                personality: "You are Scholar, a patient, encouraging tutor. You teach with the Socratic method, check understanding, and can run study/quiz sessions with spaced repetition. Explain step-by-step and adapt to the user's level.",
-                toolNames: Agent.commonToolNames + ["search_knowledge"],
+                personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. Use add_study_card / start_quiz / grade_card for spaced-repetition drills, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
+                toolNames: Agent.commonToolNames + [
+                    "search_knowledge", "add_study_card", "list_study_decks",
+                    "start_quiz", "grade_card", "bookmark_conversation", "web_search"
+                ],
                 builtIn: true
+            ),
+        ]
+    }
+
+    /// Seeded skills that showcase specialist capabilities (idempotent by id).
+    static func builtInSkills() -> [Skill] {
+        [
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!,
+                name: "Max rest 90s",
+                triggerPhrases: ["rest ninety", "ninety second rest", "max rest"],
+                steps: [
+                    SkillStep(kind: .timer, text: "Rest", seconds: 90),
+                    SkillStep(kind: .say, text: "Rest timer started — ninety seconds.")
+                ]
+            ),
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B2")!,
+                name: "Sage box breathing",
+                triggerPhrases: ["box breathing", "sage breathing"],
+                steps: [
+                    SkillStep(kind: .say, text: "We'll do one box-breathing round: inhale, hold, exhale, hold — four seconds each."),
+                    SkillStep(kind: .timer, text: "Box breathing round", seconds: 16)
+                ]
             ),
         ]
     }
@@ -829,4 +878,172 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
     }
 
     public var isActive: Bool { endedAt == nil }
+}
+
+/// One exercise line inside a reusable workout plan.
+public struct PlannedExercise: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var sets: Int?
+    public var reps: Int?
+    public var weight: Double?
+    public var restSeconds: Int?
+    public var notes: String?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        sets: Int? = nil,
+        reps: Int? = nil,
+        weight: Double? = nil,
+        restSeconds: Int? = nil,
+        notes: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.sets = sets
+        self.reps = reps
+        self.weight = weight
+        self.restSeconds = restSeconds
+        self.notes = notes
+    }
+}
+
+/// A reusable workout plan Max (or the user) can save and start later.
+public struct WorkoutPlan: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var exercises: [PlannedExercise]
+    public var notes: String?
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        exercises: [PlannedExercise] = [],
+        notes: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.exercises = exercises
+        self.notes = notes
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
+    }
+}
+
+/// An active countdown timer (rest, cook, breathing, etc.).
+public struct ActiveTimer: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var label: String
+    public var seconds: Int
+    public var firesAt: Date
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        label: String,
+        seconds: Int,
+        firesAt: Date,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.label = label
+        self.seconds = seconds
+        self.firesAt = firesAt
+        self.createdAt = createdAt
+    }
+
+    public var remainingSeconds: Int {
+        max(0, Int(firesAt.timeIntervalSinceNow.rounded()))
+    }
+}
+
+/// A pantry / fridge inventory item for Remy.
+public struct PantryItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var notes: String?
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        notes: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.notes = notes
+        self.updatedAt = updatedAt
+    }
+}
+
+/// A mood / habit check-in for Sage.
+public struct WellnessCheckin: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// Mood on a 1–5 scale (1 = low, 5 = great).
+    public var mood: Int
+    public var note: String?
+    public var at: Date
+
+    public init(
+        id: UUID = UUID(),
+        mood: Int,
+        note: String? = nil,
+        at: Date = Date()
+    ) {
+        self.id = id
+        self.mood = min(5, max(1, mood))
+        self.note = note
+        self.at = at
+    }
+}
+
+/// Spaced-repetition study card for Scholar.
+public struct StudyCard: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var deck: String
+    public var front: String
+    public var back: String
+    public var intervalDays: Double
+    public var ease: Double
+    public var repetitions: Int
+    public var dueAt: Date
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        deck: String,
+        front: String,
+        back: String,
+        intervalDays: Double = 0,
+        ease: Double = 2.5,
+        repetitions: Int = 0,
+        dueAt: Date = Date(),
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.deck = deck
+        self.front = front
+        self.back = back
+        self.intervalDays = intervalDays
+        self.ease = ease
+        self.repetitions = repetitions
+        self.dueAt = dueAt
+        self.createdAt = createdAt
+    }
+}
+
+public enum StudyGrade: String, Sendable, Codable, CaseIterable {
+    case again
+    case hard
+    case good
+    case easy
 }

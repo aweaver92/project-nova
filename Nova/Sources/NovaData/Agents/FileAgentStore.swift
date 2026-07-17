@@ -4,50 +4,89 @@ import NovaDomain
 
 /// File-backed roster of agents + the active selection. Seeds the built-in
 /// agents (Nova master + specialists) on first launch, and back-fills any newly
-/// added built-ins on later launches without clobbering the user's own edits.
+/// added built-ins on later launches. When `Agent.seedCapabilitiesVersion`
+/// bumps, refreshes built-in `toolNames` / `personality` / `role` / `voice`
+/// without clobbering user-created agents or enabled/active selection.
 public actor FileAgentStore: AgentStoring {
     private struct Persisted: Codable {
         var agents: [Agent]
         var activeId: UUID?
+        var seedCapabilitiesVersion: Int?
     }
 
     private let url: URL
     private var agents: [Agent]
     private var activeId: UUID?
+    private var seedCapabilitiesVersion: Int
 
     public init(url: URL? = nil) {
         let resolved = url ?? Self.defaultURL()
         self.url = resolved
         let loaded = Self.load(from: resolved)
         let seeds = Agent.builtInAgents()
+        let targetVersion = Agent.seedCapabilitiesVersion
 
         if loaded.agents.isEmpty {
             self.agents = seeds
             self.activeId = seeds.first(where: { $0.isMaster })?.id
-            Self.persist(Persisted(agents: seeds, activeId: activeId), to: resolved)
+            self.seedCapabilitiesVersion = targetVersion
+            Self.persist(
+                Persisted(agents: seeds, activeId: activeId, seedCapabilitiesVersion: targetVersion),
+                to: resolved
+            )
             return
         }
 
-        // Back-fill any built-in the user doesn't have yet (e.g. added in an update).
         var merged = loaded.agents
+        var dirty = false
+
+        // Back-fill any built-in the user doesn't have yet.
         for seed in seeds where !merged.contains(where: { $0.id == seed.id }) {
             merged.append(seed)
+            dirty = true
         }
+
+        let priorVersion = loaded.seedCapabilitiesVersion ?? 0
+        if priorVersion < targetVersion {
+            for seed in seeds {
+                guard let idx = merged.firstIndex(where: { $0.id == seed.id && $0.builtIn }) else { continue }
+                let existing = merged[idx]
+                merged[idx] = Agent(
+                    id: seed.id,
+                    name: seed.name,
+                    wakeWord: seed.wakeWord,
+                    voice: seed.voice,
+                    role: seed.role,
+                    personality: seed.personality,
+                    toolNames: seed.toolNames,
+                    isMaster: seed.isMaster,
+                    builtIn: true,
+                    enabled: existing.enabled,
+                    createdAt: existing.createdAt,
+                    updatedAt: Date()
+                )
+            }
+            dirty = true
+        }
+
         self.agents = merged
-        // Guarantee a master exists and is the fallback if the active id is stale.
+        self.seedCapabilitiesVersion = targetVersion
         let master = merged.first(where: { $0.isMaster }) ?? merged.first
         if let activeId = loaded.activeId, merged.contains(where: { $0.id == activeId }) {
             self.activeId = activeId
         } else {
             self.activeId = master?.id
+            dirty = true
         }
-        if merged.count != loaded.agents.count {
-            Self.persist(Persisted(agents: merged, activeId: activeId), to: resolved)
+        if dirty || priorVersion != targetVersion {
+            Self.persist(
+                Persisted(agents: merged, activeId: activeId, seedCapabilitiesVersion: targetVersion),
+                to: resolved
+            )
         }
     }
 
     public func all() -> [Agent] {
-        // Master first, then the rest alphabetically for a stable UI.
         agents.sorted { lhs, rhs in
             if lhs.isMaster != rhs.isMaster { return lhs.isMaster }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
@@ -68,7 +107,6 @@ public actor FileAgentStore: AgentStoring {
     }
 
     public func delete(id: UUID) {
-        // Never delete the master.
         guard let victim = agents.first(where: { $0.id == id }), !victim.isMaster else { return }
         agents.removeAll { $0.id == id }
         if activeId == id { activeId = agents.first(where: { $0.isMaster })?.id }
@@ -97,7 +135,10 @@ public actor FileAgentStore: AgentStoring {
     }
 
     private func persist() {
-        Self.persist(Persisted(agents: agents, activeId: activeId), to: url)
+        Self.persist(
+            Persisted(agents: agents, activeId: activeId, seedCapabilitiesVersion: seedCapabilitiesVersion),
+            to: url
+        )
     }
 
     private static func persist(_ value: Persisted, to url: URL) {
@@ -111,7 +152,7 @@ public actor FileAgentStore: AgentStoring {
     private static func load(from url: URL) -> Persisted {
         guard let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode(Persisted.self, from: data) else {
-            return Persisted(agents: [], activeId: nil)
+            return Persisted(agents: [], activeId: nil, seedCapabilitiesVersion: nil)
         }
         return decoded
     }

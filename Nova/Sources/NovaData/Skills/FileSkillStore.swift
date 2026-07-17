@@ -10,7 +10,15 @@ public actor FileSkillStore: SkillStoring {
     public init(url: URL? = nil) {
         let resolved = url ?? Self.defaultURL()
         self.url = resolved
-        self.skills = Self.load(from: resolved)
+        var loaded = Self.load(from: resolved)
+        // Seed built-in showcase skills if missing (idempotent by id).
+        var dirty = false
+        for seed in Agent.builtInSkills() where !loaded.contains(where: { $0.id == seed.id }) {
+            loaded.append(seed)
+            dirty = true
+        }
+        self.skills = loaded
+        if dirty { Self.persist(loaded, to: resolved) }
     }
 
     public func all() -> [Skill] {
@@ -36,6 +44,10 @@ public actor FileSkillStore: SkillStoring {
     }
 
     private func persist() {
+        Self.persist(skills, to: url)
+    }
+
+    private static func persist(_ skills: [Skill], to url: URL) {
         do {
             try JSONEncoder().encode(skills).write(to: url, options: .atomic)
         } catch {

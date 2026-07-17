@@ -71,6 +71,8 @@ targets:
         # Lets the SDK detect and open the Meta AI companion app.
         LSApplicationQueriesSchemes:
           - fb-viewapp
+          - spotify
+          - music
         # URL scheme Meta AI uses to call back after registration/permissions.
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor

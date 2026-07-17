@@ -230,6 +230,57 @@ public protocol WorkoutStoring: Sendable {
     func summary(limit: Int) async -> String
 }
 
+/// Reusable workout plans Max can save and start as live sessions.
+public protocol WorkoutPlanStoring: Sendable {
+    func all() async -> [WorkoutPlan]
+    func plan(id: UUID) async -> WorkoutPlan?
+    @discardableResult
+    func upsert(_ plan: WorkoutPlan) async -> WorkoutPlan
+    func delete(id: UUID) async
+    /// Human-readable catalog for injecting into Max's context.
+    func summary(limit: Int) async -> String
+}
+
+/// Spoken / local-notification countdown timers shared by skills and agent tools.
+public protocol TimerScheduling: Sendable {
+    @discardableResult
+    func schedule(seconds: Int, label: String) async -> ActiveTimer?
+    @discardableResult
+    func cancel(id: UUID?, label: String?) async -> Bool
+    func list() async -> [ActiveTimer]
+}
+
+/// Remy's pantry / fridge inventory.
+public protocol PantryStoring: Sendable {
+    func all() async -> [PantryItem]
+    @discardableResult
+    func upsert(_ item: PantryItem) async -> PantryItem
+    func delete(id: UUID) async
+    func clear() async
+    func summary() async -> String
+}
+
+/// Sage's mood / habit check-ins.
+public protocol WellnessStoring: Sendable {
+    @discardableResult
+    func log(mood: Int, note: String?) async -> WellnessCheckin
+    func recent(limit: Int) async -> [WellnessCheckin]
+    func summary(limit: Int) async -> String
+}
+
+/// Scholar's spaced-repetition study decks.
+public protocol StudyDeckStoring: Sendable {
+    func all() async -> [StudyCard]
+    func decks() async -> [String]
+    func due(limit: Int) async -> [StudyCard]
+    @discardableResult
+    func upsert(_ card: StudyCard) async -> StudyCard
+    @discardableResult
+    func grade(id: UUID, grade: StudyGrade) async -> StudyCard?
+    func delete(id: UUID) async
+    func summary(dueLimit: Int) async -> String
+}
+
 /// Result of a Nova Bridge call. `payloadJSON` is passed straight back to the
 /// model as the tool output.
 public struct BridgeResult: Sendable, Equatable {

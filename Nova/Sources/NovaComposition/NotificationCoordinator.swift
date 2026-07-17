@@ -5,9 +5,9 @@ import NovaData
 #if canImport(UserNotifications)
 import UserNotifications
 
-/// Bridges scheduled-skill notifications back into the orchestrator: when a Nova
-/// skill notification fires (or is tapped), run that skill. Deterministic steps
-/// run immediately; a spoken confirmation is added if the stream is open.
+/// Bridges scheduled-skill notifications (and countdown timers) back into the
+/// orchestrator: skill notifications run that skill; timer notifications speak a
+/// short cue when a live session is open.
 public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate {
     private let orchestrator: ConversationOrchestrator
     private let skillStore: FileSkillStore
@@ -27,6 +27,10 @@ public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDe
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        let id = notification.request.identifier
+        if id.hasPrefix(LocalTimerService.identifierPrefix) {
+            Task { await announceTimer(notification) }
+        }
         completionHandler([.banner, .sound])
     }
 
@@ -36,16 +40,33 @@ public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDe
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
-        guard let idString = info["skillId"] as? String, let id = UUID(uuidString: idString) else {
+        let id = response.notification.request.identifier
+        if id.hasPrefix(LocalTimerService.identifierPrefix) {
+            Task {
+                await announceTimer(response.notification)
+                completionHandler()
+            }
+            return
+        }
+        guard let idString = info["skillId"] as? String, let skillId = UUID(uuidString: idString) else {
             completionHandler()
             return
         }
         Task {
-            if let skill = await skillStore.all().first(where: { $0.id == id }) {
+            if let skill = await skillStore.all().first(where: { $0.id == skillId }) {
                 await orchestrator.runSkill(skill)
             }
             completionHandler()
         }
+    }
+
+    private func announceTimer(_ notification: UNNotification) async {
+        let label = (notification.request.content.userInfo["timerLabel"] as? String)
+            ?? notification.request.content.title
+        let cue = label.isEmpty
+            ? "[System: A timer just finished. Briefly tell the user their timer is up.]"
+            : "[System: The “\(label)” timer just finished. Briefly tell the user.]"
+        await orchestrator.sendUserText(cue)
     }
 }
 #endif
