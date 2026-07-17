@@ -70,6 +70,9 @@ public final class ConversationViewModel {
 
     private let orchestrator: ConversationOrchestrator
     private let metrics: InMemoryLatencyMetricsRecorder
+    // Role of the line currently being appended to, so streamed word-by-word
+    // deltas coalesce into a single line per turn instead of one line per word.
+    private var currentTranscriptRole: ConversationTurn.Role?
 
     public init(orchestrator: ConversationOrchestrator, metrics: InMemoryLatencyMetricsRecorder) {
         self.orchestrator = orchestrator
@@ -78,10 +81,11 @@ public final class ConversationViewModel {
 
     public func start() async {
         errorMessage = nil
+        currentTranscriptRole = nil
         await orchestrator.setTranscriptHandler { text, role in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.transcriptLines.append("\(role.rawValue): \(text)")
+                self.appendTranscript(text, role: role)
                 self.isAssistantSpeaking = role == .assistant
             }
         }
@@ -91,6 +95,15 @@ public final class ConversationViewModel {
             refreshLatency()
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    private func appendTranscript(_ text: String, role: ConversationTurn.Role) {
+        if currentTranscriptRole == role, let last = transcriptLines.last {
+            transcriptLines[transcriptLines.count - 1] = last + text
+        } else {
+            transcriptLines.append("\(role.rawValue): \(text)")
+            currentTranscriptRole = role
         }
     }
 

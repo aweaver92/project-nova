@@ -77,6 +77,57 @@ final class WakeWordTests: XCTestCase {
         XCTAssertEqual(d.detect("novafy this document"), .ignore)
     }
 
+    func testDetectAssumingAddressedSkipsWakeWord() {
+        let d = WakeWordDetector()
+        // No wake word, but treated as addressed (listening mode).
+        if case .converse(let command) = d.detectAssumingAddressed("what's the weather today") {
+            XCTAssertTrue(command.contains("weather"))
+        } else {
+            XCTFail("expected converse")
+        }
+        if case .vision = d.detectAssumingAddressed("what's this") {} else { XCTFail("expected vision") }
+        // Blank still ignored.
+        XCTAssertEqual(d.detectAssumingAddressed("   "), .ignore)
+    }
+
+    func testFollowUpWithinGraceWindowNeedsNoWakeWord() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start()
+        // First turn addresses Nova by name → engages the listening window.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, hello"))
+        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        // Follow-up without the wake word, within the default 10s window → answered.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
+        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 2 })
+        await orch.stop()
+    }
+
+    func testReplyReopensGraceWindow() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start()
+        // A completed reply keeps the window open, so a bare follow-up is answered.
+        await provider.emit(.responseEnded)
+        await provider.emit(.inputTranscriptionCompleted(transcript: "what time is it"))
+        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        await orch.stop()
+    }
+
+    func testGraceWindowDisabledRequiresWakeWordEveryTurn() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start(config: AISessionConfig(wakeWordGraceWindow: .zero))
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, hello"))
+        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        // With the window disabled, the next bare utterance is ignored.
+        await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
+        _ = await waitUntil { await provider.createResponseCount > 1 }
+        let count = await provider.createResponseCount
+        XCTAssertEqual(count, 1)
+        await orch.stop()
+    }
+
     func testOrchestratorIgnoresWithoutWakeWord() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)

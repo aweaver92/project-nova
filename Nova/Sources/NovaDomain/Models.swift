@@ -27,6 +27,11 @@ public struct AISessionConfig: Sendable, Equatable {
     public var wakeWord: String
     /// When true, Nova only replies to utterances that contain the wake word.
     public var requireWakeWord: Bool
+    /// Rolling "listening mode" window: once the wake word is spoken (or either
+    /// side has just spoken), follow-up utterances within this window are treated
+    /// as addressed to Nova without repeating the wake word. Set to `.zero` to
+    /// require the wake word on every turn.
+    public var wakeWordGraceWindow: Duration
     /// Phrases (after the wake word) that route to the vision path.
     public var visionTriggerPhrases: [String]
 
@@ -38,6 +43,7 @@ public struct AISessionConfig: Sendable, Equatable {
         hardTTL: Duration = .seconds(1800),
         wakeWord: String = "Nova",
         requireWakeWord: Bool = true,
+        wakeWordGraceWindow: Duration = .seconds(10),
         visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
     ) {
         self.instructions = instructions
@@ -47,6 +53,7 @@ public struct AISessionConfig: Sendable, Equatable {
         self.hardTTL = hardTTL
         self.wakeWord = wakeWord
         self.requireWakeWord = requireWakeWord
+        self.wakeWordGraceWindow = wakeWordGraceWindow
         self.visionTriggerPhrases = visionTriggerPhrases
     }
 }

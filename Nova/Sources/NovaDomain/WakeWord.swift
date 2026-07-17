@@ -51,6 +51,16 @@ public struct WakeWordDetector: Sendable {
         return classify(command: command, full: full)
     }
 
+    /// Classifies an utterance as though Nova is already being addressed, i.e.
+    /// without requiring the wake word. Used by the orchestrator's listening-mode
+    /// grace window so follow-up turns don't need "Nova" repeated. Returns
+    /// `.ignore` only for empty/blank input.
+    public func detectAssumingAddressed(_ transcript: String) -> WakeIntent {
+        let full = Self.normalize(transcript)
+        if full.isEmpty { return .ignore }
+        return classify(command: full, full: full)
+    }
+
     private func classify(command: String, full: String) -> WakeIntent {
         let haystack = command.isEmpty ? full : command
         if visionPhrases.contains(where: { haystack.contains($0) }) {

@@ -22,6 +22,9 @@ public actor ConversationOrchestrator {
     private var outputTranscript = ""
     private var sessionConfig = AISessionConfig()
     private var detector = WakeWordDetector()
+    // Timestamp of the last conversational engagement (wake word heard or a reply
+    // completed by either side). Drives the listening-mode grace window.
+    private var lastEngagement: ContinuousClock.Instant?
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
 
@@ -53,6 +56,7 @@ public actor ConversationOrchestrator {
         guard !isRunning else { return }
         isRunning = true
         sessionConfig = config
+        lastEngagement = nil
         detector = WakeWordDetector(wakeWord: config.wakeWord, visionPhrases: config.visionTriggerPhrases)
         try await ai.connect(config: config)
         try await ingress.start()
@@ -124,6 +128,9 @@ public actor ConversationOrchestrator {
             outputTranscript = ""
         case .responseEnded:
             assistantSpeaking = false
+            // A reply just completed — keep the listening window open so the user
+            // can follow up without repeating the wake word.
+            lastEngagement = .now
             if !outputTranscript.isEmpty {
                 await memory?.append(ConversationTurn(role: .assistant, text: outputTranscript))
             }
@@ -152,11 +159,34 @@ public actor ConversationOrchestrator {
     }
 
     /// Wake-word gate: with requireWakeWord on, the server transcribes but does
-    /// not auto-reply, so we decide here whether "Nova" was addressed and whether
+    /// not auto-reply, so we decide here whether Nova was addressed and whether
     /// to answer by voice or with a captured frame.
+    ///
+    /// Listening mode: if the wake word is absent but we're still inside the
+    /// grace window (the wake word was spoken, or either side replied, within
+    /// `wakeWordGraceWindow`), the utterance is treated as addressed to Nova.
     private func handleUserUtterance(_ transcript: String) async {
         guard sessionConfig.requireWakeWord else { return }
-        switch detector.detect(transcript) {
+
+        var intent = detector.detect(transcript)
+        if case .ignore = intent, isWithinGraceWindow() {
+            intent = detector.detectAssumingAddressed(transcript)
+        }
+        if case .ignore = intent { return }
+
+        // Addressed: (re)open the listening window and act on the intent.
+        lastEngagement = .now
+        await act(on: intent)
+    }
+
+    private func isWithinGraceWindow() -> Bool {
+        guard sessionConfig.wakeWordGraceWindow > .zero,
+              let last = lastEngagement else { return false }
+        return ContinuousClock.Instant.now - last <= sessionConfig.wakeWordGraceWindow
+    }
+
+    private func act(on intent: WakeIntent) async {
+        switch intent {
         case .ignore:
             return
         case .converse:
