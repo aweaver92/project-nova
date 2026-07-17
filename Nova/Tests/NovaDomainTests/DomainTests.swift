@@ -96,10 +96,12 @@ final class WakeWordTests: XCTestCase {
         try await orch.start()
         // First turn addresses Nova by name → engages the listening window.
         await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, hello"))
-        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        let engaged = await waitUntil { await provider.createResponseCount == 1 }
+        XCTAssertTrue(engaged)
         // Follow-up without the wake word, within the default 10s window → answered.
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
-        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 2 })
+        let followedUp = await waitUntil { await provider.createResponseCount == 2 }
+        XCTAssertTrue(followedUp)
         await orch.stop()
     }
 
@@ -110,7 +112,8 @@ final class WakeWordTests: XCTestCase {
         // A completed reply keeps the window open, so a bare follow-up is answered.
         await provider.emit(.responseEnded)
         await provider.emit(.inputTranscriptionCompleted(transcript: "what time is it"))
-        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        let answered = await waitUntil { await provider.createResponseCount == 1 }
+        XCTAssertTrue(answered)
         await orch.stop()
     }
 
@@ -119,7 +122,8 @@ final class WakeWordTests: XCTestCase {
         let orch = makeOrchestrator(provider: provider)
         try await orch.start(config: AISessionConfig(wakeWordGraceWindow: .zero))
         await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, hello"))
-        XCTAssertTrue(await waitUntil { await provider.createResponseCount == 1 })
+        let engaged = await waitUntil { await provider.createResponseCount == 1 }
+        XCTAssertTrue(engaged)
         // With the window disabled, the next bare utterance is ignored.
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
         _ = await waitUntil { await provider.createResponseCount > 1 }
