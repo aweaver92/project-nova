@@ -186,6 +186,9 @@ public protocol SettingsStoring: Sendable {
     /// Shared secret sent as a bearer token to the Nova Bridge.
     func bridgeToken() async -> String?
     func setBridgeToken(_ value: String?) async
+    /// Pinned Cursor agent session id shared by the Coding tab and `push_to_cursor`.
+    func codingSessionId() async -> String?
+    func setCodingSessionId(_ value: String?) async
 }
 
 public extension SettingsStoring {
@@ -194,6 +197,8 @@ public extension SettingsStoring {
     func setBridgeBaseURL(_ value: String?) async {}
     func bridgeToken() async -> String? { nil }
     func setBridgeToken(_ value: String?) async {}
+    func codingSessionId() async -> String? { nil }
+    func setCodingSessionId(_ value: String?) async {}
 }
 
 /// User-managed roster of agents plus the currently-active selection. There is
@@ -292,6 +297,52 @@ public struct BridgeResult: Sendable, Equatable {
     }
 }
 
+/// One normalized SSE event from `POST /cursor/runs` (Coding tab preview).
+public struct CodingStreamEvent: Sendable, Equatable, Codable {
+    public let type: String
+    public let text: String?
+    public let name: String?
+    public let summary: String?
+    public let path: String?
+    public let diff: String?
+    public let status: String?
+    public let error: String?
+    public let sessionId: String?
+    public let runId: String?
+    public let result: String?
+
+    public init(
+        type: String,
+        text: String? = nil,
+        name: String? = nil,
+        summary: String? = nil,
+        path: String? = nil,
+        diff: String? = nil,
+        status: String? = nil,
+        error: String? = nil,
+        sessionId: String? = nil,
+        runId: String? = nil,
+        result: String? = nil
+    ) {
+        self.type = type
+        self.text = text
+        self.name = name
+        self.summary = summary
+        self.path = path
+        self.diff = diff
+        self.status = status
+        self.error = error
+        self.sessionId = sessionId
+        self.runId = runId
+        self.result = result
+    }
+
+    /// Decode a single `data:` JSON payload from the bridge SSE stream.
+    public static func decodeSSEData(_ data: Data) -> CodingStreamEvent? {
+        try? JSONDecoder().decode(CodingStreamEvent.self, from: data)
+    }
+}
+
 /// Bridge to the user's dev machine: runs Claude Code and pushes commands to
 /// active Cursor sessions. Backed by a small "Nova Bridge" HTTP service the user
 /// runs locally; unconfigured instances return a clear, actionable message.
@@ -304,11 +355,35 @@ public protocol AgentBridging: Sendable {
     func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult
     func pushToCursor(command: String, sessionId: String?) async -> BridgeResult
     func listCursorSessions() async -> BridgeResult
+    /// Transcript history for a Cursor agent session (`GET /cursor/sessions/:id/messages`).
+    func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult
+    /// Streaming Cursor run (`POST /cursor/runs`). Invokes `onEvent` for each SSE payload.
+    func streamCursorRun(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult
+    func cancelCursorRun(runId: String) async -> BridgeResult
 }
 
 public extension AgentBridging {
     // Default keeps mocks/older conformers source-compatible.
     func health() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func streamCursorRun(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func cancelCursorRun(runId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
 }

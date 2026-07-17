@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:stream": "tsx src/cursor-stream.test.ts"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.23",

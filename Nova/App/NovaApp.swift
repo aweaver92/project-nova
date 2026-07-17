@@ -52,6 +52,7 @@ struct NovaApp: App {
                 knowledge: container.knowledgeVM,
                 visualMemory: container.visualMemoryVM,
                 agents: container.agentsVM,
+                coding: container.codingVM,
                 settings: container.settingsVM
             )
             #if canImport(MWDATCore)

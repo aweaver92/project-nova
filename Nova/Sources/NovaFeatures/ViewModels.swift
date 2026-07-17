@@ -565,6 +565,321 @@ public final class SettingsViewModel {
     }
 }
 
+/// A single row in the Coding-tab transcript (user prompt, assistant text, tool, etc.).
+public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
+    public enum Kind: String, Sendable, Equatable {
+        case user
+        case assistant
+        case thinking
+        case tool
+        case status
+        case error
+    }
+
+    public let id: UUID
+    public var kind: Kind
+    public var text: String
+    public var detail: String?
+    public var diff: String?
+    public var isExpanded: Bool
+
+    public init(
+        id: UUID = UUID(),
+        kind: Kind,
+        text: String,
+        detail: String? = nil,
+        diff: String? = nil,
+        isExpanded: Bool = false
+    ) {
+        self.id = id
+        self.kind = kind
+        self.text = text
+        self.detail = detail
+        self.diff = diff
+        self.isExpanded = isExpanded
+    }
+}
+
+public struct CodingSessionInfo: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let status: String?
+    public let summary: String?
+    public let lastModified: Double?
+
+    public init(id: String, title: String, status: String?, summary: String?, lastModified: Double?) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.summary = summary
+        self.lastModified = lastModified
+    }
+}
+
+@MainActor
+@Observable
+public final class CodingViewModel {
+    public private(set) var sessions: [CodingSessionInfo] = []
+    public private(set) var pinnedSessionId: String?
+    public private(set) var items: [CodingTranscriptItem] = []
+    public private(set) var runStatus: String = "idle"
+    public private(set) var activeRunId: String?
+    public private(set) var isRunning = false
+    public private(set) var isLoading = false
+    public private(set) var statusMessage: String = ""
+    public var draft: String = ""
+
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    private var streamingAssistantId: UUID?
+    private var streamingThinkingId: UUID?
+
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public var shortSessionId: String {
+        guard let id = pinnedSessionId, !id.isEmpty else { return "No session" }
+        if id.count <= 12 { return id }
+        return String(id.prefix(8)) + "…" + String(id.suffix(4))
+    }
+
+    public func load() async {
+        pinnedSessionId = await settings.codingSessionId()
+        await refreshSessions()
+        if let id = pinnedSessionId {
+            await loadMessages(sessionId: id)
+        }
+    }
+
+    public func refreshSessions() async {
+        isLoading = true
+        defer { isLoading = false }
+        let result = await bridge.listCursorSessions()
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = obj["sessions"] as? [[String: Any]]
+        else {
+            sessions = []
+            if !result.ok {
+                statusMessage = Self.summarize(result.payloadJSON)
+            }
+            return
+        }
+        sessions = list.compactMap { row in
+            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+            return CodingSessionInfo(
+                id: id,
+                title: (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id,
+                status: row["status"] as? String,
+                summary: row["summary"] as? String,
+                lastModified: row["lastModified"] as? Double
+            )
+        }
+        statusMessage = sessions.isEmpty ? "No Cursor sessions yet." : ""
+    }
+
+    public func attach(sessionId: String) async {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pinnedSessionId = trimmed
+        await settings.setCodingSessionId(trimmed)
+        await loadMessages(sessionId: trimmed)
+    }
+
+    public func startNewSession() async {
+        pinnedSessionId = nil
+        await settings.setCodingSessionId(nil)
+        items = []
+        activeRunId = nil
+        runStatus = "idle"
+        statusMessage = "New session — send a prompt to create one."
+    }
+
+    public func loadMessages(sessionId: String) async {
+        let result = await bridge.fetchCursorSessionMessages(sessionId: sessionId)
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = obj["messages"] as? [[String: Any]]
+        else {
+            if !result.ok {
+                statusMessage = Self.summarize(result.payloadJSON)
+            }
+            return
+        }
+        items = list.compactMap { row in
+            guard let role = row["role"] as? String,
+                  let text = row["text"] as? String,
+                  !text.isEmpty
+            else { return nil }
+            let kind: CodingTranscriptItem.Kind = role == "user" ? .user : .assistant
+            return CodingTranscriptItem(kind: kind, text: text)
+        }
+    }
+
+    public func send() async {
+        let command = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty, !isRunning else { return }
+        draft = ""
+        items.append(CodingTranscriptItem(kind: .user, text: command))
+        isRunning = true
+        runStatus = "running"
+        statusMessage = ""
+        activeRunId = nil
+        streamingAssistantId = nil
+        streamingThinkingId = nil
+
+        let result = await bridge.streamCursorRun(
+            command: command,
+            sessionId: pinnedSessionId,
+            workingDirectory: nil
+        ) { [weak self] event in
+            await self?.apply(event: event)
+        }
+
+        isRunning = false
+        streamingAssistantId = nil
+        streamingThinkingId = nil
+        if let sid = Self.string(result.payloadJSON, key: "sessionId"), !sid.isEmpty {
+            pinnedSessionId = sid
+            await settings.setCodingSessionId(sid)
+        }
+        if let rid = Self.string(result.payloadJSON, key: "runId"), !rid.isEmpty {
+            activeRunId = rid
+        }
+        if let status = Self.string(result.payloadJSON, key: "status") {
+            runStatus = status
+        } else if !result.ok {
+            runStatus = "error"
+            statusMessage = Self.summarize(result.payloadJSON)
+        } else {
+            runStatus = "idle"
+        }
+        await refreshSessions()
+    }
+
+    public func cancel() async {
+        guard let runId = activeRunId else { return }
+        _ = await bridge.cancelCursorRun(runId: runId)
+        runStatus = "cancelled"
+        isRunning = false
+    }
+
+    public func toggleExpand(_ item: CodingTranscriptItem) {
+        guard let idx = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[idx].isExpanded.toggle()
+    }
+
+    private func apply(event: CodingStreamEvent) {
+        switch event.type {
+        case "assistant_delta":
+            let text = event.text ?? ""
+            guard !text.isEmpty else { return }
+            if let id = streamingAssistantId,
+               let idx = items.firstIndex(where: { $0.id == id })
+            {
+                items[idx].text += text
+            } else {
+                let item = CodingTranscriptItem(kind: .assistant, text: text)
+                streamingAssistantId = item.id
+                streamingThinkingId = nil
+                items.append(item)
+            }
+        case "thinking_delta":
+            let text = event.text ?? ""
+            guard !text.isEmpty else { return }
+            if let id = streamingThinkingId,
+               let idx = items.firstIndex(where: { $0.id == id })
+            {
+                items[idx].text += text
+            } else {
+                let item = CodingTranscriptItem(kind: .thinking, text: text)
+                streamingThinkingId = item.id
+                items.append(item)
+            }
+        case "tool_start":
+            streamingAssistantId = nil
+            streamingThinkingId = nil
+            let name = event.name ?? "tool"
+            let label = event.path.map { "\(name) · \($0)" } ?? name
+            items.append(CodingTranscriptItem(
+                kind: .tool,
+                text: label,
+                detail: event.summary,
+                diff: nil
+            ))
+        case "tool_end":
+            streamingAssistantId = nil
+            streamingThinkingId = nil
+            let name = event.name ?? "tool"
+            let label = event.path.map { "\(name) · \($0)" } ?? name
+            if let last = items.indices.last,
+               items[last].kind == .tool,
+               items[last].text == label || items[last].text.hasPrefix(name)
+            {
+                items[last].detail = event.summary ?? items[last].detail
+                items[last].diff = event.diff
+            } else {
+                items.append(CodingTranscriptItem(
+                    kind: .tool,
+                    text: label,
+                    detail: event.summary,
+                    diff: event.diff
+                ))
+            }
+        case "status":
+            if let status = event.status {
+                runStatus = status.lowercased()
+            }
+            if let runId = event.runId, !runId.isEmpty {
+                activeRunId = runId
+            }
+            if let sid = event.sessionId, !sid.isEmpty {
+                pinnedSessionId = sid
+                Task { await settings.setCodingSessionId(sid) }
+            }
+        case "error":
+            items.append(CodingTranscriptItem(kind: .error, text: event.error ?? "Unknown error"))
+            runStatus = "error"
+        case "done":
+            if let sid = event.sessionId, !sid.isEmpty {
+                pinnedSessionId = sid
+                Task { await settings.setCodingSessionId(sid) }
+            }
+            if let runId = event.runId, !runId.isEmpty {
+                activeRunId = runId
+            }
+            runStatus = (event.status ?? "finished").lowercased()
+            streamingAssistantId = nil
+            streamingThinkingId = nil
+        default:
+            break
+        }
+    }
+
+    private static func string(_ payloadJSON: String, key: String) -> String? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let value = obj[key] as? String
+        else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func summarize(_ payloadJSON: String) -> String {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return payloadJSON
+        }
+        if let hint = obj["hint"] as? String { return hint }
+        if let error = obj["error"] as? String { return error }
+        return payloadJSON
+    }
+}
+
 @MainActor
 @Observable
 public final class AgentsViewModel {

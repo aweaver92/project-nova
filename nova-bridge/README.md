@@ -9,14 +9,44 @@ The iOS app ships the *client*; this is the *server* it talks to.
 
 ## Wire contract
 
-All JSON, `Authorization: Bearer <token>` on every request.
+All JSON unless noted, `Authorization: Bearer <token>` on every request.
 
 | Method | Path | Body | Purpose |
 |--------|------|------|---------|
 | `POST` | `/claude-code` | `{ "prompt": string, "cwd"?: string }` | Run Claude Code headlessly |
-| `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Send a prompt to a Cursor agent |
+| `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Blocking Cursor send (legacy; Coding tab prefers `/cursor/runs`) |
+| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string }` | **SSE** stream of a Cursor run (Coding tab) |
+| `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
+| `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
 | `GET`  | `/health` | — | Liveness (no auth) |
+
+### SSE events (`POST /cursor/runs`)
+
+Each event is one `data: {json}\n\n` line. Types:
+
+- `assistant_delta` — `{ "type", "text" }`
+- `thinking_delta` — `{ "type", "text" }`
+- `tool_start` / `tool_end` — `{ "type", "name", "summary"?, "path"?, "diff"? }`
+- `status` — `{ "type", "status" }`
+- `error` — `{ "type", "error" }`
+- `done` — `{ "type", "sessionId", "runId", "status", "result" }`
+
+Smoke-test a streaming run:
+
+```bash
+curl -N -X POST localhost:8787/cursor/runs \
+  -H "Authorization: Bearer $NOVA_BRIDGE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"say hello in one sentence"}'
+```
+
+Fetch history after you have a `sessionId` from `done`:
+
+```bash
+curl localhost:8787/cursor/sessions/$SESSION_ID/messages \
+  -H "Authorization: Bearer $NOVA_BRIDGE_TOKEN"
+```
 
 ## Prerequisites
 
@@ -89,8 +119,10 @@ In Nova → **Agents** tab → **Claude — Nova Bridge**:
 - **Bridge token:** the same `NOVA_BRIDGE_TOKEN` from your `.env`
 - Tap **Save bridge settings**
 
-Then say *"Nova, let me talk to Claude"* and give it a coding task, or ask Nova to
-run a Claude Code / Cursor command directly.
+Then open the **Coding** tab (visible while Claude is the active agent) to attach a
+Cursor session by id, type prompts, and watch the live SSE preview. Or say
+*"Nova, let me talk to Claude"* and give it a coding task — voice `push_to_cursor`
+uses the same pinned session id as the Coding tab.
 
 (Config precedence in the app: in-app Settings → `NOVA_BRIDGE_URL` / `NOVA_BRIDGE_TOKEN`
 env → `NovaBridgeBaseURL` / `NovaBridgeToken` in `Secrets.xcconfig`.)
@@ -103,5 +135,8 @@ env → `NovaBridgeBaseURL` / `NovaBridgeToken` in `Secrets.xcconfig`.)
 - **Security.** The bearer token is the only gate. Keep `NOVA_BRIDGE_TOKEN` secret and
   prefer Tailscale (private) over a public tunnel.
 - **`/cursor/*`** use the Cursor SDK's local runtime against `NOVA_BRIDGE_WORKDIR`.
-  `push_to_cursor` with a `sessionId` resumes that agent; without one it creates a new
-  local agent. `list_cursor_sessions` lists local agents.
+  `push_to_cursor` / `/cursor/command` with a `sessionId` resumes that agent; without one
+  it creates a new local agent. Prefer **`POST /cursor/runs`** (SSE) for the Coding tab
+  so the phone can preview progress without waiting for the full blocking response.
+  `list_cursor_sessions` lists local agents; `GET /cursor/sessions/:id/messages` loads
+  transcript history.

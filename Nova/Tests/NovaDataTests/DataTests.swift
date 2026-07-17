@@ -368,5 +368,87 @@ final class NovaBridgeClientTests: XCTestCase {
         let cursor = await bridge.pushToCursor(command: "open file", sessionId: nil)
         XCTAssertFalse(cursor.ok)
         XCTAssertTrue(cursor.payloadJSON.contains("bridge_not_configured"))
+
+        let stream = await bridge.streamCursorRun(
+            command: "hi",
+            sessionId: nil,
+            workingDirectory: nil,
+            onEvent: { _ in }
+        )
+        XCTAssertFalse(stream.ok)
+        XCTAssertTrue(stream.payloadJSON.contains("bridge_not_configured"))
+    }
+
+    func testCodingStreamEventDecodesSSEPayloads() {
+        let assistant = #"{"type":"assistant_delta","text":"Hello"}"#.data(using: .utf8)!
+        let a = CodingStreamEvent.decodeSSEData(assistant)
+        XCTAssertEqual(a?.type, "assistant_delta")
+        XCTAssertEqual(a?.text, "Hello")
+
+        let tool = #"{"type":"tool_end","name":"edit","path":"a.swift","diff":"@@ -1 +1 @@"}"#.data(using: .utf8)!
+        let t = CodingStreamEvent.decodeSSEData(tool)
+        XCTAssertEqual(t?.type, "tool_end")
+        XCTAssertEqual(t?.name, "edit")
+        XCTAssertEqual(t?.path, "a.swift")
+        XCTAssertEqual(t?.diff, "@@ -1 +1 @@")
+
+        let done = #"{"type":"done","sessionId":"abc","runId":"r1","status":"finished","result":"ok"}"#.data(using: .utf8)!
+        let d = CodingStreamEvent.decodeSSEData(done)
+        XCTAssertEqual(d?.sessionId, "abc")
+        XCTAssertEqual(d?.runId, "r1")
+        XCTAssertEqual(d?.status, "finished")
+    }
+}
+
+final class CodingSessionPinTests: XCTestCase {
+    func testCodingSessionIdRoundTrip() async {
+        let suite = "nova.tests.codingPin.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        XCTAssertNil(await store.codingSessionId())
+        await store.setCodingSessionId("  agent-123  ")
+        XCTAssertEqual(await store.codingSessionId(), "agent-123")
+        await store.setCodingSessionId("")
+        XCTAssertNil(await store.codingSessionId())
+    }
+
+    func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
+        let suite = "nova.tests.codingPinTool.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        await store.setCodingSessionId("pinned-1")
+
+        let bridge = PinCapturingBridge()
+        let tool = PushToCursorTool(bridge: bridge, settings: store)
+        let payload = try await tool.invoke(argumentsJSON: #"{"command":"fix"}"#)
+        XCTAssertTrue(payload.contains("returned-99"))
+        let used = await bridge.lastSessionId
+        XCTAssertEqual(used, "pinned-1")
+        XCTAssertEqual(await store.codingSessionId(), "returned-99")
+    }
+}
+
+/// Test double that records the session id passed to `pushToCursor` and returns a new one.
+private actor PinCapturingBridge: AgentBridging {
+    private(set) var lastSessionId: String?
+
+    func isConfigured() async -> Bool { true }
+    func health() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false}"#)
+    }
+    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+        lastSessionId = sessionId
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"sessionId":"returned-99","status":"finished","result":"done"}"#
+        )
+    }
+    func listCursorSessions() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"sessions":[]}"#)
     }
 }

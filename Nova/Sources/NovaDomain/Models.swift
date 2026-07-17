@@ -683,11 +683,11 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 2
+    static let seedCapabilitiesVersion = 3
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
-    enum SeedID {
+    public enum SeedID {
         public static let nova = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
         public static let claude = UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!
         public static let max = UUID(uuidString: "00000000-0000-0000-0000-0000000000A3")!
@@ -726,7 +726,7 @@ public extension Agent {
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Prefer run_claude_code for repo edits and investigation on their machine; use push_to_cursor / list_cursor_sessions to drive Cursor agents. Use start_meeting / end_meeting for spoken standups you later turn into notes or tickets. Use draft_message or create_reminder for follow-ups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
+                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Prefer run_claude_code for repo edits and investigation on their machine; use push_to_cursor / list_cursor_sessions to drive Cursor agents — when pushing to Cursor, omit session_id so the pinned Coding-tab session is used (the user can preview that session live). Use start_meeting / end_meeting for spoken standups you later turn into notes or tickets. Use draft_message or create_reminder for follow-ups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
                 toolNames: [
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
                     "web_search", "search_knowledge", "save_note", "list_notes",

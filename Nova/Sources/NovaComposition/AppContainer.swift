@@ -43,6 +43,7 @@ public final class AppContainer {
     public let knowledgeVM: KnowledgeViewModel
     public let visualMemoryVM: VisualMemoryViewModel
     public let agentsVM: AgentsViewModel
+    public let codingVM: CodingViewModel
     public let settingsVM: SettingsViewModel
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
@@ -258,7 +259,7 @@ public final class AppContainer {
             OpenURLTool(openURL: openURL),
             // Claude's programming tools (Claude Code + Cursor via the Nova Bridge).
             RunClaudeCodeTool(bridge: bridge),
-            PushToCursorTool(bridge: bridge),
+            PushToCursorTool(bridge: bridge, settings: settingsStore),
             ListCursorSessionsTool(bridge: bridge),
             // Max's workout + plan tools.
             StartWorkoutSessionTool(store: workoutStore),
@@ -369,6 +370,7 @@ public final class AppContainer {
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, bridge: bridge, orchestrator: orchestrator)
+        self.codingVM = CodingViewModel(bridge: bridge, settings: settingsStore)
         self.settingsVM = SettingsViewModel(store: settingsStore)
         // Starting a recording ensures the mic loop is live (no-op if already
         // running) so button-initiated captures record even when idle.

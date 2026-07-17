@@ -2,14 +2,23 @@ import express, { type Request, type Response, type NextFunction } from "express
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  formatSse,
+  normalizeHistoryMessage,
+  normalizeSdkMessage,
+  type CodingEvent,
+} from "./cursor-stream.js";
 
 /**
  * Nova Bridge — implements the wire contract the Nova iOS app's `NovaBridgeClient`
  * expects (all JSON, bearer-authenticated):
- *   POST /claude-code     { prompt, cwd? }
- *   POST /cursor/command  { command, sessionId? }
+ *   POST /claude-code              { prompt, cwd? }
+ *   POST /cursor/command           { command, sessionId? }  (blocking; prefer /cursor/runs)
+ *   POST /cursor/runs              { command, sessionId?, cwd? }  → SSE stream
+ *   POST /cursor/runs/:runId/cancel
  *   GET  /cursor/sessions
- *   GET  /health          (unauthenticated liveness check)
+ *   GET  /cursor/sessions/:id/messages
+ *   GET  /health                   (unauthenticated liveness check)
  */
 
 // --- Minimal .env loader (no dependency) -----------------------------------
@@ -129,6 +138,13 @@ function runClaude(
 }
 
 // --- Cursor (via @cursor/sdk) ----------------------------------------------
+
+/** In-flight runs keyed by runId for best-effort cancel. */
+const activeRuns = new Map<
+  string,
+  { cancel: () => Promise<void>; agentId: string }
+>();
+
 app.post("/cursor/command", requireAuth, async (req, res) => {
   const command = String(req.body?.command ?? "").trim();
   const sessionId = String(req.body?.sessionId ?? "").trim();
@@ -155,13 +171,131 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
       const result = await run.wait();
       res.json({
         ok: result.status === "finished",
-        sessionId: (agent as { agentId?: string }).agentId ?? sessionId,
+        sessionId: agent.agentId ?? sessionId,
         status: result.status,
         result: result.result ?? "",
       });
     } finally {
       await disposeAgent(agent);
     }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: describe(err) });
+  }
+});
+
+/** Streaming run for the Coding tab. Prefer this over /cursor/command. */
+app.post("/cursor/runs", requireAuth, async (req, res) => {
+  const command = String(req.body?.command ?? "").trim();
+  const sessionId = String(req.body?.sessionId ?? "").trim();
+  const cwd = String(req.body?.cwd ?? "").trim() || DEFAULT_CWD;
+  if (!command) {
+    res.status(400).json({ ok: false, error: "missing_command" });
+    return;
+  }
+  if (!CURSOR_API_KEY) {
+    res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const write = (event: CodingEvent): void => {
+    if (res.writableEnded) return;
+    res.write(formatSse(event));
+  };
+
+  let agent: Awaited<ReturnType<typeof import("@cursor/sdk").Agent.create>> | null =
+    null;
+  let runId = "";
+  let resolvedSessionId = sessionId;
+
+  try {
+    const { Agent } = await import("@cursor/sdk");
+    agent = sessionId
+      ? await Agent.resume(sessionId, { apiKey: CURSOR_API_KEY })
+      : await Agent.create({
+          apiKey: CURSOR_API_KEY,
+          model: { id: CURSOR_MODEL },
+          local: { cwd },
+        });
+    resolvedSessionId = agent.agentId;
+    write({ type: "status", status: "CREATING", sessionId: resolvedSessionId });
+
+    const run = await agent.send(command);
+    runId = run.id;
+    activeRuns.set(runId, {
+      agentId: resolvedSessionId,
+      cancel: () => run.cancel(),
+    });
+    write({
+      type: "status",
+      status: "RUNNING",
+      runId,
+      sessionId: resolvedSessionId,
+    });
+
+    for await (const msg of run.stream()) {
+      for (const event of normalizeSdkMessage(msg)) write(event);
+    }
+
+    const result = await run.wait();
+    write({
+      type: "done",
+      sessionId: resolvedSessionId,
+      runId,
+      status: result.status,
+      result: result.result ?? "",
+    });
+  } catch (err) {
+    write({ type: "error", error: describe(err) });
+    if (resolvedSessionId || runId) {
+      write({
+        type: "done",
+        sessionId: resolvedSessionId || sessionId,
+        runId: runId || "unknown",
+        status: "error",
+        result: "",
+      });
+    }
+  } finally {
+    if (runId) activeRuns.delete(runId);
+    if (agent) await disposeAgent(agent);
+    if (!res.writableEnded) res.end();
+  }
+});
+
+app.post("/cursor/runs/:runId/cancel", requireAuth, async (req, res) => {
+  const runId = String(req.params.runId ?? "").trim();
+  if (!runId) {
+    res.status(400).json({ ok: false, error: "missing_run_id" });
+    return;
+  }
+  const tracked = activeRuns.get(runId);
+  if (tracked) {
+    try {
+      await tracked.cancel();
+      res.json({ ok: true, runId, cancelled: true, source: "active" });
+      return;
+    } catch (err) {
+      res.status(500).json({ ok: false, error: describe(err) });
+      return;
+    }
+  }
+  if (!CURSOR_API_KEY) {
+    res.status(404).json({ ok: false, error: "run_not_found" });
+    return;
+  }
+  try {
+    const { Agent } = await import("@cursor/sdk");
+    await Agent.cancelRun(runId, {
+      runtime: "local",
+      cwd: DEFAULT_CWD,
+    });
+    res.json({ ok: true, runId, cancelled: true, source: "sdk" });
   } catch (err) {
     res.status(500).json({ ok: false, error: describe(err) });
   }
@@ -186,6 +320,32 @@ app.get("/cursor/sessions", requireAuth, async (_req, res) => {
       lastModified: a.lastModified,
     }));
     res.json({ ok: true, count: sessions.length, sessions });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: describe(err) });
+  }
+});
+
+app.get("/cursor/sessions/:id/messages", requireAuth, async (req, res) => {
+  const id = String(req.params.id ?? "").trim();
+  if (!id) {
+    res.status(400).json({ ok: false, error: "missing_session_id" });
+    return;
+  }
+  if (!CURSOR_API_KEY) {
+    res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
+    return;
+  }
+  try {
+    const { Agent } = await import("@cursor/sdk");
+    const raw = await Agent.messages.list(id, {
+      runtime: "local",
+      cwd: DEFAULT_CWD,
+      limit: Number(req.query.limit ?? 200) || 200,
+    });
+    const messages = raw
+      .map(normalizeHistoryMessage)
+      .filter((m): m is NonNullable<typeof m> => m !== null);
+    res.json({ ok: true, sessionId: id, count: messages.length, messages });
   } catch (err) {
     res.status(500).json({ ok: false, error: describe(err) });
   }

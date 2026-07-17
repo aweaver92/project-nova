@@ -23,20 +23,42 @@ public struct RunClaudeCodeTool: Tool {
 }
 
 /// Push a command into an active Cursor session on the user's dev machine.
+/// When `session_id` is omitted, uses the Coding-tab pinned session; after a
+/// successful send, pins the returned session id so the Coding tab can preview it.
 public struct PushToCursorTool: Tool {
     public let name = "push_to_cursor"
-    public let description = "Send a command or prompt to the user's active Cursor session (e.g. ask the Cursor agent to make a change, run a task, or open a file)."
+    public let description = "Send a command or prompt to the user's active Cursor session (e.g. ask the Cursor agent to make a change, run a task, or open a file). Prefer omitting session_id so the pinned Coding-tab session is used; pass session_id only to target a specific session from list_cursor_sessions."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"command":{"type":"string","description":"The command or prompt to send to Cursor."},"session_id":{"type":"string","description":"Optional id of a specific Cursor session (from list_cursor_sessions)."}},"required":["command"],"additionalProperties":false}
+    {"type":"object","properties":{"command":{"type":"string","description":"The command or prompt to send to Cursor."},"session_id":{"type":"string","description":"Optional id of a specific Cursor session (from list_cursor_sessions). Omit to use the pinned Coding-tab session."}},"required":["command"],"additionalProperties":false}
     """
     private let bridge: any AgentBridging
-    public init(bridge: any AgentBridging) { self.bridge = bridge }
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
 
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let command: String; let session_id: String? }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
-        return await bridge.pushToCursor(command: args.command, sessionId: args.session_id).payloadJSON
+        let explicit = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pinned = await settings.codingSessionId()
+        let sessionId = (explicit?.isEmpty == false) ? explicit : pinned
+        let result = await bridge.pushToCursor(command: args.command, sessionId: sessionId)
+        if let returned = Self.sessionId(from: result.payloadJSON), !returned.isEmpty {
+            await settings.setCodingSessionId(returned)
+        }
+        return result.payloadJSON
+    }
+
+    private static func sessionId(from payloadJSON: String) -> String? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["sessionId"] as? String
+        else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

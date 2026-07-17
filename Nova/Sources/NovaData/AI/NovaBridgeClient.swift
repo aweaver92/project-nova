@@ -31,16 +31,19 @@ public enum NovaBridgeConfig {
 /// machine that executes Claude Code and forwards commands to active Cursor
 /// sessions. Reads its config lazily so Settings changes take effect immediately.
 ///
-/// Wire contract (all JSON, bearer-authenticated):
+/// Wire contract (bearer-authenticated):
 /// - `POST {base}/claude-code` `{ "prompt": String, "cwd": String? }`
 /// - `POST {base}/cursor/command` `{ "command": String, "sessionId": String? }`
+/// - `POST {base}/cursor/runs` → SSE CodingStreamEvent payloads
 /// - `GET  {base}/cursor/sessions`
+/// - `GET  {base}/cursor/sessions/{id}/messages`
 ///
 /// Unconfigured instances never throw — they return an actionable message the
 /// model can speak, so Claude can still explain how to enable the bridge.
 public actor NovaBridgeClient: AgentBridging {
     private let configProvider: @Sendable () async -> (url: URL?, token: String?)
     private let session: URLSession
+    private static let streamTimeout: TimeInterval = 600
 
     public init(
         configProvider: @escaping @Sendable () async -> (url: URL?, token: String?),
@@ -55,7 +58,7 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func health() async -> BridgeResult {
-        await send(path: "health", method: "GET", body: nil)
+        await send(path: "health", method: "GET", body: nil, timeout: 15)
     }
 
     public func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
@@ -71,22 +74,140 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func listCursorSessions() async -> BridgeResult {
-        await send(path: "cursor/sessions", method: "GET", body: nil)
+        await send(path: "cursor/sessions", method: "GET", body: nil, timeout: 30)
+    }
+
+    public func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
+        let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
+        return await send(
+            path: "cursor/sessions/\(escaped)/messages",
+            method: "GET",
+            body: nil,
+            timeout: 60
+        )
+    }
+
+    public func streamCursorRun(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        let (base, token) = await configProvider()
+        guard let base else { return Self.notConfigured }
+
+        var body: [String: Any] = ["command": command]
+        if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
+        if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }
+
+        var request = URLRequest(url: Self.url(base: base, path: "cursor/runs"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = Self.streamTimeout
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                var data = Data()
+                for try await byte in bytes { data.append(byte) }
+                let payload = String(decoding: data, as: UTF8.self)
+                if payload.first == "{" {
+                    return BridgeResult(ok: false, payloadJSON: payload)
+                }
+                return BridgeResult(
+                    ok: false,
+                    payloadJSON: #"{"ok":false,"error":"http_\#(http.statusCode)"}"#
+                )
+            }
+
+            var buffer = ""
+            var lastSessionId = sessionId ?? ""
+            var lastRunId = ""
+            var lastStatus = "running"
+            var lastResult = ""
+            var sawDone = false
+
+            for try await line in bytes.lines {
+                if line.isEmpty {
+                    if let event = Self.parseSSEBuffer(buffer) {
+                        await onEvent(event)
+                        if event.type == "done" {
+                            sawDone = true
+                            lastSessionId = event.sessionId ?? lastSessionId
+                            lastRunId = event.runId ?? lastRunId
+                            lastStatus = event.status ?? lastStatus
+                            lastResult = event.result ?? lastResult
+                        }
+                    }
+                    buffer = ""
+                    continue
+                }
+                if line.hasPrefix(":") { continue } // SSE comment / keepalive
+                if line.hasPrefix("data:") {
+                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                    if !buffer.isEmpty { buffer += "\n" }
+                    buffer += payload
+                }
+            }
+            // Flush trailing buffer if the stream ended without a blank line.
+            if let event = Self.parseSSEBuffer(buffer) {
+                await onEvent(event)
+                if event.type == "done" {
+                    sawDone = true
+                    lastSessionId = event.sessionId ?? lastSessionId
+                    lastRunId = event.runId ?? lastRunId
+                    lastStatus = event.status ?? lastStatus
+                    lastResult = event.result ?? lastResult
+                }
+            }
+
+            let ok = sawDone && lastStatus == "finished"
+            let payload: [String: Any] = [
+                "ok": ok,
+                "sessionId": lastSessionId,
+                "runId": lastRunId,
+                "status": lastStatus,
+                "result": lastResult,
+            ]
+            let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            return BridgeResult(ok: ok, payloadJSON: String(decoding: data, as: UTF8.self))
+        } catch {
+            let escaped = Self.escape(String(describing: error))
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+        }
+    }
+
+    public func cancelCursorRun(runId: String) async -> BridgeResult {
+        let escaped = runId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runId
+        return await send(
+            path: "cursor/runs/\(escaped)/cancel",
+            method: "POST",
+            body: [:],
+            timeout: 30
+        )
     }
 
     // MARK: - Transport
 
     private func post(path: String, body: [String: Any]) async -> BridgeResult {
-        await send(path: path, method: "POST", body: body)
+        await send(path: path, method: "POST", body: body, timeout: 60)
     }
 
-    private func send(path: String, method: String, body: [String: Any]?) async -> BridgeResult {
+    private func send(
+        path: String,
+        method: String,
+        body: [String: Any]?,
+        timeout: TimeInterval
+    ) async -> BridgeResult {
         let (base, token) = await configProvider()
         guard let base else { return Self.notConfigured }
 
-        var request = URLRequest(url: base.appending(path: path))
+        var request = URLRequest(url: Self.url(base: base, path: path))
         request.httpMethod = method
-        request.timeoutInterval = 60
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body {
@@ -101,8 +222,6 @@ public actor NovaBridgeClient: AgentBridging {
             }
             let payload = String(decoding: data, as: UTF8.self)
             let ok = (200..<300).contains(http.statusCode)
-            // Pass the bridge's own JSON through when it looks like JSON; otherwise
-            // wrap it so the model always receives valid JSON.
             if payload.first == "{" || payload.first == "[" {
                 return BridgeResult(ok: ok, payloadJSON: payload)
             }
@@ -114,6 +233,19 @@ public actor NovaBridgeClient: AgentBridging {
         } catch {
             let escaped = Self.escape(String(describing: error))
             return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+        }
+    }
+
+    private static func parseSSEBuffer(_ buffer: String) -> CodingStreamEvent? {
+        let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
+        return CodingStreamEvent.decodeSSEData(data)
+    }
+
+    /// Join slash-separated path segments without percent-encoding the separators.
+    private static func url(base: URL, path: String) -> URL {
+        path.split(separator: "/").reduce(base) { partial, segment in
+            partial.appending(path: String(segment))
         }
     }
 

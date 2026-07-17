@@ -8,6 +8,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         static let spokenFollowUps = "nova.settings.spokenFollowUps"
         static let bridgeBaseURL = "nova.settings.bridgeBaseURL"
         static let bridgeToken = "nova.settings.bridgeToken"
+        static let codingSessionId = "nova.settings.codingSessionId"
     }
 
     public init(defaults: UserDefaults = .standard) {
@@ -36,6 +37,14 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
 
     public func setBridgeToken(_ value: String?) {
         defaults.set(normalized(value), forKey: Keys.bridgeToken)
+    }
+
+    public func codingSessionId() -> String? {
+        normalized(defaults.string(forKey: Keys.codingSessionId))
+    }
+
+    public func setCodingSessionId(_ value: String?) {
+        defaults.set(normalized(value), forKey: Keys.codingSessionId)
     }
 
     private func normalized(_ value: String?) -> String? {

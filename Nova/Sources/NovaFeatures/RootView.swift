@@ -1,6 +1,18 @@
 import SwiftUI
 import NovaDomain
 
+public enum RootTab: Hashable {
+    case assistant
+    case workspaces
+    case agents
+    case coding
+    case skills
+    case library
+    case recordings
+    case videos
+    case settings
+}
+
 public struct RootView: View {
     @Bindable var session: SessionViewModel
     @Bindable var conversation: ConversationViewModel
@@ -17,7 +29,9 @@ public struct RootView: View {
     @Bindable var knowledge: KnowledgeViewModel
     @Bindable var visualMemory: VisualMemoryViewModel
     @Bindable var agents: AgentsViewModel
+    @Bindable var coding: CodingViewModel
     @Bindable var settings: SettingsViewModel
+    @State private var selectedTab: RootTab = .assistant
 
     public init(
         session: SessionViewModel,
@@ -31,6 +45,7 @@ public struct RootView: View {
         knowledge: KnowledgeViewModel,
         visualMemory: VisualMemoryViewModel,
         agents: AgentsViewModel,
+        coding: CodingViewModel,
         settings: SettingsViewModel
     ) {
         self.session = session
@@ -44,34 +59,58 @@ public struct RootView: View {
         self.knowledge = knowledge
         self.visualMemory = visualMemory
         self.agents = agents
+        self.coding = coding
         self.settings = settings
     }
 
+    private var isClaudeActive: Bool {
+        agents.activeAgent?.id == Agent.SeedID.claude
+    }
+
     public var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             assistantTab
                 .tabItem { Label("Assistant", systemImage: "waveform") }
+                .tag(RootTab.assistant)
 
             WorkspacesView(workspaces: workspaces)
                 .tabItem { Label("Workspaces", systemImage: "square.stack.3d.up") }
+                .tag(RootTab.workspaces)
 
             AgentsView(agents: agents)
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
+                .tag(RootTab.agents)
+
+            if isClaudeActive {
+                CodingView(coding: coding)
+                    .tabItem { Label("Coding", systemImage: "chevron.left.forwardslash.chevron.right") }
+                    .tag(RootTab.coding)
+            }
 
             SkillsView(skills: skills)
                 .tabItem { Label("Skills", systemImage: "wand.and.stars") }
+                .tag(RootTab.skills)
 
             LibraryView(notes: notes, knowledge: knowledge, visual: visualMemory)
                 .tabItem { Label("Library", systemImage: "books.vertical") }
+                .tag(RootTab.library)
 
             RecordingsView(recording: recording)
                 .tabItem { Label("Recordings", systemImage: "waveform.circle") }
+                .tag(RootTab.recordings)
 
             VideoRecordingsView(video: video)
                 .tabItem { Label("Videos", systemImage: "video") }
+                .tag(RootTab.videos)
 
             SettingsView(settings: settings)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag(RootTab.settings)
+        }
+        .onChange(of: isClaudeActive) { _, claudeActive in
+            if !claudeActive, selectedTab == .coding {
+                selectedTab = .assistant
+            }
         }
     }
 
