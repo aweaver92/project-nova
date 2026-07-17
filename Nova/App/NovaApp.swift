@@ -7,10 +7,10 @@ import MWDATCore
 
 @main
 struct NovaApp: App {
-    /// Fake AI + silent mic + mock glasses for Simulator / first launch without
-    /// credentials or hardware. On a real iPhone 11 + glasses, flip all three to
-    /// `false` for Realtime + HFP audio + Meta AI registration and live camera.
-    private let container = AppContainer(useFakeAI: true, useSilentMic: true, useMockGlasses: true)
+    /// Device mode: real OpenAI Realtime + HFP glasses audio + Meta AI registration
+    /// and live camera. Requires a key in Config/Secrets.xcconfig and paired glasses.
+    /// For Simulator / no-hardware runs, set all three back to `true`.
+    private let container = AppContainer(useFakeAI: false, useSilentMic: false, useMockGlasses: false)
 
     init() {
         #if canImport(MWDATCore)
