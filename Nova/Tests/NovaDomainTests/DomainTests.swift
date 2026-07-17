@@ -129,19 +129,20 @@ final class WakeWordTests: XCTestCase {
     func testSpeechStartExtendsGraceWindowPastTranscriptionLatency() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
-        // Short window so the re-anchoring is observable deterministically.
-        try await orch.start(config: AISessionConfig(wakeWordGraceWindow: .milliseconds(600)))
+        // Window sized with generous margins so the re-anchoring is observable
+        // without flaking under CI scheduling jitter (Task.sleep can overshoot).
+        try await orch.start(config: AISessionConfig(wakeWordGraceWindow: .milliseconds(1200)))
         await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, hello"))
         let engaged = await waitUntil { await provider.createResponseCount == 1 }
         XCTAssertTrue(engaged)
 
         // Natural pause, then the user begins a new turn while still inside the
         // window: speech_started must re-anchor it.
-        try await Task.sleep(for: .milliseconds(400))
+        try await Task.sleep(for: .milliseconds(800))
         await provider.emit(.speechStarted)
-        // Whisper finishes AFTER the original window would have closed (400+400 >
-        // 600) but within the re-anchored one (400 <= 600).
-        try await Task.sleep(for: .milliseconds(400))
+        // Whisper finishes AFTER the original window would have closed (800+800 =
+        // 1600 > 1200) but well within the re-anchored one (800 <= 1200).
+        try await Task.sleep(for: .milliseconds(800))
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
         let followedUp = await waitUntil { await provider.createResponseCount == 2 }
         XCTAssertTrue(followedUp)
