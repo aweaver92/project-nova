@@ -66,12 +66,13 @@ final class SkillStoreTests: XCTestCase {
 
         let reloaded = FileSkillStore(url: url)
         let all = await reloaded.all()
-        XCTAssertEqual(all.count, 1)
-        XCTAssertEqual(all.first?.name, "Morning")
+        // Store may also contain built-in seeded skills; assert our upsert by id.
+        let match = all.first { $0.id == skill.id }
+        XCTAssertEqual(match?.name, "Morning")
 
         await reloaded.delete(id: skill.id)
         let after = await FileSkillStore(url: url).all()
-        XCTAssertTrue(after.isEmpty)
+        XCTAssertFalse(after.contains { $0.id == skill.id })
     }
 }
 

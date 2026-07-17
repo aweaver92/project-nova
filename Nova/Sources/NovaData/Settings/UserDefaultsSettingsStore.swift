@@ -28,7 +28,11 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func setBridgeBaseURL(_ value: String?) {
-        defaults.set(normalized(value), forKey: Keys.bridgeBaseURL)
+        if let value = normalized(value) {
+            defaults.set(value, forKey: Keys.bridgeBaseURL)
+        } else {
+            defaults.removeObject(forKey: Keys.bridgeBaseURL)
+        }
     }
 
     public func bridgeToken() -> String? {
@@ -36,7 +40,11 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func setBridgeToken(_ value: String?) {
-        defaults.set(normalized(value), forKey: Keys.bridgeToken)
+        if let value = normalized(value) {
+            defaults.set(value, forKey: Keys.bridgeToken)
+        } else {
+            defaults.removeObject(forKey: Keys.bridgeToken)
+        }
     }
 
     public func codingSessionId() -> String? {
@@ -44,7 +52,11 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func setCodingSessionId(_ value: String?) {
-        defaults.set(normalized(value), forKey: Keys.codingSessionId)
+        if let value = normalized(value) {
+            defaults.set(value, forKey: Keys.codingSessionId)
+        } else {
+            defaults.removeObject(forKey: Keys.codingSessionId)
+        }
     }
 
     private func normalized(_ value: String?) -> String? {
