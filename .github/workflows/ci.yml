@@ -1,7 +1,13 @@
 name: CI
 
+# Trigger design keeps expensive macOS minutes in check (private-repo macOS
+# bills at 10x). Previously `push:` + `pull_request:` both fired for a branch
+# with an open PR, paying for TWO macOS runs per push. Now `push` only runs on
+# `main` and tags, while everyday branch work is covered once via `pull_request`.
 on:
   push:
+    branches: [main]
+    tags: ["*"]
   pull_request:
   workflow_dispatch:
 

@@ -62,13 +62,27 @@ public struct AgentsView: View {
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
             SecureField("Bridge token", text: $agents.bridgeToken)
-            Button("Save bridge settings") {
+            Button {
                 Task { await agents.saveBridge() }
+            } label: {
+                HStack {
+                    Text("Save & test connection")
+                    if agents.bridgeChecking {
+                        Spacer()
+                        ProgressView()
+                    }
+                }
+            }
+            .disabled(agents.bridgeChecking)
+            if !agents.bridgeStatus.isEmpty {
+                Text(agents.bridgeStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         } header: {
             Text("Claude — Nova Bridge")
         } footer: {
-            Text("Claude runs Claude Code and pushes commands to your active Cursor sessions through a small bridge service you run on your dev machine. Set its URL and token here.")
+            Text("Claude runs Claude Code and pushes commands to your active Cursor sessions through a small bridge service you run on your dev machine. Enter the full URL including http:// or https:// (e.g. http://192.168.1.50:8787), plus the token from your bridge's .env.")
         }
     }
 }

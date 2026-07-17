@@ -54,6 +54,10 @@ public actor NovaBridgeClient: AgentBridging {
         await configProvider().url != nil
     }
 
+    public func health() async -> BridgeResult {
+        await send(path: "health", method: "GET", body: nil)
+    }
+
     public func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
         var body: [String: Any] = ["prompt": prompt]
         if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }

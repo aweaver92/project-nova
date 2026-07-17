@@ -1,0 +1,25 @@
+{
+  "name": "nova-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nova Bridge: a small local service that lets the Nova iOS app run Claude Code and drive Cursor agents on your dev machine.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.23",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
