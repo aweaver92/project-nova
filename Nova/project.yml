@@ -51,10 +51,16 @@ targets:
             CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
             CFBundleURLSchemes:
               - nova
+        # DAT requires all four keys present. In Developer Mode (MetaAppID "0")
+        # ClientToken/TeamID are not validated by Meta, but the SDK still expects
+        # them non-empty. Replace all three with real values from the Wearables
+        # Developer Center + your Apple Team ID for a signed/production build.
         MWDAT:
           AppLinkURLScheme: "nova://"
           # "0" enables Developer Mode registration; replace with your Meta App ID for release.
           MetaAppID: "0"
+          ClientToken: "developer-mode-placeholder"
+          TeamID: "developer-mode-placeholder"
         # Standard OpenAI key for the direct ephemeral-secret path. Empty unless
         # you provide Config/Secrets.xcconfig (git-ignored). See Config/Nova.xcconfig.
         OpenAIAPIKey: "$(OPENAI_API_KEY)"
