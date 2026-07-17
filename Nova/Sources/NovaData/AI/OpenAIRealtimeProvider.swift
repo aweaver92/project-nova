@@ -1,6 +1,9 @@
 import Foundation
 import NovaCore
 import NovaDomain
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// OpenAI Realtime WebSocket adapter. Maps wire events into `AIConversationEvent`.
 public actor OpenAIRealtimeProvider: ConversationalAIProvider {
@@ -178,7 +181,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
     public func analyze(image: CapturedFrame, prompt: String) async throws -> String {
         // Realtime image input varies by model revision; Phase 2 uses a REST fallback path via chat completions style payload over WS item create when available.
-        let b64 = image.imageData.base64EncodedString()
+        // Downscale/recompress before base64 so the WebSocket payload (and the
+        // model's decode time) stays small — this is the dominant, tunable slice
+        // of end-to-end vision latency. base64 also inflates bytes ~33%.
+        let t0 = Date()
+        let (data, mime) = Self.prepareForUpload(image)
+        let b64 = data.base64EncodedString()
+        let encodeMs = Int(Date().timeIntervalSince(t0) * 1000)
+        NovaLog.vision.info(
+            "vision upload prep: \(image.imageData.count, privacy: .public)B → \(data.count, privacy: .public)B in \(encodeMs, privacy: .public)ms"
+        )
         try await sendJSON([
             "type": "conversation.item.create",
             "item": [
@@ -188,7 +200,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     ["type": "input_text", "text": prompt],
                     [
                         "type": "input_image",
-                        "image_url": "data:\(image.mimeType);base64,\(b64)"
+                        "image_url": "data:\(mime);base64,\(b64)"
                     ]
                 ]
             ]
@@ -196,6 +208,31 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         ttfaMark = .now
         try await sendJSON(["type": "response.create"])
         return "(multimodal response streaming via events)"
+    }
+
+    /// Shrinks a captured still to a model-friendly size and re-encodes as JPEG.
+    /// Returns the original bytes unchanged when UIKit isn't available or the
+    /// image is already small enough. Longest side is capped so upload + model
+    /// decode stay fast without hurting recognition quality.
+    static func prepareForUpload(_ frame: CapturedFrame, maxDimension: CGFloat = 768, quality: CGFloat = 0.5) -> (Data, String) {
+        #if canImport(UIKit)
+        guard let image = UIImage(data: frame.imageData) else { return (frame.imageData, frame.mimeType) }
+        let longest = max(image.size.width, image.size.height)
+        let scale = longest > maxDimension ? maxDimension / longest : 1
+        let target = CGSize(width: (image.size.width * scale).rounded(), height: (image.size.height * scale).rounded())
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+        let rendered = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: target))
+        }
+        guard let jpeg = rendered.jpegData(compressionQuality: quality), jpeg.count < frame.imageData.count else {
+            return (frame.imageData, frame.mimeType)
+        }
+        return (jpeg, "image/jpeg")
+        #else
+        return (frame.imageData, frame.mimeType)
+        #endif
     }
 
     private func resolveCredential() async throws -> EphemeralCredential {

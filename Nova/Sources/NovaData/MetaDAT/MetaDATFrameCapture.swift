@@ -75,6 +75,28 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveCont = nil
     }
 
+    public func prewarm() async {
+        do {
+            try await ensureStreaming(fps: policy.liveLookFPS)
+        } catch {
+            NovaLog.vision.info("camera prewarm skipped: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    public func releaseCamera() async {
+        liveCont?.finish()
+        liveCont = nil
+        pendingPhoto?.resume(throwing: NovaError.vision("Camera released"))
+        pendingPhoto = nil
+        listenerTokens.removeAll()
+        // Dropping the strong references lets the SDK tear down the underlying
+        // session/stream so the glasses capture indicator turns off.
+        stream = nil
+        deviceSession = nil
+        isStreaming = false
+        NovaLog.vision.info("camera released")
+    }
+
     // MARK: - Session / stream lifecycle
 
     private func ensureStreaming(fps: Int) async throws {
@@ -224,6 +246,12 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveTask = nil
         liveCont?.finish()
         liveCont = nil
+    }
+
+    public func prewarm() async {}
+
+    public func releaseCamera() async {
+        await stopLiveLook()
     }
 }
 

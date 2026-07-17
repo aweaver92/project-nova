@@ -520,6 +520,10 @@ private actor MockFrameCapture: FrameCapture {
         AsyncStream { $0.finish() }
     }
     func stopLiveLook() async {}
+    private(set) var prewarmCount = 0
+    private(set) var releaseCount = 0
+    func prewarm() async { prewarmCount += 1 }
+    func releaseCamera() async { releaseCount += 1 }
 }
 
 private struct MockIngress: AudioIngress {

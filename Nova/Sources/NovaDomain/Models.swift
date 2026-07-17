@@ -196,6 +196,7 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         case delay          // seconds = pause before the next step runs
         case say            // text = phrase for Nova to speak
         case freeform       // text = natural-language instruction for the model
+        case capture        // grab a glasses still + OCR; text = optional label, feeds later steps
     }
 
     public let id: UUID
@@ -308,7 +309,7 @@ public struct Skill: Sendable, Identifiable, Codable, Equatable {
 /// facts, and past conversation.
 public struct KnowledgeHit: Sendable, Identifiable, Equatable {
     public enum Source: String, Sendable, Equatable {
-        case note, bookmark, fact, conversation
+        case note, bookmark, fact, conversation, visualMemory
     }
     public let id: UUID
     public let source: Source
@@ -439,6 +440,84 @@ public struct VoiceRecording: Sendable, Identifiable, Codable, Equatable {
 public enum VoiceRecordingState: Sendable, Equatable {
     case idle
     case recording(startedAt: Date)
+}
+
+/// Metadata for a video captured from the glasses camera and saved on device.
+///
+/// Like `VoiceRecording`, `fileName` is stored relative to the videos directory
+/// so it stays valid across relaunches even if the container path changes.
+public struct VideoRecording: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// File name (relative to the videos directory), e.g. `nova-video-…​.mp4`.
+    public let fileName: String
+    public let createdAt: Date
+    /// Length in seconds (wall-clock from start to stop).
+    public let duration: TimeInterval
+    public let width: Int
+    public let height: Int
+    /// Number of glasses frames written into the movie.
+    public let frameCount: Int
+    /// Size of the encoded movie file in bytes.
+    public let byteCount: Int
+
+    public init(
+        id: UUID = UUID(),
+        fileName: String,
+        createdAt: Date = Date(),
+        duration: TimeInterval,
+        width: Int,
+        height: Int,
+        frameCount: Int,
+        byteCount: Int
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.createdAt = createdAt
+        self.duration = duration
+        self.width = width
+        self.height = height
+        self.frameCount = frameCount
+        self.byteCount = byteCount
+    }
+}
+
+/// Lifecycle of the video recorder, published so the UI can reflect it live.
+public enum VideoRecordingState: Sendable, Equatable {
+    case idle
+    case recording(startedAt: Date)
+}
+
+/// A saved "sighting" in Nova's visual memory: a glasses still plus the text and
+/// caption read from it, so the user can later ask "what was that thing I saw?".
+///
+/// `fileName` is relative to the visual-memory directory so it stays valid across
+/// relaunches even if the container path changes.
+public struct VisualMemoryItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// Image file name (relative to the visual-memory directory), e.g. `nova-vismem-…​.jpg`.
+    public let fileName: String
+    public let createdAt: Date
+    /// Text read from the image via on-device OCR (may be empty).
+    public let text: String
+    /// Optional short label the user gave ("my parking spot", "the wine").
+    public let caption: String
+    public let workspaceId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        fileName: String,
+        createdAt: Date = Date(),
+        text: String,
+        caption: String = "",
+        workspaceId: UUID? = nil
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.createdAt = createdAt
+        self.text = text
+        self.caption = caption
+        self.workspaceId = workspaceId
+    }
 }
 
 /// A tool advertised to the model: name, description, and a JSON Schema for args.
@@ -638,7 +717,7 @@ public extension Agent {
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You explain trade-offs briefly, write clean code, and are careful and explicit about anything destructive. You can run Claude Code and push commands to the user's active Cursor sessions using your tools; confirm what you did in one short sentence. Keep spoken answers concise and offer to go deeper on request.",
+                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Use run_claude_code to make edits, run commands, and investigate the codebase, and push_to_cursor / list_cursor_sessions to drive their active Cursor sessions. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
                 toolNames: [
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
                     "web_search", "search_knowledge", "save_note", "list_notes",

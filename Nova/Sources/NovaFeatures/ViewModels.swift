@@ -345,6 +345,86 @@ public final class RecordingViewModel {
     }
 }
 
+@MainActor
+@Observable
+public final class VideoRecordingViewModel {
+    public private(set) var isRecording = false
+    public private(set) var recordings: [VideoRecording] = []
+    public private(set) var errorMessage: String?
+    /// Wall-clock start of the in-progress recording, for a live elapsed timer.
+    public private(set) var startedAt: Date?
+
+    private let recorder: any VideoRecorder
+    private let store: any VideoRecordingStoring
+    private var directoryURL: URL?
+    private var tasks: [Task<Void, Never>] = []
+
+    public init(recorder: any VideoRecorder, store: any VideoRecordingStoring) {
+        self.recorder = recorder
+        self.store = store
+        tasks.append(Task { await self.observeState() })
+    }
+
+    private func observeState() async {
+        for await state in recorder.state {
+            switch state {
+            case .idle:
+                isRecording = false
+                startedAt = nil
+                await load()
+            case .recording(let at):
+                isRecording = true
+                startedAt = at
+            }
+        }
+    }
+
+    public func load() async {
+        if directoryURL == nil {
+            directoryURL = await store.directory()
+        }
+        recordings = await store.all().sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func toggle() async {
+        if isRecording { await stop() } else { await start() }
+    }
+
+    public func start() async {
+        errorMessage = nil
+        do {
+            try await recorder.start()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func stop() async {
+        _ = await recorder.stop()
+    }
+
+    public func delete(_ recording: VideoRecording) async {
+        await store.delete(id: recording.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { recordings[$0].id }
+        for id in ids { await store.delete(id: id) }
+        await load()
+    }
+
+    public func clear() async {
+        await store.clear()
+        recordings = []
+    }
+
+    /// Absolute file URL for a recording, for playback / share / export.
+    public func fileURL(for recording: VideoRecording) -> URL? {
+        directoryURL?.appendingPathComponent(recording.fileName)
+    }
+}
+
 /// Thin bridge so Features does not import NovaData types directly for the hold API.
 public protocol MetaDATBandwidthBridge: Sendable {
     func holdVideoForAudio(_ hold: Bool) async
@@ -640,5 +720,40 @@ public final class KnowledgeViewModel {
         let ids = offsets.map { bookmarks[$0].id }
         for id in ids { await bookmarkStore.delete(id: id) }
         await load()
+    }
+}
+
+@MainActor
+@Observable
+public final class VisualMemoryViewModel {
+    public private(set) var items: [VisualMemoryItem] = []
+
+    private let store: any VisualMemoryStoring
+    private var directoryURL: URL?
+
+    public init(store: any VisualMemoryStoring) {
+        self.store = store
+    }
+
+    public func load() async {
+        if directoryURL == nil {
+            directoryURL = await store.directory()
+        }
+        items = await store.all().sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func delete(_ item: VisualMemoryItem) async {
+        await store.delete(id: item.id)
+        await load()
+    }
+
+    public func clear() async {
+        await store.clear()
+        items = []
+    }
+
+    /// Absolute file URL for a sighting's image, for thumbnail/full display.
+    public func imageURL(for item: VisualMemoryItem) -> URL? {
+        directoryURL?.appendingPathComponent(item.fileName)
     }
 }

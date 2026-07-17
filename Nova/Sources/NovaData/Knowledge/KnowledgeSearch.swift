@@ -11,6 +11,7 @@ public struct KnowledgeSearch: KnowledgeSearching {
     private let bookmarks: any BookmarkStoring
     private let facts: FileFactStore
     private let memory: any ConversationMemory
+    private let visual: (any VisualMemoryStoring)?
     private let useSemantic: Bool
 
     /// Above this cosine (mapped to [0,1]) an item is included even with no
@@ -23,12 +24,14 @@ public struct KnowledgeSearch: KnowledgeSearching {
         bookmarks: any BookmarkStoring,
         facts: FileFactStore,
         memory: any ConversationMemory,
+        visual: (any VisualMemoryStoring)? = nil,
         useSemantic: Bool = true
     ) {
         self.notes = notes
         self.bookmarks = bookmarks
         self.facts = facts
         self.memory = memory
+        self.visual = visual
         self.useSemantic = useSemantic
     }
 
@@ -62,6 +65,15 @@ public struct KnowledgeSearch: KnowledgeSearching {
             candidates.append(Candidate(
                 hit: KnowledgeHit(source: .conversation, title: turn.role.rawValue.capitalized, snippet: Self.snippet(turn.text, terms: terms), date: turn.at),
                 text: turn.text, weight: 1.0))
+        }
+        if let visual {
+            for item in await visual.all() {
+                let title = item.caption.isEmpty ? "Sighting" : item.caption
+                let body = (item.caption + " " + item.text).trimmingCharacters(in: .whitespaces)
+                candidates.append(Candidate(
+                    hit: KnowledgeHit(source: .visualMemory, title: title, snippet: Self.snippet(body, terms: terms), date: item.createdAt),
+                    text: body, weight: 1.0))
+            }
         }
 
         // Build the embedding scorer locally (not stored — it wraps a class).

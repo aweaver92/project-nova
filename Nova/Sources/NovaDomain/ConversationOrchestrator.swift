@@ -490,6 +490,11 @@ public actor ConversationOrchestrator {
 
         startIdleMonitorIfNeeded()
 
+        // NB: we deliberately do NOT pre-warm the glasses camera here. The camera
+        // is only opened on an explicit vision request or video recording so the
+        // hardware capture indicator stays off during normal voice conversations.
+        // (The LED is a Meta-enforced privacy indicator with no software toggle.)
+
         // Opportunistically compact older turns into the durable digest, off the
         // hot path so it never blocks the live conversation.
         if let memoryCompactor {
@@ -507,6 +512,11 @@ public actor ConversationOrchestrator {
         await ingress.stop()
         await egress.stop()
         await ai.disconnect()
+        // Release the glasses camera so its capture indicator turns off and it
+        // stops drawing battery once the conversation is over.
+        if let frameCapture {
+            await frameCapture.releaseCamera()
+        }
         assistantSpeaking = false
         streaming = false
     }
@@ -849,8 +859,13 @@ public actor ConversationOrchestrator {
             }
             do {
                 let frame = try await frameCapture.captureStill()
+                // Frame is captured; the camera isn't needed to send/analyze it, so
+                // release it immediately to keep the hardware capture indicator on
+                // for the shortest possible time.
+                await frameCapture.releaseCamera()
                 _ = try await askAboutFrame(frame, prompt: prompt)
             } catch {
+                await frameCapture.releaseCamera()
                 NovaLog.ai.error("vision trigger failed: \(String(describing: error), privacy: .public)")
                 await ai.createResponse()
             }

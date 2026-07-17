@@ -21,6 +21,9 @@ public final class AppContainer {
     public let notes: FileNoteStore
     public let recordings: FileRecordingStore
     public let voiceRecorder: StreamingVoiceRecorder
+    public let videoRecordings: FileVideoRecordingStore
+    public let videoRecorder: GlassesVideoRecorder
+    public let visualMemory: FileVisualMemoryStore
     public let workspaces: FileWorkspaceStore
     public let skillStore: FileSkillStore
     public let bookmarks: FileBookmarkStore
@@ -37,9 +40,11 @@ public final class AppContainer {
     public let visionVM: VisionViewModel
     public let notesVM: NotesViewModel
     public let recordingVM: RecordingViewModel
+    public let videoRecordingVM: VideoRecordingViewModel
     public let workspacesVM: WorkspacesViewModel
     public let skillsVM: SkillsViewModel
     public let knowledgeVM: KnowledgeViewModel
+    public let visualMemoryVM: VisualMemoryViewModel
     public let agentsVM: AgentsViewModel
     public let settingsVM: SettingsViewModel
 
@@ -100,6 +105,15 @@ public final class AppContainer {
         let recorder = StreamingVoiceRecorder(store: recordingStore)
         self.voiceRecorder = recorder
 
+        // Glasses camera capture is shared between the vision path and the video
+        // recorder. Created early so the video-recording tools can reference it.
+        let capture = MetaDATFrameCapture()
+        self.frameCapture = capture
+        let videoStore = FileVideoRecordingStore()
+        self.videoRecordings = videoStore
+        let videoRecorder = GlassesVideoRecorder(store: videoStore, capture: capture)
+        self.videoRecorder = videoRecorder
+
         // Phase 1: workspaces, skills, bookmarks, and personal-knowledge search.
         let workspaceStore = FileWorkspaceStore()
         self.workspaces = workspaceStore
@@ -107,11 +121,19 @@ public final class AppContainer {
         self.skillStore = skillStore
         let bookmarkStore = FileBookmarkStore()
         self.bookmarks = bookmarkStore
+
+        // Visual memory ("life log"): on-device OCR of glasses stills, saved and
+        // folded into personal-knowledge search.
+        let ocr = VisionTextRecognizer()
+        let visualStore = FileVisualMemoryStore()
+        self.visualMemory = visualStore
+
         let knowledgeSearch = KnowledgeSearch(
             notes: noteStore,
             bookmarks: bookmarkStore,
             facts: factStore,
-            memory: memory
+            memory: memory,
+            visual: visualStore
         )
 
         // Phase 2: long-term memory digest + compaction, settings, scheduling.
@@ -175,12 +197,27 @@ public final class AppContainer {
                   let http = response as? HTTPURLResponse else { return false }
             return (200..<300).contains(http.statusCode)
         }
+        // Capture step: grab a glasses still, OCR it on-device, log it to visual
+        // memory, and return the text for the skill to act on. Releases the camera
+        // immediately so the capture indicator is lit for the shortest time.
+        let captureStep: SkillRunner.Capturer = { label in
+            guard let frame = try? await capture.captureStill() else { return nil }
+            await capture.releaseCamera()
+            let text = await ocr.recognizeText(in: frame.imageData)
+            await visualStore.save(imageData: frame.imageData, text: text, caption: label, workspaceId: await workspaceStore.active()?.id)
+            return text
+        }
         let skillRunner = SkillRunner(
             notes: noteStore,
             openURL: openURL,
             startTimer: startTimer,
-            callWebhook: callWebhook
+            callWebhook: callWebhook,
+            capture: captureStep
         )
+
+        // Meeting capture: transcription (Whisper) + summary/action-item extraction.
+        let transcriber = OpenAITranscriber()
+        let meetingSummarizer = MeetingSummarizer()
 
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
@@ -199,7 +236,24 @@ public final class AppContainer {
             StartVoiceRecordingTool(recorder: recorder),
             StopVoiceRecordingTool(recorder: recorder),
             ListRecordingsTool(store: recordingStore),
+            StartVideoRecordingTool(recorder: videoRecorder),
+            StopVideoRecordingTool(recorder: videoRecorder),
+            ListVideoRecordingsTool(store: videoStore),
             BriefingTool(),
+            RememberVisualTool(
+                frameCapture: capture,
+                ocr: ocr,
+                store: visualStore,
+                workspaceId: { await workspaceStore.active()?.id }
+            ),
+            StartMeetingTool(recorder: recorder),
+            EndMeetingTool(
+                recorder: recorder,
+                store: recordingStore,
+                transcriber: transcriber,
+                summarizer: meetingSummarizer,
+                notes: noteStore
+            ),
             RunSkillTool(skills: { await skillStore.all() }, runner: skillRunner),
             SearchKnowledgeTool(search: knowledgeSearch),
             BookmarkConversationTool(store: bookmarkStore, workspaceId: { await workspaceStore.active()?.id }),
@@ -241,8 +295,6 @@ public final class AppContainer {
 
         let session = MetaDATWearableSession(useMock: useMockGlasses)
         self.wearableSession = session
-        let capture = MetaDATFrameCapture()
-        self.frameCapture = capture
 
         let orchestrator = ConversationOrchestrator(
             ai: ai,
@@ -284,6 +336,7 @@ public final class AppContainer {
         self.workspacesVM = WorkspacesViewModel(store: workspaceStore)
         self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
+        self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, bridge: bridge, orchestrator: orchestrator)
         self.settingsVM = SettingsViewModel(store: settingsStore)
         // Starting a recording ensures the mic loop is live (no-op if already
@@ -293,6 +346,7 @@ public final class AppContainer {
             store: recordingStore,
             ensureAudioActive: { try? await orchestrator.start() }
         )
+        self.videoRecordingVM = VideoRecordingViewModel(recorder: videoRecorder, store: videoStore)
 
         let bandwidth = FrameCaptureBandwidthBridge(capture: capture)
         self.visionVM = VisionViewModel(

@@ -15,6 +15,10 @@ public struct SkillRunner: SkillRunning {
     public typealias WebhookCaller = @Sendable (_ request: URLRequest) async -> Bool
     /// Pauses execution for `.delay` steps (injectable so tests don't really wait).
     public typealias Sleeper = @Sendable (_ seconds: TimeInterval) async -> Void
+    /// Captures a glasses still and returns any text read from it (via OCR) for
+    /// `.capture` steps. `label` is the step's optional caption. Injectable so the
+    /// data layer owns the camera + OCR while the runner stays testable.
+    public typealias Capturer = @Sendable (_ label: String) async -> String?
 
     /// Upper bound on a single `.delay` step so a runaway skill can't hang.
     public static let maxDelaySeconds = 300
@@ -26,6 +30,7 @@ public struct SkillRunner: SkillRunning {
     private let startTimer: TimerStarter?
     private let callWebhook: WebhookCaller?
     private let sleep: Sleeper
+    private let capture: Capturer?
 
     public init(
         notes: any NoteStoring,
@@ -33,6 +38,7 @@ public struct SkillRunner: SkillRunning {
         startTimer: TimerStarter? = nil,
         callWebhook: WebhookCaller? = nil,
         sleep: Sleeper? = nil,
+        capture: Capturer? = nil,
         reminderTool: CreateReminderTool = CreateReminderTool(),
         calendarTool: CreateCalendarEventTool = CreateCalendarEventTool()
     ) {
@@ -43,6 +49,7 @@ public struct SkillRunner: SkillRunning {
         self.sleep = sleep ?? { seconds in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         }
+        self.capture = capture
         self.reminderTool = reminderTool
         self.calendarTool = calendarTool
     }
@@ -69,6 +76,8 @@ public struct SkillRunner: SkillRunning {
                 if !step.text.isEmpty { result.sayLines.append(step.text) }
             case .freeform:
                 if !step.text.isEmpty { result.freeform.append(step.text) }
+            case .capture:
+                await runCapture(step, into: &result)
             }
         }
         return result
@@ -150,5 +159,19 @@ public struct SkillRunner: SkillRunning {
         let capped = min(seconds, Self.maxDelaySeconds)
         await sleep(TimeInterval(capped))
         result.summaryLines.append("waited \(capped) second\(capped == 1 ? "" : "s")")
+    }
+
+    private func runCapture(_ step: SkillStep, into result: inout SkillRunResult) async {
+        guard let capture else { return }
+        let text = await capture(step.text)
+        if let text, !text.isEmpty {
+            result.summaryLines.append("captured what you're looking at")
+            // Hand the OCR'd text to the model so subsequent freeform steps (or
+            // the reply) can act on it (e.g. log a receipt, summarize a document).
+            let label = step.text.isEmpty ? "" : " (\(step.text))"
+            result.freeform.append("Text captured from the glasses camera\(label):\n\(text)")
+        } else {
+            result.summaryLines.append("captured an image but found no readable text")
+        }
     }
 }

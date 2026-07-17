@@ -287,6 +287,7 @@ struct SkillEditorView: View {
         case .delay: return "Wait / delay"
         case .say: return "Speak text"
         case .freeform: return "Ask the AI (freeform)"
+        case .capture: return "Capture + read (camera)"
         }
     }
 }
@@ -333,6 +334,8 @@ private struct SkillStepEditor: View {
                 TextField("What Nova should say", text: $step.text, axis: .vertical)
             case .freeform:
                 TextField("Instruction for the AI", text: $step.text, axis: .vertical)
+            case .capture:
+                TextField("Label (optional, e.g. 'receipt')", text: $step.text)
             }
         }
         .padding(.vertical, 2)

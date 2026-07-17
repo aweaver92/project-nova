@@ -46,9 +46,11 @@ struct NovaApp: App {
                 vision: container.visionVM,
                 notes: container.notesVM,
                 recording: container.recordingVM,
+                video: container.videoRecordingVM,
                 workspaces: container.workspacesVM,
                 skills: container.skillsVM,
                 knowledge: container.knowledgeVM,
+                visualMemory: container.visualMemoryVM,
                 agents: container.agentsVM,
                 settings: container.settingsVM
             )

@@ -62,6 +62,13 @@ public protocol FrameCapture: Sendable {
     func captureStill() async throws -> CapturedFrame
     func startLiveLook(fps: Int) async throws -> AsyncStream<CapturedFrame>
     func stopLiveLook() async
+    /// Best-effort: open the glasses camera stream ahead of time so the first
+    /// `captureStill` doesn't pay the full cold-start (permission + session +
+    /// stream negotiation) latency. Safe to call repeatedly; a no-op if warm.
+    func prewarm() async
+    /// Fully release the camera session/stream so the capture indicator turns off
+    /// and battery isn't drained once vision is no longer needed.
+    func releaseCamera() async
 }
 
 public protocol TokenService: Sendable {
@@ -309,4 +316,51 @@ public protocol RecordingStoring: Sendable {
     func all() async -> [VoiceRecording]
     func delete(id: UUID) async
     func clear() async
+}
+
+/// Records video from the glasses camera to a movie file on the device. Unlike
+/// `VoiceRecorder` (which is fed PCM), the video recorder pulls frames directly
+/// from a `FrameCapture` live-look, so it owns its own frame source.
+public protocol VideoRecorder: Sendable {
+    /// Emits the recorder's state on each transition; the first value is current.
+    var state: AsyncStream<VideoRecordingState> { get }
+    func isRecording() async -> Bool
+    /// Begin a new recording. A no-op if one is already in progress.
+    func start() async throws
+    /// Finalize and persist the current recording. Returns the saved recording,
+    /// or `nil` if nothing was captured (or we were idle).
+    @discardableResult
+    func stop() async -> VideoRecording?
+}
+
+/// Durable storage + listing for saved glasses video recordings.
+public protocol VideoRecordingStoring: Sendable {
+    func directory() async -> URL
+    @discardableResult
+    func register(_ recording: VideoRecording) async -> VideoRecording
+    func all() async -> [VideoRecording]
+    func delete(id: UUID) async
+    func clear() async
+}
+
+/// On-device optical character recognition. Returns the text read from an image
+/// (empty string when nothing is found or OCR is unavailable).
+public protocol TextRecognizing: Sendable {
+    func recognizeText(in imageData: Data) async -> String
+}
+
+/// Durable storage for the visual memory ("life log"): glasses stills plus the
+/// text/caption read from them, so they can be searched later.
+public protocol VisualMemoryStoring: Sendable {
+    func directory() async -> URL
+    @discardableResult
+    func save(imageData: Data, text: String, caption: String, workspaceId: UUID?) async -> VisualMemoryItem
+    func all() async -> [VisualMemoryItem]
+    func delete(id: UUID) async
+    func clear() async
+}
+
+/// Transcribes a recorded audio file to text (e.g. OpenAI Whisper).
+public protocol AudioTranscribing: Sendable {
+    func transcribe(fileURL: URL) async throws -> String
 }

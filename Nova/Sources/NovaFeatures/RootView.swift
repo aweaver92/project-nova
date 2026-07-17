@@ -11,9 +11,11 @@ public struct RootView: View {
     @Bindable var vision: VisionViewModel
     @Bindable var notes: NotesViewModel
     @Bindable var recording: RecordingViewModel
+    @Bindable var video: VideoRecordingViewModel
     @Bindable var workspaces: WorkspacesViewModel
     @Bindable var skills: SkillsViewModel
     @Bindable var knowledge: KnowledgeViewModel
+    @Bindable var visualMemory: VisualMemoryViewModel
     @Bindable var agents: AgentsViewModel
     @Bindable var settings: SettingsViewModel
 
@@ -23,9 +25,11 @@ public struct RootView: View {
         vision: VisionViewModel,
         notes: NotesViewModel,
         recording: RecordingViewModel,
+        video: VideoRecordingViewModel,
         workspaces: WorkspacesViewModel,
         skills: SkillsViewModel,
         knowledge: KnowledgeViewModel,
+        visualMemory: VisualMemoryViewModel,
         agents: AgentsViewModel,
         settings: SettingsViewModel
     ) {
@@ -34,9 +38,11 @@ public struct RootView: View {
         self.vision = vision
         self.notes = notes
         self.recording = recording
+        self.video = video
         self.workspaces = workspaces
         self.skills = skills
         self.knowledge = knowledge
+        self.visualMemory = visualMemory
         self.agents = agents
         self.settings = settings
     }
@@ -55,11 +61,14 @@ public struct RootView: View {
             SkillsView(skills: skills)
                 .tabItem { Label("Skills", systemImage: "wand.and.stars") }
 
-            LibraryView(notes: notes, knowledge: knowledge)
+            LibraryView(notes: notes, knowledge: knowledge, visual: visualMemory)
                 .tabItem { Label("Library", systemImage: "books.vertical") }
 
             RecordingsView(recording: recording)
                 .tabItem { Label("Recordings", systemImage: "waveform.circle") }
+
+            VideoRecordingsView(video: video)
+                .tabItem { Label("Videos", systemImage: "video") }
 
             SettingsView(settings: settings)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
