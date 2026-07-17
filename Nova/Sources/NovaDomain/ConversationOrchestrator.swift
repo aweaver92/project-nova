@@ -572,8 +572,11 @@ public actor ConversationOrchestrator {
             onTranscript?(delta, .assistant)
         case .outputAudio(let pcm24):
             let t0 = ContinuousClock.Instant.now
-            let pcm8 = await resampler.resample(pcm24, from: 24_000, to: 8_000)
-            await egress.enqueue(AudioChunk(pcm: pcm8, sampleRate: 8_000))
+            // Play the assistant voice at its native 24 kHz. Downsampling to 8 kHz
+            // here needlessly crushed it to narrowband before the (already
+            // band-limited) Bluetooth link; let the audio engine/route do any
+            // final conversion so wideband HFP can be used when negotiated.
+            await egress.enqueue(AudioChunk(pcm: pcm24, sampleRate: 24_000))
             metrics.mark(.audioToSpeaker, startedAt: t0)
         case .responseStarted:
             assistantSpeaking = true

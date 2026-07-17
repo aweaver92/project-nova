@@ -21,7 +21,11 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
             } else {
                 NovaLog.audio.warning("No bluetoothHFP input yet; continuing with current route")
             }
-            try session.setPreferredSampleRate(8_000)
+            // Prefer wideband HFP (mSBC, 16 kHz) over narrowband (CVSD, 8 kHz).
+            // Modern Bluetooth headsets — including the Meta glasses — negotiate
+            // wideband when asked, which is audibly clearer for the Nova voice.
+            // The system falls back to 8 kHz if wideband isn't available.
+            try session.setPreferredSampleRate(16_000)
             // Match the ~20 ms conversational cadence: small enough to keep latency
             // low, large enough to avoid render underruns / choppy playback.
             try? session.setPreferredIOBufferDuration(0.02)

@@ -187,6 +187,12 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     private let lock = NSLock()
     private var started = false
 
+    /// Digital make-up gain applied to the assistant voice before playback. The
+    /// HFP call-audio path is quieter than A2DP media, so we lift the level to be
+    /// closer to Meta AI. Values above ~2.5 risk audible clipping on loud
+    /// syllables; each sample is hard-limited to the Int16 range regardless.
+    private static let outputGain: Float = 2.2
+
     public init() {}
 
     public func enqueue(_ chunk: AudioChunk) async {
@@ -199,9 +205,22 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
         ) else { return }
 
         let frameCount = AVAudioFrameCount(chunk.pcm.count / 2)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
         buffer.frameLength = frameCount
-        chunk.pcm.copyBytes(to: UnsafeMutableBufferPointer(start: buffer.int16ChannelData![0], count: Int(frameCount)))
+
+        // Apply make-up gain with hard limiting into the destination buffer.
+        let gain = Self.outputGain
+        let lo = Float(Int16.min), hi = Float(Int16.max)
+        let dst = buffer.int16ChannelData![0]
+        chunk.pcm.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Int16.self)
+            for i in 0..<Int(frameCount) {
+                let amplified = (Float(src[i]) * gain).rounded()
+                dst[i] = Int16(min(hi, max(lo, amplified)))
+            }
+        }
+
         player.scheduleBuffer(buffer, completionHandler: nil)
         if !player.isPlaying { player.play() }
     }
