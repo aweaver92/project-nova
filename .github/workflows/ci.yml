@@ -103,8 +103,14 @@ jobs:
 
   ios-ipa:
     name: Nova iOS (unsigned .ipa)
-    # AltStore installable build. Manual dispatch or a version tag only.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    # AltStore installable build. Runs on every push to main (the repo is public,
+    # so macOS minutes are free) plus manual dispatch and version tags. No OpenAI
+    # key is baked in anymore — the app mints Realtime secrets from the Nova
+    # Bridge at runtime, so the artifact carries no secrets.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: macos-latest
     defaults:
       run:
@@ -116,29 +122,30 @@ jobs:
           xcode-version: latest-stable
       - name: Resolve package dependencies
         run: xcodebuild -resolvePackageDependencies
+
+      # Gate the IPA on a green test suite so auto-builds from push never ship a
+      # broken app.
+      - name: Pick an available iPhone simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')
+          echo "Using simulator UDID: $UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: Build + test (iOS Simulator)
+        run: |
+          xcodebuild test \
+            -scheme Nova-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate app project
         run: xcodegen generate
 
-      # Bake the OpenAI key in from the OPENAI_API_KEY Actions secret (never
-      # committed). NOTE: this embeds the key in plaintext in the .ipa's
-      # Info.plist — anyone who can download the artifact can read it. Keep the
-      # repo private (or drop the key + rotate) and rotate if it leaks.
-      - name: Inject OpenAI key (private build)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          if [ -n "$OPENAI_API_KEY" ]; then
-            printf 'OPENAI_API_KEY = %s\n' "$OPENAI_API_KEY" > Config/Secrets.xcconfig
-            echo "Wrote Config/Secrets.xcconfig from the OPENAI_API_KEY secret."
-          else
-            echo "::warning::No OPENAI_API_KEY secret set — the .ipa will build without an embedded key and Realtime will fail at runtime. Add it under Settings → Secrets and variables → Actions."
-          fi
-
-      # Single compile: build the real device app unsigned; AltStore re-signs at
-      # install time. This replaces the old sim-build + test + sim-app + device
-      # sequence (~4 compiles) with one.
+      # Build the real device app unsigned; AltStore re-signs at install time.
       - name: Build unsigned device app (arm64)
         run: |
           xcodebuild build \

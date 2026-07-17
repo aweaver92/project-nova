@@ -53,13 +53,28 @@ public final class AppContainer {
         let metrics = InMemoryLatencyMetricsRecorder()
         self.metrics = metrics
 
+        // Settings + bridge config are built early because the Realtime token
+        // service mints ephemeral secrets through the Nova Bridge, reusing the
+        // exact same config source as NovaBridgeClient (in-app Settings → env →
+        // Info.plist).
+        let settingsStore = UserDefaultsSettingsStore()
+        let bridgeConfig: @Sendable () async -> (url: URL?, token: String?) = {
+            if let urlString = await settingsStore.bridgeBaseURL(),
+               let url = URL(string: urlString) {
+                return (url, await settingsStore.bridgeToken())
+            }
+            return NovaBridgeConfig.fallback()
+        }
+
         let tokenStore = KeychainTokenStore()
-        // Real credential path: if a standard OpenAI key is available (env or
-        // Info.plist), mint short-lived ephemeral secrets directly from OpenAI.
-        // Otherwise fall back to the stub (NOVA_OPENAI_STUB_TOKEN).
+        // Realtime credential path priority:
+        // 1. A standard OpenAI key in env/Info.plist (Simulator / dev) → mint
+        //    ephemeral secrets directly from OpenAI.
+        // 2. Otherwise mint them through the Nova Bridge's `/realtime/token`, so
+        //    the shipped .ipa carries no OpenAI key at all.
         let tokenService: any TokenService = OpenAICredentials.apiKey()
             .map { DirectOpenAITokenService(apiKey: $0) }
-            ?? StubTokenService()
+            ?? BridgeTokenService(configProvider: bridgeConfig)
         let resampler = PCMResampler()
         let coordinator = AudioSessionCoordinator()
 
@@ -142,7 +157,6 @@ public final class AppContainer {
             digestStore: digestStore,
             summarizer: OpenAIMemorySummarizer()
         )
-        let settingsStore = UserDefaultsSettingsStore()
         self.settings = settingsStore
         let scheduler = SkillScheduler()
         self.skillScheduler = scheduler
@@ -158,13 +172,7 @@ public final class AppContainer {
         let wellnessStore = FileWellnessStore()
         let studyStore = FileStudyDeckStore()
         let timerService = LocalTimerService()
-        let bridge = NovaBridgeClient(configProvider: {
-            if let urlString = await settingsStore.bridgeBaseURL(),
-               let url = URL(string: urlString) {
-                return (url, await settingsStore.bridgeToken())
-            }
-            return NovaBridgeConfig.fallback()
-        })
+        let bridge = NovaBridgeClient(configProvider: bridgeConfig)
         self.bridge = bridge
 
         // App-layer callbacks skills/drafting need (opening links, local timers).

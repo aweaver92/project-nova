@@ -429,6 +429,38 @@ final class CodingSessionPinTests: XCTestCase {
     }
 }
 
+final class BridgeTokenServiceTests: XCTestCase {
+    func testParsesValueAndExpiry() throws {
+        let json = #"{"ok":true,"value":"ek_abc123","expires_at":1893456000,"model":"gpt-realtime"}"#
+        let cred = try BridgeTokenService.credential(from: Data(json.utf8))
+        XCTAssertEqual(cred.token, "ek_abc123")
+        XCTAssertEqual(cred.expiresAt, Date(timeIntervalSince1970: 1_893_456_000))
+    }
+
+    func testAcceptsLegacyTokenField() throws {
+        let json = #"{"token":"ek_legacy"}"#
+        let cred = try BridgeTokenService.credential(from: Data(json.utf8))
+        XCTAssertEqual(cred.token, "ek_legacy")
+        // Missing expiry falls back to a short-lived window in the near future.
+        XCTAssertGreaterThan(cred.expiresAt, Date())
+    }
+
+    func testMissingSecretThrows() {
+        let json = #"{"ok":false,"error":"openai_api_key_missing"}"#
+        XCTAssertThrowsError(try BridgeTokenService.credential(from: Data(json.utf8)))
+    }
+
+    func testUnconfiguredBridgeThrows() async {
+        let service = BridgeTokenService(configProvider: { (nil, nil) })
+        do {
+            _ = try await service.fetchRealtimeClientSecret()
+            XCTFail("expected an error when the bridge is not configured")
+        } catch {
+            // expected — no URL means no way to mint a secret.
+        }
+    }
+}
+
 /// Minimal settings double that only implements the coding-session pin.
 private actor FakeCodingSettingsStore: SettingsStoring {
     private var pinned: String?

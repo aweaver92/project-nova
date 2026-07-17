@@ -12,6 +12,7 @@ import {
 /**
  * Nova Bridge — implements the wire contract the Nova iOS app's `NovaBridgeClient`
  * expects (all JSON, bearer-authenticated):
+ *   POST /realtime/token           { model? }               → { value, expires_at }
  *   POST /claude-code              { prompt, cwd? }
  *   POST /cursor/command           { command, sessionId? }  (blocking; prefer /cursor/runs)
  *   POST /cursor/runs              { command, sessionId?, cwd? }  → SSE stream
@@ -47,6 +48,10 @@ const PORT = Number(process.env.PORT ?? 8787);
 const TOKEN = process.env.NOVA_BRIDGE_TOKEN ?? "";
 const CURSOR_API_KEY = process.env.CURSOR_API_KEY ?? "";
 const CURSOR_MODEL = process.env.CURSOR_MODEL ?? "composer-2.5";
+// Server-side OpenAI key used ONLY to mint short-lived Realtime client secrets
+// for the app (POST /realtime/token). It never leaves this machine.
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime";
 const DEFAULT_CWD = process.env.NOVA_BRIDGE_WORKDIR || process.cwd();
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_ARGS = (process.env.CLAUDE_ARGS ?? "").trim();
@@ -76,8 +81,57 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "nova-bridge",
     cursorConfigured: CURSOR_API_KEY.length > 0,
+    openaiConfigured: OPENAI_API_KEY.length > 0,
     defaultCwd: DEFAULT_CWD,
   });
+});
+
+// --- OpenAI Realtime ephemeral token ---------------------------------------
+// Mints a short-lived GA Realtime client secret (`ek_...`) so the iOS app never
+// has to ship the standard OpenAI key. The app authenticates with its bridge
+// bearer token, then uses the returned `value` directly for the Realtime socket.
+app.post("/realtime/token", requireAuth, async (req, res) => {
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ ok: false, error: "openai_api_key_missing" });
+    return;
+  }
+  const model = String(req.body?.model ?? "").trim() || OPENAI_REALTIME_MODEL;
+  try {
+    const upstream = await fetch(
+      "https://api.openai.com/v1/realtime/client_secrets",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ session: { type: "realtime", model } }),
+      },
+    );
+    const text = await upstream.text();
+    if (!upstream.ok) {
+      res.status(502).json({
+        ok: false,
+        error: "openai_client_secrets_failed",
+        status: upstream.status,
+        detail: text.slice(0, 500),
+      });
+      return;
+    }
+    const data = JSON.parse(text) as { value?: string; expires_at?: number };
+    if (!data.value) {
+      res.status(502).json({ ok: false, error: "openai_no_secret" });
+      return;
+    }
+    res.json({
+      ok: true,
+      value: data.value,
+      expires_at: data.expires_at,
+      model,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: describe(err) });
+  }
 });
 
 // --- Claude Code ------------------------------------------------------------
@@ -370,5 +424,6 @@ app.listen(PORT, () => {
   console.log(`Nova Bridge listening on http://0.0.0.0:${PORT}`);
   console.log(`  token set:       ${TOKEN ? "yes" : "NO (set NOVA_BRIDGE_TOKEN)"}`);
   console.log(`  cursor api key:  ${CURSOR_API_KEY ? "yes" : "no"}`);
+  console.log(`  openai api key:  ${OPENAI_API_KEY ? "yes" : "no (realtime token endpoint disabled)"}`);
   console.log(`  default cwd:     ${DEFAULT_CWD}`);
 });

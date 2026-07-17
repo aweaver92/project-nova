@@ -139,6 +139,83 @@ public struct HTTPTokenService: TokenService {
     }
 }
 
+/// Mints a GA Realtime ephemeral secret via the user's **Nova Bridge** instead of
+/// calling OpenAI directly, so the standard OpenAI key never ships in the app.
+/// Reads bridge config lazily from the same source as `NovaBridgeClient` (in-app
+/// Settings → env → Info.plist), so URL/token changes take effect immediately.
+/// The bridge authenticates the request with the shared bearer token and returns
+/// `{ "value": "ek_...", "expires_at": <unix seconds> }` (legacy `token` accepted).
+public struct BridgeTokenService: TokenService {
+    public typealias ConfigProvider = @Sendable () async -> (url: URL?, token: String?)
+
+    private let configProvider: ConfigProvider
+    private let path: String
+    private let model: String?
+    private let session: URLSession
+
+    public init(
+        configProvider: @escaping ConfigProvider,
+        path: String = "realtime/token",
+        model: String? = nil,
+        session: URLSession = .shared
+    ) {
+        self.configProvider = configProvider
+        self.path = path
+        self.model = model
+        self.session = session
+    }
+
+    public func fetchRealtimeClientSecret() async throws -> EphemeralCredential {
+        let (base, token) = await configProvider()
+        guard let base else {
+            throw NovaError.credentials(
+                "Nova Bridge not configured — set the bridge URL and token in the Agents tab to enable voice."
+            )
+        }
+        var request = URLRequest(url: Self.url(base: base, path: path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        var body: [String: Any] = [:]
+        if let model, !model.isEmpty { body["model"] = model }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NovaError.credentials("Nova Bridge realtime token failed (HTTP \(code))")
+        }
+        return try Self.credential(from: data)
+    }
+
+    /// Parses the bridge (OpenAI GA-shaped) response into an `EphemeralCredential`.
+    /// Exposed for testing.
+    static func credential(from data: Data) throws -> EphemeralCredential {
+        struct Payload: Decodable {
+            let value: String?
+            let token: String?
+            let expires_at: TimeInterval?
+            var secret: String? { value ?? token }
+        }
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        guard let secret = payload.secret, !secret.isEmpty else {
+            throw NovaError.credentials("Nova Bridge returned no realtime secret")
+        }
+        // GA secrets are short-lived; fall back to +60s if the bridge omits expiry.
+        let expiresAt = payload.expires_at.map { Date(timeIntervalSince1970: $0) }
+            ?? Date().addingTimeInterval(60)
+        return EphemeralCredential(token: secret, expiresAt: expiresAt)
+    }
+
+    /// Join slash-separated path segments without percent-encoding the separators.
+    private static func url(base: URL, path: String) -> URL {
+        path.split(separator: "/").reduce(base) { partial, segment in
+            partial.appending(path: String(segment))
+        }
+    }
+}
+
 public final class KeychainTokenStore: SecureTokenStore, @unchecked Sendable {
     private let service: String
     private let account: String

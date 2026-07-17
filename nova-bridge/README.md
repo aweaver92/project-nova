@@ -4,6 +4,8 @@ A small service you run on your dev machine so the **Nova iOS app** can:
 
 - run **Claude Code** tasks (edit files, run commands) — `run_claude_code`
 - drive **Cursor** agents — `push_to_cursor`, `list_cursor_sessions`
+- mint short-lived **OpenAI Realtime** secrets so the voice assistant works
+  without baking the OpenAI key into the app — `POST /realtime/token`
 
 The iOS app ships the *client*; this is the *server* it talks to.
 
@@ -13,6 +15,7 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 
 | Method | Path | Body | Purpose |
 |--------|------|------|---------|
+| `POST` | `/realtime/token` | `{ "model"?: string }` | Mint a short-lived OpenAI Realtime secret → `{ "value", "expires_at" }` |
 | `POST` | `/claude-code` | `{ "prompt": string, "cwd"?: string }` | Run Claude Code headlessly |
 | `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Blocking Cursor send (legacy; Coding tab prefers `/cursor/runs`) |
 | `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string }` | **SSE** stream of a Cursor run (Coding tab) |
@@ -48,6 +51,15 @@ curl localhost:8787/cursor/sessions/$SESSION_ID/messages \
   -H "Authorization: Bearer $NOVA_BRIDGE_TOKEN"
 ```
 
+Smoke-test the Realtime token mint (needs `OPENAI_API_KEY` in `.env`):
+
+```bash
+curl -X POST localhost:8787/realtime/token \
+  -H "Authorization: Bearer $NOVA_BRIDGE_TOKEN" \
+  -H "Content-Type: application/json" -d '{}'
+# → {"ok":true,"value":"ek_...","expires_at":...,"model":"gpt-realtime"}
+```
+
 ## Prerequisites
 
 - **Node.js 20+**
@@ -67,6 +79,8 @@ Edit `.env`:
 
 - `NOVA_BRIDGE_TOKEN` — a long random secret. You'll paste the **same** value into the app.
 - `CURSOR_API_KEY` — your Cursor key (only for the Cursor endpoints).
+- `OPENAI_API_KEY` — your OpenAI key. Required for the voice assistant: the app mints
+  short-lived Realtime secrets through `/realtime/token` instead of embedding this key.
 - `NOVA_BRIDGE_WORKDIR` — default project directory for tasks (optional; defaults to where you launch it).
 - `CLAUDE_ARGS` — to let Claude Code edit files unattended, set e.g. `--permission-mode acceptEdits` (or `--dangerously-skip-permissions`, broader — use with care).
 
