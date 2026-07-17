@@ -48,6 +48,9 @@ public protocol WakeWordListening: Sendable {
 public protocol WearableSession: Sendable {
     var state: AsyncStream<WearableSessionState> { get }
     var registration: AsyncStream<RegistrationState> { get }
+    /// Human-readable registration trace (raw SDK state transitions + errors) for
+    /// on-device diagnostics. Each yield is the latest multi-line snapshot.
+    var diagnostics: AsyncStream<String> { get }
     func register() async throws
     func start() async throws
     func pause() async
@@ -236,9 +239,20 @@ public struct BridgeResult: Sendable, Equatable {
 /// runs locally; unconfigured instances return a clear, actionable message.
 public protocol AgentBridging: Sendable {
     func isConfigured() async -> Bool
+    /// Liveness check against the bridge's unauthenticated `/health` endpoint.
+    /// Surfaces whether the configured URL is reachable, so the UI can give the
+    /// user real feedback instead of failing silently on the first coding task.
+    func health() async -> BridgeResult
     func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult
     func pushToCursor(command: String, sessionId: String?) async -> BridgeResult
     func listCursorSessions() async -> BridgeResult
+}
+
+public extension AgentBridging {
+    // Default keeps mocks/older conformers source-compatible.
+    func health() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
 }
 
 /// Registers/cancels proactive local notifications for scheduled skills.

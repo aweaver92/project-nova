@@ -17,12 +17,21 @@ import MWDATCore
 public actor MetaDATWearableSession: WearableSession {
     private var stateCont: AsyncStream<WearableSessionState>.Continuation?
     private var regCont: AsyncStream<NovaDomain.RegistrationState>.Continuation?
+    private var diagCont: AsyncStream<String>.Continuation?
     public let state: AsyncStream<WearableSessionState>
     public let registration: AsyncStream<NovaDomain.RegistrationState>
+    public let diagnostics: AsyncStream<String>
 
     private var current: WearableSessionState = .idle
     private var reg: NovaDomain.RegistrationState = .unknown
+    private var transitions: [String] = []
     private let useMock: Bool
+
+    private static let diagTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     #if canImport(MWDATCore) && os(iOS)
     private var regObservation: Task<Void, Never>?
@@ -32,20 +41,40 @@ public actor MetaDATWearableSession: WearableSession {
         self.useMock = useMock
         var sCont: AsyncStream<WearableSessionState>.Continuation!
         var rCont: AsyncStream<NovaDomain.RegistrationState>.Continuation!
+        var dCont: AsyncStream<String>.Continuation!
         state = AsyncStream { sCont = $0 }
         registration = AsyncStream { rCont = $0 }
+        diagnostics = AsyncStream { dCont = $0 }
         stateCont = sCont
         regCont = rCont
+        diagCont = dCont
+    }
+
+    /// Record a diagnostics line (timestamped) and publish the latest snapshot of
+    /// recent transitions so the UI can show exactly where registration fails.
+    private func diag(_ message: String) {
+        let stamp = Self.diagTimeFormatter.string(from: Date())
+        transitions.append("[\(stamp)] \(message)")
+        if transitions.count > 12 { transitions.removeFirst(transitions.count - 12) }
+        NovaLog.session.info("DAT: \(message, privacy: .public)")
+        diagCont?.yield(transitions.joined(separator: "\n"))
     }
 
     public func register() async throws {
         #if canImport(MWDATCore) && os(iOS)
         if !useMock {
             setState(.registering)
+            diag("Register tapped — Developer Mode (MetaAppID=0). Opening Meta AI…")
             observeRegistration()
             // Opens the Meta AI companion app; the result arrives asynchronously
             // via registrationStateStream() after Meta AI calls back into handleUrl.
-            _ = try await Wearables.shared.startRegistration()
+            do {
+                _ = try await Wearables.shared.startRegistration()
+                diag("startRegistration() returned; awaiting Meta AI callback")
+            } catch {
+                diag("startRegistration() threw: \(String(describing: error))")
+                throw error
+            }
             NovaLog.session.info("DAT registration started (awaiting Meta AI)")
             return
         }
@@ -53,9 +82,11 @@ public actor MetaDATWearableSession: WearableSession {
 
         setReg(.unregistered)
         setState(.registering)
+        diag("[mock] registering")
         try await Task.sleep(for: .milliseconds(300))
         setReg(.registered)
         setState(.ready)
+        diag("[mock] registered")
         NovaLog.session.info("DAT mock registration complete")
     }
 
@@ -105,6 +136,7 @@ public actor MetaDATWearableSession: WearableSession {
     }
 
     private func applyRegistration(_ sdkState: MWDATCore.RegistrationState) {
+        diag("SDK registration → \(String(describing: sdkState))")
         switch sdkState {
         case .registered:
             setReg(.registered)

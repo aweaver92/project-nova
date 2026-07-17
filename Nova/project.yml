@@ -51,6 +51,11 @@ targets:
         NSLocalNetworkUsageDescription: "Nova connects to the Nova Bridge running on your computer over your local network."
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # Meta DAT discovers/link-leases the glasses over the local network via
+        # Bonjour; required alongside NSLocalNetworkUsageDescription for the
+        # glasses to be found during registration.
+        NSBonjourServices:
+          - _bonjour._tcp
         # Meta Wearables DAT: external-accessory link + background access.
         UISupportedExternalAccessoryProtocols:
           - com.meta.ar.wearable
@@ -59,6 +64,9 @@ targets:
           # pocketed, so wake-word listening continues hands-free.
           - audio
           - bluetooth-central
+          # Meta DAT expects `bluetooth-peripheral` + `external-accessory` for the
+          # glasses link/link-lease to survive backgrounding.
+          - bluetooth-peripheral
           - external-accessory
         # Lets the SDK detect and open the Meta AI companion app.
         LSApplicationQueriesSchemes:
@@ -69,16 +77,17 @@ targets:
             CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
             CFBundleURLSchemes:
               - nova
-        # DAT requires all four keys present. In Developer Mode (MetaAppID "0")
-        # ClientToken/TeamID are not validated by Meta, but the SDK still expects
-        # them non-empty. Replace all three with real values from the Wearables
-        # Developer Center + your Apple Team ID for a signed/production build.
+        # Developer Mode config: per Meta's DAT docs, a Developer-Mode app needs
+        # ONLY AppLinkURLScheme + MetaAppID "0". Adding a (placeholder) ClientToken
+        # and TeamID makes the SDK see "all attestation keys present" and take the
+        # PRODUCTION registration path — which needs a real registered app + a
+        # universal link we don't have, yielding Meta AI's generic "Internal Error".
+        # For a signed/production build, add real ClientToken (Wearables Developer
+        # Center) + TeamID (your Apple Team ID) and set a real MetaAppID.
         MWDAT:
           AppLinkURLScheme: "nova://"
           # "0" enables Developer Mode registration; replace with your Meta App ID for release.
           MetaAppID: "0"
-          ClientToken: "developer-mode-placeholder"
-          TeamID: "developer-mode-placeholder"
         # Standard OpenAI key for the direct ephemeral-secret path. Empty unless
         # you provide Config/Secrets.xcconfig (git-ignored). See Config/Nova.xcconfig.
         OpenAIAPIKey: "$(OPENAI_API_KEY)"

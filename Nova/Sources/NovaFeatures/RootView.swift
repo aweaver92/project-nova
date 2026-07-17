@@ -220,6 +220,15 @@ public struct RootView: View {
             if let error = session.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
+            if !session.registrationDiagnostics.isEmpty {
+                DisclosureGroup("Registration diagnostics") {
+                    Text(session.registrationDiagnostics)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
         }
     }
 

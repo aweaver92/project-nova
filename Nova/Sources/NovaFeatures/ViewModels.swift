@@ -10,6 +10,8 @@ public final class SessionViewModel {
     public private(set) var sessionState: WearableSessionState = .idle
     public private(set) var statusMessage: String = "Idle"
     public private(set) var errorMessage: String?
+    /// Raw registration trace (SDK state transitions + errors) for diagnostics.
+    public private(set) var registrationDiagnostics: String = ""
 
     private let session: any WearableSession
     private var tasks: [Task<Void, Never>] = []
@@ -33,7 +35,12 @@ public final class SessionViewModel {
                 }
             }
         }()
-        _ = await (reg, st)
+        async let dg: Void = {
+            for await value in session.diagnostics {
+                await MainActor.run { self.registrationDiagnostics = value }
+            }
+        }()
+        _ = await (reg, st, dg)
     }
 
     public func register() async {
@@ -486,18 +493,25 @@ public final class AgentsViewModel {
     /// Nova Bridge connection fields (editable in the Agents tab).
     public var bridgeBaseURL: String = ""
     public var bridgeToken: String = ""
+    /// User-facing result of the last save / connection test. Empty until acted on.
+    public private(set) var bridgeStatus: String = ""
+    /// True while a save + health check is in flight (drives a spinner/disable).
+    public private(set) var bridgeChecking = false
 
     private let store: any AgentStoring
     private let settings: any SettingsStoring
+    private let bridge: any AgentBridging
     private let orchestrator: ConversationOrchestrator
 
     public init(
         store: any AgentStoring,
         settings: any SettingsStoring,
+        bridge: any AgentBridging,
         orchestrator: ConversationOrchestrator
     ) {
         self.store = store
         self.settings = settings
+        self.bridge = bridge
         self.orchestrator = orchestrator
         // Reflect voice-driven switches ("Nova, let me talk to Claude") live.
         Task { [weak self] in
@@ -544,9 +558,43 @@ public final class AgentsViewModel {
         await load()
     }
 
+    /// Persist the bridge settings, then immediately verify the URL is reachable
+    /// via the unauthenticated `/health` endpoint so the user gets real feedback
+    /// (saved + reachable, saved-but-unreachable, or not configured).
     public func saveBridge() async {
-        await settings.setBridgeBaseURL(bridgeBaseURL)
-        await settings.setBridgeToken(bridgeToken)
+        let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        await settings.setBridgeBaseURL(trimmedURL)
+        await settings.setBridgeToken(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        if trimmedURL.isEmpty {
+            bridgeStatus = "Saved. No URL set — enter your bridge URL (including http:// or https://)."
+            return
+        }
+        guard trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") else {
+            bridgeStatus = "Saved, but the URL is missing a scheme. Use http://host:8787 or https://host."
+            return
+        }
+
+        bridgeChecking = true
+        bridgeStatus = "Saved. Checking connection…"
+        let result = await bridge.health()
+        bridgeChecking = false
+        if result.ok {
+            bridgeStatus = "Saved. Bridge reachable."
+        } else {
+            bridgeStatus = "Saved, but couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
+        }
+    }
+
+    /// Pull a short, human-readable reason out of the bridge's JSON payload.
+    private static func summarize(_ payloadJSON: String) -> String {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return payloadJSON
+        }
+        if let hint = obj["hint"] as? String { return hint }
+        if let error = obj["error"] as? String { return error }
+        return payloadJSON
     }
 }
 
