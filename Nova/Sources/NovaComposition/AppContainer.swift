@@ -284,7 +284,7 @@ public final class AppContainer {
         self.workspacesVM = WorkspacesViewModel(store: workspaceStore)
         self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
-        self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, orchestrator: orchestrator)
+        self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, bridge: bridge, orchestrator: orchestrator)
         self.settingsVM = SettingsViewModel(store: settingsStore)
         // Starting a recording ensures the mic loop is live (no-op if already
         // running) so button-initiated captures record even when idle.
