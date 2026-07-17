@@ -277,6 +277,9 @@ public actor ConversationOrchestrator {
                 try await beginStreaming(sessionConfig)
             } catch {
                 NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
+                // Don't leave a dead session (mic stopped, no transcripts): fall
+                // back to a healthy state so the user can keep talking / recover.
+                await restoreSession()
                 return
             }
         } else {
@@ -307,6 +310,35 @@ public actor ConversationOrchestrator {
     public func setActiveAgentFromUI(_ id: UUID) async {
         if agents.isEmpty { await loadAgentRoster() }
         await switchAgent(toId: id, greet: streaming)
+        // Recover a dead session: if we're running but neither streaming nor
+        // intentionally idle on the on-device wake word (detectionTask == nil),
+        // a prior reconnect likely failed and left the mic/transcripts dead.
+        // Re-establish so tapping an agent always brings the session back.
+        if isRunning, !streaming, detectionTask == nil {
+            await restoreSession()
+        }
+    }
+
+    /// Return the session to a healthy state after a failed reconnect: prefer
+    /// on-device wake-word listening when configured, otherwise reopen the cloud
+    /// stream. No-op when not running or already streaming.
+    private func restoreSession() async {
+        guard isRunning, !streaming else { return }
+        if sessionConfig.useLocalWakeWord, let listener = wakeWordListener {
+            do {
+                try await beginLocalListening(listener)
+                return
+            } catch {
+                NovaLog.session.error("restoreSession: local listening failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        do {
+            try await beginStreaming(sessionConfig)
+            lastEngagement = .now
+            listeningSuspended = false
+        } catch {
+            NovaLog.session.error("restoreSession: stream reopen failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Best-effort command text to re-ask after a hand-off back to the master.

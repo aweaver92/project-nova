@@ -43,6 +43,14 @@ targets:
         NSRemindersFullAccessUsageDescription: "Nova creates and reads reminders when you ask it to."
         NSCalendarsFullAccessUsageDescription: "Nova reads and creates calendar events when you ask it to."
         NSBluetoothAlwaysUsageDescription: "Nova connects to your Meta glasses over Bluetooth for audio and camera."
+        # Reach the Nova Bridge (Claude Code / Cursor) running on the user's dev
+        # machine over the local network by LAN IP. iOS prompts for local-network
+        # access on first connect, and ATS must allow plaintext HTTP to LAN hosts.
+        # This exception is scoped to local networking only — it does NOT relax
+        # ATS for arbitrary internet hosts.
+        NSLocalNetworkUsageDescription: "Nova connects to the Nova Bridge running on your computer over your local network."
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         # Meta Wearables DAT: external-accessory link + background access.
         UISupportedExternalAccessoryProtocols:
           - com.meta.ar.wearable
