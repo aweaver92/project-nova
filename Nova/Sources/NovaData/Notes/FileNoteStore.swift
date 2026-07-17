@@ -23,6 +23,18 @@ public actor FileNoteStore: NoteStoring {
 
     public func all() -> [Note] { notes }
 
+    public func update(id: UUID, text: String) {
+        guard let idx = notes.firstIndex(where: { $0.id == id }) else { return }
+        notes[idx].text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        notes[idx].updatedAt = Date()
+        persist()
+    }
+
+    public func delete(id: UUID) {
+        notes.removeAll { $0.id == id }
+        persist()
+    }
+
     public func clear() {
         notes.removeAll()
         persist()

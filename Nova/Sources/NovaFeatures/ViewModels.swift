@@ -191,8 +191,33 @@ public final class NotesViewModel {
         self.store = store
     }
 
+    /// Reloads from the store, most-recently-edited first. Call on appear so
+    /// notes Nova saved by voice show up alongside ones edited by hand.
     public func load() async {
-        notes = await store.all().sorted { $0.at > $1.at }
+        notes = await store.all().sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    @discardableResult
+    public func create(_ text: String) async -> Note {
+        let note = await store.save(text)
+        await load()
+        return note
+    }
+
+    public func update(_ note: Note, text: String) async {
+        await store.update(id: note.id, text: text)
+        await load()
+    }
+
+    public func delete(_ note: Note) async {
+        await store.delete(id: note.id)
+        await load()
+    }
+
+    public func delete(at offsets: IndexSet) async {
+        let ids = offsets.map { notes[$0].id }
+        for id in ids { await store.delete(id: id) }
+        await load()
     }
 
     public func clear() async {
@@ -203,7 +228,7 @@ public final class NotesViewModel {
     /// Plain-text rendering for the share sheet / export.
     public var exportText: String {
         notes
-            .map { "\($0.at.formatted(date: .abbreviated, time: .shortened))\n\($0.text)" }
+            .map { "\($0.updatedAt.formatted(date: .abbreviated, time: .shortened))\n\($0.text)" }
             .joined(separator: "\n\n")
     }
 }

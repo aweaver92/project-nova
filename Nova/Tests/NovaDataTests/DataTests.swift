@@ -131,6 +131,25 @@ final class NoteStoreTests: XCTestCase {
         let empty = await cleared.all()
         XCTAssertTrue(empty.isEmpty)
     }
+
+    func testUpdateAndDeleteNotes() async throws {
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let store = FileNoteStore(url: url)
+        let a = await store.save("first")
+        let b = await store.save("second")
+
+        await store.update(id: a.id, text: "first edited")
+        await store.delete(id: b.id)
+
+        let reloaded = FileNoteStore(url: url)
+        let notes = await reloaded.all()
+        XCTAssertEqual(notes.count, 1)
+        XCTAssertEqual(notes.first?.id, a.id)
+        XCTAssertEqual(notes.first?.text, "first edited")
+        XCTAssertGreaterThanOrEqual(notes.first!.updatedAt, notes.first!.at)
+    }
 }
 
 final class FileConversationMemoryTests: XCTestCase {

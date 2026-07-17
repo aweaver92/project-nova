@@ -83,7 +83,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                         "type": "semantic_vad",
                         "create_response": !config.requireWakeWord
                     ] : NSNull(),
-                    "transcription": ["model": "whisper-1"]
+                    "transcription": ["model": "whisper-1", "language": "en"]
                 ] as [String: Any],
                 "output": [
                     "format": ["type": "audio/pcm", "rate": 24000],

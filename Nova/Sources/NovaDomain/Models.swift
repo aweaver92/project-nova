@@ -53,6 +53,8 @@ public struct AISessionConfig: Sendable, Equatable {
         instructions: String = """
         You are Nova, a concise wearable voice assistant on smart glasses. Give short, natural, spoken-friendly answers. The user addresses you by saying 'Nova'; never repeat the wake word back.
 
+        Always speak and reply in English (US). Even if a word is misheard as another language, respond in English. Only use another language if the user explicitly asks you to.
+
         Accuracy above all — never fabricate. Do not invent facts, numbers, dates, names, quotes, citations, statistics, or events. If you are not confident an answer is correct, verify it with a tool or say so plainly; admitting uncertainty is always better than guessing.
 
         Grounding: you have live web access through the web_search tool. For anything about current events, news, prices, live scores, schedules, people, companies, products, documentation, or any fact that could have changed since your training — or whenever you are not fully certain — call web_search first and base your answer strictly on its results. Never state such facts from memory, and never claim you searched unless you actually called the tool. If a search returns nothing useful, say so instead of guessing.
@@ -157,13 +159,27 @@ public struct ConversationTurn: Sendable, Equatable, Identifiable, Codable {
 
 public struct Note: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
-    public let text: String
+    public var text: String
+    /// Created timestamp.
     public let at: Date
+    /// Last-modified timestamp (defaults to `at` for notes saved before this field existed).
+    public var updatedAt: Date
 
-    public init(id: UUID = UUID(), text: String, at: Date = Date()) {
+    public init(id: UUID = UUID(), text: String, at: Date = Date(), updatedAt: Date? = nil) {
         self.id = id
         self.text = text
         self.at = at
+        self.updatedAt = updatedAt ?? at
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, text, at, updatedAt }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        text = try c.decode(String.self, forKey: .text)
+        at = try c.decode(Date.self, forKey: .at)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? at
     }
 }
 

@@ -74,11 +74,13 @@ public protocol ConversationMemory: Sendable {
     func clear() async
 }
 
-/// Durable voice-note storage the UI can list/export and tools can append to.
+/// Durable voice-note storage the UI can list/edit/export and tools can append to.
 public protocol NoteStoring: Sendable {
     @discardableResult
     func save(_ text: String) async -> Note
     func all() async -> [Note]
+    func update(id: UUID, text: String) async
+    func delete(id: UUID) async
     func clear() async
 }
 

@@ -28,6 +28,9 @@ public struct RootView: View {
             assistantTab
                 .tabItem { Label("Assistant", systemImage: "waveform") }
 
+            NotesView(notes: notes)
+                .tabItem { Label("Notes", systemImage: "note.text") }
+
             PatchNotesView()
                 .tabItem { Label("Patch Notes", systemImage: "sparkles") }
         }
@@ -41,7 +44,6 @@ public struct RootView: View {
                 statusSection
                 glassesSection
                 conversationSection
-                notesSection
             }
             .listSectionSpacing(.compact)
             .navigationTitle("Nova")
@@ -50,7 +52,6 @@ public struct RootView: View {
             // and use the wake word hands-free (the `audio` background mode keeps
             // the glasses mic session alive while the screen is locked).
             .task {
-                await notes.load()
                 if !conversation.isRunning {
                     await conversation.start()
                 }
@@ -62,23 +63,17 @@ public struct RootView: View {
 
     private var headerSection: some View {
         Section {
-            VStack(spacing: 8) {
-                // Logo asset ships in the app bundle (App/Assets.xcassets),
-                // so it resolves against Bundle.main from this package view.
-                Image("logo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxHeight: 120)
-                Text("Voice companion for your Meta glasses")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Nova — voice companion for Meta glasses")
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
+            // Logo asset ships in the app bundle (App/Assets.xcassets),
+            // so it resolves against Bundle.main from this package view.
+            Image("logo")
+                .resizable()
+                .scaledToFit()
+                .frame(maxHeight: 200)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .accessibilityLabel("Nova")
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
         }
     }
 
@@ -180,41 +175,6 @@ public struct RootView: View {
         } footer: {
             if !conversation.latencyHint.isEmpty {
                 Text(conversation.latencyHint).font(.caption2)
-            }
-        }
-    }
-
-    private var notesSection: some View {
-        Section {
-            if notes.notes.isEmpty {
-                Text("Say “Nova, take a note …” to capture one hands-free.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(notes.notes) { note in
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(note.text).font(.footnote)
-                    Text(note.at.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 2)
-            }
-            if !notes.notes.isEmpty {
-                ShareLink(item: notes.exportText) {
-                    Label("Export notes", systemImage: "square.and.arrow.up")
-                }
-                Button("Clear notes", role: .destructive) { Task { await notes.clear() } }
-            }
-        } header: {
-            HStack {
-                Text("Notes")
-                Spacer()
-                Button { Task { await notes.load() } } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Refresh notes")
             }
         }
     }
