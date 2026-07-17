@@ -138,8 +138,10 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(persisted)
 
         await store.setCodingSessionId(" sess-1 ")
-        XCTAssertEqual(await store.codingSessionId(), "sess-1")
-        XCTAssertEqual(await reloaded.codingSessionId(), "sess-1")
+        let fromStore = await store.codingSessionId()
+        XCTAssertEqual(fromStore, "sess-1")
+        let fromReload = await reloaded.codingSessionId()
+        XCTAssertEqual(fromReload, "sess-1")
     }
 }
 
