@@ -49,6 +49,28 @@ public extension PatchNote {
     /// The changelog. Newest first — add a new entry at the top for each build.
     static let all: [PatchNote] = [
         PatchNote(
+            version: "0.3.0",
+            date: "Jul 17, 2026",
+            summary: "Redesigned companion UI. Nova now complements Meta AI instead of replacing it.",
+            entries: [
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Refreshed home screen: a clear connection-status panel, a one-tap listening control, and chat-style transcripts.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Glasses controls are now contextual — you only see the actions that make sense for the current state.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Hid the in-app camera / “what am I looking at?” tools. Those are handled natively by “Hey Meta,” so Nova now focuses on being your voice companion.",
+                    testable: true
+                ),
+            ]
+        ),
+        PatchNote(
             version: "0.2.0",
             date: "Jul 17, 2026",
             summary: "Voice quality overhaul and this Patch Notes tab.",
@@ -142,7 +164,7 @@ public struct PatchNotesView: View {
     /// Reads the app's version/build from the bundle for the "Installed" footer.
     public static func bundleVersion() -> String {
         let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "0.2.0"
+        let short = info?["CFBundleShortVersionString"] as? String ?? "0.3.0"
         if let build = info?["CFBundleVersion"] as? String {
             return "\(short) (\(build))"
         }

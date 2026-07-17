@@ -285,6 +285,14 @@ public actor ConversationOrchestrator {
                 inputTranscript = ""
             }
         case .speechStarted:
+            // Anchor the grace window at the start of the user's turn. If we were
+            // already inside the listening window, the user beginning a new turn
+            // keeps it open — so natural pauses and Whisper's transcription
+            // latency don't force them to repeat the wake word. (The very first
+            // turn still needs "Nova", since the window isn't open yet.)
+            if isWithinGraceWindow() {
+                lastEngagement = .now
+            }
             if assistantSpeaking {
                 await handleBargeIn()
             }
