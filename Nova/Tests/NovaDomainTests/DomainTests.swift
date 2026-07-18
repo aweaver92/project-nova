@@ -263,7 +263,8 @@ final class WakeWordTests: XCTestCase {
         await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
         let switched = await waitUntil { await provider.lastVoice == "cedar" }
         XCTAssertTrue(switched)
-        XCTAssertEqual(await orch.currentAgent?.name, "Claude")
+        let activeClaude = await orch.currentAgent
+        XCTAssertEqual(activeClaude?.name, "Claude")
         let interrupted = await provider.interruptCount
         XCTAssertGreaterThanOrEqual(interrupted, 1)
 
