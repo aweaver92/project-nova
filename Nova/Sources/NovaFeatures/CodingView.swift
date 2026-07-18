@@ -139,7 +139,7 @@ public struct CodingView: View {
                     Spacer()
                     Text(status.clean ? "Clean" : "\(status.changedFiles.count) changed")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(status.clean ? .secondary : .orange)
+                        .foregroundStyle(status.clean ? Color.secondary : Color.orange)
                 }
                 if !status.changedFiles.isEmpty {
                     Text(status.changedFiles.prefix(6).map(\.path).joined(separator: ", "))
