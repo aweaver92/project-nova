@@ -24,6 +24,7 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(scholar.toolNames!.contains("start_quiz"))
         XCTAssertTrue(claude.toolNames!.contains("push_to_cursor"))
         XCTAssertTrue(claude.toolNames!.contains("list_repos"))
+        XCTAssertTrue(claude.toolNames!.contains("create_web_project"))
         XCTAssertTrue(claude.toolNames!.contains("publish_repo"))
         XCTAssertTrue(claude.toolNames!.contains("draft_message"))
     }

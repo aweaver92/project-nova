@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -20,8 +21,11 @@ import {
   RepoError,
   RepoService,
   sanitizeBranchSlug,
+  scaffoldWebProject,
   timingSafeTokenEqual,
   validateGitHubHttpsUrl,
+  validateProjectName,
+  validateWebProjectTemplate,
 } from "./repo-service.js";
 
 function section(name: string): void {
@@ -49,6 +53,39 @@ section("sanitizeBranchSlug");
   assert.equal(sanitizeBranchSlug("nova/already"), "nova/already");
   assert.throws(() => sanitizeBranchSlug("main"), RepoError);
   assert.throws(() => sanitizeBranchSlug("../escape"), RepoError);
+}
+
+section("web project validation and templates");
+{
+  assert.equal(validateProjectName("My-Web_App"), "my-web_app");
+  assert.throws(() => validateProjectName("../escape"), RepoError);
+  assert.throws(() => validateProjectName("-option"), RepoError);
+  assert.equal(validateWebProjectTemplate("react-vite"), "react-vite");
+  assert.throws(() => validateWebProjectTemplate("shell"), RepoError);
+
+  const base = mkdtempSync(join(tmpdir(), "nova-web-templates-"));
+  try {
+    const expected: Record<string, string> = {
+      static: "index.html",
+      vite: "src/main.js",
+      "react-vite": "src/App.jsx",
+      nextjs: "app/page.tsx",
+    };
+    for (const [template, file] of Object.entries(expected)) {
+      const root = join(base, template);
+      mkdirSync(root);
+      scaffoldWebProject(
+        root,
+        `test-${template}`,
+        validateWebProjectTemplate(template),
+      );
+      assert.equal(existsSync(join(root, file)), true);
+      assert.equal(existsSync(join(root, "README.md")), true);
+      assert.match(readFileSync(join(root, "README.md"), "utf8"), /Created from Nova/);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }
 
 section("parsePorcelainStatus / ahead-behind / token");

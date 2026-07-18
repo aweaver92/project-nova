@@ -50,6 +50,23 @@ final class RepoWorkflowTests: XCTestCase {
         let repoId = await bridge.lastClaudeRepoId
         XCTAssertEqual(repoId, "abcdef0123456789")
     }
+
+    func testCreateWebProjectSelectsRepoAndClearsSession() async throws {
+        let settings = InMemoryRepoSettings(repoId: nil, sessionId: "old-session")
+        let bridge = RecordingRepoBridge()
+        let tool = CreateWebProjectTool(bridge: bridge, settings: settings)
+        let payload = try await tool.invoke(argumentsJSON: """
+        {"name":"portfolio-site","description":"A design portfolio","template":"react-vite"}
+        """)
+        XCTAssertTrue(payload.contains("https://github.com/acme/portfolio-site"))
+        let selected = await settings.codingSelectedRepoId()
+        let session = await settings.codingSessionId()
+        XCTAssertEqual(selected, "abcdef0123456789")
+        XCTAssertNil(session)
+        let request = await bridge.lastCreateRequest
+        XCTAssertEqual(request?.name, "portfolio-site")
+        XCTAssertEqual(request?.template, .reactVite)
+    }
 }
 
 private actor InMemoryRepoSettings: SettingsStoring {
@@ -79,6 +96,7 @@ private actor RecordingRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var lastPublishRequest: BridgePublishRequest?
     private(set) var lastClaudeRepoId: String?
+    private(set) var lastCreateRequest: BridgeCreateProjectRequest?
 
     func isConfigured() async -> Bool { true }
 
@@ -91,6 +109,14 @@ private actor RecordingRepoBridge: AgentBridging {
         BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"selectedRepoId":"\#(repoId)","repo":{"id":"\#(repoId)","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}}"#
+        )
+    }
+
+    func createPublicWebProject(request: BridgeCreateProjectRequest) async -> BridgeResult {
+        lastCreateRequest = request
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"repo":{"id":"abcdef0123456789","name":"portfolio-site","relativePath":"portfolio-site","rootLabel":"src","selected":true},"repoUrl":"https://github.com/acme/portfolio-site","template":"react-vite","selectedRepoId":"abcdef0123456789"}"#
         )
     }
 

@@ -823,7 +823,9 @@ public final class CodingViewModel {
     public private(set) var repoDiff: BridgeRepoDiff?
     public private(set) var showDiff = false
     public private(set) var lastPublishResult: BridgePublishResult?
+    public private(set) var lastCreatedProject: BridgeCreateProjectResult?
     public private(set) var isRefreshingRepo = false
+    public private(set) var isCreatingProject = false
     public private(set) var isPublishing = false
     public private(set) var items: [CodingTranscriptItem] = []
     public private(set) var runStatus: String = "idle"
@@ -833,6 +835,9 @@ public final class CodingViewModel {
     public private(set) var statusMessage: String = ""
     public var draft: String = ""
     public var cloneURL: String = ""
+    public var newProjectName: String = ""
+    public var newProjectDescription: String = ""
+    public var newProjectTemplate: WebProjectTemplate = .reactVite
     public var publishBranchName: String = ""
     public var publishCommitMessage: String = ""
     public var publishPRTitle: String = ""
@@ -952,6 +957,53 @@ public final class CodingViewModel {
         await refreshRepositories()
         await refreshRepoStatusAndDiff()
         statusMessage = "Cloned \(repo.name)."
+    }
+
+    public func createPublicWebProject() async {
+        let name = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let description = newProjectDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !isCreatingProject else { return }
+        lastCreatedProject = nil
+
+        let detail = """
+        Public GitHub repository: \(name)
+        Template: \(newProjectTemplate.title)
+        The bridge will scaffold, commit, and push the initial project publicly.
+        """
+        if let confirmPublish {
+            let allowed = await confirmPublish("Create public web project?", detail)
+            guard allowed else {
+                statusMessage = "Project creation cancelled."
+                return
+            }
+        }
+
+        isCreatingProject = true
+        defer { isCreatingProject = false }
+        let result = await bridge.createPublicWebProject(
+            request: BridgeCreateProjectRequest(
+                name: name,
+                description: description.isEmpty ? nil : description,
+                template: newProjectTemplate
+            )
+        )
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let created = try? JSONDecoder().decode(BridgeCreateProjectResult.self, from: data)
+        else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+
+        lastCreatedProject = created
+        selectedRepoId = created.selectedRepoId
+        await settings.setCodingSelectedRepoId(created.selectedRepoId)
+        await startNewSession()
+        newProjectName = ""
+        newProjectDescription = ""
+        await refreshRepositories()
+        await refreshRepoStatusAndDiff()
+        statusMessage = "Created public project \(created.repo.name)."
     }
 
     public func refreshRepoStatusAndDiff() async {

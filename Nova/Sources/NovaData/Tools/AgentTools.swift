@@ -166,6 +166,47 @@ public struct CloneRepoTool: Tool {
     }
 }
 
+/// Create, scaffold, commit, and publish a new public web project.
+public struct CreateWebProjectTool: Tool {
+    public let name = "create_web_project"
+    public let description = "Create a new PUBLIC GitHub repository and local web project on the bridge PC, scaffold a web template, make the initial commit, push main, select the repo, and clear the old Cursor session."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"name":{"type":"string","description":"GitHub repository name using lowercase letters, numbers, dots, hyphens, or underscores."},"description":{"type":"string","description":"Optional public GitHub repository description."},"template":{"type":"string","enum":["static","vite","react-vite","nextjs"],"description":"Web starter template. Prefer react-vite for interactive frontends or nextjs for full-stack sites."}},"required":["name","template"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let name: String
+            let description: String?
+            let template: WebProjectTemplate
+        }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let result = await bridge.createPublicWebProject(
+            request: BridgeCreateProjectRequest(
+                name: args.name,
+                description: args.description,
+                template: args.template
+            )
+        )
+        if result.ok,
+           let data = result.payloadJSON.data(using: .utf8),
+           let created = try? JSONDecoder().decode(BridgeCreateProjectResult.self, from: data)
+        {
+            await settings.setCodingSelectedRepoId(created.selectedRepoId)
+            await settings.setCodingSessionId(nil)
+        }
+        return result.payloadJSON
+    }
+}
+
 /// Inspect Git status for the selected (or specified) repository.
 public struct RepoStatusTool: Tool {
     public let name = "repo_status"

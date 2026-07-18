@@ -10,6 +10,7 @@ public struct CodingView: View {
     @State private var showSessions = false
     @State private var showRepos = false
     @State private var showClone = false
+    @State private var showCreateProject = false
     @State private var showPublish = false
 
     public init(coding: CodingViewModel, embedded: Bool = false) {
@@ -67,6 +68,7 @@ public struct CodingView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button("Repositories…") { showRepos = true }
+                    Button("New web project…") { showCreateProject = true }
                     Button("Clone GitHub repo…") { showClone = true }
                     Button("New session") {
                         Task { await coding.startNewSession() }
@@ -98,6 +100,7 @@ public struct CodingView: View {
         .sheet(isPresented: $showSessions) { sessionPicker }
         .sheet(isPresented: $showRepos) { repoPicker }
         .sheet(isPresented: $showClone) { cloneSheet }
+        .sheet(isPresented: $showCreateProject) { createProjectSheet }
         .sheet(isPresented: $showPublish) { publishSheet }
         .task { await coding.load() }
     }
@@ -327,6 +330,10 @@ public struct CodingView: View {
         NavigationStack {
             List {
                 Section {
+                    Button("New public web project…") {
+                        showRepos = false
+                        showCreateProject = true
+                    }
                     Button("Clone GitHub repo…") {
                         showRepos = false
                         showClone = true
@@ -408,6 +415,73 @@ public struct CodingView: View {
                         }
                     }
                     .disabled(coding.cloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || coding.isRefreshingRepo)
+                }
+            }
+        }
+    }
+
+    private var createProjectSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Public GitHub repository") {
+                    TextField("project-name", text: $coding.newProjectName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField(
+                        "Short description (optional)",
+                        text: $coding.newProjectDescription,
+                        axis: .vertical
+                    )
+                    .lineLimit(2...4)
+                }
+
+                Section("Web template") {
+                    Picker("Template", selection: $coding.newProjectTemplate) {
+                        ForEach(WebProjectTemplate.allCases) { template in
+                            Text(template.title).tag(template)
+                        }
+                    }
+                    .pickerStyle(.navigationLink)
+                    Text(coding.newProjectTemplate.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Label("Repository visibility: Public", systemImage: "globe")
+                    Text("Nova creates the repository under the bridge PC’s authenticated GitHub account, scaffolds the selected starter, commits it to main, pushes it, selects it in Coding, and starts a fresh Cursor session.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let created = coding.lastCreatedProject,
+                   let url = URL(string: created.repoUrl)
+                {
+                    Section("Created") {
+                        Link(created.repoUrl, destination: url)
+                    }
+                }
+            }
+            .navigationTitle("New web project")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showCreateProject = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(coding.isCreatingProject ? "Creating…" : "Create") {
+                        Task {
+                            await coding.createPublicWebProject()
+                            if coding.lastCreatedProject != nil {
+                                showCreateProject = false
+                            }
+                        }
+                    }
+                    .disabled(
+                        coding.newProjectName
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty || coding.isCreatingProject
+                    )
                 }
             }
         }

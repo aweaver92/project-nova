@@ -22,7 +22,7 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /cursor/sessions
  *   GET  /cursor/sessions/:id/messages
  *   GET  /repos
- *   POST /repos/clone | /repos/select
+ *   POST /repos/clone | /repos/create | /repos/select
  *   GET  /repos/:repoId/status | /diff
  *   POST /repos/:repoId/publish
  *   GET  /health                   (unauthenticated liveness check)
@@ -130,6 +130,30 @@ app.post("/repos/clone", requireAuth, async (req, res) => {
     const rootLabel = String(req.body?.rootLabel ?? "").trim() || undefined;
     const summary = await repos.clone(url, rootLabel);
     res.json({ ok: true, repo: summary, selectedRepoId: summary.id });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/create", requireAuth, async (req, res) => {
+  try {
+    const result = await repos.createPublicWebProject({
+      name: String(req.body?.name ?? ""),
+      description:
+        typeof req.body?.description === "string"
+          ? req.body.description
+          : undefined,
+      template: String(req.body?.template ?? "react-vite") as
+        | "static"
+        | "vite"
+        | "react-vite"
+        | "nextjs",
+      rootLabel:
+        typeof req.body?.rootLabel === "string"
+          ? req.body.rootLabel
+          : undefined,
+    });
+    res.status(201).json({ ok: true, ...result });
   } catch (err) {
     sendRepoError(res, err);
   }

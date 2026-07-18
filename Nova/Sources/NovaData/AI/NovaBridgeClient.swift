@@ -224,6 +224,22 @@ public actor NovaBridgeClient: AgentBridging {
         return await post(path: "repos/clone", body: body, timeout: 320)
     }
 
+    public func createPublicWebProject(
+        request: BridgeCreateProjectRequest
+    ) async -> BridgeResult {
+        var body: [String: Any] = [
+            "name": request.name,
+            "template": request.template.rawValue,
+        ]
+        if let description = request.description, !description.isEmpty {
+            body["description"] = description
+        }
+        if let rootLabel = request.rootLabel, !rootLabel.isEmpty {
+            body["rootLabel"] = rootLabel
+        }
+        return await post(path: "repos/create", body: body, timeout: 320)
+    }
+
     public func selectRepository(repoId: String) async -> BridgeResult {
         await post(path: "repos/select", body: ["repoId": repoId])
     }

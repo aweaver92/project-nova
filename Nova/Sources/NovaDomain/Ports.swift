@@ -368,6 +368,71 @@ public struct BridgeRepoSummary: Sendable, Equatable, Codable, Identifiable {
     }
 }
 
+public enum WebProjectTemplate: String, Sendable, Equatable, Codable, CaseIterable, Identifiable {
+    case staticSite = "static"
+    case vite
+    case reactVite = "react-vite"
+    case nextjs
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .staticSite: "Static HTML/CSS/JS"
+        case .vite: "Vite Vanilla"
+        case .reactVite: "React + Vite"
+        case .nextjs: "Next.js + TypeScript"
+        }
+    }
+
+    public var detail: String {
+        switch self {
+        case .staticSite: "No build tools; ideal for landing pages and prototypes."
+        case .vite: "Lightweight modern JavaScript website."
+        case .reactVite: "React single-page app with Vite."
+        case .nextjs: "App Router starter for full-stack websites."
+        }
+    }
+}
+
+public struct BridgeCreateProjectRequest: Sendable, Equatable, Codable {
+    public let name: String
+    public let description: String?
+    public let template: WebProjectTemplate
+    public let rootLabel: String?
+
+    public init(
+        name: String,
+        description: String? = nil,
+        template: WebProjectTemplate,
+        rootLabel: String? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.template = template
+        self.rootLabel = rootLabel
+    }
+}
+
+public struct BridgeCreateProjectResult: Sendable, Equatable, Codable {
+    public let repo: BridgeRepoSummary
+    public let repoUrl: String
+    public let template: WebProjectTemplate
+    public let selectedRepoId: String
+
+    public init(
+        repo: BridgeRepoSummary,
+        repoUrl: String,
+        template: WebProjectTemplate,
+        selectedRepoId: String
+    ) {
+        self.repo = repo
+        self.repoUrl = repoUrl
+        self.template = template
+        self.selectedRepoId = selectedRepoId
+    }
+}
+
 public struct BridgeChangedFile: Sendable, Equatable, Codable, Identifiable {
     public var id: String { path }
     public let path: String
@@ -544,6 +609,7 @@ public protocol AgentBridging: Sendable {
 
     func listRepos() async -> BridgeResult
     func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult
+    func createPublicWebProject(request: BridgeCreateProjectRequest) async -> BridgeResult
     func selectRepository(repoId: String) async -> BridgeResult
     func repositoryStatus(repoId: String) async -> BridgeResult
     func repositoryDiff(repoId: String) async -> BridgeResult
@@ -611,6 +677,9 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func createPublicWebProject(request: BridgeCreateProjectRequest) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func selectRepository(repoId: String) async -> BridgeResult {

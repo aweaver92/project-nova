@@ -287,6 +287,7 @@ public final class AppContainer {
             ListReposTool(bridge: bridge),
             SelectRepoTool(bridge: bridge, settings: settingsStore),
             CloneRepoTool(bridge: bridge, settings: settingsStore),
+            CreateWebProjectTool(bridge: bridge, settings: settingsStore),
             RepoStatusTool(bridge: bridge, settings: settingsStore),
             RepoDiffTool(bridge: bridge, settings: settingsStore),
             PublishRepoTool(bridge: bridge, settings: settingsStore),
