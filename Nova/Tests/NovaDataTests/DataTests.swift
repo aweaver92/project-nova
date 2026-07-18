@@ -523,11 +523,14 @@ final class CodingSessionPinTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = UserDefaultsSettingsStore(defaults: defaults)
-        XCTAssertNil(await store.codingSelectedRepoId())
+        let initial = await store.codingSelectedRepoId()
+        XCTAssertNil(initial)
         await store.setCodingSelectedRepoId("  abcdef0123456789  ")
-        XCTAssertEqual(await store.codingSelectedRepoId(), "abcdef0123456789")
+        let selected = await store.codingSelectedRepoId()
+        XCTAssertEqual(selected, "abcdef0123456789")
         await store.setCodingSelectedRepoId("")
-        XCTAssertNil(await store.codingSelectedRepoId())
+        let cleared = await store.codingSelectedRepoId()
+        XCTAssertNil(cleared)
     }
 
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {

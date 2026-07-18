@@ -9,8 +9,10 @@ final class RepoWorkflowTests: XCTestCase {
         let tool = SelectRepoTool(bridge: bridge, settings: settings)
         let payload = try await tool.invoke(argumentsJSON: #"{"repo_id":"abcdef0123456789"}"#)
         XCTAssertTrue(payload.contains("abcdef0123456789"))
-        XCTAssertNil(await settings.codingSessionId())
-        XCTAssertEqual(await settings.codingSelectedRepoId(), "abcdef0123456789")
+        let session = await settings.codingSessionId()
+        let selected = await settings.codingSelectedRepoId()
+        XCTAssertNil(session)
+        XCTAssertEqual(selected, "abcdef0123456789")
     }
 
     func testPublishRepoRequiresSelectedRepo() async throws {

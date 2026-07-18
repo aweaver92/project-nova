@@ -30,7 +30,8 @@ final class CodingRepoViewModelTests: XCTestCase {
         await vm.selectRepository("abcdef0123456789")
         XCTAssertNil(vm.pinnedSessionId)
         XCTAssertEqual(vm.selectedRepoId, "abcdef0123456789")
-        XCTAssertNil(await settings.codingSessionId())
+        let sessionAfter = await settings.codingSessionId()
+        XCTAssertNil(sessionAfter)
     }
 }
 
