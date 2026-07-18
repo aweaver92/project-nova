@@ -109,11 +109,14 @@ public actor ConversationOrchestrator {
     public private(set) var lastError: String?
     public private(set) var listenHealth = ListenHealth()
     private var micChunksSent = 0
+    private var micChunksAppendOK = 0
+    private var micChunksAppendFailed = 0
     private var micBytesSent = 0
     private var micPeakHeard: Float = 0
     private var lastMicEnergyAt: ContinuousClock.Instant?
     private var lastChunkAt: ContinuousClock.Instant?
     private var userTranscriptChars = 0
+    private var cloudVadSpeechEvents = 0
     private var didFailoverMicRoute = false
     private var didAnnounceMicSilent = false
     private var didAnnounceCloudQuiet = false
@@ -215,11 +218,22 @@ public actor ConversationOrchestrator {
         onListenHealth = handler
     }
 
-    /// Inject a user-authored text turn (e.g. a tapped follow-up suggestion) and
-    /// let the model reply. No-op while the cloud stream is closed.
+    /// Inject a user-authored text turn (typed chat or a tapped follow-up) and
+    /// let the model reply. Surfaces an error when the Realtime stream is closed.
     public func sendUserText(_ text: String) async {
-        guard streaming else { return }
-        await ai.sendUserText(text)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard streaming else {
+            let message = "Start Listen (or send again) to open the agent session before text chat."
+            lastError = message
+            onError?(message)
+            return
+        }
+        lastUserText = trimmed
+        lastActivity = .now
+        lastEngagement = .now
+        listeningSuspended = false
+        await ai.sendUserText(trimmed)
     }
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
@@ -452,6 +466,10 @@ public actor ConversationOrchestrator {
 
     private func beginLocalListening(_ listener: any WakeWordListening) async throws {
         if streaming { await teardownStreaming() }
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            detail: "Local wake word armed — say \"Nova\" to open Realtime (or turn off Local wake word in Settings)."
+        )
         try await listener.start()
         NovaLog.session.info("Local wake-word listening (cloud stream closed)")
         detectionTask = Task { [weak self] in
@@ -490,6 +508,7 @@ public actor ConversationOrchestrator {
 
     private func beginStreaming(_ config: AISessionConfig) async throws {
         guard !streaming else { return }
+        publishListenHealth(phase: .connecting, detail: "Preparing agent context…")
         // Prime the session with durable facts + recent memory for continuity.
         var effective = config
         // Active-agent persona + voice: the persona is front-loaded ahead of the
@@ -543,28 +562,41 @@ public actor ConversationOrchestrator {
         if let toolRouter {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
         }
+        // Cloud first so text chat can work even when mic permission/HFP stalls.
+        publishListenHealth(phase: .connecting, detail: "Minting Realtime token / opening WebSocket…")
         try await ai.connect(config: effective)
-        do {
-            try await ingress.start()
-        } catch {
-            await ai.disconnect()
-            throw error
-        }
         streaming = true
         lastActivity = .now
         micChunksSent = 0
+        micChunksAppendOK = 0
+        micChunksAppendFailed = 0
         micBytesSent = 0
         micPeakHeard = 0
         lastMicEnergyAt = nil
         lastChunkAt = nil
         userTranscriptChars = 0
+        cloudVadSpeechEvents = 0
         didFailoverMicRoute = false
         didAnnounceMicSilent = false
         didAnnounceCloudQuiet = false
         publishListenHealth(
             phase: .waitingForSpeech,
-            detail: "Realtime connected — speak naturally."
+            detail: "Realtime connected — starting microphone (Allow if prompted)…"
         )
+
+        do {
+            try await ingress.start()
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                detail: "Realtime connected — speak or type."
+            )
+        } catch {
+            // Keep the cloud session: typed chat still works without mic ingress.
+            let message = "Mic unavailable — text chat still works. \(error)"
+            NovaLog.session.error("Mic ingress failed after Realtime connect: \(String(describing: error), privacy: .public)")
+            publishListenHealth(phase: .error, detail: message)
+            onError?(message)
+        }
 
         ingressTask = Task { [weak self] in
             guard let self else { return }
@@ -588,6 +620,7 @@ public actor ConversationOrchestrator {
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
                 let sent = await self.ai.appendAudio(pcm24)
+                await self.noteAppendResult(sent: sent)
                 if sent {
                     // End-to-end: capture → socket send completion.
                     await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
@@ -649,6 +682,14 @@ public actor ConversationOrchestrator {
             if listenHealth.phase == .waitingForSpeech || listenHealth.phase == .micSilent {
                 publishListenHealth(phase: .hearingYou, detail: "Local mic energy detected")
             }
+        }
+    }
+
+    private func noteAppendResult(sent: Bool) {
+        if sent {
+            micChunksAppendOK += 1
+        } else {
+            micChunksAppendFailed += 1
         }
     }
 
@@ -751,8 +792,12 @@ public actor ConversationOrchestrator {
                !didAnnounceCloudQuiet
             {
                 didAnnounceCloudQuiet = true
+                let vad = cloudVadSpeechEvents > 0
+                    ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
+                    : "Cloud VAD never fired — audio may not be reaching OpenAI (or session.update lost a race)"
+                let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
                 let message = """
-                Hearing you on \(route), but no cloud transcript yet. Realtime STT may be stuck — Stop and Listen again. Bridge token mint is OK if Listen stayed green.
+                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
                 """
                 lastError = message
                 onError?(message)
@@ -929,6 +974,13 @@ public actor ConversationOrchestrator {
             await requestFollowUps()
             onMetricsTick?()
         case .speechStarted:
+            cloudVadSpeechEvents += 1
+            if userTranscriptChars == 0 {
+                publishListenHealth(
+                    phase: .hearingYou,
+                    detail: "Cloud VAD heard speech — waiting for transcript…"
+                )
+            }
             // Anchor the grace window at the start of the user's turn. If we were
             // already inside the listening window, the user beginning a new turn
             // keeps it open — so natural pauses and Whisper's transcription

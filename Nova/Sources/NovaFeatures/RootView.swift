@@ -36,6 +36,8 @@ public struct RootView: View {
     @State private var showGlassesDetails = false
     @State private var showTranscript = true
     @State private var showRealtimeWarning = false
+    @State private var draftMessage = ""
+    @State private var isSendingText = false
 
     public init(
         session: SessionViewModel,
@@ -129,6 +131,7 @@ public struct RootView: View {
             List {
                 hudSection
                 listenSection
+                textChatSection
                 if coding.pinnedSessionId != nil {
                     codingResumeSection
                 }
@@ -171,9 +174,9 @@ public struct RootView: View {
                 if session.registrationState == .registered {
                     visionSection
                 }
-                // Always show live transcript while Listen is on so mic/STT
-                // failures are visible without hunting for the bubble toggle.
-                if showTranscript || conversation.isRunning {
+                // Always show live transcript while Listen is on or text chat is
+                // in use so mic/STT failures and typed turns stay visible.
+                if showTranscript || conversation.isRunning || !conversation.transcript.isEmpty {
                     conversationSection
                     suggestionsSection
                 }
@@ -388,7 +391,7 @@ public struct RootView: View {
             }
             .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
 
-            if conversation.isRunning {
+            if conversation.isRunning || conversation.listenHealth.phase == .connecting {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Circle()
@@ -442,6 +445,52 @@ public struct RootView: View {
         }
     }
 
+    private var textChatSection: some View {
+        Section {
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Message \(agents.activeName)…", text: $draftMessage, axis: .vertical)
+                    .lineLimit(1...6)
+                    .textInputAutocapitalization(.sentences)
+                Button {
+                    Task { await sendDraftMessage() }
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
+                        .symbolRenderingMode(.hierarchical)
+                }
+                .disabled(
+                    isSendingText
+                        || draftMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || settings.realtimeMintBlocked && !conversation.isRunning
+                )
+                .accessibilityLabel("Send message")
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 12))
+        } header: {
+            Text("Text chat")
+        } footer: {
+            Text(
+                conversation.isRunning
+                    ? "Sends to the active agent over the live session — useful when the mic path is broken."
+                    : "Send opens the agent session automatically, then delivers your message."
+            )
+        }
+    }
+
+    private func sendDraftMessage() async {
+        let text = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isSendingText else { return }
+        if settings.realtimeMintBlocked && !conversation.isRunning {
+            showRealtimeWarning = true
+            return
+        }
+        isSendingText = true
+        showTranscript = true
+        draftMessage = ""
+        await conversation.sendTypedMessage(text)
+        isSendingText = false
+    }
+
     private var conversationSection: some View {
         Section {
             if conversation.transcript.isEmpty {
@@ -450,8 +499,8 @@ public struct RootView: View {
                 } description: {
                     Text(
                         conversation.isRunning
-                            ? "Speak now. Your words should appear here as You: …"
-                            : "Tap Listen, then speak. Transcripts stay visible so you can verify the mic."
+                            ? "Speak or type below. Your words appear here as You: …"
+                            : "Type a message above, or tap Listen to talk. Transcripts stay visible."
                     )
                 }
                 .listRowBackground(Color.clear)
@@ -460,7 +509,7 @@ public struct RootView: View {
                     transcriptBubble(line)
                         .listRowSeparator(.hidden)
                 }
-                if conversation.isRunning {
+                if !conversation.transcript.isEmpty {
                     Button("Clear transcript") {
                         conversation.clearTranscript()
                     }

@@ -165,18 +165,17 @@ public final class ConversationViewModel {
         }
         do {
             var config = AISessionConfig()
-            if let settings {
-                config.useLocalWakeWord = await settings.useLocalWakeWord()
-            }
-            // Manual Listen already means the user engaged. Requiring "Nova" again
-            // (plus imperfect STT) was canceling server-VAD replies → Listen green,
-            // total silence. Keep wake-word gating only for on-device wake mode.
-            if !config.useLocalWakeWord {
-                config.requireWakeWord = false
-            }
-            listenHealth = ListenHealth(phase: .connecting, detail: "Starting Realtime…")
-            try await orchestrator.start(config: config)
+            // Explicit Listen / typed chat must open Realtime immediately.
+            // "Local wake word first" is for idle always-on mode only — if we
+            // honor it here, start() returns after on-device mic setup and the
+            // UI stays stuck on "Connecting… Starting Realtime…" with no cloud
+            // session (and text chat cannot send).
+            config.useLocalWakeWord = false
+            config.requireWakeWord = false
+            // Show Stop + diagnostics while connect is in flight.
             isRunning = true
+            listenHealth = ListenHealth(phase: .connecting, detail: "Starting Realtime (bridge token → OpenAI)…")
+            try await orchestrator.start(config: config)
             usage?.markSessionStarted()
             refreshLatency()
             refreshUsage()
@@ -202,7 +201,25 @@ public final class ConversationViewModel {
     /// Continue the conversation from a tapped follow-up suggestion.
     public func sendSuggestion(_ text: String) async {
         suggestions = []
-        await orchestrator.sendUserText(text)
+        await sendTypedMessage(text)
+    }
+
+    /// Typed chat with the active agent. Starts Listen automatically when needed
+    /// so text works even when the mic path is broken.
+    public func sendTypedMessage(_ text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if !isRunning {
+            await start()
+            guard isRunning else { return }
+        }
+        // Realtime does not echo typed `input_text` as STT deltas — show it locally.
+        // Force a new bubble so a typed turn never concatenates onto partial STT.
+        suggestions = []
+        transcript.append(ConversationTranscriptLine(role: .user, text: trimmed))
+        currentTranscriptRole = .user
+        await orchestrator.sendUserText(trimmed)
+        refreshLatency()
     }
 
     public func stop() async {

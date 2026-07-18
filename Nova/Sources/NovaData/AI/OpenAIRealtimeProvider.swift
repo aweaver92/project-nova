@@ -76,10 +76,33 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
     private func openSocket(config: AISessionConfig) async throws {
         let connectStarted = ContinuousClock.Instant.now
+        // Run connect on this actor (no nested TaskGroup re-entry). Bound hangs
+        // with request timeouts + session.updated wait inside unrestricted path.
+        do {
+            try await openSocketUnrestricted(config: config)
+        } catch {
+            await tearDownSocket(clearConfig: false)
+            metrics?.increment(.sessionFailures)
+            throw error
+        }
+        metrics?.mark(.connectReady, startedAt: connectStarted)
+        if let reconnectStartedAt {
+            metrics?.mark(.reconnectDowntime, startedAt: reconnectStartedAt)
+            self.reconnectStartedAt = nil
+        }
+        NovaLog.ai.info("Realtime connected")
+    }
+
+    private func openSocketUnrestricted(config: AISessionConfig) async throws {
         let credential = try await resolveCredential()
-        let session = URLSession(configuration: .default)
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 25
+        let session = URLSession(configuration: configuration)
         self.session = session
         var request = URLRequest(url: url)
+        request.timeoutInterval = 20
         request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
 
         let task = session.webSocketTask(with: request)
@@ -111,8 +134,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                         "create_response": true,
                         "interrupt_response": true
                     ] as [String: Any] : NSNull(),
+                    // whisper-1 is the most compatible Realtime input-STT model;
+                    // gpt-4o-mini-transcribe is fine for /audio/transcriptions but
+                    // has been flaky for some Realtime sessions.
                     "transcription": [
-                        "model": "gpt-4o-mini-transcribe",
+                        "model": "whisper-1",
                         "language": "en"
                     ]
                 ] as [String: Any],
@@ -141,16 +167,18 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         // Start the receive loop before session.update so we can observe session.updated.
         receiveTask?.cancel()
-        waitingForSessionUpdated = true
         receiveTask = Task { await self.receiveLoop(generation: generation) }
 
         do {
+            // Arm the wait *immediately before* session.update. Treating
+            // `session.created` as ready (old behavior) raced: created arrives on
+            // connect, clears the flag, and we start streaming into a default
+            // session with no input transcription → local mic energy, no You: lines.
+            waitingForSessionUpdated = true
             try await sendJSON(["type": "session.update", "session": sessionDict])
             try await waitForSessionUpdated(timeout: Self.sessionReadyTimeout)
         } catch {
             waitingForSessionUpdated = false
-            await tearDownSocket(clearConfig: false)
-            metrics?.increment(.sessionFailures)
             throw error
         }
 
@@ -160,12 +188,6 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         cancelledResponseId = nil
         ttfaMark = nil
         speechEndMark = nil
-        metrics?.mark(.connectReady, startedAt: connectStarted)
-        if let reconnectStartedAt {
-            metrics?.mark(.reconnectDowntime, startedAt: reconnectStartedAt)
-            self.reconnectStartedAt = nil
-        }
-        NovaLog.ai.info("Realtime connected")
     }
 
     private func waitForSessionUpdated(timeout: Duration) async throws {
@@ -492,8 +514,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         else { return }
 
         switch type {
-        case "session.updated", "session.created":
+        case "session.updated":
             waitingForSessionUpdated = false
+        case "session.created":
+            // Informational only — do not clear the session.update wait.
+            break
         case "response.audio.delta", "response.output_audio.delta":
             // Suppress late audio from a cancelled response.
             if let cancelled = cancelledResponseId,
@@ -522,6 +547,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         case "conversation.item.input_audio_transcription.completed":
             let transcript = json["transcript"] as? String ?? ""
             eventsContinuation?.yield(.inputTranscriptionCompleted(transcript: transcript))
+        case "conversation.item.input_audio_transcription.failed":
+            let message = (json["error"] as? [String: Any])?["message"] as? String
+                ?? (json["message"] as? String)
+                ?? "input audio transcription failed"
+            eventsContinuation?.yield(.error(message: "Realtime STT failed: \(message)"))
         case "input_audio_buffer.speech_started":
             eventsContinuation?.yield(.speechStarted)
         case "input_audio_buffer.speech_stopped":

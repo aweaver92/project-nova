@@ -46,7 +46,7 @@ public struct SettingsView: View {
                 } header: {
                     Text("Cost & privacy")
                 } footer: {
-                    Text("Disabling follow-ups or web search avoids paid API calls. Local wake word keeps Realtime closed until you say Nova.")
+                    Text("Disabling follow-ups or web search avoids paid API calls. Local wake word is for idle always-on mode; tapping Listen or sending a text chat still opens Realtime immediately.")
                 }
 
                 Section {

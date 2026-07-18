@@ -153,16 +153,28 @@ public struct BridgeTokenService: TokenService {
     private let model: String?
     private let session: URLSession
 
+    /// Keep mint snappy so Listen cannot sit on "Connecting…" for a full
+    /// URLSession default (~60s) when the phone cannot reach the bridge.
+    private static let mintTimeout: TimeInterval = 12
+
     public init(
         configProvider: @escaping ConfigProvider,
         path: String = "realtime/token",
         model: String? = nil,
-        session: URLSession = .shared
+        session: URLSession? = nil
     ) {
         self.configProvider = configProvider
         self.path = path
         self.model = model
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = Self.mintTimeout
+            config.timeoutIntervalForResource = Self.mintTimeout
+            config.waitsForConnectivity = false
+            self.session = URLSession(configuration: config)
+        }
     }
 
     public func fetchRealtimeClientSecret() async throws -> EphemeralCredential {
@@ -174,6 +186,7 @@ public struct BridgeTokenService: TokenService {
         }
         var request = URLRequest(url: Self.url(base: base, path: path))
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.mintTimeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -181,7 +194,15 @@ public struct BridgeTokenService: TokenService {
         if let model, !model.isEmpty { body["model"] = model }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw NovaError.credentials(
+                "Bridge unreachable for Realtime token (\(base.host ?? "?")): \(error.localizedDescription). Use the Tailscale HTTPS URL (https://….ts.net), keep Tailscale + `tailscale serve` up on the PC, and confirm nova-bridge is running."
+            )
+        }
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw NovaError.credentials("Nova Bridge realtime token failed (HTTP \(code))")
