@@ -140,9 +140,9 @@ public struct RootView: View {
                         route: .training
                     )
                 }
-                if wellness.hasResumeSignal {
+                if agents.isSageActive {
                     specialistResumeSection(
-                        title: "Open Wellness · \(wellness.resumeSubtitle)",
+                        title: "Open Wellness",
                         systemImage: "leaf",
                         footer: "Opens Wellness under Agents for check-ins and breath timers.",
                         route: .wellness
