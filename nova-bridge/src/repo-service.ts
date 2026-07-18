@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve as pathResolve, sep } from "node:path";
+import { BaselineService, type AgentReview } from "./baseline-service.js";
 import { resolveGhBin, resolveGitBin, toolReadiness } from "./tool-paths.js";
 
 /** Names we never descend into while discovering git repos (Dropbox-safe). */
@@ -448,6 +449,9 @@ export class RepoService {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly gitBin: string | null;
   private readonly ghBin: string | null;
+  private readonly baselines: BaselineService;
+  /** Latest baseline id per repo (for publish defaults / review UI). */
+  private readonly activeBaseline = new Map<string, string>();
   private discoverCache: { at: number; repos: RepoSummary[] } | null = null;
   private static readonly DISCOVER_CACHE_MS = 5_000;
 
@@ -456,11 +460,13 @@ export class RepoService {
     defaultWorkdir?: string;
     gitBin?: string | null;
     ghBin?: string | null;
+    baselineStateDir?: string;
   }) {
     const defaultWorkdir = opts?.defaultWorkdir ?? process.env.NOVA_BRIDGE_WORKDIR ?? process.cwd();
     this.roots = parseRepoRoots(opts?.rootsEnv ?? process.env.NOVA_REPO_ROOTS, defaultWorkdir);
     this.gitBin = opts?.gitBin === undefined ? resolveGitBin() : opts.gitBin;
     this.ghBin = opts?.ghBin === undefined ? resolveGhBin() : opts.ghBin;
+    this.baselines = new BaselineService(opts?.baselineStateDir);
 
     // Prefer selecting the default workdir repo if it is a git root.
     try {
@@ -624,6 +630,81 @@ export class RepoService {
       return a.name.localeCompare(b.name);
     });
     return { repoId: resolved.repoId, path: resolved.relativePath, entries };
+  }
+
+  /** Snapshot every currently-dirty path before an agent run. */
+  async createBaseline(repoId: string): Promise<{ baselineId: string; fileCount: number }> {
+    return this.withLock(repoId, async () => {
+      const repo = this.resolveRepo(repoId);
+      const status = await this.statusUnlocked(repo.path, repo.id, repo.name);
+      const created = this.baselines.create(
+        repo.id,
+        repo.path,
+        status.changedFiles.map((f) => f.path),
+      );
+      this.activeBaseline.set(repo.id, created.baselineId);
+      return created;
+    });
+  }
+
+  async agentReview(repoId: string, baselineId?: string | null): Promise<AgentReview> {
+    return this.withLock(repoId, async () => {
+      const repo = this.resolveRepo(repoId);
+      const id = (baselineId ?? this.activeBaseline.get(repo.id) ?? "").trim();
+      if (!id) throw new RepoError("not_found", "no_active_baseline", 404);
+      const status = await this.statusUnlocked(repo.path, repo.id, repo.name);
+      const review = this.baselines.review(
+        repo.id,
+        id,
+        repo.path,
+        status.changedFiles.map((f) => f.path),
+      );
+      this.activeBaseline.set(repo.id, id);
+      return review;
+    });
+  }
+
+  async keepReviewPaths(
+    repoId: string,
+    baselineId: string,
+    paths: string[],
+  ): Promise<AgentReview> {
+    return this.withLock(repoId, async () => {
+      const repo = this.resolveRepo(repoId);
+      this.baselines.keep(repo.id, baselineId, paths);
+      this.activeBaseline.set(repo.id, baselineId);
+      const status = await this.statusUnlocked(repo.path, repo.id, repo.name);
+      return this.baselines.review(
+        repo.id,
+        baselineId,
+        repo.path,
+        status.changedFiles.map((f) => f.path),
+      );
+    });
+  }
+
+  async restoreReviewPaths(
+    repoId: string,
+    baselineId: string,
+    paths: string[],
+    contentTokens?: Record<string, string>,
+  ): Promise<AgentReview> {
+    return this.withLock(repoId, async () => {
+      const repo = this.resolveRepo(repoId);
+      this.baselines.restore(repo.id, baselineId, repo.path, paths, contentTokens);
+      this.activeBaseline.set(repo.id, baselineId);
+      const status = await this.statusUnlocked(repo.path, repo.id, repo.name);
+      return this.baselines.review(
+        repo.id,
+        baselineId,
+        repo.path,
+        status.changedFiles.map((f) => f.path),
+      );
+    });
+  }
+
+  activeBaselineId(repoId: string): string | null {
+    return this.activeBaseline.get(repoId) ?? null;
   }
 
   private findByIdUnder(dir: string, id: string, depth: number): string | null {
@@ -1057,7 +1138,29 @@ export class RepoService {
         }
       }
 
-      const paths = req.paths?.length ? req.paths : current.changedFiles.map((f) => f.path);
+      // Prefer agent-only remaining deltas from the active baseline when the
+      // client omits paths. Pre-existing dirty files (unchanged vs baseline)
+      // stay out of the PR. Fall back to the full dirty set when no baseline.
+      let paths = req.paths?.length ? [...req.paths] : [];
+      if (!paths.length) {
+        const baselineId = this.activeBaseline.get(repo.id);
+        if (baselineId) {
+          try {
+            const review = this.baselines.review(
+              repo.id,
+              baselineId,
+              repo.path,
+              current.changedFiles.map((f) => f.path),
+            );
+            paths = review.files.map((f) => f.path);
+          } catch {
+            paths = [];
+          }
+        }
+        if (!paths.length) {
+          paths = current.changedFiles.map((f) => f.path);
+        }
+      }
       for (const p of paths) assertSafeRelPath(p);
       if (!paths.length) throw new RepoError("nothing_to_publish", "no_paths");
 

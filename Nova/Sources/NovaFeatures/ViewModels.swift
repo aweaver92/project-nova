@@ -604,6 +604,7 @@ public final class SettingsViewModel {
     public private(set) var useLocalWakeWord: Bool = false
     public private(set) var visualMemoryEnabled: Bool = true
     public private(set) var meetingCloudProcessingEnabled: Bool = true
+    public private(set) var codingAutoOpenPreview: Bool = false
     public var voiceRetentionDays: Int = 0
     public var videoRetentionDays: Int = 0
     public var visualMemoryRetentionDays: Int = 0
@@ -641,6 +642,7 @@ public final class SettingsViewModel {
         useLocalWakeWord = await store.useLocalWakeWord()
         visualMemoryEnabled = await store.visualMemoryEnabled()
         meetingCloudProcessingEnabled = await store.meetingCloudProcessingEnabled()
+        codingAutoOpenPreview = await store.codingAutoOpenPreview()
         voiceRetentionDays = await store.voiceRetentionDays()
         videoRetentionDays = await store.videoRetentionDays()
         visualMemoryRetentionDays = await store.visualMemoryRetentionDays()
@@ -648,6 +650,11 @@ public final class SettingsViewModel {
         bridgeToken = await store.bridgeToken() ?? ""
         codingWorkingDirectory = await store.codingWorkingDirectory() ?? ""
         await refreshBridgeHealth()
+    }
+
+    public func setCodingAutoOpenPreview(_ enabled: Bool) async {
+        codingAutoOpenPreview = enabled
+        await store.setCodingAutoOpenPreview(enabled)
     }
 
     public func setSpokenFollowUps(_ enabled: Bool) async {
@@ -818,6 +825,62 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
 }
 
 /// Live process row for the Agents-window style activity strip.
+public enum CodingStallPhase: String, Sendable, Equatable {
+    case idle
+    case running
+    case stillWorking
+    case looksStuck
+}
+
+/// In-memory Coding prompt store used by tests and as a default dependency.
+public actor InMemoryCodingPromptStore: CodingPromptStoring {
+    private var repos: [String: CodingRepoPromptState] = [:]
+
+    public init() {}
+
+    public func state(repoId: String) async -> CodingRepoPromptState {
+        if let existing = repos[repoId] { return existing }
+        let fresh = CodingRepoPromptState(repoId: repoId)
+        repos[repoId] = fresh
+        return fresh
+    }
+
+    public func setPinnedPaths(_ paths: [CodingContextPin], repoId: String) async {
+        var state = await state(repoId: repoId)
+        state.pinnedPaths = Array(paths.prefix(3))
+        repos[repoId] = state
+    }
+
+    public func upsertTemplate(_ template: CodingPromptTemplate, repoId: String) async {
+        var state = await state(repoId: repoId)
+        if let idx = state.templates.firstIndex(where: { $0.id == template.id }) {
+            state.templates[idx] = template
+        } else {
+            state.templates.insert(template, at: 0)
+        }
+        repos[repoId] = state
+    }
+
+    public func deleteTemplate(id: UUID, repoId: String) async {
+        var state = await state(repoId: repoId)
+        state.templates.removeAll { $0.id == id }
+        repos[repoId] = state
+    }
+
+    public func appendHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async {
+        var state = await state(repoId: repoId)
+        state.history.insert(entry, at: 0)
+        if state.history.count > 50 { state.history = Array(state.history.prefix(50)) }
+        repos[repoId] = state
+    }
+
+    public func clearHistory(repoId: String) async {
+        var state = await state(repoId: repoId)
+        state.history = []
+        repos[repoId] = state
+    }
+}
+
 public struct CodingActivityStep: Identifiable, Equatable, Sendable {
     public let id: UUID
     public var phase: String
@@ -898,6 +961,13 @@ public final class CodingViewModel {
     public private(set) var isLoadingRepoFiles = false
     /// Relative file/folder selected as the next browser preview target.
     public private(set) var previewTargetPath: String?
+    public private(set) var autoOpenPreview = false
+    public private(set) var agentReview: BridgeAgentReview?
+    public private(set) var activeBaselineId: String?
+    public private(set) var expandedReviewPath: String?
+    public private(set) var pinnedPaths: [CodingContextPin] = []
+    public private(set) var savedTemplates: [CodingPromptTemplate] = []
+    public private(set) var promptHistory: [CodingPromptHistoryEntry] = []
     public private(set) var items: [CodingTranscriptItem] = []
     /// Live Agents-window style process feed for the current (or last) run.
     public private(set) var activitySteps: [CodingActivityStep] = []
@@ -908,6 +978,8 @@ public final class CodingViewModel {
     public private(set) var statusMessage: String = ""
     /// Set while a run is in flight; drives the elapsed-time readout.
     public private(set) var runStartedAt: Date?
+    public private(set) var lastSSEActivityAt: Date?
+    public private(set) var stallPhase: CodingStallPhase = .idle
     public var draft: String = ""
     public private(set) var pendingImages: [CodingImageAttachment] = []
     private var lastSentCommand: String = ""
@@ -924,16 +996,31 @@ public final class CodingViewModel {
     public var onSpokenProgress: ((String) async -> Void)?
     /// Optional confirmation gate for publish (Create PR).
     public var confirmPublish: ((String, String) async -> Bool)?
+    /// Opens URLs (Safari) — injected from AppContainer.
+    public var openURL: ((URL) async -> Bool)?
 
     private let bridge: any AgentBridging
     private let settings: any SettingsStoring
+    private let prompts: any CodingPromptStoring
     private var streamingAssistantId: UUID?
     private var streamingThinkingId: UUID?
     private var lastSpokenAt: Date = .distantPast
+    private var runGeneration = 0
+    private var previewOpenGeneration = 0
+    private var watchdogTask: Task<Void, Never>?
+    var stallSoftSeconds: TimeInterval = 45
+    var stallHardSeconds: TimeInterval = 90
+    /// Watchdog poll interval (shortened in unit tests).
+    var stallPollSeconds: TimeInterval = 5
 
-    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+    public init(
+        bridge: any AgentBridging,
+        settings: any SettingsStoring,
+        prompts: any CodingPromptStoring = InMemoryCodingPromptStore()
+    ) {
         self.bridge = bridge
         self.settings = settings
+        self.prompts = prompts
     }
 
     public var shortSessionId: String {
@@ -992,14 +1079,29 @@ public final class CodingViewModel {
         pinnedSessionId = await settings.codingSessionId()
         workingDirectory = await settings.codingWorkingDirectory() ?? ""
         selectedRepoId = await settings.codingSelectedRepoId()
+        autoOpenPreview = await settings.codingAutoOpenPreview()
         await refreshRepositories()
         await refreshSessions()
+        await reloadPromptState()
         if let id = pinnedSessionId {
             await loadMessages(sessionId: id)
         }
         if selectedRepoId != nil {
             await refreshRepoStatusAndDiff()
         }
+    }
+
+    private func reloadPromptState() async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else {
+            pinnedPaths = []
+            savedTemplates = []
+            promptHistory = []
+            return
+        }
+        let state = await prompts.state(repoId: repoId)
+        pinnedPaths = state.pinnedPaths
+        savedTemplates = state.templates
+        promptHistory = state.history
     }
 
     public func refreshRepositories() async {
@@ -1037,9 +1139,13 @@ public final class CodingViewModel {
         selectedRepoId = trimmed
         await settings.setCodingSelectedRepoId(trimmed)
         activePreview = nil
+        previewOpenGeneration += 1
         repoFileEntries = []
         repoBrowsePath = ""
         previewTargetPath = nil
+        agentReview = nil
+        activeBaselineId = nil
+        await reloadPromptState()
         // Resumed Cursor sessions keep their original cwd — start fresh.
         await startNewSession()
         await refreshRepositories()
@@ -1201,6 +1307,9 @@ public final class CodingViewModel {
         guard let repoId = selectedRepoId, !repoId.isEmpty, !isStartingPreview else { return }
         isStartingPreview = true
         defer { isStartingPreview = false }
+        previewOpenGeneration += 1
+        let openGeneration = previewOpenGeneration
+        autoOpenPreview = await settings.codingAutoOpenPreview()
 
         let selectedPath = path ?? previewTargetPath
         let result = await bridge.startPreview(repoId: repoId, path: selectedPath)
@@ -1216,7 +1325,8 @@ public final class CodingViewModel {
         while let current = activePreview,
               current.repoId == repoId,
               current.isPending,
-              attempts < 60
+              attempts < 60,
+              openGeneration == previewOpenGeneration
         {
             try? await Task.sleep(for: .seconds(2))
             attempts += 1
@@ -1226,17 +1336,24 @@ public final class CodingViewModel {
             else { break }
             activePreview = refreshed
         }
-        if let final = activePreview, final.repoId == repoId {
-            if final.isReady {
-                statusMessage = "Preview ready: \(final.url)"
-            } else if final.state == "error" {
-                statusMessage = "Preview failed: \(final.error ?? "unknown")"
+        guard openGeneration == previewOpenGeneration,
+              let final = activePreview,
+              final.repoId == repoId
+        else { return }
+        if final.isReady {
+            statusMessage = "Preview ready: \(final.url)"
+            if autoOpenPreview, let url = URL(string: final.url) {
+                let opened = await openURL?(url) ?? false
+                if opened { statusMessage = "Opened preview in Safari" }
             }
+        } else if final.state == "error" {
+            statusMessage = "Preview failed: \(final.error ?? "unknown")"
         }
     }
 
     public func stopPreview() async {
         guard let preview = activePreview else { return }
+        previewOpenGeneration += 1
         _ = await bridge.stopPreview(repoId: preview.repoId)
         activePreview = nil
     }
@@ -1281,14 +1398,25 @@ public final class CodingViewModel {
     }
 
     public func preparePublishDraft() {
+        let publishPaths = defaultPublishPaths()
         let branchHint = repoStatus?.branch.hasPrefix("nova/") == true
             ? (repoStatus?.branch ?? "")
             : "fix-\(ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-").prefix(16))"
         if publishBranchName.isEmpty { publishBranchName = String(branchHint) }
         if publishCommitMessage.isEmpty {
-            publishCommitMessage = "Nova: update \(repoStatus?.changedFiles.count ?? 0) file(s)"
+            publishCommitMessage = "Nova: update \(publishPaths.count) file(s)"
         }
         if publishPRTitle.isEmpty { publishPRTitle = publishCommitMessage }
+    }
+
+    public func defaultPublishPaths() -> [String] {
+        if let review = agentReview {
+            let kept = review.files.filter(\.kept).map(\.path)
+            if !kept.isEmpty { return kept }
+            // Before any Keep actions, publish the remaining agent-only deltas.
+            return review.files.map(\.path)
+        }
+        return repoStatus?.changedFiles.map(\.path) ?? []
     }
 
     public func publishPullRequest() async {
@@ -1297,11 +1425,16 @@ public final class CodingViewModel {
             return
         }
         preparePublishDraft()
+        let paths = defaultPublishPaths()
+        guard !paths.isEmpty else {
+            statusMessage = "No agent changes left to publish."
+            return
+        }
         let detail = """
         Branch: \(publishBranchName)
         Commit: \(publishCommitMessage)
         PR: \(publishPRTitle)
-        Files: \(status.changedFiles.map(\.path).joined(separator: ", "))
+        Files: \(paths.joined(separator: ", "))
         """
         if let confirmPublish {
             let allowed = await confirmPublish("Create pull request?", detail)
@@ -1318,7 +1451,7 @@ public final class CodingViewModel {
             commitMessage: publishCommitMessage,
             prTitle: publishPRTitle,
             prBody: publishPRBody.isEmpty ? publishCommitMessage : publishPRBody,
-            paths: status.changedFiles.map(\.path)
+            paths: paths
         )
         let result = await bridge.publishRepository(repoId: repoId, request: request)
         guard result.ok, let published = Self.decodePublishResult(result.payloadJSON) else {
@@ -1328,6 +1461,7 @@ public final class CodingViewModel {
         lastPublishResult = published
         statusMessage = "Opened PR \(published.prUrl)"
         await refreshRepoStatusAndDiff()
+        await refreshAgentReview()
     }
 
     public func refreshSessions() async {
@@ -1367,12 +1501,28 @@ public final class CodingViewModel {
     }
 
     public func startNewSession() async {
+        stopWatchdog()
+        runGeneration += 1
         pinnedSessionId = nil
         await settings.setCodingSessionId(nil)
         items = []
         activeRunId = nil
         runStatus = "idle"
+        stallPhase = .idle
+        lastSSEActivityAt = nil
         statusMessage = "New session — send a prompt to create one."
+    }
+
+    /// Cancel the active stream, drop the Cursor session pin, and keep the last
+    /// prompt ready for an immediate retry.
+    public func restartSession() async {
+        await cancel()
+        await startNewSession()
+        if !lastSentCommand.isEmpty {
+            draft = lastSentCommand
+            pendingImages = lastSentImages
+        }
+        statusMessage = "Session restarted. Review the prompt and send again."
     }
 
     public func loadMessages(sessionId: String) async {
@@ -1401,33 +1551,61 @@ public final class CodingViewModel {
         let command = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isRunning, !command.isEmpty || !pendingImages.isEmpty else { return }
         let images = pendingImages
-        let effectiveCommand = command.isEmpty
+        let userText = command.isEmpty
             ? "Analyze the attached image. Identify the visible error and recommend the next debugging steps."
             : command
+        let bridgeCommand = CodingPromptComposer.command(userText: userText, pins: pinnedPaths)
         draft = ""
         pendingImages = []
         let imageSuffix = images.isEmpty
             ? ""
             : "\n📎 \(images.count) image\(images.count == 1 ? "" : "s")"
-        items.append(CodingTranscriptItem(kind: .user, text: effectiveCommand + imageSuffix))
-        lastSentCommand = effectiveCommand
+        // Transcript keeps the original user text so retries never duplicate pins.
+        items.append(CodingTranscriptItem(kind: .user, text: userText + imageSuffix))
+        lastSentCommand = userText
         lastSentImages = images
+        runGeneration += 1
+        let generation = runGeneration
         isRunning = true
         runStatus = "running"
+        stallPhase = .running
         statusMessage = ""
         activeRunId = nil
         runStartedAt = Date()
+        lastSSEActivityAt = Date()
         activitySteps = [
             CodingActivityStep(phase: "status", text: "Connecting to bridge…", isDone: false)
         ]
         streamingAssistantId = nil
         streamingThinkingId = nil
+        startWatchdog(generation: generation)
 
         let persistedRepoId = await settings.codingSelectedRepoId()
         let repoId = selectedRepoId ?? persistedRepoId
         selectedRepoId = repoId
         let cwd = await settings.codingWorkingDirectory()
         workingDirectory = cwd ?? ""
+
+        if let repoId, !repoId.isEmpty {
+            await prompts.appendHistory(
+                CodingPromptHistoryEntry(text: userText),
+                repoId: repoId
+            )
+            await reloadPromptState()
+            let baselineResult = await bridge.createBaseline(repoId: repoId)
+            if baselineResult.ok,
+               let data = baselineResult.payloadJSON.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let baselineId = obj["baselineId"] as? String,
+               !baselineId.isEmpty
+            {
+                activeBaselineId = baselineId
+                agentReview = nil
+                expandedReviewPath = nil
+            } else if !baselineResult.ok {
+                statusMessage = Self.summarize(baselineResult.payloadJSON)
+            }
+        }
 
         // Relay SSE events onto MainActor via AsyncStream so the bridge actor's
         // read loop never awaits MainActor directly (that deadlocks: send() is
@@ -1436,12 +1614,12 @@ public final class CodingViewModel {
         let (eventStream, eventContinuation) = AsyncStream<CodingStreamEvent>.makeStream()
         let applyTask = Task { [weak self] in
             for await event in eventStream {
-                await self?.apply(event: event)
+                await self?.apply(event: event, generation: generation)
             }
         }
 
         let result = await bridge.streamCursorRun(
-            command: effectiveCommand,
+            command: bridgeCommand,
             images: images,
             sessionId: pinnedSessionId,
             workingDirectory: repoId == nil ? cwd : nil,
@@ -1452,8 +1630,11 @@ public final class CodingViewModel {
         eventContinuation.finish()
         await applyTask.value
 
+        guard generation == runGeneration else { return }
+        stopWatchdog()
         isRunning = false
         runStartedAt = nil
+        stallPhase = .idle
         streamingAssistantId = nil
         streamingThinkingId = nil
         if let sid = Self.string(result.payloadJSON, key: "sessionId"), !sid.isEmpty {
@@ -1478,9 +1659,12 @@ public final class CodingViewModel {
         }
         await refreshSessions()
         await refreshRepoStatusAndDiff()
+        await refreshAgentReview()
     }
 
     public func cancel() async {
+        runGeneration += 1
+        stopWatchdog()
         // Always abort the HTTP stream first — activeRunId is only set after the
         // first RUNNING event, which never arrives if SSE apply is wedged.
         _ = await bridge.cancelActiveStream()
@@ -1490,6 +1674,7 @@ public final class CodingViewModel {
         runStatus = "cancelled"
         isRunning = false
         runStartedAt = nil
+        stallPhase = .idle
         for idx in activitySteps.indices where !activitySteps[idx].isDone {
             activitySteps[idx].isDone = true
         }
@@ -1506,17 +1691,175 @@ public final class CodingViewModel {
 
     public var canRetry: Bool { !lastSentCommand.isEmpty && !isRunning }
 
-    /// Starter prompts shown when the transcript is empty.
+    /// Built-in task templates plus any user-saved templates for the repo.
     public var suggestedPrompts: [String] {
         if selectedRepoId == nil {
             return []
         }
-        return [
+        let builtIn = [
             "Summarize this repository and its structure",
             "Find and fix any failing builds or tests",
             "Review the latest changes for bugs",
             "Add a README with setup instructions",
         ]
+        return builtIn + savedTemplates.map(\.body)
+    }
+
+    public var builtInTemplates: [(title: String, body: String)] {
+        [
+            ("Summarize repo", "Summarize this repository and its structure"),
+            ("Fix builds/tests", "Find and fix any failing builds or tests"),
+            ("Review changes", "Review the latest changes for bugs"),
+            ("Add README", "Add a README with setup instructions"),
+        ]
+    }
+
+    public func applyTemplate(_ body: String) {
+        draft = body
+    }
+
+    public func saveCurrentDraftAsTemplate(title: String) async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else { return }
+        let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let template = CodingPromptTemplate(
+            title: trimmedTitle.isEmpty ? String(body.prefix(40)) : trimmedTitle,
+            body: body
+        )
+        await prompts.upsertTemplate(template, repoId: repoId)
+        await reloadPromptState()
+    }
+
+    public func deleteTemplate(_ template: CodingPromptTemplate) async {
+        guard let repoId = selectedRepoId else { return }
+        await prompts.deleteTemplate(id: template.id, repoId: repoId)
+        await reloadPromptState()
+    }
+
+    public func runHistoryEntry(_ entry: CodingPromptHistoryEntry) async {
+        guard !isRunning else { return }
+        draft = entry.text
+        await send()
+    }
+
+    public func editHistoryEntry(_ entry: CodingPromptHistoryEntry) {
+        draft = entry.text
+    }
+
+    public func pinPath(_ path: String, isDirectory: Bool) async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else { return }
+        let normalized = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        var next = pinnedPaths.filter { $0.path != normalized }
+        next.insert(
+            CodingContextPin(path: normalized, kind: isDirectory ? "directory" : "file"),
+            at: 0
+        )
+        if next.count > 3 { next = Array(next.prefix(3)) }
+        await prompts.setPinnedPaths(next, repoId: repoId)
+        pinnedPaths = next
+    }
+
+    public func unpinPath(_ path: String) async {
+        guard let repoId = selectedRepoId else { return }
+        let next = pinnedPaths.filter { $0.path != path }
+        await prompts.setPinnedPaths(next, repoId: repoId)
+        pinnedPaths = next
+    }
+
+    public func toggleReviewExpanded(_ path: String) {
+        expandedReviewPath = expandedReviewPath == path ? nil : path
+    }
+
+    public func keepReviewPaths(_ paths: [String]) async {
+        guard let repoId = selectedRepoId,
+              let baselineId = activeBaselineId ?? agentReview?.baselineId,
+              !paths.isEmpty
+        else { return }
+        let result = await bridge.keepReviewPaths(
+            repoId: repoId,
+            baselineId: baselineId,
+            paths: paths
+        )
+        guard result.ok else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        await refreshAgentReview()
+        await refreshRepoStatusAndDiff()
+        statusMessage = paths.count == 1 ? "Kept \(paths[0])" : "Kept \(paths.count) files"
+    }
+
+    public func revertReviewPaths(_ paths: [String]) async {
+        guard let repoId = selectedRepoId,
+              let baselineId = activeBaselineId ?? agentReview?.baselineId,
+              let review = agentReview,
+              !paths.isEmpty
+        else { return }
+        var tokens: [String: String] = [:]
+        for file in review.files where paths.contains(file.path) {
+            tokens[file.path] = file.contentToken
+        }
+        let result = await bridge.restoreReviewPaths(
+            repoId: repoId,
+            baselineId: baselineId,
+            paths: paths,
+            contentTokens: tokens
+        )
+        guard result.ok else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        await refreshAgentReview()
+        await refreshRepoStatusAndDiff()
+        statusMessage = paths.count == 1 ? "Reverted \(paths[0])" : "Reverted \(paths.count) files"
+    }
+
+    public func keepAllReviewChanges() async {
+        guard let review = agentReview else { return }
+        await keepReviewPaths(review.files.filter { !$0.kept }.map(\.path))
+    }
+
+    public func revertAllReviewChanges() async {
+        guard let review = agentReview else { return }
+        await revertReviewPaths(review.files.filter { !$0.kept }.map(\.path))
+    }
+
+    public func refreshAgentReview() async {
+        guard let repoId = selectedRepoId,
+              let baselineId = activeBaselineId
+        else {
+            agentReview = nil
+            return
+        }
+        let result = await bridge.fetchAgentReview(repoId: repoId, baselineId: baselineId)
+        guard result.ok,
+              let review = Self.decodeAgentReview(result.payloadJSON)
+        else {
+            if !result.ok {
+                // Baseline may have expired; clear quietly.
+                agentReview = nil
+            }
+            return
+        }
+        agentReview = review
+        activeBaselineId = review.baselineId
+        if !review.files.isEmpty {
+            showDiff = true
+        }
+    }
+
+    private static func decodeAgentReview(_ payloadJSON: String) -> BridgeAgentReview? {
+        guard let data = payloadJSON.data(using: .utf8) else { return nil }
+        if let direct = try? JSONDecoder().decode(BridgeAgentReview.self, from: data) {
+            return direct
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let reviewObj = obj["review"],
+              let reviewData = try? JSONSerialization.data(withJSONObject: reviewObj)
+        else { return nil }
+        return try? JSONDecoder().decode(BridgeAgentReview.self, from: reviewData)
     }
 
     public func toggleExpand(_ item: CodingTranscriptItem) {
@@ -1524,7 +1867,9 @@ public final class CodingViewModel {
         items[idx].isExpanded.toggle()
     }
 
-    private func apply(event: CodingStreamEvent) {
+    private func apply(event: CodingStreamEvent, generation: Int) {
+        guard generation == runGeneration else { return }
+        noteSSEActivity()
         switch event.type {
         case "assistant_delta":
             let text = event.text ?? ""
@@ -1682,6 +2027,46 @@ public final class CodingViewModel {
         // Keep the Agents strip focused on the current turn.
         if activitySteps.count > 40 {
             activitySteps.removeFirst(activitySteps.count - 40)
+        }
+    }
+
+    private func noteSSEActivity() {
+        lastSSEActivityAt = Date()
+        if isRunning, stallPhase != .running {
+            stallPhase = .running
+        }
+    }
+
+    private func startWatchdog(generation: Int) {
+        stopWatchdog()
+        let poll = max(0.02, stallPollSeconds)
+        watchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(poll))
+                guard let self, !Task.isCancelled else { return }
+                self.evaluateStall(generation: generation)
+            }
+        }
+    }
+
+    private func stopWatchdog() {
+        watchdogTask?.cancel()
+        watchdogTask = nil
+    }
+
+    private func evaluateStall(generation: Int) {
+        guard generation == runGeneration, isRunning else {
+            if generation == runGeneration { stallPhase = .idle }
+            return
+        }
+        let last = lastSSEActivityAt ?? runStartedAt ?? Date()
+        let silence = Date().timeIntervalSince(last)
+        if silence >= stallHardSeconds {
+            stallPhase = .looksStuck
+        } else if silence >= stallSoftSeconds {
+            stallPhase = .stillWorking
+        } else {
+            stallPhase = .running
         }
     }
 

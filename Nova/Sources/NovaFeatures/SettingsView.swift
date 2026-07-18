@@ -116,6 +116,22 @@ public struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle(
+                        "Open preview in Safari when ready",
+                        isOn: Binding(
+                            get: { settings.codingAutoOpenPreview },
+                            set: { enabled in
+                                Task { await settings.setCodingAutoOpenPreview(enabled) }
+                            }
+                        )
+                    )
+                } header: {
+                    Text("Coding")
+                } footer: {
+                    Text("When enabled, a newly started preview opens in Safari exactly once as soon as it becomes ready.")
+                }
+
+                Section {
                     HStack {
                         Text("Latency gate")
                         Spacer()

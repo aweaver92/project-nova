@@ -11,6 +11,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         static let codingSessionId = "nova.settings.codingSessionId"
         static let codingWorkingDirectory = "nova.settings.codingWorkingDirectory"
         static let codingSelectedRepoId = "nova.settings.codingSelectedRepoId"
+        static let codingAutoOpenPreview = "nova.settings.codingAutoOpenPreview"
         static let followUpSuggestionsEnabled = "nova.settings.followUpSuggestionsEnabled"
         static let webSearchEnabled = "nova.settings.webSearchEnabled"
         static let useLocalWakeWord = "nova.settings.useLocalWakeWord"
@@ -71,6 +72,14 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
 
     public func setCodingSelectedRepoId(_ value: String?) async {
         setOptionalString(normalized(value), forKey: Keys.codingSelectedRepoId)
+    }
+
+    public func codingAutoOpenPreview() async -> Bool {
+        defaults.bool(forKey: Keys.codingAutoOpenPreview)
+    }
+
+    public func setCodingAutoOpenPreview(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.codingAutoOpenPreview)
     }
 
     public func followUpSuggestionsEnabled() async -> Bool {

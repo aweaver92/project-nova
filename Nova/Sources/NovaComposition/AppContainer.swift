@@ -24,6 +24,7 @@ public final class AppContainer {
     public let visualMemory: FileVisualMemoryStore
     public let workspaces: FileWorkspaceStore
     public let skillStore: FileSkillStore
+    public let codingPromptStore: FileCodingPromptStore
     public let bookmarks: FileBookmarkStore
     public let digestStore: FileMemoryDigestStore
     public let settings: UserDefaultsSettingsStore
@@ -140,6 +141,8 @@ public final class AppContainer {
         self.workspaces = workspaceStore
         let skillStore = FileSkillStore()
         self.skillStore = skillStore
+        let codingPromptStore = FileCodingPromptStore()
+        self.codingPromptStore = codingPromptStore
         let bookmarkStore = FileBookmarkStore()
         self.bookmarks = bookmarkStore
 
@@ -419,7 +422,11 @@ public final class AppContainer {
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
-        let codingVM = CodingViewModel(bridge: bridge, settings: settingsStore)
+        let codingVM = CodingViewModel(
+            bridge: bridge,
+            settings: settingsStore,
+            prompts: codingPromptStore
+        )
         codingVM.onSpokenProgress = { [weak orchestrator] line in
             guard let orchestrator else { return }
             let agent = await orchestrator.currentAgent
@@ -428,6 +435,16 @@ public final class AppContainer {
         }
         codingVM.confirmPublish = { [toolConfirmation] title, detail in
             await toolConfirmation.confirm(title: title, detail: detail)
+        }
+        codingVM.openURL = { url in
+            #if canImport(UIKit)
+            await MainActor.run {
+                UIApplication.shared.open(url)
+            }
+            return true
+            #else
+            return false
+            #endif
         }
         self.codingVM = codingVM
         let settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)

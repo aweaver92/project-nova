@@ -722,3 +722,22 @@ final class AgentDirectorTests: XCTestCase {
         XCTAssertEqual(director.control(for: "end the conversation"), .none)
     }
 }
+
+final class CodingPromptComposerTests: XCTestCase {
+    func testComposesPinnedPathsWithoutMutatingEmptyPins() {
+        let bare = CodingPromptComposer.command(userText: "  Fix the build  ", pins: [])
+        XCTAssertEqual(bare, "Fix the build")
+
+        let composed = CodingPromptComposer.command(
+            userText: "Add a button",
+            pins: [
+                CodingContextPin(path: "src/App.tsx", kind: "file"),
+                CodingContextPin(path: "src/components", kind: "directory"),
+            ]
+        )
+        XCTAssertTrue(composed.hasPrefix("Focus on these paths (repo-relative):"))
+        XCTAssertTrue(composed.contains("- src/App.tsx (file)"))
+        XCTAssertTrue(composed.contains("- src/components (directory)"))
+        XCTAssertTrue(composed.hasSuffix("Add a button"))
+    }
+}

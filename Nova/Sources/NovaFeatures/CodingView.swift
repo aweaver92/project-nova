@@ -14,9 +14,22 @@ public struct CodingView: View {
     @State private var showCreateProject = false
     @State private var showPublish = false
     @State private var showRepoFiles = false
+    @State private var showPromptHistory = false
+    @State private var showTemplates = false
+    @State private var showKeepAllConfirm = false
+    @State private var showRevertAllConfirm = false
+    @State private var saveTemplateTitle = ""
+    @State private var showSaveTemplate = false
+    /// Repository browser action: preview a path, or pin it into prompts.
+    @State private var browseMode: RepoBrowseMode = .preview
     #if canImport(UIKit)
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     #endif
+
+    private enum RepoBrowseMode: String, CaseIterable {
+        case preview
+        case pin
+    }
 
     public init(coding: CodingViewModel, embedded: Bool = false) {
         self.coding = coding
@@ -39,6 +52,10 @@ public struct CodingView: View {
         VStack(spacing: 0) {
             repoStatusCard
             Divider()
+            if coding.stallPhase == .stillWorking || coding.stallPhase == .looksStuck {
+                stallBanner
+                Divider()
+            }
             if coding.isRunning || !coding.activitySteps.isEmpty {
                 agentProcessPanel
                 Divider()
@@ -117,10 +134,71 @@ public struct CodingView: View {
         .sheet(isPresented: $showCreateProject) { createProjectSheet }
         .sheet(isPresented: $showPublish) { publishSheet }
         .sheet(isPresented: $showRepoFiles) { repositoryFileBrowser }
+        .sheet(isPresented: $showPromptHistory) { promptHistorySheet }
+        .sheet(isPresented: $showTemplates) { templatesSheet }
+        .alert("Keep all agent changes?", isPresented: $showKeepAllConfirm) {
+            Button("Keep all") {
+                Task { await coding.keepAllReviewChanges() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Leaves files on disk unchanged and marks them kept for publishing.")
+        }
+        .alert("Revert all agent changes?", isPresented: $showRevertAllConfirm) {
+            Button("Revert all", role: .destructive) {
+                Task { await coding.revertAllReviewChanges() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Restores pre-run content for agent-touched files only. Your earlier uncommitted work stays untouched.")
+        }
+        .alert("Save template", isPresented: $showSaveTemplate) {
+            TextField("Title", text: $saveTemplateTitle)
+            Button("Save") {
+                Task {
+                    await coding.saveCurrentDraftAsTemplate(title: saveTemplateTitle)
+                    saveTemplateTitle = ""
+                }
+            }
+            Button("Cancel", role: .cancel) { saveTemplateTitle = "" }
+        } message: {
+            Text("Saves the current draft as a reusable prompt for this repository.")
+        }
         .task {
             await coding.load()
             await coding.refreshPreviews()
         }
+    }
+
+    @ViewBuilder
+    private var stallBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: coding.stallPhase == .looksStuck ? "exclamationmark.triangle.fill" : "hourglass")
+                .foregroundStyle(coding.stallPhase == .looksStuck ? Color.orange : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(coding.stallPhase == .looksStuck ? "Looks stuck" : "Still working…")
+                    .font(.caption.weight(.semibold))
+                Text(
+                    coding.stallPhase == .looksStuck
+                        ? "No agent activity for a while. You can restart the session and retry."
+                        : "The agent is quiet but still connected."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if coding.stallPhase == .looksStuck {
+                Button("Restart session") {
+                    Task { await coding.restartSession() }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
     }
 
     @ViewBuilder
@@ -171,25 +249,39 @@ public struct CodingView: View {
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(status.clean ? Color.secondary : Color.orange)
                 }
-                if !status.changedFiles.isEmpty {
+                if let review = coding.agentReview, !review.files.isEmpty {
+                    Text("\(review.pendingCount) agent change\(review.pendingCount == 1 ? "" : "s") · \(review.keptCount) kept")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if !status.changedFiles.isEmpty {
                     Text(status.changedFiles.prefix(6).map(\.path).joined(separator: ", "))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
                 HStack {
-                    Button(coding.showDiff ? "Hide diff" : "Review diff") {
-                        coding.toggleShowDiff()
+                    if coding.agentReview != nil {
+                        Button(coding.showDiff ? "Hide review" : "Review changes") {
+                            coding.toggleShowDiff()
+                        }
+                        .font(.caption)
+                    } else {
+                        Button(coding.showDiff ? "Hide diff" : "Review diff") {
+                            coding.toggleShowDiff()
+                        }
+                        .font(.caption)
+                        .disabled(coding.repoDiff?.diff.isEmpty != false && status.clean)
                     }
-                    .font(.caption)
-                    .disabled(coding.repoDiff?.diff.isEmpty != false && status.clean)
                     Spacer()
                     Button("Create pull request") {
                         coding.preparePublishDraft()
                         showPublish = true
                     }
                     .font(.caption.weight(.semibold))
-                    .disabled(status.clean || coding.isPublishing)
+                    .disabled(
+                        coding.isPublishing
+                            || (coding.agentReview.map { $0.files.isEmpty } ?? status.clean)
+                    )
                 }
             } else if coding.selectedRepoId == nil {
                 Text("Pick or clone a GitHub repository to code against.")
@@ -199,20 +291,24 @@ public struct CodingView: View {
 
             previewRow
 
-            if coding.showDiff, let diff = coding.repoDiff {
-                ScrollView {
-                    Text(diff.diff.isEmpty ? "(no textual diff — untracked files only)" : diff.diff)
-                        .font(.system(.caption2, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
-                }
-                .frame(maxHeight: 160)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                if diff.truncated {
-                    Text("Diff truncated for review.")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
+            if coding.showDiff {
+                if let review = coding.agentReview {
+                    agentReviewPanel(review)
+                } else if let diff = coding.repoDiff {
+                    ScrollView {
+                        Text(diff.diff.isEmpty ? "(no textual diff — untracked files only)" : diff.diff)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 160)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    if diff.truncated {
+                        Text("Diff truncated for review.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                 }
             }
 
@@ -234,6 +330,87 @@ public struct CodingView: View {
         }
         .padding(12)
         .background(Color(.tertiarySystemBackground))
+    }
+
+    @ViewBuilder
+    private func agentReviewPanel(_ review: BridgeAgentReview) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Agent changes")
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Keep all") { showKeepAllConfirm = true }
+                    .font(.caption)
+                    .disabled(review.pendingCount == 0)
+                Button("Revert all", role: .destructive) { showRevertAllConfirm = true }
+                    .font(.caption)
+                    .disabled(review.pendingCount == 0)
+            }
+            ForEach(review.files) { file in
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        coding.toggleReviewExpanded(file.path)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(file.change.uppercased())
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(file.kept ? Color.secondary : Color.orange)
+                            Text(file.path)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            if file.kept {
+                                Text("Kept")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Image(systemName: coding.expandedReviewPath == file.path ? "chevron.up" : "chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    if coding.expandedReviewPath == file.path {
+                        if file.binary {
+                            Text("Binary file — preview unavailable.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ScrollView {
+                                Text(file.diff.isEmpty ? "(no textual diff)" : file.diff)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 140)
+                        }
+                        if file.truncated {
+                            Text("Diff truncated.")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                        if !file.kept {
+                            HStack {
+                                Button("Keep") {
+                                    Task { await coding.keepReviewPaths([file.path]) }
+                                }
+                                .font(.caption.weight(.semibold))
+                                Button("Revert", role: .destructive) {
+                                    Task { await coding.revertReviewPaths([file.path]) }
+                                }
+                                .font(.caption.weight(.semibold))
+                                Spacer()
+                            }
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
     }
 
     /// Live preview: serve the repo from the bridge PC and open it in Safari.
@@ -313,6 +490,13 @@ public struct CodingView: View {
     private var repositoryFileBrowser: some View {
         NavigationStack {
             List {
+                Section {
+                    Picker("Mode", selection: $browseMode) {
+                        Text("Preview").tag(RepoBrowseMode.preview)
+                        Text("Pin context").tag(RepoBrowseMode.pin)
+                    }
+                    .pickerStyle(.segmented)
+                }
                 if coding.isLoadingRepoFiles && coding.repoFileEntries.isEmpty {
                     HStack {
                         Spacer()
@@ -330,10 +514,15 @@ public struct CodingView: View {
                         Button {
                             if entry.isDirectory {
                                 Task { await coding.browseRepository(path: entry.path) }
-                            } else {
+                            } else if browseMode == .preview {
                                 coding.choosePreviewTarget(entry.path)
                                 showRepoFiles = false
                                 Task { await coding.startPreview(path: entry.path) }
+                            } else {
+                                Task {
+                                    await coding.pinPath(entry.path, isDirectory: false)
+                                    showRepoFiles = false
+                                }
                             }
                         } label: {
                             HStack(spacing: 10) {
@@ -356,12 +545,28 @@ public struct CodingView: View {
                                     }
                                 }
                                 Spacer()
-                                Image(systemName: entry.isDirectory ? "chevron.right" : "safari")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                                if browseMode == .pin, !entry.isDirectory {
+                                    Image(systemName: "pin.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Image(systemName: entry.isDirectory ? "chevron.right" : "safari")
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                }
                             }
                         }
                         .buttonStyle(.plain)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            if browseMode == .pin {
+                                Button("Pin") {
+                                    Task {
+                                        await coding.pinPath(entry.path, isDirectory: entry.isDirectory)
+                                    }
+                                }
+                                .tint(.accentColor)
+                            }
+                        }
                     }
                 }
             }
@@ -391,22 +596,43 @@ public struct CodingView: View {
                     }
                     .disabled(coding.repoBrowsePath.isEmpty || coding.isLoadingRepoFiles)
                     Spacer()
-                    Button {
-                        let path = coding.repoBrowsePath
-                        coding.choosePreviewTarget(path.isEmpty ? nil : path)
-                        showRepoFiles = false
-                        Task {
-                            await coding.startPreview(path: path.isEmpty ? nil : path)
+                    if browseMode == .preview {
+                        Button {
+                            let path = coding.repoBrowsePath
+                            coding.choosePreviewTarget(path.isEmpty ? nil : path)
+                            showRepoFiles = false
+                            Task {
+                                await coding.startPreview(path: path.isEmpty ? nil : path)
+                            }
+                        } label: {
+                            Label(
+                                coding.repoBrowsePath.isEmpty
+                                    ? "Preview repo root"
+                                    : "Preview this folder",
+                                systemImage: "safari"
+                            )
                         }
-                    } label: {
-                        Label(
-                            coding.repoBrowsePath.isEmpty
-                                ? "Preview repo root"
-                                : "Preview this folder",
-                            systemImage: "safari"
-                        )
+                        .disabled(coding.isLoadingRepoFiles)
+                    } else {
+                        Button {
+                            let path = coding.repoBrowsePath
+                            Task {
+                                await coding.pinPath(
+                                    path.isEmpty ? "." : path,
+                                    isDirectory: true
+                                )
+                                showRepoFiles = false
+                            }
+                        } label: {
+                            Label(
+                                coding.repoBrowsePath.isEmpty
+                                    ? "Pin repo root"
+                                    : "Pin this folder",
+                                systemImage: "pin"
+                            )
+                        }
+                        .disabled(coding.isLoadingRepoFiles || coding.pinnedPaths.count >= 3)
                     }
-                    .disabled(coding.isLoadingRepoFiles)
                 }
             }
             .task {
@@ -545,15 +771,15 @@ public struct CodingView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             }
-            ForEach(coding.suggestedPrompts, id: \.self) { prompt in
+            ForEach(coding.builtInTemplates, id: \.title) { template in
                 Button {
-                    coding.draft = prompt
+                    coding.applyTemplate(template.body)
                     Task { await coding.send() }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "sparkles")
                             .font(.caption)
-                        Text(prompt)
+                        Text(template.title)
                             .font(.subheadline)
                             .multilineTextAlignment(.leading)
                     }
@@ -564,6 +790,28 @@ public struct CodingView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
+            }
+            if !coding.savedTemplates.isEmpty {
+                ForEach(coding.savedTemplates) { template in
+                    Button {
+                        coding.applyTemplate(template.body)
+                        Task { await coding.send() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc.text")
+                                .font(.caption)
+                            Text(template.title)
+                                .font(.subheadline)
+                                .multilineTextAlignment(.leading)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
         .padding(.horizontal)
@@ -714,6 +962,63 @@ public struct CodingView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if !coding.pinnedPaths.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(coding.pinnedPaths) { pin in
+                            HStack(spacing: 4) {
+                                Image(systemName: pin.isDirectory ? "folder" : "doc")
+                                    .font(.caption2)
+                                Text(pin.path)
+                                    .font(.caption2.monospaced())
+                                    .lineLimit(1)
+                                Button {
+                                    Task { await coding.unpinPath(pin.path) }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption2)
+                                }
+                                .accessibilityLabel("Unpin \(pin.path)")
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(Capsule())
+                        }
+                    }
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    browseMode = .pin
+                    showRepoFiles = true
+                } label: {
+                    Label("Pin", systemImage: "pin")
+                        .font(.caption.weight(.semibold))
+                }
+                .disabled(coding.selectedRepoId == nil || coding.pinnedPaths.count >= 3)
+                Button { showTemplates = true } label: {
+                    Label("Templates", systemImage: "doc.text")
+                        .font(.caption.weight(.semibold))
+                }
+                .disabled(coding.selectedRepoId == nil)
+                Button { showPromptHistory = true } label: {
+                    Label("Recent", systemImage: "clock")
+                        .font(.caption.weight(.semibold))
+                }
+                .disabled(coding.selectedRepoId == nil || coding.promptHistory.isEmpty)
+                Spacer()
+                Button {
+                    saveTemplateTitle = String(coding.draft.prefix(40))
+                    showSaveTemplate = true
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.caption)
+                }
+                .disabled(coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
             #if canImport(UIKit)
             if !coding.pendingImages.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -1003,11 +1308,17 @@ public struct CodingView: View {
     private var publishSheet: some View {
         NavigationStack {
             Form {
-                Section("Review") {
+                Section("Agent paths to publish") {
                     if let status = coding.repoStatus {
                         LabeledContent("Branch now", value: status.branch)
-                        ForEach(status.changedFiles) { file in
-                            Text("\(file.status) \(file.path)")
+                    }
+                    let paths = coding.defaultPublishPaths()
+                    if paths.isEmpty {
+                        Text("No agent changes left to publish.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(paths, id: \.self) { path in
+                            Text(path)
                                 .font(.caption.monospaced())
                         }
                     }
@@ -1044,10 +1355,114 @@ public struct CodingView: View {
                             }
                         }
                     }
-                    .disabled(coding.isPublishing || coding.repoStatus?.clean == true)
+                    .disabled(
+                        coding.isPublishing
+                            || coding.defaultPublishPaths().isEmpty
+                    )
                 }
             }
             .onAppear { coding.preparePublishDraft() }
+        }
+    }
+
+    private var promptHistorySheet: some View {
+        NavigationStack {
+            List {
+                if coding.promptHistory.isEmpty {
+                    Text("No recent prompts for this repository.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(coding.promptHistory) { entry in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(entry.text)
+                                .font(.subheadline)
+                                .lineLimit(4)
+                            Text(entry.sentAt.formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            HStack {
+                                Button("Edit") {
+                                    coding.editHistoryEntry(entry)
+                                    showPromptHistory = false
+                                }
+                                .font(.caption.weight(.semibold))
+                                Button("Run") {
+                                    showPromptHistory = false
+                                    Task { await coding.runHistoryEntry(entry) }
+                                }
+                                .font(.caption.weight(.semibold))
+                                .disabled(coding.isRunning)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .navigationTitle("Recent prompts")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { showPromptHistory = false }
+                }
+            }
+        }
+    }
+
+    private var templatesSheet: some View {
+        NavigationStack {
+            List {
+                Section("Built-in") {
+                    ForEach(coding.builtInTemplates, id: \.title) { template in
+                        Button {
+                            coding.applyTemplate(template.body)
+                            showTemplates = false
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(template.title)
+                                    .foregroundStyle(.primary)
+                                Text(template.body)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+                Section("Saved for this repo") {
+                    if coding.savedTemplates.isEmpty {
+                        Text("No saved templates yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(coding.savedTemplates) { template in
+                            Button {
+                                coding.applyTemplate(template.body)
+                                showTemplates = false
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(template.title)
+                                        .foregroundStyle(.primary)
+                                    Text(template.body)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                            .swipeActions {
+                                Button("Delete", role: .destructive) {
+                                    Task { await coding.deleteTemplate(template) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Templates")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { showTemplates = false }
+                }
+            }
         }
     }
 

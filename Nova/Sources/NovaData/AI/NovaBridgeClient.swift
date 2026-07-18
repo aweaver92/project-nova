@@ -396,6 +396,49 @@ public actor NovaBridgeClient: AgentBridging {
         return await post(path: "repos/\(escaped)/publish", body: body, timeout: 320)
     }
 
+    public func createBaseline(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await post(path: "repos/\(escaped)/baselines", body: [:], timeout: 60)
+    }
+
+    public func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        return await send(
+            path: "repos/\(repo)/baselines/\(baseline)/review",
+            method: "GET",
+            body: nil,
+            timeout: 60
+        )
+    }
+
+    public func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        return await post(
+            path: "repos/\(repo)/baselines/\(baseline)/keep",
+            body: ["paths": paths],
+            timeout: 60
+        )
+    }
+
+    public func restoreReviewPaths(
+        repoId: String,
+        baselineId: String,
+        paths: [String],
+        contentTokens: [String: String]?
+    ) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        var body: [String: Any] = ["paths": paths]
+        if let contentTokens { body["contentTokens"] = contentTokens }
+        return await post(
+            path: "repos/\(repo)/baselines/\(baseline)/restore",
+            body: body,
+            timeout: 60
+        )
+    }
+
     // MARK: - Live preview
 
     public func startPreview(repoId: String) async -> BridgeResult {

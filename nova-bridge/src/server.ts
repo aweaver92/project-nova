@@ -29,6 +29,10 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   POST /repos/clone | /repos/create | /repos/select
  *   GET  /repos/:repoId/status | /diff | /files?path=
  *   POST /repos/:repoId/publish
+ *   POST /repos/:repoId/baselines                 → create pre-run snapshot
+ *   GET  /repos/:repoId/baselines/:id/review      → agent-only file diffs
+ *   POST /repos/:repoId/baselines/:id/keep        { paths }
+ *   POST /repos/:repoId/baselines/:id/restore     { paths, contentTokens? }
  *   GET  /preview                  active previews
  *   POST /preview/start            { repoId, path? }  → LAN preview URL
  *   POST /preview/stop             { repoId }
@@ -225,6 +229,72 @@ app.post("/repos/:repoId/publish", requireAuth, async (req, res) => {
         : undefined,
     });
     res.json({ ok: true, ...result });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/:repoId/baselines", requireAuth, async (req, res) => {
+  try {
+    const created = await repos.createBaseline(String(req.params.repoId ?? ""));
+    res.json({ ok: true, ...created });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.get("/repos/:repoId/baselines/:baselineId/review", requireAuth, async (req, res) => {
+  try {
+    const review = await repos.agentReview(
+      String(req.params.repoId ?? ""),
+      String(req.params.baselineId ?? ""),
+    );
+    res.json({ ok: true, review });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/:repoId/baselines/:baselineId/keep", requireAuth, async (req, res) => {
+  try {
+    const paths = Array.isArray(req.body?.paths)
+      ? req.body.paths.filter((p: unknown): p is string => typeof p === "string")
+      : [];
+    if (!paths.length) {
+      res.status(400).json({ ok: false, error: "missing_paths" });
+      return;
+    }
+    const review = await repos.keepReviewPaths(
+      String(req.params.repoId ?? ""),
+      String(req.params.baselineId ?? ""),
+      paths,
+    );
+    res.json({ ok: true, review });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/:repoId/baselines/:baselineId/restore", requireAuth, async (req, res) => {
+  try {
+    const paths = Array.isArray(req.body?.paths)
+      ? req.body.paths.filter((p: unknown): p is string => typeof p === "string")
+      : [];
+    if (!paths.length) {
+      res.status(400).json({ ok: false, error: "missing_paths" });
+      return;
+    }
+    const contentTokens =
+      req.body?.contentTokens && typeof req.body.contentTokens === "object"
+        ? (req.body.contentTokens as Record<string, string>)
+        : undefined;
+    const review = await repos.restoreReviewPaths(
+      String(req.params.repoId ?? ""),
+      String(req.params.baselineId ?? ""),
+      paths,
+      contentTokens,
+    );
+    res.json({ ok: true, review });
   } catch (err) {
     sendRepoError(res, err);
   }

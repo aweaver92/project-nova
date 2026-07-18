@@ -199,6 +199,9 @@ public protocol SettingsStoring: Sendable {
     /// Opaque bridge repository id selected in the Coding tab.
     func codingSelectedRepoId() async -> String?
     func setCodingSelectedRepoId(_ value: String?) async
+    /// Open the live preview URL in Safari when it becomes ready. Default off.
+    func codingAutoOpenPreview() async -> Bool
+    func setCodingAutoOpenPreview(_ enabled: Bool) async
     /// Generate follow-up suggestion chips (paid Responses call). Default on.
     func followUpSuggestionsEnabled() async -> Bool
     func setFollowUpSuggestionsEnabled(_ enabled: Bool) async
@@ -237,6 +240,8 @@ public extension SettingsStoring {
     func setCodingWorkingDirectory(_ value: String?) async {}
     func codingSelectedRepoId() async -> String? { nil }
     func setCodingSelectedRepoId(_ value: String?) async {}
+    func codingAutoOpenPreview() async -> Bool { false }
+    func setCodingAutoOpenPreview(_ enabled: Bool) async {}
     func followUpSuggestionsEnabled() async -> Bool { true }
     func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {}
     func webSearchEnabled() async -> Bool { true }
@@ -537,6 +542,158 @@ public struct BridgePublishResult: Sendable, Equatable, Codable {
     }
 }
 
+/// One agent-only file delta from a pre-run baseline review.
+public struct BridgeAgentReviewFile: Identifiable, Sendable, Equatable, Codable {
+    public let path: String
+    /// "added" | "modified" | "deleted" | "binary"
+    public let change: String
+    public let diff: String
+    public let truncated: Bool
+    public let binary: Bool
+    public let contentToken: String
+    public let kept: Bool
+
+    public var id: String { path }
+
+    public init(
+        path: String,
+        change: String,
+        diff: String,
+        truncated: Bool,
+        binary: Bool,
+        contentToken: String,
+        kept: Bool
+    ) {
+        self.path = path
+        self.change = change
+        self.diff = diff
+        self.truncated = truncated
+        self.binary = binary
+        self.contentToken = contentToken
+        self.kept = kept
+    }
+}
+
+public struct BridgeAgentReview: Sendable, Equatable, Codable {
+    public let baselineId: String
+    public let repoId: String
+    public let files: [BridgeAgentReviewFile]
+    public let pendingCount: Int
+    public let keptCount: Int
+
+    public init(
+        baselineId: String,
+        repoId: String,
+        files: [BridgeAgentReviewFile],
+        pendingCount: Int,
+        keptCount: Int
+    ) {
+        self.baselineId = baselineId
+        self.repoId = repoId
+        self.files = files
+        self.pendingCount = pendingCount
+        self.keptCount = keptCount
+    }
+}
+
+public struct CodingPromptTemplate: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public var title: String
+    public var body: String
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        body: String,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.body = body
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct CodingPromptHistoryEntry: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public var text: String
+    public var sentAt: Date
+    public var imageCount: Int
+
+    public init(
+        id: UUID = UUID(),
+        text: String,
+        sentAt: Date = Date(),
+        imageCount: Int = 0
+    ) {
+        self.id = id
+        self.text = text
+        self.sentAt = sentAt
+        self.imageCount = imageCount
+    }
+}
+
+public struct CodingContextPin: Identifiable, Sendable, Equatable, Codable {
+    public var path: String
+    /// "file" | "directory"
+    public var kind: String
+
+    public var id: String { path }
+    public var isDirectory: Bool { kind == "directory" }
+
+    public init(path: String, kind: String) {
+        self.path = path
+        self.kind = kind
+    }
+}
+
+public struct CodingRepoPromptState: Sendable, Equatable, Codable {
+    public var repoId: String
+    public var templates: [CodingPromptTemplate]
+    public var history: [CodingPromptHistoryEntry]
+    public var pinnedPaths: [CodingContextPin]
+
+    public init(
+        repoId: String,
+        templates: [CodingPromptTemplate] = [],
+        history: [CodingPromptHistoryEntry] = [],
+        pinnedPaths: [CodingContextPin] = []
+    ) {
+        self.repoId = repoId
+        self.templates = templates
+        self.history = history
+        self.pinnedPaths = pinnedPaths
+    }
+}
+
+/// Prefixes pinned repo-relative paths onto a Coding prompt without mutating history text.
+public enum CodingPromptComposer {
+    public static func command(userText: String, pins: [CodingContextPin]) -> String {
+        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pins.isEmpty else { return trimmed }
+        var lines = ["Focus on these paths (repo-relative):"]
+        for pin in pins.prefix(3) {
+            lines.append("- \(pin.path) (\(pin.isDirectory ? "directory" : "file"))")
+        }
+        lines.append("")
+        lines.append(trimmed)
+        return lines.joined(separator: "\n")
+    }
+}
+
+public protocol CodingPromptStoring: Sendable {
+    func state(repoId: String) async -> CodingRepoPromptState
+    func setPinnedPaths(_ paths: [CodingContextPin], repoId: String) async
+    func upsertTemplate(_ template: CodingPromptTemplate, repoId: String) async
+    func deleteTemplate(id: UUID, repoId: String) async
+    func appendHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async
+    func clearHistory(repoId: String) async
+}
+
 /// One shallow entry returned by the authenticated repository browser.
 public struct BridgeRepoFileEntry: Identifiable, Sendable, Equatable, Codable {
     public let name: String
@@ -733,6 +890,15 @@ public protocol AgentBridging: Sendable {
     func repositoryDiff(repoId: String) async -> BridgeResult
     func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
+    func createBaseline(repoId: String) async -> BridgeResult
+    func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult
+    func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult
+    func restoreReviewPaths(
+        repoId: String,
+        baselineId: String,
+        paths: [String],
+        contentTokens: [String: String]?
+    ) async -> BridgeResult
 
     /// Live preview servers (`/preview/*`) so Safari on the phone can open
     /// whatever the coding agents generated.
@@ -840,6 +1006,23 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func createBaseline(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func restoreReviewPaths(
+        repoId: String,
+        baselineId: String,
+        paths: [String],
+        contentTokens: [String: String]?
+    ) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func startPreview(repoId: String) async -> BridgeResult {
