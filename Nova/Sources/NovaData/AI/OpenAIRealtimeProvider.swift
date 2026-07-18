@@ -107,9 +107,19 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     // orchestrator decides whether "Nova" was addressed.
                     "turn_detection": config.enableServerVAD ? [
                         "type": "semantic_vad",
-                        "create_response": !config.requireWakeWord
+                        "create_response": !config.requireWakeWord,
+                        // When the user starts talking over Nova, cancel the
+                        // in-flight reply (barge-in) instead of leaving two
+                        // responses fighting on the wire.
+                        "interrupt_response": true
                     ] as [String: Any] : NSNull(),
-                    "transcription": ["model": "whisper-1", "language": "en"]
+                    // gpt-4o-mini-transcribe is the current conversation-session
+                    // STT model; whisper-1 often yields no completed transcripts
+                    // on GA Realtime, which leaves wake-word gating silent.
+                    "transcription": [
+                        "model": "gpt-4o-mini-transcribe",
+                        "language": "en"
+                    ]
                 ] as [String: Any],
                 "output": [
                     "format": ["type": "audio/pcm", "rate": 24000],
@@ -235,12 +245,6 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             ttfaMark = speechEndMark ?? .now
         }
         do {
-            // A prior reply (or coding announce) still marked active will make the
-            // server reject a new response.create — cancel first so voice turns
-            // and agent hand-offs are not silently dropped.
-            if responseActive {
-                await interrupt()
-            }
             try await sendJSON(["type": "response.create"])
         } catch {
             metrics?.increment(.sendFailures)
@@ -269,9 +273,6 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     public func sendUserText(_ text: String) async {
         guard connected else { return }
         do {
-            if responseActive {
-                await interrupt()
-            }
             try await sendJSON([
                 "type": "conversation.item.create",
                 "item": [

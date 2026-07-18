@@ -93,6 +93,10 @@ public actor ConversationOrchestrator {
     private var skipFollowUpOnce = false
     // Serializes tool dispatch without blocking the provider event loop.
     private var toolTask: Task<Void, Never>?
+    /// Bumped when a completed transcription is handled so speech-stopped
+    /// fallbacks don't double-trigger a response.
+    private var utteranceEpoch = 0
+    private var speechStoppedFallbackTask: Task<Void, Never>?
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
@@ -451,10 +455,14 @@ public actor ConversationOrchestrator {
         // Already invoked locally, so the cloud session should reply to the
         // command that follows without requiring the wake word again.
         var engaged = sessionConfig
+        let previousRequireWakeWord = sessionConfig.requireWakeWord
         engaged.requireWakeWord = false
         do {
+            // Keep the live gate in sync with the Realtime session shape.
+            sessionConfig.requireWakeWord = false
             try await beginStreaming(engaged)
         } catch {
+            sessionConfig.requireWakeWord = previousRequireWakeWord
             NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
             if let listener = wakeWordListener, isRunning {
                 try? await beginLocalListening(listener)
@@ -578,8 +586,10 @@ public actor ConversationOrchestrator {
         // provider's single-consumer event stream stays connected across reconnects.
         ingressTask?.cancel()
         idleTask?.cancel()
+        speechStoppedFallbackTask?.cancel()
         ingressTask = nil
         idleTask = nil
+        speechStoppedFallbackTask = nil
         await ingress.stop()
         await egress.stop()
         await ai.disconnect()
@@ -649,6 +659,9 @@ public actor ConversationOrchestrator {
             inputTranscript += delta
             onTranscript?(delta, .user)
         case .inputTranscriptionCompleted(let transcript):
+            utteranceEpoch &+= 1
+            speechStoppedFallbackTask?.cancel()
+            speechStoppedFallbackTask = nil
             await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
             outputTranscript += delta
@@ -702,7 +715,12 @@ public actor ConversationOrchestrator {
                 await handleBargeIn()
             }
         case .speechStopped:
-            break
+            // Wake-word mode depends on a completed transcript to decide whether
+            // to answer. If STT is slow or drops the completion event, fall back
+            // to whatever partial transcript we already have.
+            if sessionConfig.requireWakeWord {
+                scheduleSpeechStoppedFallback()
+            }
         case .toolCall(let id, let name, let argumentsJSON):
             guard toolRouter != nil else { break }
             // Chain onto a serial tool queue so slow tools cannot starve audio /
@@ -757,6 +775,35 @@ public actor ConversationOrchestrator {
             detectionTask?.cancel()
             detectionTask = nil
         }
+    }
+
+    /// If input transcription never completes after VAD ends the turn, still try
+    /// to answer from whatever partial transcript we accumulated.
+    private func scheduleSpeechStoppedFallback() {
+        speechStoppedFallbackTask?.cancel()
+        let epoch = utteranceEpoch
+        speechStoppedFallbackTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard let self, !Task.isCancelled else { return }
+            await self.runSpeechStoppedFallback(epoch: epoch)
+        }
+    }
+
+    private func runSpeechStoppedFallback(epoch: Int) async {
+        guard epoch == utteranceEpoch, sessionConfig.requireWakeWord, streaming else { return }
+        let partial = inputTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        utteranceEpoch &+= 1
+        if !partial.isEmpty {
+            NovaLog.session.info("STT completion timed out; using partial transcript for wake-word gate")
+            await handleUserUtterance(partial)
+            return
+        }
+        // Whisper/STT sometimes yields an empty completion even though VAD already
+        // committed the user's audio. Ask the model anyway so "Nova …" is not
+        // dropped into silence.
+        NovaLog.session.info("STT empty after speech; creating response from committed audio")
+        lastEngagement = .now
+        await ai.createResponse()
     }
 
     /// Wake-word gate: with requireWakeWord on, the server transcribes but does
