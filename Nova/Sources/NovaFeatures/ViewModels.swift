@@ -777,6 +777,8 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
     public var detail: String?
     public var diff: String?
     public var isExpanded: Bool
+    /// For tool rows: false while the tool is still running.
+    public var isDone: Bool
 
     public init(
         id: UUID = UUID(),
@@ -784,7 +786,8 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         text: String,
         detail: String? = nil,
         diff: String? = nil,
-        isExpanded: Bool = false
+        isExpanded: Bool = false,
+        isDone: Bool = true
     ) {
         self.id = id
         self.kind = kind
@@ -792,6 +795,25 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         self.detail = detail
         self.diff = diff
         self.isExpanded = isExpanded
+        self.isDone = isDone
+    }
+
+    /// SF Symbol for tool rows, keyed off the tool name prefix ("edit · path").
+    public var toolSymbolName: String {
+        let name = text.split(separator: "·").first.map {
+            $0.trimmingCharacters(in: .whitespaces).lowercased()
+        } ?? ""
+        switch name {
+        case "read": return "doc.text.magnifyingglass"
+        case "edit", "write": return "pencil.line"
+        case "shell": return "terminal"
+        case "grep", "glob", "semsearch": return "magnifyingglass"
+        case "ls": return "folder"
+        case "delete": return "trash"
+        case "todo", "updatetodos": return "checklist"
+        case "task": return "person.2"
+        default: return "wrench.and.screwdriver"
+        }
     }
 }
 
@@ -878,8 +900,12 @@ public final class CodingViewModel {
     public private(set) var isRunning = false
     public private(set) var isLoading = false
     public private(set) var statusMessage: String = ""
+    /// Set while a run is in flight; drives the elapsed-time readout.
+    public private(set) var runStartedAt: Date?
     public var draft: String = ""
     public private(set) var pendingImages: [CodingImageAttachment] = []
+    private var lastSentCommand: String = ""
+    private var lastSentImages: [CodingImageAttachment] = []
     public var cloneURL: String = ""
     public var newProjectName: String = ""
     public var newProjectDescription: String = ""
@@ -1337,10 +1363,13 @@ public final class CodingViewModel {
             ? ""
             : "\n📎 \(images.count) image\(images.count == 1 ? "" : "s")"
         items.append(CodingTranscriptItem(kind: .user, text: effectiveCommand + imageSuffix))
+        lastSentCommand = effectiveCommand
+        lastSentImages = images
         isRunning = true
         runStatus = "running"
         statusMessage = ""
         activeRunId = nil
+        runStartedAt = Date()
         activitySteps = [
             CodingActivityStep(phase: "status", text: "Connecting to bridge…", isDone: false)
         ]
@@ -1363,6 +1392,7 @@ public final class CodingViewModel {
         }
 
         isRunning = false
+        runStartedAt = nil
         streamingAssistantId = nil
         streamingThinkingId = nil
         if let sid = Self.string(result.payloadJSON, key: "sessionId"), !sid.isEmpty {
@@ -1389,10 +1419,34 @@ public final class CodingViewModel {
         _ = await bridge.cancelCursorRun(runId: runId)
         runStatus = "cancelled"
         isRunning = false
+        runStartedAt = nil
         for idx in activitySteps.indices where !activitySteps[idx].isDone {
             activitySteps[idx].isDone = true
         }
         upsertActivity(phase: "status", text: "Cancelled", done: true)
+    }
+
+    /// Re-send the last prompt (used by the Retry button on error rows).
+    public func retryLast() async {
+        guard !isRunning, !lastSentCommand.isEmpty else { return }
+        draft = lastSentCommand
+        pendingImages = lastSentImages
+        await send()
+    }
+
+    public var canRetry: Bool { !lastSentCommand.isEmpty && !isRunning }
+
+    /// Starter prompts shown when the transcript is empty.
+    public var suggestedPrompts: [String] {
+        if selectedRepoId == nil {
+            return []
+        }
+        return [
+            "Summarize this repository and its structure",
+            "Find and fix any failing builds or tests",
+            "Review the latest changes for bugs",
+            "Add a README with setup instructions",
+        ]
     }
 
     public func toggleExpand(_ item: CodingTranscriptItem) {
@@ -1442,7 +1496,8 @@ public final class CodingViewModel {
                 kind: .tool,
                 text: label,
                 detail: event.summary,
-                diff: nil
+                diff: nil,
+                isDone: false
             ))
             upsertActivity(phase: "tool", text: label, detail: event.summary, done: false)
             speakProgress(Self.spokenToolLine(name: name, path: event.path, ended: false))
@@ -1457,6 +1512,7 @@ public final class CodingViewModel {
             {
                 items[last].detail = event.summary ?? items[last].detail
                 items[last].diff = event.diff
+                items[last].isDone = true
             } else {
                 items.append(CodingTranscriptItem(
                     kind: .tool,
@@ -1514,6 +1570,9 @@ public final class CodingViewModel {
             runStatus = (event.status ?? "finished").lowercased()
             streamingAssistantId = nil
             streamingThinkingId = nil
+            for idx in items.indices where items[idx].kind == .tool && !items[idx].isDone {
+                items[idx].isDone = true
+            }
             upsertActivity(
                 phase: "status",
                 text: runStatus == "finished" ? "Finished" : runStatus.capitalized,

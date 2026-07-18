@@ -60,12 +60,17 @@ public struct CodingView: View {
                 VStack(spacing: 1) {
                     Text(coding.shortSessionId)
                         .font(.caption.monospaced().weight(.semibold))
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 6, height: 6)
                         Text(coding.runStatus)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .textCase(.uppercase)
-                        if coding.isRunning { ProgressView().controlSize(.mini) }
+                        if coding.isRunning, let started = coding.runStartedAt {
+                            ElapsedTimeText(since: started)
+                        }
                     }
                     Text(coding.selectedRepoName)
                         .font(.caption2)
@@ -332,6 +337,16 @@ public struct CodingView: View {
         .background(Color(.secondarySystemBackground))
     }
 
+    private var statusColor: Color {
+        switch coding.runStatus.lowercased() {
+        case "running", "creating", "connecting": return .green
+        case "finished", "idle": return .secondary.opacity(0.6)
+        case "error", "expired": return .red
+        case "cancelled": return .orange
+        default: return .secondary.opacity(0.6)
+        }
+    }
+
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -342,6 +357,9 @@ public struct CodingView: View {
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal)
+                    }
+                    if coding.items.isEmpty && !coding.isRunning {
+                        emptyTranscriptState
                     }
                     ForEach(coding.items) { item in
                         transcriptRow(item)
@@ -355,7 +373,62 @@ public struct CodingView: View {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
+            .onChange(of: coding.items.last?.text.count ?? 0) { _, _ in
+                // Follow streaming text growth, not just new rows.
+                guard coding.isRunning, let last = coding.items.last else { return }
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
         }
+    }
+
+    /// Friendly first-run state with tappable starter prompts.
+    private var emptyTranscriptState: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Start coding")
+                    .font(.headline)
+                Text(
+                    coding.selectedRepoId == nil
+                        ? "Pick a repository above, then describe what you want built or fixed."
+                        : "Describe what you want built or fixed, or try one of these."
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            }
+            ForEach(coding.suggestedPrompts, id: \.self) { prompt in
+                Button {
+                    coding.draft = prompt
+                    Task { await coding.send() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.caption)
+                        Text(prompt)
+                            .font(.subheadline)
+                            .multilineTextAlignment(.leading)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.top, 24)
+    }
+
+    /// Inline markdown (bold, code, links) without treating text as a format string.
+    private static func markdownText(_ text: String) -> Text {
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attributed)
+        }
+        return Text(verbatim: text)
     }
 
     @ViewBuilder
@@ -371,27 +444,62 @@ public struct CodingView: View {
             }
             .padding(.horizontal)
         case .assistant:
-            Text(item.text)
+            Self.markdownText(item.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal)
+                .textSelection(.enabled)
+                .contextMenu {
+                    Button {
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = item.text
+                        #endif
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
         case .thinking:
-            Text(item.text)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .italic()
+            Button {
+                coding.toggleExpand(item)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "brain")
+                            .font(.caption2)
+                        Text("Thinking")
+                            .font(.caption2.weight(.semibold))
+                            .textCase(.uppercase)
+                        Image(systemName: item.isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.tertiary)
+                    Text(item.text)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .italic()
+                        .lineLimit(item.isExpanded ? nil : 3)
+                        .multilineTextAlignment(.leading)
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal)
         case .tool:
             VStack(alignment: .leading, spacing: 3) {
                 Button {
                     coding.toggleExpand(item)
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: "wrench.and.screwdriver")
+                        Image(systemName: item.toolSymbolName)
                             .font(.caption)
+                            .foregroundStyle(item.isDone ? Color.secondary : Color.accentColor)
                         Text(item.text)
                             .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         Spacer()
+                        if !item.isDone && coding.isRunning {
+                            ProgressView().controlSize(.mini)
+                        }
                         if item.diff != nil {
                             Image(systemName: item.isExpanded ? "chevron.up" : "chevron.down")
                                 .font(.caption2)
@@ -425,10 +533,32 @@ public struct CodingView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
         case .error:
-            Text(item.text)
-                .font(.footnote)
-                .foregroundStyle(.red)
-                .padding(.horizontal)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Text(item.text)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+                if coding.canRetry {
+                    Button {
+                        Task { await coding.retryLast() }
+                    } label: {
+                        Label("Retry last prompt", systemImage: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal)
         }
     }
 
@@ -836,6 +966,20 @@ public struct CodingView: View {
                 }
             }
             .task { await coding.refreshSessions() }
+        }
+    }
+}
+
+/// m:ss elapsed readout that ticks once per second while a run is active.
+private struct ElapsedTimeText: View {
+    let since: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: since, by: 1)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(since)))
+            Text(String(format: "· %d:%02d", seconds / 60, seconds % 60))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
     }
 }

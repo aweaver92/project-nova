@@ -53,6 +53,24 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertTrue(vm.items.first?.text.contains("Analyze the attached image") == true)
         XCTAssertTrue(vm.items.first?.text.contains("📎 1 image") == true)
     }
+
+    func testRetryLastResendsPreviousCommand() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+
+        XCTAssertFalse(vm.canRetry)
+        vm.draft = "fix the build"
+        await vm.send()
+        XCTAssertTrue(vm.canRetry)
+
+        await vm.retryLast()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["fix the build", "fix the build"])
+        let userRows = vm.items.filter { $0.kind == .user }
+        XCTAssertEqual(userRows.count, 2)
+    }
 }
 
 private actor MemorySettings: SettingsStoring {
@@ -81,6 +99,7 @@ private actor MemorySettings: SettingsStoring {
 private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var receivedImageCount = 0
+    private(set) var receivedCommands: [String] = []
 
     func isConfigured() async -> Bool { true }
 
@@ -137,6 +156,7 @@ private actor DirtyRepoBridge: AgentBridging {
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
         receivedImageCount = images.count
+        receivedCommands.append(command)
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"finished","result":"ok"}"#
