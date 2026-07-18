@@ -43,6 +43,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     private var analyzeWait: CheckedContinuation<String, Error>?
     private var analyzeBuffer = ""
     private let usage: UsageMeter?
+    /// Completes when `input_audio_buffer.committed` arrives (or times out).
+    private var commitWait: CheckedContinuation<Void, Never>?
+    private var commitWaitGeneration = 0
 
     public init(
         tokenService: any TokenService,
@@ -246,12 +249,29 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
     public func commitInputAudio() async {
         guard connected else { return }
+        commitWaitGeneration &+= 1
+        let gen = commitWaitGeneration
         do {
             try await sendJSON(["type": "input_audio_buffer.commit"])
         } catch {
             metrics?.increment(.sendFailures)
             NovaLog.ai.error("commitInputAudio failed: \(String(describing: error), privacy: .public)")
+            return
         }
+        // Wait briefly for committed so createResponse does not race an empty buffer.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            commitWait = cont
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(800))
+                await self?.finishCommitWait(generation: gen)
+            }
+        }
+    }
+
+    private func finishCommitWait(generation: Int) {
+        guard generation == commitWaitGeneration, let wait = commitWait else { return }
+        commitWait = nil
+        wait.resume()
     }
 
     public func createResponse() async {
@@ -573,6 +593,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 ttfaMark = speechEndMark
             }
             eventsContinuation?.yield(.speechStopped)
+        case "input_audio_buffer.committed":
+            speechEndMark = .now
+            finishCommitWait(generation: commitWaitGeneration)
         case "response.created":
             responseActive = true
             activeResponseId = (json["response"] as? [String: Any])?["id"] as? String
@@ -613,6 +636,8 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             eventsContinuation?.yield(.toolCall(id: id, name: name, argumentsJSON: args))
         case "error":
             let message = (json["error"] as? [String: Any])?["message"] as? String ?? "unknown"
+            // Unblock a pending commit wait so the orchestrator can unlock/retry.
+            finishCommitWait(generation: commitWaitGeneration)
             // Benign under server VAD barge-in: a cancel can race with the response
             // completing, so the server reports no active response to cancel.
             let lowered = message.lowercased()

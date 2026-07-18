@@ -123,7 +123,7 @@ async function mintEphemeral(env) {
   }
 }
 
-function runRealtime(authToken, pcm) {
+function runRealtime(authToken, pcm, { turns = 1 } = {}) {
   return new Promise((resolve) => {
     const ws = new WebSocket(REALTIME_URL, {
       headers: { Authorization: `Bearer ${authToken}` },
@@ -133,10 +133,11 @@ function runRealtime(authToken, pcm) {
       sessionError: null,
       speechStarted: false,
       speechStopped: false,
-      committed: false,
-      transcript: "",
+      committed: 0,
+      transcripts: [],
       transcriptionFailed: null,
       appendedChunks: 0,
+      responseDones: 0,
     };
     const done = () => {
       try {
@@ -144,12 +145,11 @@ function runRealtime(authToken, pcm) {
       } catch {}
       resolve(result);
     };
-    const overall = setTimeout(done, 25_000);
+    const overall = setTimeout(done, 45_000);
+    let turn = 0;
 
-    ws.addEventListener("open", () => {
-      ws.send(JSON.stringify(appSessionUpdate()));
-      // Match the app: client-commit path (turn_detection null). Stream speech,
-      // then trailing silence, then commit + create_response.
+    function streamOneTurn() {
+      turn += 1;
       const bytesPerChunk = Math.floor(SAMPLE_RATE * 0.02) * 2;
       const silence = Buffer.alloc(bytesPerChunk);
       let off = 0;
@@ -164,8 +164,8 @@ function runRealtime(authToken, pcm) {
           silenceLeft--;
         } else {
           clearInterval(iv);
+          // Match the app: wait for committed before response.create.
           ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          ws.send(JSON.stringify({ type: "response.create" }));
           return;
         }
         result.appendedChunks++;
@@ -176,6 +176,11 @@ function runRealtime(authToken, pcm) {
           })
         );
       }, 20);
+    }
+
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify(appSessionUpdate()));
+      streamOneTurn();
     });
 
     ws.addEventListener("message", (evt) => {
@@ -196,16 +201,27 @@ function runRealtime(authToken, pcm) {
           result.speechStopped = true;
           break;
         case "input_audio_buffer.committed":
-          result.committed = true;
+          result.committed += 1;
+          ws.send(JSON.stringify({ type: "response.create" }));
           break;
-        case "conversation.item.input_audio_transcription.completed":
-          result.transcript = (j.transcript || "").trim();
-          clearTimeout(overall);
-          setTimeout(done, 250);
+        case "conversation.item.input_audio_transcription.completed": {
+          const t = (j.transcript || "").trim();
+          if (t) result.transcripts.push(t);
           break;
+        }
         case "conversation.item.input_audio_transcription.failed":
           result.transcriptionFailed =
             j.error?.message || "transcription failed";
+          break;
+        case "response.done":
+          result.responseDones += 1;
+          if (turn < turns) {
+            // Second utterance without relying on cloud VAD — proves multi-commit.
+            setTimeout(streamOneTurn, 400);
+          } else {
+            clearTimeout(overall);
+            setTimeout(done, 250);
+          }
           break;
         case "error":
           if (!result.sessionUpdated) {
@@ -213,6 +229,8 @@ function runRealtime(authToken, pcm) {
             clearTimeout(overall);
             setTimeout(done, 100);
           }
+          // Ignore post-session noise (cancel races, etc.); assertions below
+          // catch real failures via commit/transcript counts.
           break;
       }
     });
@@ -250,22 +268,24 @@ async function main() {
       : "Bridge not reachable â€” using raw API key"
   );
 
-  console.log("â†’ Opening Realtime socket with the app's session shapeâ€¦");
-  const r = await runRealtime(authToken, pcm);
+  console.log("→ Opening Realtime socket with the app's session shape (2 client commits)…");
+  const r = await runRealtime(authToken, pcm, { turns: 2 });
 
   console.log("\n--- Results ---");
   console.log(JSON.stringify(r, null, 2));
 
-  if (r.sessionError) fail(`session.update rejected: ${r.sessionError}`);
+  if (r.sessionError) fail(`Realtime error: ${r.sessionError}`);
   if (!r.sessionUpdated) fail("Never received session.updated");
   ok("session.updated accepted");
-  if (!r.committed) fail("input_audio_buffer.commit never confirmed");
-  ok("Client commit confirmed");
+  if (r.committed < 2) fail(`Expected 2 commits, got ${r.committed}`);
+  ok(`Client commits confirmed: ${r.committed}`);
   if (r.transcriptionFailed) fail(`STT failed: ${r.transcriptionFailed}`);
-  if (!r.transcript) fail("No transcript produced");
-  ok(`Transcript: "${r.transcript}"`);
+  if (r.transcripts.length < 1) fail("No transcript produced");
+  ok(`Transcripts: ${JSON.stringify(r.transcripts)}`);
+  if (r.responseDones < 2) fail(`Expected 2 response.done, got ${r.responseDones}`);
+  ok(`response.done × ${r.responseDones}`);
 
-  console.log("\n🎉 PASS: client-commit Realtime path healthy.");
+  console.log("\n🎉 PASS: multi-turn client-commit Realtime path healthy.");
   process.exit(0);
 }
 

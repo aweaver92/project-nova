@@ -128,10 +128,11 @@ public actor ConversationOrchestrator {
     private var outboundPeakHeard: Float = 0
     private var outboundRmsHeard: Float = 0
     private var outboundZcrHeard: Float = 0
-    /// Local energy VAD — used when cloud `speech_started` never arrives.
-    private var clientSpeechActive = false
-    private var clientSpeechQuietSince: ContinuousClock.Instant?
-    private var didClientCommitFallback = false
+    /// Local energy VAD — primary turn detector (`turn_detection` is null).
+    private var clientVAD = ClientEnergyVAD()
+    private var pendingClientCommit = false
+    private var lastOutboundPeak: Float = 0
+    private var lastOutboundZcr: Float = 0
     /// Rolling outbound PCM for bridge diagnose dumps (~4 s @ 24 kHz mono).
     private var outboundRing = Data()
     private let outboundRingMaxBytes = 24_000 * 2 * 4
@@ -693,9 +694,10 @@ public actor ConversationOrchestrator {
         outboundPeakHeard = 0
         outboundRmsHeard = 0
         outboundZcrHeard = 0
-        clientSpeechActive = false
-        clientSpeechQuietSince = nil
-        didClientCommitFallback = false
+        clientVAD.reset()
+        pendingClientCommit = false
+        lastOutboundPeak = 0
+        lastOutboundZcr = 0
         outboundRing = Data()
         lastMicEnergyAt = nil
         lastChunkAt = nil
@@ -844,17 +846,15 @@ public actor ConversationOrchestrator {
             outboundRing.removeFirst(outboundRing.count - outboundRingMaxBytes)
         }
 
-        // Client-side energy VAD (primary — cloud server_vad is disabled).
-        // Require some zero-crossings so a stuck DC bias cannot trigger commits.
-        if stats.peak >= 0.05, stats.zcr >= 0.015 {
-            clientSpeechActive = true
-            clientSpeechQuietSince = nil
-        } else if clientSpeechActive {
-            if stats.peak < 0.025 {
-                if clientSpeechQuietSince == nil { clientSpeechQuietSince = .now }
-            } else {
-                clientSpeechQuietSince = nil
-            }
+        lastOutboundPeak = stats.peak
+        lastOutboundZcr = outboundZcrHeard
+        if clientVAD.observe(
+            peak: stats.peak,
+            zcr: outboundZcrHeard,
+            ringBytes: outboundRing.count,
+            now: .now
+        ) == .commit {
+            pendingClientCommit = true
         }
     }
 
@@ -959,18 +959,28 @@ public actor ConversationOrchestrator {
         }
 
         if heardRecently || micPeakHeard >= 0.02 {
-            // Client energy VAD is the primary turn detector (server_vad is off).
-            if !didClientCommitFallback,
-               !assistantSpeaking,
-               clientSpeechActive,
-               let quietSince = clientSpeechQuietSince,
-               now - quietSince >= .milliseconds(550),
-               outboundPeakHeard >= 0.08,
-               outboundZcrHeard >= 0.01
-            {
-                didClientCommitFallback = true
-                clientSpeechActive = false
-                clientSpeechQuietSince = nil
+            // Advance VAD when chunks pause but the mic level is still readable,
+            // and recover if a prior commit never got a server ACK.
+            let pollPeak: Float
+            let pollZcr: Float
+            if let lastChunkAt, now - lastChunkAt < .milliseconds(250) {
+                pollPeak = max(liveLevel, lastOutboundPeak)
+                pollZcr = lastOutboundZcr
+            } else {
+                pollPeak = liveLevel
+                pollZcr = liveLevel >= 0.05 ? lastOutboundZcr : 0
+            }
+            if clientVAD.observe(
+                peak: pollPeak,
+                zcr: pollZcr,
+                ringBytes: outboundRing.count,
+                now: now
+            ) == .commit {
+                pendingClientCommit = true
+            }
+
+            if pendingClientCommit, !assistantSpeaking {
+                pendingClientCommit = false
                 let clip = outboundRing
                 NovaLog.session.info(
                     "Client VAD end-of-speech; committing input buffer zcr=\(self.outboundZcrHeard)"
@@ -1186,7 +1196,8 @@ public actor ConversationOrchestrator {
             speechStoppedFallbackTask?.cancel()
             speechStoppedFallbackTask = nil
             userTranscriptChars += transcript.count
-            didClientCommitFallback = false
+            clientVAD.acknowledgeTurnFinished()
+            pendingClientCommit = false
             if !transcript.isEmpty {
                 // Completed events sometimes arrive without deltas — surface the
                 // full turn so the UI is never blank when STT succeeded.
@@ -1210,9 +1221,13 @@ public actor ConversationOrchestrator {
         case .responseStarted:
             assistantSpeaking = true
             outputTranscript = ""
+            // Don't carry a mid-reply energy commit into the next listen window.
+            pendingClientCommit = false
+            clientVAD.reset()
         case .responseEnded:
             assistantSpeaking = false
-            didClientCommitFallback = false
+            clientVAD.acknowledgeTurnFinished()
+            pendingClientCommit = false
             // If a "Nova, stop" just landed, this is the cancelled response
             // completing. Don't reopen the listening window or emit follow-ups —
             // stay stood down until the wake word is heard again.
@@ -1238,9 +1253,9 @@ public actor ConversationOrchestrator {
             onMetricsTick?()
         case .speechStarted:
             cloudVadSpeechEvents += 1
-            didClientCommitFallback = false
-            clientSpeechActive = false
-            clientSpeechQuietSince = nil
+            // Cloud VAD (if ever re-enabled) owns the turn — don't double-commit.
+            clientVAD.reset()
+            pendingClientCommit = false
             if userTranscriptChars == 0 {
                 publishListenHealth(
                     phase: .hearingYou,
@@ -1278,6 +1293,13 @@ public actor ConversationOrchestrator {
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
             lastError = message
             onError?(message)
+            let lowered = message.lowercased()
+            if lowered.contains("buffer") || lowered.contains("commit") || lowered.contains("already has an active response") {
+                // Empty/short commit or response.create race — unlock client VAD
+                // so the next utterance can try again (old sticky flag never recovered).
+                clientVAD.unlockForRetry()
+                pendingClientCommit = false
+            }
             if message.localizedCaseInsensitiveContains("reconnect attempts exhausted") {
                 await handleTransportExhausted()
             }
