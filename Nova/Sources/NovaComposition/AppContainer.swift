@@ -259,8 +259,6 @@ public final class AppContainer {
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
-        // Filled after agentsVM exists — keeps voice quiz and Study UI on one queue.
-        let studyUIBridge = StudyUIBridge()
         // Bound after the orchestrator exists so voice can call switch_agent.
         let switchAgentSink = SwitchAgentSink()
         var tools: [any Tool] = [
@@ -372,9 +370,9 @@ public final class AppContainer {
             ListStudyCardsTool(store: studyStore),
             UpdateStudyCardTool(store: studyStore),
             DeleteStudyCardTool(store: studyStore),
-            StartQuizTool(store: studyStore, ui: studyUIBridge),
-            RevealCardTool(store: studyStore, ui: studyUIBridge),
-            GradeCardTool(store: studyStore, ui: studyUIBridge)
+            StartQuizTool(store: studyStore),
+            RevealCardTool(store: studyStore),
+            GradeCardTool(store: studyStore)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
@@ -498,22 +496,6 @@ public final class AppContainer {
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
-        let studyVM = self.studyVM
-        let agentsVM = self.agentsVM
-        studyUIBridge.onQuizStart = { deck in
-            await MainActor.run {
-                studyVM.requestStartReview(deck: deck)
-                agentsVM.requestRoute(.study)
-            }
-        }
-        studyUIBridge.onReveal = { id in
-            await MainActor.run {
-                studyVM.syncRevealFromVoice(cardId: id)
-            }
-        }
-        studyUIBridge.onGrade = { id in
-            await studyVM.syncGradeFromVoice(cardId: id)
-        }
         let codingVM = CodingViewModel(
             bridge: bridge,
             settings: settingsStore,
@@ -545,7 +527,6 @@ public final class AppContainer {
             shopping: shoppingStore,
             meals: mealPlanStore,
             nutrition: nutritionStore,
-            timers: timerService,
             analyzeImage: { [orchestrator] frame, prompt in
                 try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },
