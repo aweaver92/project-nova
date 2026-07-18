@@ -10,6 +10,10 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-bridge-service.ps1",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-service.ps1",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-bridge.ps1",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-bridge.ps1",
     "typecheck": "tsc --noEmit",
     "test:stream": "tsx src/cursor-stream.test.ts",
     "test:repos": "tsx src/repo-service.test.ts",
