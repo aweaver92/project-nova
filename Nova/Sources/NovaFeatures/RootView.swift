@@ -387,7 +387,7 @@ public struct RootView: View {
                 ContentUnavailableView {
                     Label("Waiting", systemImage: "text.bubble")
                 } description: {
-                    Text("Say “Nova …” toward the phone mic while Listen is on.")
+                    Text("Listen is on — speak toward the phone mic. Wake word is optional in this mode.")
                 }
                 .listRowBackground(Color.clear)
             } else {

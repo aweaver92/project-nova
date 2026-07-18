@@ -52,15 +52,15 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
 
     private func installTapAndStartEngine() throws {
         let input = engine.inputNode
-        // Enable the Voice-Processing I/O unit (AEC + noise suppression + AGC).
-        // Must be toggled while the engine is stopped; guard against redundant
-        // re-enables on route-change/interruption recovery.
-        if !input.isVoiceProcessingEnabled {
+        // Voice-Processing AEC can mute far-field speech when capture is on the
+        // phone mic (our preferred route with glasses HFP often silent). Keep VP
+        // off so Listen actually hears the user; server-side NR handles noise.
+        if input.isVoiceProcessingEnabled {
             do {
-                try input.setVoiceProcessingEnabled(true)
-                NovaLog.audio.info("Voice processing (AEC/NS/AGC) enabled")
+                try input.setVoiceProcessingEnabled(false)
+                NovaLog.audio.info("Voice processing disabled for phone-mic capture")
             } catch {
-                NovaLog.audio.warning("Voice processing unavailable: \(String(describing: error), privacy: .public)")
+                NovaLog.audio.warning("Could not disable voice processing: \(String(describing: error), privacy: .public)")
             }
         }
         input.removeTap(onBus: 0)

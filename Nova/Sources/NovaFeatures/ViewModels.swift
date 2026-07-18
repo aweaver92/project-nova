@@ -146,6 +146,12 @@ public final class ConversationViewModel {
             if let settings {
                 config.useLocalWakeWord = await settings.useLocalWakeWord()
             }
+            // Manual Listen already means the user engaged. Requiring "Nova" again
+            // (plus imperfect STT) was canceling server-VAD replies → Listen green,
+            // total silence. Keep wake-word gating only for on-device wake mode.
+            if !config.useLocalWakeWord {
+                config.requireWakeWord = false
+            }
             try await orchestrator.start(config: config)
             isRunning = true
             usage?.markSessionStarted()
