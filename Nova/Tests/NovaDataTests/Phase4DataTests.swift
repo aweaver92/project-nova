@@ -89,7 +89,8 @@ final class SkillRunnerWebhookDelayTests: XCTestCase {
         let result = await runner.run(skill)
         XCTAssertTrue(result.summaryLines.contains("saved a note"))
         XCTAssertTrue(result.summaryLines.contains { $0.contains("skipped") })
-        XCTAssertEqual(await attempts.value, 1)
+        let attemptCount = await attempts.value
+        XCTAssertEqual(attemptCount, 1)
         let saved = await notes.all()
         XCTAssertTrue(saved.contains { $0.text.contains("Said hi") })
     }
