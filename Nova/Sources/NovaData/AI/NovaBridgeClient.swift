@@ -69,7 +69,7 @@ public actor NovaBridgeClient: AgentBridging {
         {
             body["cwd"] = workingDirectory
         }
-        return await post(path: "claude-code", body: body)
+        return await post(path: "claude-code", body: body, timeout: 600)
     }
 
     public func pushToCursor(
@@ -86,7 +86,7 @@ public actor NovaBridgeClient: AgentBridging {
         {
             body["cwd"] = workingDirectory
         }
-        return await post(path: "cursor/command", body: body)
+        return await post(path: "cursor/command", body: body, timeout: 600)
     }
 
     public func listCursorSessions() async -> BridgeResult {
@@ -197,8 +197,7 @@ public actor NovaBridgeClient: AgentBridging {
             let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             return BridgeResult(ok: ok, payloadJSON: String(decoding: data, as: UTF8.self))
         } catch {
-            let escaped = Self.escape(String(describing: error))
-            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
         }
     }
 
@@ -323,8 +322,7 @@ public actor NovaBridgeClient: AgentBridging {
                 payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)","error":"non_json_response"}"#
             )
         } catch {
-            let escaped = Self.escape(String(describing: error))
-            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
         }
     }
 
@@ -345,6 +343,45 @@ public actor NovaBridgeClient: AgentBridging {
         ok: false,
         payloadJSON: #"{"ok":false,"error":"bridge_not_configured","hint":"Ask the user to set the Nova Bridge URL and token in the Agents tab settings, then try again."}"#
     )
+
+    /// Map URLSession failures into short, actionable bridge errors for the UI.
+    private static func encodeTransportError(_ error: Error) -> String {
+        let urlError = error as? URLError
+        let code = urlError?.code
+        let (key, hint): (String, String) = {
+            switch code {
+            case .timedOut:
+                return (
+                    "bridge_timeout",
+                    "The bridge took too long. Is nova-bridge still running on the PC?"
+                )
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+                return (
+                    "bridge_unreachable",
+                    "Can't reach Nova Bridge. Check Wi‑Fi and the Bridge URL in Settings."
+                )
+            case .networkConnectionLost, .notConnectedToInternet:
+                return (
+                    "bridge_connection_lost",
+                    "Lost connection mid-run (Wi‑Fi, VPN, or bridge restarted). Try again."
+                )
+            default:
+                let raw = error.localizedDescription
+                if raw.localizedCaseInsensitiveContains("network")
+                    || raw.localizedCaseInsensitiveContains("connection")
+                {
+                    return (
+                        "bridge_connection_lost",
+                        "Lost connection to Nova Bridge. Confirm the PC bridge is running, then retry."
+                    )
+                }
+                return ("transport_error", raw)
+            }
+        }()
+        let escapedHint = escape(hint)
+        let escapedDetail = escape(String(describing: error))
+        return #"{"ok":false,"error":"\#(key)","hint":"\#(escapedHint)","detail":"\#(escapedDetail)"}"#
+    }
 
     private static func escape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\")

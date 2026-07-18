@@ -456,6 +456,18 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     res.write(formatSse(event));
   };
 
+  // iOS URLSession drops idle SSE streams with "Network Request failed".
+  // Comment frames keep the TCP connection alive during long thinking gaps.
+  const keepalive = setInterval(() => {
+    if (res.writableEnded) return;
+    try {
+      res.write(`: keepalive ${Date.now()}\n\n`);
+    } catch {
+      /* connection already gone */
+    }
+  }, 12_000);
+  req.on("close", () => clearInterval(keepalive));
+
   let agent: Awaited<ReturnType<typeof import("@cursor/sdk").Agent.create>> | null =
     null;
   let runId = "";
@@ -579,6 +591,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       });
     }
   } finally {
+    clearInterval(keepalive);
     if (runId) activeRuns.delete(runId);
     if (agent) await disposeAgent(agent);
     if (!res.writableEnded) res.end();
