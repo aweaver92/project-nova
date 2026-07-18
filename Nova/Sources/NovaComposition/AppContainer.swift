@@ -259,11 +259,16 @@ public final class AppContainer {
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
+        // Filled after agentsVM exists — keeps voice quiz and Study UI on one queue.
+        let studyUIBridge = StudyUIBridge()
+        // Bound after the orchestrator exists so voice can call switch_agent.
+        let switchAgentSink = SwitchAgentSink()
         var tools: [any Tool] = [
             WebSearchTool(
                 isEnabled: { await settingsStore.webSearchEnabled() },
                 onUsage: { usage.recordResponsesCall() }
             ),
+            SwitchAgentTool(perform: { name in await switchAgentSink.switchTo(named: name) }),
             InspectNovaCodebaseTool(bridge: bridge),
             WeatherTool(),
             CreateReminderTool(),
@@ -367,9 +372,9 @@ public final class AppContainer {
             ListStudyCardsTool(store: studyStore),
             UpdateStudyCardTool(store: studyStore),
             DeleteStudyCardTool(store: studyStore),
-            StartQuizTool(store: studyStore),
-            RevealCardTool(store: studyStore),
-            GradeCardTool(store: studyStore)
+            StartQuizTool(store: studyStore, ui: studyUIBridge),
+            RevealCardTool(store: studyStore, ui: studyUIBridge),
+            GradeCardTool(store: studyStore, ui: studyUIBridge)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
@@ -478,6 +483,7 @@ public final class AppContainer {
             }
         )
         self.orchestrator = orchestrator
+        switchAgentSink.bind(orchestrator)
 
         self.sessionVM = SessionViewModel(session: session)
         self.conversationVM = ConversationViewModel(
@@ -492,6 +498,22 @@ public final class AppContainer {
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
+        let studyVM = self.studyVM
+        let agentsVM = self.agentsVM
+        studyUIBridge.onQuizStart = { deck in
+            await MainActor.run {
+                studyVM.requestStartReview(deck: deck)
+                agentsVM.requestRoute(.study)
+            }
+        }
+        studyUIBridge.onReveal = { id in
+            await MainActor.run {
+                studyVM.syncRevealFromVoice(cardId: id)
+            }
+        }
+        studyUIBridge.onGrade = { id in
+            await studyVM.syncGradeFromVoice(cardId: id)
+        }
         let codingVM = CodingViewModel(
             bridge: bridge,
             settings: settingsStore,
@@ -523,6 +545,7 @@ public final class AppContainer {
             shopping: shoppingStore,
             meals: mealPlanStore,
             nutrition: nutritionStore,
+            timers: timerService,
             analyzeImage: { [orchestrator] frame, prompt in
                 try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },
@@ -568,5 +591,27 @@ struct FrameCaptureBandwidthBridge: MetaDATBandwidthBridge {
     let capture: MetaDATFrameCapture
     func holdVideoForAudio(_ hold: Bool) async {
         await capture.setAudioPriorityHold(hold)
+    }
+}
+
+/// Late-binds `switch_agent` tool → orchestrator (tools are built before it).
+private final class SwitchAgentSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var orchestrator: ConversationOrchestrator?
+
+    func bind(_ orchestrator: ConversationOrchestrator) {
+        lock.lock()
+        self.orchestrator = orchestrator
+        lock.unlock()
+    }
+
+    func switchTo(named name: String) async -> String {
+        lock.lock()
+        let orch = orchestrator
+        lock.unlock()
+        guard let orch else {
+            return #"{"ok":false,"error":"switch_not_ready"}"#
+        }
+        return await orch.switchToAgent(named: name)
     }
 }

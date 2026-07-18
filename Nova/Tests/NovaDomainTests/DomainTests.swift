@@ -240,6 +240,41 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testAgentSwitchWorksWhenWakeWordGateDisabled() async throws {
+        // Listen sets requireWakeWord=false; handoff phrases must still work.
+        let provider = MockProvider()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let switched = await waitUntil { await provider.lastVoice == "cedar" }
+        XCTAssertTrue(switched)
+        XCTAssertEqual(await orch.currentAgent?.name, "Claude")
+        let interrupted = await provider.interruptCount
+        XCTAssertGreaterThanOrEqual(interrupted, 1)
+
+        let payload = await orch.switchToAgent(named: "Nova")
+        XCTAssertTrue(payload.contains("\"ok\":true"))
+        let back = await waitUntil { await provider.lastVoice == "marin" }
+        XCTAssertTrue(back)
+
+        await orch.stop()
+    }
+
     func testGraceWindowDisabledRequiresWakeWordEveryTurn() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)

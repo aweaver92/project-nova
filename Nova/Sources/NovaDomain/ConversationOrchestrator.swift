@@ -409,6 +409,32 @@ public actor ConversationOrchestrator {
         }
     }
 
+    /// Tool / voice handoff by display name or wake word (e.g. "Claude", "Max").
+    /// Returns a JSON payload the model can read aloud.
+    public func switchToAgent(named rawName: String) async -> String {
+        if agents.isEmpty { await loadAgentRoster() }
+        let needle = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            return #"{"ok":false,"error":"missing_agent_name"}"#
+        }
+        let target = agents.first {
+            $0.name.lowercased() == needle || $0.wakeWord.lowercased() == needle
+        }
+        guard let target else {
+            let list = agents.map(\.name).sorted().joined(separator: ", ")
+            return #"{"ok":false,"error":"unknown_agent","available":"\#(Self.jsonEscape(list))"}"#
+        }
+        // Stop any in-flight "configuration issue" reply before reconnecting.
+        await ai.interrupt()
+        await switchAgent(toId: target.id, greet: streaming || isRunning)
+        return #"{"ok":true,"active":"\#(Self.jsonEscape(target.name))","role":"\#(Self.jsonEscape(target.role))"}"#
+    }
+
+    private static func jsonEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
     /// Return the session to a healthy state after a failed reconnect: prefer
     /// on-device wake-word listening when configured, otherwise reopen the cloud
     /// stream. No-op when not running or already streaming.
@@ -452,7 +478,7 @@ public actor ConversationOrchestrator {
             if !others.isEmpty {
                 let list = others.map { "\($0.name) (\($0.role))" }.joined(separator: "; ")
                 let example = others.first?.name ?? "Claude"
-                s += "\n\nYou are the master assistant and lead a team of specialists: \(list). The user can hand off to one by saying, for example, \"Nova, let me talk to \(example)\". Only you can switch specialists. If the user asks for one of these specialties, offer to hand off."
+                s += "\n\nYou are the master assistant and lead a team of specialists: \(list). When the user asks to talk to a specialist (or return to you), call the switch_agent tool with their name — e.g. \(example). Do not claim a configuration problem or tell them to use Settings; the tool performs the handoff. They can also say \"Nova, let me talk to \(example)\"."
             }
             return s
         }
@@ -1082,24 +1108,25 @@ public actor ConversationOrchestrator {
         lastEngagement = .now
     }
 
-    /// Wake-word gate: with requireWakeWord on, the server transcribes but does
-    /// not auto-reply, so we decide here whether Nova was addressed and whether
-    /// to answer by voice or with a captured frame.
+    /// Handles completed user transcripts: always runs agent handoff phrases,
+    /// then (when requireWakeWord is on) the wake-word reply gate.
     ///
     /// Listening mode: if the wake word is absent but we're still inside the
     /// grace window (the wake word was spoken, or either side replied, within
     /// `wakeWordGraceWindow`), the utterance is treated as addressed to Nova.
     private func handleUserUtterance(_ transcript: String) async {
-        guard sessionConfig.requireWakeWord else { return }
-
-        // 0) Master control channel — only "Nova, …" can switch/end specialists.
+        // 0) Master control channel — always, even when Listen disables the
+        //    wake-word reply gate. Otherwise "Nova, let me talk to Claude" is
+        //    ignored and the model invents a "configuration" excuse.
         if let director = agentDirector {
             switch director.control(for: transcript) {
             case .switchTo(let id):
+                await ai.interrupt()
                 await switchAgent(toId: id, greet: true)
                 return
             case .endConversation:
                 if let master = masterAgent {
+                    await ai.interrupt()
                     await switchAgent(toId: master.id, greet: true)
                 }
                 return
@@ -1121,10 +1148,15 @@ public actor ConversationOrchestrator {
                 }
                 listeningSuspended = false
                 let command = Self.commandText(for: masterIntent, fallback: transcript)
+                await ai.interrupt()
                 await switchAgent(toId: master.id, greet: false, actOnText: command)
                 return
             }
         }
+
+        // Wake-word reply gating only — Listen sets requireWakeWord=false so the
+        // model answers every turn; handoffs above still run.
+        guard sessionConfig.requireWakeWord else { return }
 
         // 2) Strict pass: did the utterance actually contain the active wake word?
         let strict = detector.detect(transcript)

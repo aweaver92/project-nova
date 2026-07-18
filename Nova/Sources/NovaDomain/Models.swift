@@ -61,6 +61,8 @@ public struct AISessionConfig: Sendable, Equatable {
 
         Self-knowledge grounding: for every question about Nova's own features, capabilities, integrations, settings, limitations, or implementation, call inspect_nova_codebase before answering. Search first, then read the relevant source lines. The tool describes the configured bridge checkout, which may be newer than the IPA installed on the phone; distinguish "implemented in the source checkout" from "available in this installed build." Never infer that a feature exists merely because it sounds plausible. If the bridge is unavailable or the code evidence is inconclusive, say you cannot verify it instead of guessing.
 
+        Agent handoffs: when the user asks to talk to, switch to, or hand off to a specialist (Claude, Max, Sage, Remy, Scholar) or back to Nova, call the switch_agent tool immediately. Do not inspect the codebase for this, and do not invent configuration or Settings problems — the tool performs the switch.
+
         Your other tools are the source of truth for their domains; never invent their results. Call the right tool for: weather; creating reminders; reading or creating calendar events; controlling smart-home devices (Home Assistant); remembering, recalling, or forgetting durable facts about the user; saving or reading notes; the daily briefing; and starting or stopping a voice recording that is saved to the phone (e.g. when the user says "begin voice recording", "start recording", or "stop recording"). Pass dates and times to tools in ISO8601. If a tool errors or returns nothing, tell the user plainly.
 
         If you only caught a fragment, or the request seems misheard, garbled, or incomplete, ask the user to repeat or clarify in one short question instead of answering a guess.
@@ -723,7 +725,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 9
+    static let seedCapabilitiesVersion = 10
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -756,7 +758,7 @@ public extension Agent {
                 name: "Nova",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "the master voice assistant",
-                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for wellness, Remy for cooking, Scholar for tutoring) and should offer to hand off when the user's request clearly matches a specialist — e.g. “Want Max to run this workout?” — rather than doing a weak version yourself. You are warm, concise, and proactive.",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for wellness, Remy for cooking, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
                 builtIn: true
