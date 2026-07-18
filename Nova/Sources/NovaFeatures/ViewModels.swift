@@ -1127,7 +1127,8 @@ public final class CodingViewModel {
         streamingAssistantId = nil
         streamingThinkingId = nil
 
-        let repoId = selectedRepoId ?? await settings.codingSelectedRepoId()
+        let persistedRepoId = await settings.codingSelectedRepoId()
+        let repoId = selectedRepoId ?? persistedRepoId
         selectedRepoId = repoId
         let cwd = await settings.codingWorkingDirectory()
         workingDirectory = cwd ?? ""

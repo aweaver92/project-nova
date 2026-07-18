@@ -22,7 +22,8 @@ public struct RunClaudeCodeTool: Tool {
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let prompt: String; let repo_id: String? }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
-        let repoId = args.repo_id ?? await settings.codingSelectedRepoId()
+        let selected = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selected
         return await bridge.runClaudeCode(
             prompt: args.prompt,
             workingDirectory: nil,
@@ -54,7 +55,8 @@ public struct PushToCursorTool: Tool {
         let explicit = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
         let pinned = await settings.codingSessionId()
         let sessionId = (explicit?.isEmpty == false) ? explicit : pinned
-        let repoId = args.repo_id ?? await settings.codingSelectedRepoId()
+        let selected = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selected
         let result = await bridge.pushToCursor(
             command: args.command,
             sessionId: sessionId,
@@ -182,7 +184,8 @@ public struct RepoStatusTool: Tool {
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let repo_id: String? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(repo_id: nil)
-        guard let repoId = args.repo_id ?? await settings.codingSelectedRepoId(), !repoId.isEmpty else {
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
             return #"{"ok":false,"error":"no_repo_selected"}"#
         }
         return await bridge.repositoryStatus(repoId: repoId).payloadJSON
@@ -207,7 +210,8 @@ public struct RepoDiffTool: Tool {
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let repo_id: String? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(repo_id: nil)
-        guard let repoId = args.repo_id ?? await settings.codingSelectedRepoId(), !repoId.isEmpty else {
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
             return #"{"ok":false,"error":"no_repo_selected"}"#
         }
         return await bridge.repositoryDiff(repoId: repoId).payloadJSON
@@ -239,7 +243,8 @@ public struct PublishRepoTool: Tool {
             let pr_body: String?
         }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
-        guard let repoId = args.repo_id ?? await settings.codingSelectedRepoId(), !repoId.isEmpty else {
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
             return #"{"ok":false,"error":"no_repo_selected"}"#
         }
         let request = BridgePublishRequest(
