@@ -82,8 +82,27 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
         previous?.finish()
 
         try await coordinator.activateConversationalHFP()
-        try await mutateEngine {
-            try self.installTapAndStartEngine()
+        // Input format can report 0 Hz for a beat after route activation; retry
+        // briefly instead of starting a tap that would mis-label PCM to the cloud.
+        var started = false
+        var lastError: Error?
+        for attempt in 0..<6 {
+            do {
+                try await mutateEngine {
+                    try self.installTapAndStartEngine()
+                }
+                started = true
+                break
+            } catch {
+                lastError = error
+                NovaLog.audio.warning(
+                    "HFP tap not ready (attempt \(attempt + 1)): \(String(describing: error), privacy: .public)"
+                )
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+        }
+        guard started else {
+            throw lastError ?? NovaError.audioSession("HFP tap failed to start")
         }
         registerObservers()
         NovaLog.audio.info("HFP ingress started (\(AudioSessionCoordinator.currentInputDescription(), privacy: .public))")
@@ -105,24 +124,32 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
         }
         input.removeTap(onBus: 0)
         let format = input.inputFormat(forBus: 0)
-        // Install tap; convert to 8 kHz mono PCM16 if hardware differs.
+        // Reject the transient 0 Hz formats Core Audio can report during route
+        // flips — emitting those mislabeled as 8/24 kHz produces "ws ok" appends
+        // that cloud VAD never treats as speech.
+        guard format.sampleRate >= 8_000, format.channelCount >= 1 else {
+            throw NovaError.audioSession(
+                "Input format not ready (\(format.sampleRate) Hz, \(format.channelCount) ch)"
+            )
+        }
+        // Capture at OpenAI's native 24 kHz so uplink skips the 8→24 resampler.
         guard let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
-            sampleRate: 8_000,
+            sampleRate: 24_000,
             channels: 1,
             interleaved: true
         ) else {
-            throw NovaError.audioSession("Failed to build 8 kHz PCM16 tap format")
+            throw NovaError.audioSession("Failed to build 24 kHz PCM16 tap format")
         }
-        let converter = AVAudioConverter(from: format, to: target)
+        guard let converter = AVAudioConverter(from: format, to: target) else {
+            throw NovaError.audioSession(
+                "No converter \(format.sampleRate)Hz → 24kHz PCM16"
+            )
+        }
 
-        input.installTap(onBus: 0, bufferSize: 960, format: format) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2_880, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             let capturedAt = ContinuousClock.Instant.now
-            guard let converter else {
-                self.emit(Self.int16Data(from: buffer), capturedAt: capturedAt)
-                return
-            }
             let ratio = target.sampleRate / format.sampleRate
             let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
             guard let outBuffer = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCapacity) else { return }
@@ -138,7 +165,7 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
                 return buffer
             }
             if error == nil {
-                self.emit(Self.int16Data(from: outBuffer), capturedAt: capturedAt)
+                self.emit(Self.int16Data(from: outBuffer), sampleRate: 24_000, capturedAt: capturedAt)
             }
         }
 
@@ -283,8 +310,8 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
         sink?.finish()
     }
 
-    private func emit(_ data: Data, capturedAt: ContinuousClock.Instant) {
-        guard !data.isEmpty else { return }
+    private func emit(_ data: Data, sampleRate: Int, capturedAt: ContinuousClock.Instant) {
+        guard !data.isEmpty, sampleRate > 0 else { return }
         let peak = Self.peakLevel(of: data)
         lock.lock()
         let sink = continuation
@@ -295,7 +322,7 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
         guard alive, let sink else { return }
         // bufferingNewest drops oldest under backpressure; yield's discarded
         // value isn't exposed, so queue lag is observed via t_mic_queue_wait.
-        sink.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
+        sink.yield(AudioChunk(pcm: data, sampleRate: sampleRate, capturedAt: capturedAt))
     }
 
     /// Peak absolute sample as 0...1 for the mic meter.

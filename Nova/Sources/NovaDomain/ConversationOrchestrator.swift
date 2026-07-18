@@ -918,7 +918,7 @@ public actor ConversationOrchestrator {
                 didAnnounceCloudQuiet = true
                 let vad = cloudVadSpeechEvents > 0
                     ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
-                    : "Cloud VAD never fired — audio may not be reaching OpenAI (or session.update lost a race)"
+                    : "Cloud VAD never fired — check noise reduction / input sample rate (ws appends alone are not enough)"
                 let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
                 let message = """
                 Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.

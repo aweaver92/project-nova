@@ -234,8 +234,8 @@ final class VoiceRecordingTests: XCTestCase {
             .appendingPathComponent("nova-recordings-\(UUID().uuidString)", isDirectory: true)
     }
 
-    /// 200 ms of 8 kHz mono PCM16 = 1600 samples = 3200 bytes.
-    private func chunk(ms: Int, sampleRate: Int = 8_000) -> AudioChunk {
+    /// 200 ms of 24 kHz mono PCM16 = 4800 samples = 9600 bytes.
+    private func chunk(ms: Int, sampleRate: Int = 24_000) -> AudioChunk {
         let samples = sampleRate * ms / 1000
         let data = [Int16](repeating: 1234, count: samples)
             .withUnsafeBufferPointer { Data(buffer: $0) }
@@ -261,20 +261,20 @@ final class VoiceRecordingTests: XCTestCase {
         let stopped = await recorder.stop()
         let saved = try XCTUnwrap(stopped)
 
-        // Duration derives from sample count: 8000 samples / 8000 Hz ≈ 1s.
+        // Duration derives from sample count: 24000 samples / 24000 Hz ≈ 1s.
         XCTAssertEqual(saved.duration, 1.0, accuracy: 0.05)
-        XCTAssertEqual(saved.sampleRate, 8_000)
-        XCTAssertEqual(saved.byteCount, 16_000)
+        XCTAssertEqual(saved.sampleRate, 24_000)
+        XCTAssertEqual(saved.byteCount, 48_000)
 
         // File exists on disk with a canonical 44-byte WAV header + payload.
         let url = dir.appendingPathComponent(saved.fileName)
         let fileData = try Data(contentsOf: url)
-        XCTAssertEqual(fileData.count, 44 + 16_000)
+        XCTAssertEqual(fileData.count, 44 + 48_000)
         XCTAssertEqual(Array(fileData.prefix(4)), Array("RIFF".utf8))
         XCTAssertEqual(Array(fileData[8..<12]), Array("WAVE".utf8))
         // data chunk size (little-endian) at offset 40 == payload bytes.
         let dataSize = fileData[40..<44].reversed().reduce(0) { ($0 << 8) | UInt32($1) }
-        XCTAssertEqual(Int(dataSize), 16_000)
+        XCTAssertEqual(Int(dataSize), 48_000)
 
         // Metadata survives a fresh store instance.
         let reloaded = FileRecordingStore(directory: dir)
@@ -290,8 +290,8 @@ final class VoiceRecordingTests: XCTestCase {
         let recorder = StreamingVoiceRecorder(store: store)
 
         try await recorder.start()
-        // 24 kHz chunk must be dropped (recorder captures the 8 kHz mic feed).
-        await recorder.append(chunk(ms: 200, sampleRate: 24_000))
+        // 8 kHz chunk must be dropped (recorder captures the 24 kHz mic feed).
+        await recorder.append(chunk(ms: 200, sampleRate: 8_000))
         let saved = await recorder.stop()
         // Nothing valid captured → empty recording discarded.
         XCTAssertNil(saved)

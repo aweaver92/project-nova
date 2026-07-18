@@ -121,24 +121,24 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Prefer far-field: capture is routed to the phone mic (glasses
-                    // HFP input is often silent for third-party apps). near_field
-                    // can suppress speech when the phone sits a few feet away.
-                    "noise_reduction": ["type": "far_field"],
-                    // Always let VAD start a reply. Wake-word gating cancels
-                    // non-addressed turns in the orchestrator (see handleUserUtterance).
-                    // Waiting for STT before response.create caused Listen-green
-                    // silence when the transcript was late/empty.
+                    // Phone mic / HFP close-talk is near-field. far_field NR was
+                    // suppressing speech so local energy looked fine but cloud VAD
+                    // never fired (ws appends OK, speech_started never arrived).
+                    "noise_reduction": ["type": "near_field"],
+                    // server_vad keys off energy and reliably emits speech_started;
+                    // semantic_vad can stay quiet on short/phone-mic turns.
                     "turn_detection": config.enableServerVAD ? [
-                        "type": "semantic_vad",
+                        "type": "server_vad",
+                        "threshold": 0.35,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
                         "create_response": true,
                         "interrupt_response": true
                     ] as [String: Any] : NSNull(),
-                    // whisper-1 is the most compatible Realtime input-STT model;
-                    // gpt-4o-mini-transcribe is fine for /audio/transcriptions but
-                    // has been flaky for some Realtime sessions.
+                    // gpt-4o-mini-transcribe is the GA-friendly Realtime input STT;
+                    // whisper-1 still works but mini has been more consistent here.
                     "transcription": [
-                        "model": "whisper-1",
+                        "model": "gpt-4o-mini-transcribe",
                         "language": "en"
                     ]
                 ] as [String: Any],
@@ -306,20 +306,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func interrupt() async {
-        // Cancel in-flight speech when present; always clear the input buffer so a
-        // mid-utterance agent handoff cannot leave audio that the *next* session
-        // would treat as a fresh turn (or race a stale response.cancel).
-        let shouldCancel = responseActive
-        if shouldCancel {
-            cancelledResponseId = activeResponseId
-            responseActive = false
-        }
-        guard connected else { return }
+        // Only cancel when a response is actually streaming; otherwise the server
+        // rejects with "Cancellation failed: no active response found".
+        // Do NOT clear the input buffer here — a clear while the user is speaking
+        // (handoff / barge-in races) wipes audio that VAD has not committed yet.
+        // Agent switches tear down the socket instead.
+        guard responseActive else { return }
+        cancelledResponseId = activeResponseId
+        responseActive = false
         do {
-            if shouldCancel {
-                try await sendJSON(["type": "response.cancel"])
-            }
-            try await sendJSON(["type": "input_audio_buffer.clear"])
+            try await sendJSON(["type": "response.cancel"])
         } catch {
             metrics?.increment(.sendFailures)
         }
@@ -523,6 +519,14 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         switch type {
         case "session.updated":
             waitingForSessionUpdated = false
+            if let session = json["session"] as? [String: Any],
+               let audio = session["audio"] as? [String: Any],
+               let input = audio["input"] as? [String: Any]
+            {
+                let vad = (input["turn_detection"] as? [String: Any])?["type"] as? String ?? "none"
+                let stt = (input["transcription"] as? [String: Any])?["model"] as? String ?? "none"
+                NovaLog.ai.info("session.updated vad=\(vad, privacy: .public) stt=\(stt, privacy: .public)")
+            }
         case "session.created":
             // Informational only — do not clear the session.update wait.
             break
