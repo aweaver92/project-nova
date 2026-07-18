@@ -512,15 +512,38 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   if (typeof res.flushHeaders === "function") res.flushHeaders();
+  // Small SSE frames otherwise sit in Nagle/TCP buffers on Windows — the phone
+  // stays on "Connecting to bridge…" even though the agent is already running.
+  try {
+    res.socket?.setNoDelay(true);
+  } catch {
+    /* ignore */
+  }
 
+  const flush = (): void => {
+    const flushable = res as Response & { flush?: () => void };
+    if (typeof flushable.flush === "function") {
+      try {
+        flushable.flush();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
   const write = (event: CodingEvent): void => {
     if (res.writableEnded) return;
-    res.write(formatSse(event));
+    try {
+      res.write(formatSse(event));
+      flush();
+    } catch {
+      /* connection already gone */
+    }
   };
   const writeComment = (text: string): void => {
     if (res.writableEnded) return;
     try {
       res.write(`: ${text}\n\n`);
+      flush();
     } catch {
       /* connection already gone */
     }
@@ -654,6 +677,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
 
     const message =
       images.length > 0 ? { text: command, images } : command;
+    console.log(`[cursor/runs] sending prompt (${command.length} chars, ${images.length} images)`);
     const run = await withTimeout(
       "agent_send",
       agent.send(message, {
@@ -672,6 +696,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       cancel: () => run.cancel(),
     });
     setKeepaliveMs(12_000);
+    console.log(`[cursor/runs] run started id=${runId}`);
     write({
       type: "status",
       status: "RUNNING",
@@ -724,8 +749,10 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       }
     })();
 
+    console.log(`[cursor/runs] waiting for run ${runId}`);
     const result = await run.wait();
     await streamDrain.catch(() => undefined);
+    console.log(`[cursor/runs] run ${runId} finished status=${result.status}`);
 
     // If neither deltas nor stream produced assistant text, fall back to wait().
     if (!sawAssistant && result.result?.trim()) {
@@ -746,6 +773,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     });
   } catch (err) {
     const message = describe(err);
+    console.log(`[cursor/runs] error: ${message}`);
     const friendly =
       message.includes("timeout_after_")
         ? `Cursor agent setup timed out (${message}). Try New session, or restart nova-bridge if Dropbox/VPN is busy.`
@@ -768,7 +796,13 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   } finally {
     clearInterval(keepalive);
     if (runId) activeRuns.delete(runId);
-    if (agent) await disposeAgent(agent);
+    if (agent) {
+      try {
+        await withTimeout("agent_dispose", disposeAgent(agent), 10_000);
+      } catch (err) {
+        console.log(`[cursor/runs] dispose timed out/failed: ${describe(err)}`);
+      }
+    }
     if (!res.writableEnded) res.end();
   }
 });
