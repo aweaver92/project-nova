@@ -98,6 +98,15 @@ public actor ConversationOrchestrator {
     private var utteranceEpoch = 0
     private var speechStoppedFallbackTask: Task<Void, Never>?
     private var listenHealthTask: Task<Void, Never>?
+    /// Bumped on every stream teardown / superseding engage so a stale
+    /// `beginStreaming` (actor-reentrant after an `await`) cannot double-connect
+    /// Realtime + mic after an agent switch.
+    private var streamGeneration = 0
+    /// Mutex for engage/disengage/switch. Swift actors reenter at `await`, so
+    /// overlapping voice/tool/UI handoffs can otherwise interleave teardown and
+    /// reconnect and crash Core Audio / orphan ingress tasks.
+    private var lifecycleLocked = false
+    private var lifecycleWaiters: [CheckedContinuation<Void, Never>] = []
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
@@ -238,41 +247,44 @@ public actor ConversationOrchestrator {
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
         guard !isRunning else { return }
-        isRunning = true
-        lastError = nil
-        sessionConfig = config
-        lastEngagement = nil
-        listeningSuspended = false
-        do {
-            await loadAgentRoster()
-            let activeWake = activeAgent?.wakeWord ?? config.wakeWord
-            detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
+        try await withLifecycle {
+            guard !isRunning else { return }
+            isRunning = true
+            lastError = nil
+            sessionConfig = config
+            lastEngagement = nil
+            listeningSuspended = false
+            do {
+                await loadAgentRoster()
+                let activeWake = activeAgent?.wakeWord ?? config.wakeWord
+                detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
 
-            // Single, long-lived consumer of provider events. It must outlive
-            // individual engage/disengage cycles because the provider's event stream
-            // supports only one consumer and persists across reconnects.
-            eventTask = Task { [weak self] in
-                guard let self else { return }
-                for await event in await self.ai.events {
-                    await self.handle(event)
+                // Single, long-lived consumer of provider events. It must outlive
+                // individual engage/disengage cycles because the provider's event stream
+                // supports only one consumer and persists across reconnects.
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
                 }
-            }
 
-            // On-device wake-word gating: stay off the cloud until "Nova" is heard.
-            // Falls back to always-on streaming if no listener is wired or if the
-            // local listener fails to start.
-            if config.useLocalWakeWord, let listener = wakeWordListener {
-                do {
-                    try await beginLocalListening(listener)
-                    return
-                } catch {
-                    NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+                // On-device wake-word gating: stay off the cloud until "Nova" is heard.
+                // Falls back to always-on streaming if no listener is wired or if the
+                // local listener fails to start.
+                if config.useLocalWakeWord, let listener = wakeWordListener {
+                    do {
+                        try await beginLocalListening(listener)
+                        return
+                    } catch {
+                        NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+                    }
                 }
+                try await beginStreaming(config)
+            } catch {
+                await cleanupFailedStart()
+                throw error
             }
-            try await beginStreaming(config)
-        } catch {
-            await cleanupFailedStart()
-            throw error
         }
     }
 
@@ -295,19 +307,48 @@ public actor ConversationOrchestrator {
     }
 
     public func stop() async {
-        isRunning = false
-        detectionTask?.cancel()
-        detectionTask = nil
-        await wakeWordListener?.stop()
-        await teardownStreaming()
-        eventTask?.cancel()
-        eventTask = nil
-        // Ending the session returns control to the master for next time.
-        if let master = masterAgent, activeAgent?.id != master.id {
-            activeAgent = master
-            await persistActiveAgent?(master.id)
-            onAgentChanged?(master)
+        await withLifecycle {
+            isRunning = false
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            await teardownStreaming()
+            eventTask?.cancel()
+            eventTask = nil
+            // Ending the session returns control to the master for next time.
+            if let master = masterAgent, activeAgent?.id != master.id {
+                activeAgent = master
+                await persistActiveAgent?(master.id)
+                onAgentChanged?(master)
+            }
         }
+    }
+
+    // MARK: - Lifecycle serialization (agent switch / engage / disengage)
+
+    private func acquireLifecycle() async {
+        if !lifecycleLocked {
+            lifecycleLocked = true
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lifecycleWaiters.append(cont)
+        }
+    }
+
+    private func releaseLifecycle() {
+        if lifecycleWaiters.isEmpty {
+            lifecycleLocked = false
+        } else {
+            let next = lifecycleWaiters.removeFirst()
+            next.resume()
+        }
+    }
+
+    private func withLifecycle<T>(_ body: () async throws -> T) async rethrows -> T {
+        await acquireLifecycle()
+        defer { releaseLifecycle() }
+        return try await body()
     }
 
     // MARK: - Agents (master Nova + specialist sub-agents)
@@ -348,6 +389,12 @@ public actor ConversationOrchestrator {
     /// + scoped context + toolset take effect. Optionally speaks a short hand-off
     /// in the new voice, or answers a pending master command as `actOnText`.
     private func switchAgent(toId id: UUID, greet: Bool, actOnText: String? = nil) async {
+        await withLifecycle {
+            await performSwitchAgent(toId: id, greet: greet, actOnText: actOnText)
+        }
+    }
+
+    private func performSwitchAgent(toId id: UUID, greet: Bool, actOnText: String? = nil) async {
         guard let target = agents.first(where: { $0.id == id }) ?? masterAgent else { return }
         let alreadyActive = activeAgent?.id == target.id
         activeAgent = target
@@ -362,14 +409,20 @@ public actor ConversationOrchestrator {
         // Reconnect so the voice/instructions actually change (voice is fixed for
         // the life of a Realtime connection).
         if streaming {
+            // Cut any in-flight specialist audio before tearing the graph down so
+            // the user doesn't hear a clipped overlap across the handoff.
+            await egress.flush()
             await teardownStreaming()
             do {
                 try await beginStreaming(sessionConfig)
+            } catch is CancellationError {
+                NovaLog.session.info("Agent switch reconnect superseded")
+                return
             } catch {
                 NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
                 // Don't leave a dead session (mic stopped, no transcripts): fall
                 // back to a healthy state so the user can keep talking / recover.
-                await restoreSession()
+                await restoreSessionUnlocked()
                 return
             }
         } else {
@@ -398,14 +451,16 @@ public actor ConversationOrchestrator {
 
     /// UI-initiated activation (tapping an agent in the Agents tab).
     public func setActiveAgentFromUI(_ id: UUID) async {
-        if agents.isEmpty { await loadAgentRoster() }
-        await switchAgent(toId: id, greet: streaming)
-        // Recover a dead session: if we're running but neither streaming nor
-        // intentionally idle on the on-device wake word (detectionTask == nil),
-        // a prior reconnect likely failed and left the mic/transcripts dead.
-        // Re-establish so tapping an agent always brings the session back.
-        if isRunning, !streaming, detectionTask == nil {
-            await restoreSession()
+        await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+            await performSwitchAgent(toId: id, greet: streaming)
+            // Recover a dead session: if we're running but neither streaming nor
+            // intentionally idle on the on-device wake word (detectionTask == nil),
+            // a prior reconnect likely failed and left the mic/transcripts dead.
+            // Re-establish so tapping an agent always brings the session back.
+            if isRunning, !streaming, detectionTask == nil {
+                await restoreSessionUnlocked()
+            }
         }
     }
 
@@ -439,6 +494,13 @@ public actor ConversationOrchestrator {
     /// on-device wake-word listening when configured, otherwise reopen the cloud
     /// stream. No-op when not running or already streaming.
     private func restoreSession() async {
+        await withLifecycle {
+            await restoreSessionUnlocked()
+        }
+    }
+
+    /// Same as `restoreSession` but for callers that already hold the lifecycle lock.
+    private func restoreSessionUnlocked() async {
         guard isRunning, !streaming else { return }
         if sessionConfig.useLocalWakeWord, let listener = wakeWordListener {
             do {
@@ -507,25 +569,27 @@ public actor ConversationOrchestrator {
     }
 
     private func onWakeWordDetected() async {
-        guard isRunning, !streaming else { return }
-        NovaLog.session.info("Wake word detected on-device; opening stream")
-        detectionTask?.cancel()
-        detectionTask = nil
-        await wakeWordListener?.stop()
-        // Already invoked locally, so the cloud session should reply to the
-        // command that follows without requiring the wake word again.
-        var engaged = sessionConfig
-        let previousRequireWakeWord = sessionConfig.requireWakeWord
-        engaged.requireWakeWord = false
-        do {
-            // Keep the live gate in sync with the Realtime session shape.
-            sessionConfig.requireWakeWord = false
-            try await beginStreaming(engaged)
-        } catch {
-            sessionConfig.requireWakeWord = previousRequireWakeWord
-            NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
-            if let listener = wakeWordListener, isRunning {
-                try? await beginLocalListening(listener)
+        await withLifecycle {
+            guard isRunning, !streaming else { return }
+            NovaLog.session.info("Wake word detected on-device; opening stream")
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            // Already invoked locally, so the cloud session should reply to the
+            // command that follows without requiring the wake word again.
+            var engaged = sessionConfig
+            let previousRequireWakeWord = sessionConfig.requireWakeWord
+            engaged.requireWakeWord = false
+            do {
+                // Keep the live gate in sync with the Realtime session shape.
+                sessionConfig.requireWakeWord = false
+                try await beginStreaming(engaged)
+            } catch {
+                sessionConfig.requireWakeWord = previousRequireWakeWord
+                NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
+                if let listener = wakeWordListener, isRunning {
+                    try? await beginLocalListening(listener)
+                }
             }
         }
     }
@@ -534,6 +598,8 @@ public actor ConversationOrchestrator {
 
     private func beginStreaming(_ config: AISessionConfig) async throws {
         guard !streaming else { return }
+        streamGeneration &+= 1
+        let gen = streamGeneration
         publishListenHealth(phase: .connecting, detail: "Preparing agent context…")
         // Prime the session with durable facts + recent memory for continuity.
         var effective = config
@@ -549,6 +615,7 @@ public actor ConversationOrchestrator {
         }
         if let profileProvider {
             let facts = await profileProvider()
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
             if !facts.isEmpty {
                 effective.instructions += "\n\nWhat you know about the user:\n\(facts)"
             }
@@ -556,9 +623,11 @@ public actor ConversationOrchestrator {
         // Memory is scoped per-agent (so each specialist has its own window);
         // the master falls back to the active workspace.
         let scopeId = await memoryScopeId()
+        guard gen == streamGeneration, isRunning else { throw CancellationError() }
         // Durable long-term digest first (older, compacted context)…
         if let digestStore {
             let digest = await digestStore.digest(workspaceId: scopeId)
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
             if !digest.isEmpty {
                 effective.instructions += "\n\nLong-term memory for this context:\n\(digest)"
             }
@@ -566,6 +635,7 @@ public actor ConversationOrchestrator {
         // …then the recent rolling window.
         if let memory {
             let summary = await memory.summary(workspaceId: scopeId)
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
             }
@@ -573,6 +643,7 @@ public actor ConversationOrchestrator {
         // Active workspace context + available skills catalog.
         if let contextProvider {
             let ctx = await contextProvider()
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -580,6 +651,7 @@ public actor ConversationOrchestrator {
         // Agent-specific extra context (e.g. the trainer's recent workouts).
         if let agent = activeAgent, let agentContextProvider {
             let ctx = await agentContextProvider(agent)
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -587,10 +659,15 @@ public actor ConversationOrchestrator {
         // Advertise available tools, scoped to the active agent's allowlist.
         if let toolRouter {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
         }
         // Cloud first so text chat can work even when mic permission/HFP stalls.
         publishListenHealth(phase: .connecting, detail: "Minting Realtime token / opening WebSocket…")
         try await ai.connect(config: effective)
+        guard gen == streamGeneration, isRunning else {
+            await ai.disconnect()
+            throw CancellationError()
+        }
         streaming = true
         lastActivity = .now
         micChunksSent = 0
@@ -612,11 +689,24 @@ public actor ConversationOrchestrator {
 
         do {
             try await ingress.start()
+            guard gen == streamGeneration, isRunning else {
+                await ingress.stop()
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
             publishListenHealth(
                 phase: .waitingForSpeech,
                 detail: "Realtime connected — speak or type."
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            guard gen == streamGeneration, isRunning else {
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
             // Keep the cloud session: typed chat still works without mic ingress.
             let message = "Mic unavailable — text chat still works. \(error)"
             NovaLog.session.error("Mic ingress failed after Realtime connect: \(String(describing: error), privacy: .public)")
@@ -627,6 +717,7 @@ public actor ConversationOrchestrator {
         ingressTask = Task { [weak self] in
             guard let self else { return }
             for await chunk in await self.ingress.chunks {
+                guard await self.isCurrentStream(gen) else { return }
                 // Queue wait: time from capture callback to orchestrator processing.
                 await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
                 await self.noteMicChunk(chunk)
@@ -645,6 +736,7 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
+                guard await self.isCurrentStream(gen) else { return }
                 let sent = await self.ai.appendAudio(pcm24)
                 await self.noteAppendResult(sent: sent)
                 if sent {
@@ -671,7 +763,13 @@ public actor ConversationOrchestrator {
         }
     }
 
+    private func isCurrentStream(_ generation: Int) -> Bool {
+        streaming && generation == streamGeneration && isRunning
+    }
+
     private func teardownStreaming() async {
+        // Invalidate in-flight beginStreaming / ingress pumps before awaiting I/O.
+        streamGeneration &+= 1
         // Note: the long-lived `eventTask` intentionally survives teardown so the
         // provider's single-consumer event stream stays connected across reconnects.
         ingressTask?.cancel()
@@ -904,14 +1002,20 @@ public actor ConversationOrchestrator {
     }
 
     private func disengageIfIdle() async -> Bool {
+        // Preflight without the lock so the idle timer doesn't serialize behind
+        // unrelated handoffs; re-check inside the critical section.
         guard streaming, !assistantSpeaking else { return false }
         guard ContinuousClock.Instant.now - lastActivity >= sessionConfig.streamIdleTimeout else { return false }
-        NovaLog.session.info("Idle timeout; closing stream, back to wake-word listening")
-        await teardownStreaming()
-        if let listener = wakeWordListener, isRunning {
-            try? await beginLocalListening(listener)
+        return await withLifecycle {
+            guard streaming, !assistantSpeaking else { return false }
+            guard ContinuousClock.Instant.now - lastActivity >= sessionConfig.streamIdleTimeout else { return false }
+            NovaLog.session.info("Idle timeout; closing stream, back to wake-word listening")
+            await teardownStreaming()
+            if let listener = wakeWordListener, isRunning {
+                try? await beginLocalListening(listener)
+            }
+            return true
         }
-        return true
     }
 
     public func askAboutFrame(_ frame: CapturedFrame, prompt: String) async throws -> String {
@@ -1067,17 +1171,19 @@ public actor ConversationOrchestrator {
     /// Reconnect attempts exhausted: leave the half-dead streaming state and
     /// restore local wake-word listening when available so the user can retry.
     private func handleTransportExhausted() async {
-        metrics.increment(.sessionFailures)
-        await teardownStreaming()
-        if sessionConfig.useLocalWakeWord, let listener = wakeWordListener, isRunning {
-            try? await beginLocalListening(listener)
-        } else {
-            // Always-on streaming mode: fully stand down so `start()` can retry.
-            isRunning = false
-            eventTask?.cancel()
-            eventTask = nil
-            detectionTask?.cancel()
-            detectionTask = nil
+        await withLifecycle {
+            metrics.increment(.sessionFailures)
+            await teardownStreaming()
+            if sessionConfig.useLocalWakeWord, let listener = wakeWordListener, isRunning {
+                try? await beginLocalListening(listener)
+            } else {
+                // Always-on streaming mode: fully stand down so `start()` can retry.
+                isRunning = false
+                eventTask?.cancel()
+                eventTask = nil
+                detectionTask?.cancel()
+                detectionTask = nil
+            }
         }
     }
 

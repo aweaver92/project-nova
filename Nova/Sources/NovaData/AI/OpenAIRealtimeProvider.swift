@@ -306,13 +306,20 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func interrupt() async {
-        // Only cancel when a response is actually streaming; otherwise the server
-        // rejects with "Cancellation failed: no active response found".
-        guard responseActive else { return }
-        cancelledResponseId = activeResponseId
-        responseActive = false
+        // Cancel in-flight speech when present; always clear the input buffer so a
+        // mid-utterance agent handoff cannot leave audio that the *next* session
+        // would treat as a fresh turn (or race a stale response.cancel).
+        let shouldCancel = responseActive
+        if shouldCancel {
+            cancelledResponseId = activeResponseId
+            responseActive = false
+        }
+        guard connected else { return }
         do {
-            try await sendJSON(["type": "response.cancel"])
+            if shouldCancel {
+                try await sendJSON(["type": "response.cancel"])
+            }
+            try await sendJSON(["type": "input_audio_buffer.clear"])
         } catch {
             metrics?.increment(.sendFailures)
         }
