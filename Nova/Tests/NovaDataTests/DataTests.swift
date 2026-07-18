@@ -405,7 +405,7 @@ final class FileAgentStoreTests: XCTestCase {
         XCTAssertTrue(active.isMaster)
     }
 
-    func testActiveSelectionPersistsAndMasterUndeletable() async {
+    func testActiveSelectionResetsToMasterOnColdStartAndMasterUndeletable() async {
         let url = tempURL()
         defer { try? FileManager.default.removeItem(at: url) }
         let store = FileAgentStore(url: url)
@@ -413,10 +413,14 @@ final class FileAgentStoreTests: XCTestCase {
         let master = await store.master()
 
         await store.setActive(id: claude.id)
-        // Reload from the same file: the selection survived.
+        let activeSameProcess = await store.active()
+        XCTAssertEqual(activeSameProcess.id, claude.id)
+
+        // Cold start (new store from the same file) always opens on Nova.
         let reloaded = FileAgentStore(url: url)
         let active = await reloaded.active()
-        XCTAssertEqual(active.id, claude.id)
+        XCTAssertEqual(active.id, master.id)
+        XCTAssertTrue(active.isMaster)
 
         // Deleting the master is a no-op; deleting a specialist works.
         await reloaded.delete(id: master.id)
@@ -425,7 +429,7 @@ final class FileAgentStoreTests: XCTestCase {
         await reloaded.delete(id: claude.id)
         let afterClaudeDelete = await reloaded.all()
         XCTAssertFalse(afterClaudeDelete.contains { $0.id == claude.id })
-        // Removing the active agent falls back to the master.
+        // Removing a specialist while master is active keeps master active.
         let activeAfter = await reloaded.active()
         XCTAssertTrue(activeAfter.isMaster)
     }
