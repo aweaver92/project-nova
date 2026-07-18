@@ -62,8 +62,16 @@ struct NovaApp: App {
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.
+            // handleUrl must complete so Wearables can apply the Always-Allow result
+            // before the next createSession / activeDevice wait.
             .onOpenURL { url in
-                Task { _ = try? await Wearables.shared.handleUrl(url) }
+                Task {
+                    do {
+                        _ = try await Wearables.shared.handleUrl(url)
+                    } catch {
+                        print("Wearables.handleUrl failed: \(error)")
+                    }
+                }
             }
             #endif
         }
