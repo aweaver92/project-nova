@@ -70,8 +70,16 @@ try {
   writeFileSync(join(tmp, "about", "index.html"), "<h1>about</h1>");
 
   const service = new PreviewService({ portBase: 18790, portCount: 3 });
-  const info = await service.start("cafe0123cafe0123", tmp, "tmp");
+  const info = await service.start(
+    "cafe0123cafe0123",
+    tmp,
+    "index.html",
+    "index.html",
+    "index.html",
+  );
   assert(info.kind === "static", "static round trip kind");
+  assert(info.path === "index.html", "selected target path exposed");
+  assert(info.urlPath === "index.html", "selected file URL path exposed");
 
   // Wait for listen callback.
   for (let i = 0; i < 20 && service.get("cafe0123cafe0123")?.state !== "ready"; i++) {

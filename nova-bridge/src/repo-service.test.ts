@@ -230,6 +230,24 @@ async function realGitIntegration(): Promise<void> {
     const { repos } = svc.listRepos();
     assert.ok(repos.length >= 1);
     const repoId = repos[0]!.id;
+
+    section("repository file browser");
+    mkdirSync(join(base, "src"));
+    mkdirSync(join(base, "node_modules"));
+    writeFileSync(join(base, "src", "index.html"), "<h1>preview</h1>");
+    writeFileSync(join(base, ".env"), "SECRET=nope");
+    const rootListing = svc.listFiles(repoId);
+    assert.ok(rootListing.entries.some((e) => e.name === "src" && e.kind === "directory"));
+    assert.ok(rootListing.entries.some((e) => e.name === "README.md" && e.kind === "file"));
+    assert.ok(!rootListing.entries.some((e) => e.name === ".env"));
+    assert.ok(!rootListing.entries.some((e) => e.name === "node_modules"));
+    const srcListing = svc.listFiles(repoId, "src");
+    assert.deepEqual(srcListing.entries.map((e) => e.path), ["src/index.html"]);
+    const file = svc.resolveRepoPath(repoId, "src/index.html");
+    assert.equal(file.kind, "file");
+    assert.throws(() => svc.resolveRepoPath(repoId, "../outside"), RepoError);
+    assert.throws(() => svc.resolveRepoPath(repoId, ".git/config"), RepoError);
+
     const status = await svc.status(repoId);
     assert.equal(status.clean, false);
     assert.ok(status.statusToken.length === 24);

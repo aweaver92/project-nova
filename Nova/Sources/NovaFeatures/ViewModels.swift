@@ -892,6 +892,12 @@ public final class CodingViewModel {
     /// Live preview server for the selected repo ("Preview in browser").
     public private(set) var activePreview: BridgePreviewInfo?
     public private(set) var isStartingPreview = false
+    /// Shallow repository browser state.
+    public private(set) var repoFileEntries: [BridgeRepoFileEntry] = []
+    public private(set) var repoBrowsePath: String = ""
+    public private(set) var isLoadingRepoFiles = false
+    /// Relative file/folder selected as the next browser preview target.
+    public private(set) var previewTargetPath: String?
     public private(set) var items: [CodingTranscriptItem] = []
     /// Live Agents-window style process feed for the current (or last) run.
     public private(set) var activitySteps: [CodingActivityStep] = []
@@ -1031,6 +1037,9 @@ public final class CodingViewModel {
         selectedRepoId = trimmed
         await settings.setCodingSelectedRepoId(trimmed)
         activePreview = nil
+        repoFileEntries = []
+        repoBrowsePath = ""
+        previewTargetPath = nil
         // Resumed Cursor sessions keep their original cwd — start fresh.
         await startNewSession()
         await refreshRepositories()
@@ -1155,19 +1164,52 @@ public final class CodingViewModel {
 
     // MARK: - Live preview ("open in browser")
 
+    public func browseRepository(path: String = "") async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else { return }
+        isLoadingRepoFiles = true
+        defer { isLoadingRepoFiles = false }
+        let normalized = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = await bridge.listRepositoryFiles(
+            repoId: repoId,
+            path: normalized.isEmpty ? nil : normalized
+        )
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(RepoFilePayload.self, from: data)
+        else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        repoBrowsePath = payload.path
+        repoFileEntries = payload.entries
+    }
+
+    public func browseParentDirectory() async {
+        guard !repoBrowsePath.isEmpty else { return }
+        let parent = repoBrowsePath.split(separator: "/").dropLast().joined(separator: "/")
+        await browseRepository(path: parent)
+    }
+
+    public func choosePreviewTarget(_ path: String?) {
+        let normalized = path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        previewTargetPath = normalized.isEmpty ? nil : normalized
+    }
+
     /// Start (or reuse) a preview server for the selected repo, then poll the
     /// bridge until the dev server is ready. Static sites are ready instantly.
-    public func startPreview() async {
+    public func startPreview(path: String? = nil) async {
         guard let repoId = selectedRepoId, !repoId.isEmpty, !isStartingPreview else { return }
         isStartingPreview = true
         defer { isStartingPreview = false }
 
-        let result = await bridge.startPreview(repoId: repoId)
+        let selectedPath = path ?? previewTargetPath
+        let result = await bridge.startPreview(repoId: repoId, path: selectedPath)
         guard result.ok, let preview = Self.decodePreview(result.payloadJSON) else {
             statusMessage = Self.summarize(result.payloadJSON)
             return
         }
         activePreview = preview
+        previewTargetPath = preview.path
 
         // Vite/Next dev servers may npm-install + boot; poll until ready.
         var attempts = 0
@@ -1231,6 +1273,11 @@ public final class CodingViewModel {
               let listData = try? JSONSerialization.data(withJSONObject: listObj)
         else { return [] }
         return (try? JSONDecoder().decode([BridgePreviewInfo].self, from: listData)) ?? []
+    }
+
+    private struct RepoFilePayload: Decodable {
+        let path: String
+        let entries: [BridgeRepoFileEntry]
     }
 
     public func preparePublishDraft() {

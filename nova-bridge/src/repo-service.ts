@@ -49,6 +49,28 @@ export type ChangedFile = {
   unstaged: boolean;
 };
 
+export type RepoFileEntry = {
+  name: string;
+  path: string;
+  kind: "file" | "directory";
+  size?: number;
+};
+
+export type RepoFileListing = {
+  repoId: string;
+  path: string;
+  entries: RepoFileEntry[];
+};
+
+export type ResolvedRepoPath = {
+  repoId: string;
+  repoPath: string;
+  relativePath: string;
+  absolutePath: string;
+  name: string;
+  kind: "file" | "directory";
+};
+
 export type RepoStatus = {
   repoId: string;
   name: string;
@@ -526,6 +548,82 @@ export class RepoService {
       }
     }
     throw new RepoError("not_found", "unknown_repo", 404);
+  }
+
+  /**
+   * Resolve a phone-supplied relative path without permitting symlink/junction
+   * escapes. Empty means the repository root.
+   */
+  resolveRepoPath(repoId: string, requestedPath?: string | null): ResolvedRepoPath {
+    const repo = this.resolveRepo(repoId);
+    const relativePath = (requestedPath ?? "").trim().replace(/\\/g, "/");
+    if (relativePath) {
+      assertSafeRelPath(relativePath);
+      if (relativePath.split("/").some((part) => !part || part.startsWith("."))) {
+        throw new RepoError("invalid_path", "hidden_path_rejected", 403);
+      }
+    }
+
+    const candidate = relativePath
+      ? pathResolve(repo.path, ...relativePath.split("/"))
+      : repo.path;
+    let absolutePath: string;
+    try {
+      absolutePath = realpathSync(candidate);
+    } catch {
+      throw new RepoError("not_found", "path_not_found", 404);
+    }
+    if (!isInsideRoot(absolutePath, repo.path)) {
+      throw new RepoError("path_escape", "outside_repository", 403);
+    }
+    const stat = lstatSync(absolutePath);
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+      throw new RepoError("invalid_path", "unsupported_path_type", 400);
+    }
+    return {
+      repoId: repo.id,
+      repoPath: repo.path,
+      relativePath,
+      absolutePath,
+      name: relativePath ? basename(absolutePath) : repo.name,
+      kind: stat.isDirectory() ? "directory" : "file",
+    };
+  }
+
+  /** List one directory level for the mobile repository browser. */
+  listFiles(repoId: string, requestedPath?: string | null): RepoFileListing {
+    const resolved = this.resolveRepoPath(repoId, requestedPath);
+    if (resolved.kind !== "directory") {
+      throw new RepoError("invalid_path", "path_is_not_directory", 400);
+    }
+    const entries: RepoFileEntry[] = [];
+    for (const name of readdirSync(resolved.absolutePath).sort((a, b) => a.localeCompare(b))) {
+      if (name.startsWith(".") || this.isSkippableDir(name)) continue;
+      const childPath = join(resolved.absolutePath, name);
+      try {
+        const stat = lstatSync(childPath);
+        if (stat.isSymbolicLink()) continue;
+        const kind = stat.isDirectory() ? "directory" : stat.isFile() ? "file" : null;
+        if (!kind) continue;
+        const relative = resolved.relativePath
+          ? `${resolved.relativePath}/${name}`
+          : name;
+        entries.push({
+          name,
+          path: relative.replace(/\\/g, "/"),
+          kind,
+          ...(kind === "file" ? { size: stat.size } : {}),
+        });
+        if (entries.length >= 500) break;
+      } catch {
+        /* Dropbox placeholders can disappear while listing; skip them. */
+      }
+    }
+    entries.sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === "directory" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return { repoId: resolved.repoId, path: resolved.relativePath, entries };
   }
 
   private findByIdUnder(dir: string, id: string, depth: number): string | null {

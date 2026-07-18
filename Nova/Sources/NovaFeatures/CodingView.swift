@@ -13,6 +13,7 @@ public struct CodingView: View {
     @State private var showClone = false
     @State private var showCreateProject = false
     @State private var showPublish = false
+    @State private var showRepoFiles = false
     #if canImport(UIKit)
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     #endif
@@ -115,6 +116,7 @@ public struct CodingView: View {
         .sheet(isPresented: $showClone) { cloneSheet }
         .sheet(isPresented: $showCreateProject) { createProjectSheet }
         .sheet(isPresented: $showPublish) { publishSheet }
+        .sheet(isPresented: $showRepoFiles) { repositoryFileBrowser }
         .task {
             await coding.load()
             await coding.refreshPreviews()
@@ -132,6 +134,15 @@ public struct CodingView: View {
                         .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.bordered)
+                if coding.selectedRepoId != nil {
+                    Button {
+                        showRepoFiles = true
+                    } label: {
+                        Label("Files", systemImage: "folder.badge.gearshape")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                }
                 Spacer()
                 Button {
                     Task { await coding.refreshRepoStatusAndDiff() }
@@ -229,50 +240,190 @@ public struct CodingView: View {
     @ViewBuilder
     private var previewRow: some View {
         if let preview = coding.activePreview {
-            HStack(spacing: 8) {
-                Image(systemName: preview.isReady ? "globe" : "hourglass")
-                    .font(.caption)
-                    .foregroundStyle(preview.isReady ? Color.accentColor : .secondary)
-                if preview.isReady, let url = URL(string: preview.url) {
-                    Link(destination: url) {
-                        Text(preview.url)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                } else {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(preview.state == "installing" ? "Installing dependencies…" : preview.state == "error" ? "Preview failed" : "Starting \(preview.kind) server…")
-                            .font(.caption)
-                            .foregroundStyle(preview.state == "error" ? Color.red : .secondary)
-                        if preview.state == "error", let detail = preview.error ?? preview.lastOutput {
-                            Text(detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: preview.isReady ? "globe" : "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(preview.isReady ? Color.accentColor : .secondary)
+                    if preview.isReady, let url = URL(string: preview.url) {
+                        Link(destination: url) {
+                            Text(preview.url)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(preview.state == "installing" ? "Installing dependencies…" : preview.state == "error" ? "Preview failed" : "Starting \(preview.kind) server…")
+                                .font(.caption)
+                                .foregroundStyle(preview.state == "error" ? Color.red : .secondary)
+                            if preview.state == "error", let detail = preview.error ?? preview.lastOutput {
+                                Text(detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        if preview.isPending {
+                            ProgressView().controlSize(.mini)
                         }
                     }
-                    if preview.isPending {
-                        ProgressView().controlSize(.mini)
+                    Spacer()
+                    Button("Change") {
+                        showRepoFiles = true
                     }
+                    .font(.caption)
+                    Button("Stop") {
+                        Task { await coding.stopPreview() }
+                    }
+                    .font(.caption)
                 }
-                Spacer()
-                Button("Stop") {
-                    Task { await coding.stopPreview() }
-                }
-                .font(.caption)
+                Label(
+                    preview.path?.isEmpty == false ? (preview.path ?? "") : "Repository root",
+                    systemImage: "scope"
+                )
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
             }
         } else if coding.selectedRepoId != nil {
-            Button {
-                Task { await coding.startPreview() }
-            } label: {
-                Label(
-                    coding.isStartingPreview ? "Starting preview…" : "Preview in browser",
-                    systemImage: "safari"
-                )
-                .font(.caption.weight(.semibold))
+            HStack {
+                Button {
+                    showRepoFiles = true
+                } label: {
+                    Label(
+                        coding.isStartingPreview ? "Starting preview…" : "Choose preview file or folder",
+                        systemImage: "safari"
+                    )
+                    .font(.caption.weight(.semibold))
+                }
+                .disabled(coding.isStartingPreview)
+                if let target = coding.previewTargetPath {
+                    Text(target)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
-            .disabled(coding.isStartingPreview)
+        }
+    }
+
+    private var repositoryFileBrowser: some View {
+        NavigationStack {
+            List {
+                if coding.isLoadingRepoFiles && coding.repoFileEntries.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView("Loading files…")
+                        Spacer()
+                    }
+                } else if coding.repoFileEntries.isEmpty {
+                    ContentUnavailableView(
+                        "No files",
+                        systemImage: "folder",
+                        description: Text("This folder is empty.")
+                    )
+                } else {
+                    ForEach(coding.repoFileEntries) { entry in
+                        Button {
+                            if entry.isDirectory {
+                                Task { await coding.browseRepository(path: entry.path) }
+                            } else {
+                                coding.choosePreviewTarget(entry.path)
+                                showRepoFiles = false
+                                Task { await coding.startPreview(path: entry.path) }
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: entry.isDirectory ? "folder.fill" : fileSymbol(entry.name))
+                                    .foregroundStyle(entry.isDirectory ? Color.accentColor : .secondary)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entry.name)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    if !entry.isDirectory, let size = entry.size {
+                                        Text(
+                                            ByteCountFormatter.string(
+                                                fromByteCount: Int64(size),
+                                                countStyle: .file
+                                            )
+                                        )
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: entry.isDirectory ? "chevron.right" : "safari")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .navigationTitle(
+                coding.repoBrowsePath.isEmpty
+                    ? coding.selectedRepoName
+                    : coding.repoBrowsePath
+            )
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { showRepoFiles = false }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await coding.browseRepository(path: coding.repoBrowsePath) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(coding.isLoadingRepoFiles)
+                }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button {
+                        Task { await coding.browseParentDirectory() }
+                    } label: {
+                        Label("Up", systemImage: "arrow.up")
+                    }
+                    .disabled(coding.repoBrowsePath.isEmpty || coding.isLoadingRepoFiles)
+                    Spacer()
+                    Button {
+                        let path = coding.repoBrowsePath
+                        coding.choosePreviewTarget(path.isEmpty ? nil : path)
+                        showRepoFiles = false
+                        Task {
+                            await coding.startPreview(path: path.isEmpty ? nil : path)
+                        }
+                    } label: {
+                        Label(
+                            coding.repoBrowsePath.isEmpty
+                                ? "Preview repo root"
+                                : "Preview this folder",
+                            systemImage: "safari"
+                        )
+                    }
+                    .disabled(coding.isLoadingRepoFiles)
+                }
+            }
+            .task {
+                await coding.browseRepository(path: coding.repoBrowsePath)
+            }
+        }
+    }
+
+    private func fileSymbol(_ name: String) -> String {
+        switch name.split(separator: ".").last?.lowercased() {
+        case "html", "htm": return "doc.richtext"
+        case "swift": return "swift"
+        case "js", "ts", "tsx", "jsx": return "curlybraces"
+        case "json": return "list.bullet.rectangle"
+        case "png", "jpg", "jpeg", "gif", "webp", "svg": return "photo"
+        case "md": return "doc.text"
+        default: return "doc"
         }
     }
 

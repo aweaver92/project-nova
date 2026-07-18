@@ -348,6 +348,41 @@ public actor NovaBridgeClient: AgentBridging {
         return await send(path: "repos/\(escaped)/diff", method: "GET", body: nil, timeout: 60)
     }
 
+    public func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        let (base, token) = await configProvider()
+        guard let base else { return Self.notConfigured }
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        var components = URLComponents(
+            url: Self.url(base: base, path: "repos/\(escaped)/files"),
+            resolvingAgainstBaseURL: false
+        )
+        if let path, !path.isEmpty {
+            components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        }
+        guard let url = components?.url else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"invalid_files_url"}"#)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        do {
+            let (data, response) = try await session.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode),
+               data.isEmpty
+            {
+                return BridgeResult(
+                    ok: false,
+                    payloadJSON: #"{"ok":false,"error":"http_\#(http.statusCode)"}"#
+                )
+            }
+            let payload = String(decoding: data, as: UTF8.self)
+            return BridgeResult(ok: (response as? HTTPURLResponse)?.statusCode == 200, payloadJSON: payload)
+        } catch {
+            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
+        }
+    }
+
     public func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
         let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
         var body: [String: Any] = [
@@ -364,8 +399,14 @@ public actor NovaBridgeClient: AgentBridging {
     // MARK: - Live preview
 
     public func startPreview(repoId: String) async -> BridgeResult {
+        await startPreview(repoId: repoId, path: nil)
+    }
+
+    public func startPreview(repoId: String, path: String?) async -> BridgeResult {
         // Dev servers may run `npm install` first; keep a generous timeout.
-        await post(path: "preview/start", body: ["repoId": repoId], timeout: 120)
+        var body: [String: Any] = ["repoId": repoId]
+        if let path, !path.isEmpty { body["path"] = path }
+        return await post(path: "preview/start", body: body, timeout: 120)
     }
 
     public func stopPreview(repoId: String) async -> BridgeResult {

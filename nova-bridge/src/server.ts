@@ -27,10 +27,10 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /cursor/sessions/:id/messages
  *   GET  /repos
  *   POST /repos/clone | /repos/create | /repos/select
- *   GET  /repos/:repoId/status | /diff
+ *   GET  /repos/:repoId/status | /diff | /files?path=
  *   POST /repos/:repoId/publish
  *   GET  /preview                  active previews
- *   POST /preview/start            { repoId }  → LAN preview URL
+ *   POST /preview/start            { repoId, path? }  → LAN preview URL
  *   POST /preview/stop             { repoId }
  *   GET  /health                   (unauthenticated liveness check)
  */
@@ -201,6 +201,17 @@ app.get("/repos/:repoId/diff", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/repos/:repoId/files", requireAuth, (req, res) => {
+  try {
+    const requestedPath =
+      typeof req.query.path === "string" ? req.query.path.trim() : "";
+    const listing = repos.listFiles(String(req.params.repoId ?? ""), requestedPath);
+    res.json({ ok: true, ...listing });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
 app.post("/repos/:repoId/publish", requireAuth, async (req, res) => {
   try {
     const result = await repos.publish(String(req.params.repoId ?? ""), {
@@ -226,7 +237,7 @@ app.get("/preview", requireAuth, (req, res) => {
   const host = req.get("host");
   const list = previews.list().map((p) => ({
     ...p,
-    url: previewUrl(host, p.port),
+    url: previewTargetUrl(host, p.port, p.urlPath),
   }));
   res.json({ ok: true, previews: list });
 });
@@ -238,16 +249,51 @@ app.post("/preview/start", requireAuth, async (req, res) => {
     return;
   }
   try {
-    const { id, path, name } = repos.resolveRepo(repoId);
-    const info = await previews.start(id, path, name);
+    const requestedPath =
+      typeof req.body?.path === "string" ? req.body.path.trim() : "";
+    const target = repos.resolveRepoPath(repoId, requestedPath);
+    // A folder is its own preview root (and may contain its own Vite/Next app).
+    // A file is served from the repository root so relative assets still work;
+    // Safari opens its encoded repository-relative URL directly.
+    const serveDir =
+      target.kind === "directory" ? target.absolutePath : target.repoPath;
+    const urlPath =
+      target.kind === "file" ? target.relativePath : "";
+    const info = await previews.start(
+      target.repoId,
+      serveDir,
+      target.name,
+      target.relativePath,
+      urlPath,
+    );
     res.json({
       ok: true,
-      preview: { ...info, url: previewUrl(req.get("host"), info.port) },
+      preview: {
+        ...info,
+        url: previewTargetUrl(req.get("host"), info.port, info.urlPath),
+      },
     });
   } catch (err) {
     sendRepoError(res, err);
   }
 });
+
+function previewTargetUrl(
+  host: string | undefined,
+  port: number,
+  relativePath?: string,
+): string {
+  const base = previewUrl(host, port);
+  if (!relativePath) return base;
+  return (
+    base +
+    relativePath
+      .split("/")
+      .filter(Boolean)
+      .map((part) => encodeURIComponent(part))
+      .join("/")
+  );
+}
 
 app.post("/preview/stop", requireAuth, async (req, res) => {
   const repoId = String(req.body?.repoId ?? "").trim();

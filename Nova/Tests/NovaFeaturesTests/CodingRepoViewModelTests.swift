@@ -71,6 +71,27 @@ final class CodingRepoViewModelTests: XCTestCase {
         let userRows = vm.items.filter { $0.kind == .user }
         XCTAssertEqual(userRows.count, 2)
     }
+
+    func testBrowsesFoldersAndStartsSelectedFilePreview() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        await vm.browseRepository()
+        XCTAssertEqual(vm.repoFileEntries.map(\.name), ["src", "index.html"])
+        XCTAssertEqual(vm.repoBrowsePath, "")
+
+        await vm.browseRepository(path: "src")
+        XCTAssertEqual(vm.repoBrowsePath, "src")
+        XCTAssertEqual(vm.repoFileEntries.first?.path, "src/page.html")
+
+        await vm.startPreview(path: "src/page.html")
+        XCTAssertEqual(vm.activePreview?.path, "src/page.html")
+        XCTAssertEqual(vm.activePreview?.url, "http://192.168.0.66:8790/src/page.html")
+        let target = await bridge.receivedPreviewPath
+        XCTAssertEqual(target, "src/page.html")
+    }
 }
 
 private actor MemorySettings: SettingsStoring {
@@ -100,6 +121,7 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var receivedImageCount = 0
     private(set) var receivedCommands: [String] = []
+    private(set) var receivedPreviewPath: String?
 
     func isConfigured() async -> Bool { true }
 
@@ -129,6 +151,32 @@ private actor DirtyRepoBridge: AgentBridging {
             ok: true,
             payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","diff":"diff --git a/a.swift","truncated":false,"statusToken":"tok1234567890123456789012"}"#
         )
+    }
+
+    func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        if path == "src" {
+            return BridgeResult(
+                ok: true,
+                payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","path":"src","entries":[{"name":"page.html","path":"src/page.html","kind":"file","size":42}]}"#
+            )
+        }
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","path":"","entries":[{"name":"src","path":"src","kind":"directory"},{"name":"index.html","path":"index.html","kind":"file","size":100}]}"#
+        )
+    }
+
+    func startPreview(repoId: String, path: String?) async -> BridgeResult {
+        receivedPreviewPath = path
+        let target = path ?? ""
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"preview":{"repoId":"\#(repoId)","name":"page.html","path":"\#(target)","kind":"static","state":"ready","port":8790,"url":"http://192.168.0.66:8790/src/page.html"}}"#
+        )
+    }
+
+    func listPreviews() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"previews":[]}"#)
     }
 
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {

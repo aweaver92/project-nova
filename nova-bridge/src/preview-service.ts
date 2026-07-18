@@ -22,6 +22,10 @@ export type PreviewState = "installing" | "starting" | "ready" | "error" | "stop
 export type PreviewInfo = {
   repoId: string;
   name: string;
+  /** Repository-relative file/folder selected by the phone (empty = root). */
+  path?: string;
+  /** URL path to open after the server starts (used for a selected file). */
+  urlPath?: string;
   kind: PreviewKind;
   state: PreviewState;
   port: number;
@@ -156,6 +160,8 @@ export class PreviewService {
     return {
       repoId: p.repoId,
       name: p.name,
+      ...(p.path ? { path: p.path } : {}),
+      ...(p.urlPath ? { urlPath: p.urlPath } : {}),
       kind: p.kind,
       state: p.state,
       port: p.port,
@@ -184,9 +190,21 @@ export class PreviewService {
    * Start (or return the existing) preview for a repo. Dev servers become
    * ready asynchronously — poll `get()`/`list()` until state is "ready".
    */
-  async start(repoId: string, dir: string, name: string): Promise<PreviewInfo> {
+  async start(
+    repoId: string,
+    dir: string,
+    name: string,
+    path = "",
+    urlPath = "",
+  ): Promise<PreviewInfo> {
     const existing = this.active.get(repoId);
-    if (existing && existing.state !== "error" && existing.state !== "stopped") {
+    if (
+      existing &&
+      existing.state !== "error" &&
+      existing.state !== "stopped" &&
+      (existing.path ?? "") === path &&
+      (existing.urlPath ?? "") === urlPath
+    ) {
       return this.publicInfo(existing);
     }
     if (existing) await this.stop(repoId);
@@ -196,6 +214,8 @@ export class PreviewService {
     const preview: ActivePreview = {
       repoId,
       name,
+      ...(path ? { path } : {}),
+      ...(urlPath ? { urlPath } : {}),
       kind,
       state: "starting",
       port,

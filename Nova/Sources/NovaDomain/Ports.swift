@@ -537,11 +537,44 @@ public struct BridgePublishResult: Sendable, Equatable, Codable {
     }
 }
 
+/// One shallow entry returned by the authenticated repository browser.
+public struct BridgeRepoFileEntry: Identifiable, Sendable, Equatable, Codable {
+    public let name: String
+    public let path: String
+    /// "file" | "directory"
+    public let kind: String
+    public let size: Int?
+
+    public var id: String { path }
+    public var isDirectory: Bool { kind == "directory" }
+
+    public init(name: String, path: String, kind: String, size: Int? = nil) {
+        self.name = name
+        self.path = path
+        self.kind = kind
+        self.size = size
+    }
+}
+
+public struct BridgeRepoFileListing: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let path: String
+    public let entries: [BridgeRepoFileEntry]
+
+    public init(repoId: String, path: String, entries: [BridgeRepoFileEntry]) {
+        self.repoId = repoId
+        self.path = path
+        self.entries = entries
+    }
+}
+
 /// A live preview server on the bridge PC (`/preview/*`). `url` is reachable
 /// from the phone because the bridge derives the host from this request.
 public struct BridgePreviewInfo: Sendable, Equatable, Codable {
     public let repoId: String
     public let name: String
+    /// Selected repository-relative file/folder (nil/empty means repo root).
+    public let path: String?
     /// "static" | "vite" | "nextjs" | "dev"
     public let kind: String
     /// "installing" | "starting" | "ready" | "error" | "stopped"
@@ -554,6 +587,7 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
     public init(
         repoId: String,
         name: String,
+        path: String? = nil,
         kind: String,
         state: String,
         port: Int,
@@ -563,6 +597,7 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
     ) {
         self.repoId = repoId
         self.name = name
+        self.path = path
         self.kind = kind
         self.state = state
         self.port = port
@@ -696,11 +731,13 @@ public protocol AgentBridging: Sendable {
     func selectRepository(repoId: String) async -> BridgeResult
     func repositoryStatus(repoId: String) async -> BridgeResult
     func repositoryDiff(repoId: String) async -> BridgeResult
+    func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
 
     /// Live preview servers (`/preview/*`) so Safari on the phone can open
     /// whatever the coding agents generated.
     func startPreview(repoId: String) async -> BridgeResult
+    func startPreview(repoId: String, path: String?) async -> BridgeResult
     func stopPreview(repoId: String) async -> BridgeResult
     func listPreviews() async -> BridgeResult
 }
@@ -799,11 +836,20 @@ public extension AgentBridging {
     func repositoryDiff(repoId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
+    func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func startPreview(repoId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func startPreview(repoId: String, path: String?) async -> BridgeResult {
+        if path == nil || path?.isEmpty == true {
+            return await startPreview(repoId: repoId)
+        }
+        return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func stopPreview(repoId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
