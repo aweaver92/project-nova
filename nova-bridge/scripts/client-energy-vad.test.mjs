@@ -139,4 +139,32 @@ function unlockForRetry(vad) {
   assert.equal(observe(vad, { peak: 0.01, zcr: 0, ringBytes: 100, now: 700 }), "none");
 }
 
+function observeBargeIn(vad, { peak, zcr, now }) {
+  const bargeInPeak = vad.bargeInPeak ?? 0.12;
+  const bargeInHoldMs = vad.bargeInHoldMs ?? 280;
+  if (peak >= bargeInPeak && zcr >= vad.speechZcr) {
+    if (vad.bargeInSince == null) vad.bargeInSince = now;
+    if (now - vad.bargeInSince >= bargeInHoldMs) {
+      vad.bargeInSince = null;
+      return true;
+    }
+    return false;
+  }
+  vad.bargeInSince = null;
+  return false;
+}
+
+{
+  const vad = makeVad();
+  vad.bargeInPeak = 0.12;
+  vad.bargeInHoldMs = 280;
+  vad.bargeInSince = null;
+  assert.equal(observeBargeIn(vad, { peak: 0.2, zcr: 0.05, now: 0 }), false);
+  assert.equal(observeBargeIn(vad, { peak: 0.2, zcr: 0.05, now: 200 }), false);
+  assert.equal(observeBargeIn(vad, { peak: 0.2, zcr: 0.05, now: 300 }), true);
+  // Quiet resets hold.
+  assert.equal(observeBargeIn(vad, { peak: 0.01, zcr: 0, now: 400 }), false);
+  assert.equal(observeBargeIn(vad, { peak: 0.2, zcr: 0.05, now: 410 }), false);
+}
+
 console.log("✅ client-energy-vad.test.mjs PASS");

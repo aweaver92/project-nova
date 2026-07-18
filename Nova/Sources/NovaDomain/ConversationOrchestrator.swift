@@ -764,7 +764,10 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
-                await self.noteOutboundAudio(pcm24)
+                let shouldBargeIn = await self.noteOutboundAudio(pcm24)
+                if shouldBargeIn {
+                    await self.handleBargeIn()
+                }
                 guard await self.isCurrentStream(gen) else { return }
                 let sent = await self.ai.appendAudio(pcm24)
                 await self.noteAppendResult(sent: sent)
@@ -840,7 +843,10 @@ public actor ConversationOrchestrator {
         }
     }
 
-    private func noteOutboundAudio(_ pcm24: Data) {
+    /// Returns `true` when local mic energy should interrupt the assistant
+    /// (voice barge-in). Cloud `speech_started` never arrives with
+    /// `turn_detection: null`, so this is the only voice path.
+    private func noteOutboundAudio(_ pcm24: Data) -> Bool {
         let stats = Self.pcmStats(pcm24)
         if stats.peak > outboundPeakHeard { outboundPeakHeard = stats.peak }
         if stats.rms > outboundRmsHeard { outboundRmsHeard = stats.rms }
@@ -854,14 +860,25 @@ public actor ConversationOrchestrator {
 
         lastOutboundPeak = stats.peak
         lastOutboundZcr = outboundZcrHeard
+        let now = ContinuousClock.Instant.now
+
+        if assistantSpeaking {
+            return clientVAD.observeBargeIn(
+                peak: stats.peak,
+                zcr: outboundZcrHeard,
+                now: now
+            )
+        }
+
         if clientVAD.observe(
             peak: stats.peak,
             zcr: outboundZcrHeard,
             ringBytes: outboundRing.count,
-            now: .now
+            now: now
         ) == .commit {
             pendingClientCommit = true
         }
+        return false
     }
 
     private func noteAppendResult(sent: Bool) {
@@ -899,11 +916,26 @@ public actor ConversationOrchestrator {
 
         let now = ContinuousClock.Instant.now
         if assistantSpeaking {
+            // Health poll is a backup barge-in path when chunk timing is sparse.
+            if clientVAD.observeBargeIn(
+                peak: max(liveLevel, lastOutboundPeak),
+                zcr: lastOutboundZcr,
+                now: now
+            ) {
+                await handleBargeIn()
+                publishListenHealth(
+                    phase: .hearingYou,
+                    micLevel: liveLevel,
+                    inputRoute: route,
+                    detail: "Voice barge-in — listening…"
+                )
+                return
+            }
             publishListenHealth(
                 phase: .speaking,
                 micLevel: liveLevel,
                 inputRoute: route,
-                detail: "Playing assistant audio"
+                detail: "Playing assistant audio — speak to interrupt"
             )
             return
         }
@@ -1641,7 +1673,12 @@ public actor ConversationOrchestrator {
         await ai.interrupt()
         await egress.flush()
         assistantSpeaking = false
+        pendingClientCommit = false
+        clientVAD.reset()
         metrics.mark(.bargeInCancel, startedAt: t0)
+        if streaming {
+            publishListenHealth(phase: .hearingYou, detail: "Interrupted — listening…")
+        }
         onMetricsTick?()
     }
 }

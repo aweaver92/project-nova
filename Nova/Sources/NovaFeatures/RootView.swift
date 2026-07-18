@@ -537,6 +537,8 @@ public struct RootView: View {
                         conversation.clearTranscript()
                     }
                     .font(.caption)
+                    // List swallows taps on default-styled row buttons.
+                    .buttonStyle(.borderless)
                 }
             }
         } header: {

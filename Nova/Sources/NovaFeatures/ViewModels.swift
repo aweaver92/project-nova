@@ -240,6 +240,7 @@ public final class ConversationViewModel {
 
     public func bargeIn() async {
         await orchestrator.handleBargeIn()
+        isAssistantSpeaking = false
         refreshLatency()
     }
 

@@ -28,6 +28,12 @@ public struct ClientEnergyVAD: Sendable, Equatable {
     public private(set) var quietSince: ContinuousClock.Instant?
     public private(set) var lastCommitAt: ContinuousClock.Instant?
 
+    /// Sustained local speech while the assistant is talking (voice barge-in).
+    /// Higher than normal speechPeak so speaker echo is less likely to trip it.
+    public var bargeInPeak: Float = 0.12
+    public var bargeInHold: Duration = .milliseconds(280)
+    public private(set) var bargeInSince: ContinuousClock.Instant?
+
     public init() {}
 
     /// Call when a turn actually completed (transcript / response.done).
@@ -36,6 +42,7 @@ public struct ClientEnergyVAD: Sendable, Equatable {
         speechActive = false
         speechStartedAt = nil
         quietSince = nil
+        bargeInSince = nil
         lastCommitAt = now
     }
 
@@ -44,6 +51,7 @@ public struct ClientEnergyVAD: Sendable, Equatable {
         speechActive = false
         speechStartedAt = nil
         quietSince = nil
+        bargeInSince = nil
         lastCommitAt = nil
     }
 
@@ -52,6 +60,26 @@ public struct ClientEnergyVAD: Sendable, Equatable {
         speechStartedAt = nil
         quietSince = nil
         lastCommitAt = nil
+        bargeInSince = nil
+    }
+
+    /// Returns `true` once mic energy has stayed speech-like for `bargeInHold`
+    /// while the assistant is speaking. Resets its hold timer on quiet frames.
+    public mutating func observeBargeIn(
+        peak: Float,
+        zcr: Float,
+        now: ContinuousClock.Instant
+    ) -> Bool {
+        if peak >= bargeInPeak, zcr >= speechZcr {
+            if bargeInSince == nil { bargeInSince = now }
+            if let bargeInSince, now - bargeInSince >= bargeInHold {
+                self.bargeInSince = nil
+                return true
+            }
+            return false
+        }
+        bargeInSince = nil
+        return false
     }
 
     /// If a commit never got a server ACK, clear the cooldown lock after `timeout`.

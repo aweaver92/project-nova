@@ -130,4 +130,28 @@ final class ClientEnergyVADTests: XCTestCase {
             .none
         )
     }
+
+    func testBargeInRequiresSustainedLoudSpeech() {
+        var vad = makeVAD()
+        vad.bargeInPeak = 0.12
+        vad.bargeInHold = .milliseconds(280)
+        let t0 = ContinuousClock.Instant.now
+
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(200))))
+        XCTAssertTrue(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(300))))
+
+        // Quiet resets; must hold again.
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.01, zcr: 0, now: t0.advanced(by: .milliseconds(400))))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(410))))
+    }
+
+    func testBargeInIgnoresSoftEchoLikeEnergy() {
+        var vad = makeVAD()
+        vad.bargeInPeak = 0.12
+        let t0 = ContinuousClock.Instant.now
+        // Below barge-in peak (normal speechPeak would accept this).
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, zcr: 0.05, now: t0))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, zcr: 0.05, now: t0.advanced(by: .milliseconds(400))))
+    }
 }
