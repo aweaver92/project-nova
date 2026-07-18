@@ -1342,7 +1342,7 @@ public final class CodingViewModel {
         statusMessage = ""
         activeRunId = nil
         activitySteps = [
-            CodingActivityStep(phase: "status", text: "Starting…", isDone: false)
+            CodingActivityStep(phase: "status", text: "Connecting to bridge…", isDone: false)
         ]
         streamingAssistantId = nil
         streamingThinkingId = nil

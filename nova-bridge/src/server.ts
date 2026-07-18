@@ -517,17 +517,36 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     if (res.writableEnded) return;
     res.write(formatSse(event));
   };
-
-  // iOS URLSession drops idle SSE streams with "Network Request failed".
-  // Comment frames keep the TCP connection alive during long thinking gaps.
-  const keepalive = setInterval(() => {
+  const writeComment = (text: string): void => {
     if (res.writableEnded) return;
     try {
-      res.write(`: keepalive ${Date.now()}\n\n`);
+      res.write(`: ${text}\n\n`);
     } catch {
       /* connection already gone */
     }
-  }, 12_000);
+  };
+
+  // Emit body bytes immediately. iOS drops SSE if Agent.create/resume blocks
+  // for a long time with only headers and no payload.
+  write({ type: "status", status: "CONNECTING" });
+  write({
+    type: "activity",
+    phase: "status",
+    text: sessionId ? "Resuming Cursor session…" : "Creating Cursor agent…",
+    detail: cwd,
+    done: false,
+  });
+  writeComment(`setup ${Date.now()}`);
+
+  // Aggressive keepalives during Agent.create/resume; relax once RUNNING.
+  let keepaliveMs = 4_000;
+  let keepalive = setInterval(() => writeComment(`keepalive ${Date.now()}`), keepaliveMs);
+  const setKeepaliveMs = (ms: number): void => {
+    if (ms === keepaliveMs) return;
+    keepaliveMs = ms;
+    clearInterval(keepalive);
+    keepalive = setInterval(() => writeComment(`keepalive ${Date.now()}`), keepaliveMs);
+  };
   req.on("close", () => clearInterval(keepalive));
 
   let agent: Awaited<ReturnType<typeof import("@cursor/sdk").Agent.create>> | null =
@@ -535,7 +554,29 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   let runId = "";
   let resolvedSessionId = sessionId;
 
+  const withTimeout = async <T>(
+    label: string,
+    promise: Promise<T>,
+    ms: number,
+  ): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`${label}_timeout_after_${ms}ms`)),
+            ms,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   try {
+    const setupStarted = Date.now();
     const { Agent, configureCursorSdk } = await import("@cursor/sdk");
     // NordVPN / some Windows stacks break HTTP/2 agent streams → empty UI.
     try {
@@ -543,15 +584,62 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     } catch {
       /* older SDKs may not accept this */
     }
-    agent = sessionId
-      ? await Agent.resume(sessionId, { apiKey: CURSOR_API_KEY })
-      : await Agent.create({
-          apiKey: CURSOR_API_KEY,
-          model: { id: CURSOR_MODEL },
-          local: { cwd },
+
+    try {
+      agent = sessionId
+        ? await withTimeout(
+            "agent_resume",
+            Agent.resume(sessionId, { apiKey: CURSOR_API_KEY }),
+            90_000,
+          )
+        : await withTimeout(
+            "agent_create",
+            Agent.create({
+              apiKey: CURSOR_API_KEY,
+              model: { id: CURSOR_MODEL },
+              local: { cwd },
+            }),
+            90_000,
+          );
+    } catch (err) {
+      // Stale/corrupt session pins often hang or fail resume. Fall back once.
+      if (sessionId) {
+        console.log(
+          `[cursor/runs] resume failed (${describe(err)}); creating fresh agent`,
+        );
+        write({
+          type: "activity",
+          phase: "status",
+          text: "Resume failed — starting a new session…",
+          detail: describe(err),
+          done: false,
         });
+        agent = await withTimeout(
+          "agent_create_fallback",
+          Agent.create({
+            apiKey: CURSOR_API_KEY,
+            model: { id: CURSOR_MODEL },
+            local: { cwd },
+          }),
+          90_000,
+        );
+      } else {
+        throw err;
+      }
+    }
+
     resolvedSessionId = agent.agentId;
+    console.log(
+      `[cursor/runs] agent ready in ${Date.now() - setupStarted}ms id=${resolvedSessionId}`,
+    );
     write({ type: "status", status: "CREATING", sessionId: resolvedSessionId });
+    write({
+      type: "activity",
+      phase: "status",
+      text: "Agent ready — sending prompt…",
+      detail: resolvedSessionId,
+      done: false,
+    });
 
     let sawAssistant = false;
     // Live Agents-window style updates come from onDelta/onStep. Coarse
@@ -566,19 +654,24 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
 
     const message =
       images.length > 0 ? { text: command, images } : command;
-    const run = await agent.send(message, {
-      onDelta: ({ update }) => {
-        emit(normalizeInteractionUpdate(update));
-      },
-      onStep: ({ step }) => {
-        emit(normalizeConversationStep(step));
-      },
-    });
+    const run = await withTimeout(
+      "agent_send",
+      agent.send(message, {
+        onDelta: ({ update }) => {
+          emit(normalizeInteractionUpdate(update));
+        },
+        onStep: ({ step }) => {
+          emit(normalizeConversationStep(step));
+        },
+      }),
+      60_000,
+    );
     runId = run.id;
     activeRuns.set(runId, {
       agentId: resolvedSessionId,
       cancel: () => run.cancel(),
     });
+    setKeepaliveMs(12_000);
     write({
       type: "status",
       status: "RUNNING",
@@ -652,16 +745,26 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       result: result.result ?? "",
     });
   } catch (err) {
-    write({ type: "error", error: describe(err) });
-    if (resolvedSessionId || runId) {
-      write({
-        type: "done",
-        sessionId: resolvedSessionId || sessionId,
-        runId: runId || "unknown",
-        status: "error",
-        result: "",
-      });
-    }
+    const message = describe(err);
+    const friendly =
+      message.includes("timeout_after_")
+        ? `Cursor agent setup timed out (${message}). Try New session, or restart nova-bridge if Dropbox/VPN is busy.`
+        : message;
+    write({ type: "error", error: friendly });
+    write({
+      type: "activity",
+      phase: "status",
+      text: "Failed to start",
+      detail: friendly,
+      done: true,
+    });
+    write({
+      type: "done",
+      sessionId: resolvedSessionId || sessionId || "unknown",
+      runId: runId || "unknown",
+      status: "error",
+      result: "",
+    });
   } finally {
     clearInterval(keepalive);
     if (runId) activeRuns.delete(runId);
