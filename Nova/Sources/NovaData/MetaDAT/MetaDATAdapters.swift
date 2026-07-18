@@ -60,6 +60,11 @@ public actor MetaDATWearableSession: WearableSession {
         diagCont?.yield(transitions.joined(separator: "\n"))
     }
 
+    /// True when DAT registration succeeded (or mock mode).
+    public func isRegistered() -> Bool {
+        useMock || reg == .registered
+    }
+
     public func register() async throws {
         #if canImport(MWDATCore) && os(iOS)
         if !useMock {
@@ -72,8 +77,11 @@ public actor MetaDATWearableSession: WearableSession {
                 _ = try await Wearables.shared.startRegistration()
                 diag("startRegistration() returned; awaiting Meta AI callback")
             } catch {
-                diag("startRegistration() threw: \(String(describing: error))")
-                throw error
+                let mapped = Self.mapRegistrationError(error)
+                diag("startRegistration() threw: \(mapped)")
+                setReg(.failed)
+                setState(.failed)
+                throw NovaError.wearable(mapped)
             }
             NovaLog.session.info("DAT registration started (awaiting Meta AI)")
             return
@@ -149,6 +157,38 @@ public actor MetaDATWearableSession: WearableSession {
             // .available / .unavailable — app known to Meta AI but not yet approved.
             setReg(.unregistered)
         }
+    }
+
+    /// Maps SDK `RegistrationError` (and opaque failures) into actionable copy.
+    private static func mapRegistrationError(_ error: Error) -> String {
+        let checklist = """
+        Developer Mode checklist:
+        1) Meta AI installed; glasses paired & connected
+        2) In Meta AI App Info, tap version 7×, toggle Developer Mode OFF→ON, force-quit Meta AI
+        3) Retry Register from Nova (callback scheme nova://)
+        4) Only one third-party Developer Mode app can stay registered
+        """
+        if let reg = error as? RegistrationError {
+            let tip: String
+            switch reg {
+            case .alreadyRegistered:
+                tip = "Already registered — check Meta AI → App connections, or unregister and retry."
+            case .configurationInvalid:
+                tip = "DAT config invalid — confirm Wearables.configure() and MetaAppID=0 (Developer Mode)."
+            case .metaAINotInstalled:
+                tip = "Install or update the Meta AI app, then retry."
+            case .networkUnavailable:
+                tip = "Network unavailable — reconnect Wi‑Fi/cellular and retry."
+            case .timeout:
+                tip = "Registration timed out — keep Nova and Meta AI in the foreground and retry."
+            case .unknown:
+                tip = "Unknown registration error from Meta AI."
+            @unknown default:
+                tip = "Unrecognized RegistrationError (\(String(describing: reg)))."
+            }
+            return "\(tip)\n\(String(describing: reg))\n\n\(checklist)"
+        }
+        return "Registration failed: \(String(describing: error))\n\n\(checklist)"
     }
     #endif
 }

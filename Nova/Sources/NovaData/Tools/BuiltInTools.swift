@@ -95,7 +95,7 @@ public struct WeatherTool: Tool {
 public struct HomeAssistantTool: Tool {
     public let name = "home_assistant"
     public let description = "Control smart-home devices via Home Assistant (e.g. turn lights/switches on or off)."
-    public let requiresConfirmation = false
+    public let requiresConfirmation = true
     public let parametersJSON = """
     {"type":"object","properties":{"domain":{"type":"string","description":"HA domain, e.g. 'light', 'switch', 'climate'"},"service":{"type":"string","description":"Service to call, e.g. 'turn_on', 'turn_off', 'toggle'"},"entityId":{"type":"string","description":"Target entity_id, e.g. 'light.office'"}},"required":["domain","service"],"additionalProperties":false}
     """

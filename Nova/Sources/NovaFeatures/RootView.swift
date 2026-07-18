@@ -15,7 +15,6 @@ public enum RootTab: Hashable {
 public struct RootView: View {
     @Bindable var session: SessionViewModel
     @Bindable var conversation: ConversationViewModel
-    // Vision remains wired but hidden — "Hey Meta" owns camera UX for now.
     @Bindable var vision: VisionViewModel
     @Bindable var notes: NotesViewModel
     @Bindable var recording: RecordingViewModel
@@ -27,9 +26,12 @@ public struct RootView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
     @Bindable var settings: SettingsViewModel
+    @Bindable var toolConfirmation: ToolConfirmationCoordinator
     @State private var selectedTab: RootTab = .assistant
     @State private var showSettings = false
     @State private var showGlassesDetails = false
+    @State private var showTranscript = true
+    @State private var showRealtimeWarning = false
 
     public init(
         session: SessionViewModel,
@@ -44,7 +46,8 @@ public struct RootView: View {
         visualMemory: VisualMemoryViewModel,
         agents: AgentsViewModel,
         coding: CodingViewModel,
-        settings: SettingsViewModel
+        settings: SettingsViewModel,
+        toolConfirmation: ToolConfirmationCoordinator
     ) {
         self.session = session
         self.conversation = conversation
@@ -59,6 +62,7 @@ public struct RootView: View {
         self.agents = agents
         self.coding = coding
         self.settings = settings
+        self.toolConfirmation = toolConfirmation
     }
 
     public var body: some View {
@@ -86,6 +90,18 @@ public struct RootView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings, conversation: conversation)
         }
+        .alert(
+            toolConfirmation.prompt?.title ?? "Confirm",
+            isPresented: Binding(
+                get: { toolConfirmation.prompt != nil },
+                set: { if !$0 { toolConfirmation.respond(false) } }
+            )
+        ) {
+            Button("Allow") { toolConfirmation.respond(true) }
+            Button("Deny", role: .cancel) { toolConfirmation.respond(false) }
+        } message: {
+            Text(toolConfirmation.prompt?.detail ?? "")
+        }
     }
 
     private var assistantTab: some View {
@@ -93,8 +109,16 @@ public struct RootView: View {
             List {
                 hudSection
                 listenSection
-                conversationSection
-                suggestionsSection
+                if agents.isClaudeActive, coding.pinnedSessionId != nil {
+                    codingResumeSection
+                }
+                if session.registrationState == .registered {
+                    visionSection
+                }
+                if showTranscript {
+                    conversationSection
+                    suggestionsSection
+                }
                 moreSection
             }
             .listSectionSpacing(.compact)
@@ -108,22 +132,44 @@ public struct RootView: View {
                         .frame(width: 28, height: 28)
                         .accessibilityHidden(true)
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { showTranscript.toggle() } label: {
+                        Image(systemName: showTranscript ? "text.bubble.fill" : "text.bubble")
+                    }
+                    .accessibilityLabel(showTranscript ? "Hide chat transcript" : "Show chat transcript")
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                     }
                     .accessibilityLabel("Settings")
                 }
             }
+            .alert("Realtime unavailable", isPresented: $showRealtimeWarning) {
+                Button("Open Settings") { showSettings = true }
+                Button("Start anyway") {
+                    Task { await conversation.start() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Bridge health reports OPENAI_API_KEY missing. Restart nova-bridge after adding the key, or open Settings to re-test.")
+            }
             .task {
                 await recording.load()
                 await workspaces.load()
                 await agents.load()
-                if !conversation.isRunning {
-                    await conversation.start()
-                }
+                await coding.load()
+                await settings.load()
+                await startListeningIfReady()
             }
         }
+    }
+
+    private func startListeningIfReady() async {
+        guard !conversation.isRunning else { return }
+        if settings.realtimeMintBlocked {
+            showRealtimeWarning = true
+            return
+        }
+        await conversation.start()
     }
 
     // MARK: - Assistant sections
@@ -169,13 +215,58 @@ public struct RootView: View {
         }
     }
 
+    private var codingResumeSection: some View {
+        Section {
+            Button {
+                selectedTab = .agents
+            } label: {
+                Label(
+                    "Continue Cursor · \(coding.shortSessionId)",
+                    systemImage: "chevron.left.forwardslash.chevron.right"
+                )
+            }
+        } footer: {
+            Text("Opens Coding under Agents with the pinned Cursor session.")
+        }
+    }
+
+    @ViewBuilder
+    private var visionSection: some View {
+        Section {
+            Button {
+                Task { await vision.askAboutView(prompt: "What am I looking at? Describe it briefly.") }
+            } label: {
+                Label("What’s this?", systemImage: "eye")
+            }
+            if !vision.lastAnswer.isEmpty {
+                Text(vision.lastAnswer)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let error = vision.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text("Vision")
+        } footer: {
+            Text("Uses the glasses camera. Also say “Nova, what’s this?” while listening.")
+        }
+    }
+
     private var listenSection: some View {
         Section {
             HStack(spacing: 10) {
                 Button {
                     Task {
-                        if conversation.isRunning { await conversation.stop() }
-                        else { await conversation.start() }
+                        if conversation.isRunning {
+                            await conversation.stop()
+                        } else if settings.realtimeMintBlocked {
+                            showRealtimeWarning = true
+                        } else {
+                            await conversation.start()
+                        }
                     }
                 } label: {
                     Label(
@@ -275,6 +366,7 @@ public struct RootView: View {
     private var glassesControls: some View {
         if session.registrationState != .registered {
             Button {
+                showGlassesDetails = true
                 Task { await session.register() }
             } label: {
                 Label("Connect Meta glasses", systemImage: "link")
@@ -302,7 +394,15 @@ public struct RootView: View {
             }
         }
         if let error = session.errorMessage {
-            Text(error).font(.caption2).foregroundStyle(.red)
+            Text(error)
+                .font(.caption2)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+            Text("""
+            Quick checklist: Meta AI installed · glasses connected · Developer Mode OFF→ON + force-quit Meta AI · retry Register · callback nova://
+            """)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
         }
         if !session.registrationDiagnostics.isEmpty {
             Text(session.registrationDiagnostics)

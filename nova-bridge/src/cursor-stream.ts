@@ -86,23 +86,55 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
   switch (m.type) {
     case "assistant": {
       const message = asRecord(m.message);
-      const text = textFromContent(message?.content);
+      let text = textFromContent(message?.content);
+      if (!text && typeof message?.content === "string") text = message.content;
+      if (!text && typeof m.text === "string") text = m.text;
+      if (!text && typeof m.delta === "string") text = m.delta;
       return text ? [{ type: "assistant_delta", text }] : [];
     }
     case "thinking": {
-      const text = typeof m.text === "string" ? m.text : "";
+      const text =
+        typeof m.text === "string"
+          ? m.text
+          : typeof m.delta === "string"
+            ? m.delta
+            : "";
       return text ? [{ type: "thinking_delta", text }] : [];
     }
-    case "tool_call": {
+    // Newer local-run stream updates (InteractionUpdateSchema family).
+    case "text-delta":
+    case "text_delta":
+    case "assistant_delta": {
+      const text =
+        typeof m.text === "string"
+          ? m.text
+          : typeof m.delta === "string"
+            ? m.delta
+            : "";
+      return text ? [{ type: "assistant_delta", text }] : [];
+    }
+    case "thinking-delta":
+    case "thinking_delta": {
+      const text =
+        typeof m.text === "string"
+          ? m.text
+          : typeof m.delta === "string"
+            ? m.delta
+            : "";
+      return text ? [{ type: "thinking_delta", text }] : [];
+    }
+    case "tool_call":
+    case "tool-call-started":
+    case "tool_call_started": {
       const name = typeof m.name === "string" ? m.name : "tool";
       const status = typeof m.status === "string" ? m.status : "running";
-      const path = pathFromArgs(m.args);
-      if (status === "running") {
+      const path = pathFromArgs(m.args ?? m.arguments);
+      if (status === "running" || m.type !== "tool_call") {
         return [
           {
             type: "tool_start",
             name,
-            summary: summaryFrom(m.args),
+            summary: summaryFrom(m.args ?? m.arguments),
             ...(path ? { path } : {}),
           },
         ];
@@ -112,6 +144,20 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           type: "tool_end",
           name,
           summary: summaryFrom(m.result, status === "error" ? "error" : undefined),
+          ...(path ? { path } : {}),
+          ...(diffFromResult(m.result) ? { diff: diffFromResult(m.result) } : {}),
+        },
+      ];
+    }
+    case "tool-call-completed":
+    case "tool_call_completed": {
+      const name = typeof m.name === "string" ? m.name : "tool";
+      const path = pathFromArgs(m.args ?? m.arguments);
+      return [
+        {
+          type: "tool_end",
+          name,
+          summary: summaryFrom(m.result),
           ...(path ? { path } : {}),
           ...(diffFromResult(m.result) ? { diff: diffFromResult(m.result) } : {}),
         },

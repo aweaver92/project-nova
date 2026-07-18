@@ -11,6 +11,7 @@ import UIKit
 @MainActor
 public final class AppContainer {
     public let metrics: InMemoryLatencyMetricsRecorder
+    public let usage: UsageMeter
     public let wearableSession: MetaDATWearableSession
     public let frameCapture: MetaDATFrameCapture
     public let memory: any ConversationMemory
@@ -31,6 +32,7 @@ public final class AppContainer {
     public let bridge: NovaBridgeClient
     public let skillScheduler: SkillScheduler
     public let toolRouter: ToolRouter
+    public let toolConfirmation: ToolConfirmationCoordinator
     public let orchestrator: ConversationOrchestrator
     public let sessionVM: SessionViewModel
     public let conversationVM: ConversationViewModel
@@ -52,6 +54,10 @@ public final class AppContainer {
     public init(useFakeAI: Bool = false, useSilentMic: Bool = false, useMockGlasses: Bool = true) {
         let metrics = InMemoryLatencyMetricsRecorder()
         self.metrics = metrics
+        let usage = UsageMeter()
+        self.usage = usage
+        let toolConfirmation = ToolConfirmationCoordinator()
+        self.toolConfirmation = toolConfirmation
 
         // Settings + bridge config are built early because the Realtime token
         // service mints ephemeral secrets through the Nova Bridge, reusing the
@@ -72,6 +78,7 @@ public final class AppContainer {
         //    ephemeral secrets directly from OpenAI.
         // 2. Otherwise mint them through the Nova Bridge's `/realtime/token`, so
         //    the shipped .ipa carries no OpenAI key at all.
+        let usesBridgeRealtime = OpenAICredentials.apiKey() == nil
         let tokenService: any TokenService = OpenAICredentials.apiKey()
             .map { DirectOpenAITokenService(apiKey: $0) }
             ?? BridgeTokenService(configProvider: bridgeConfig)
@@ -85,7 +92,8 @@ public final class AppContainer {
             ai = OpenAIRealtimeProvider(
                 tokenService: tokenService,
                 tokenStore: tokenStore,
-                metrics: metrics
+                metrics: metrics,
+                usage: usage
             )
         }
 
@@ -201,18 +209,23 @@ public final class AppContainer {
         // memory, and return the text for the skill to act on. Releases the camera
         // immediately so the capture indicator is lit for the shortest time.
         let captureStep: SkillRunner.Capturer = { label in
+            guard await settingsStore.visualMemoryEnabled() else { return nil }
             guard let frame = try? await capture.captureStill() else { return nil }
             await capture.releaseCamera()
             let text = await ocr.recognizeText(in: frame.imageData)
             await visualStore.save(imageData: frame.imageData, text: text, caption: label, workspaceId: await workspaceStore.active()?.id)
             return text
         }
+        let skillConfirm: SkillRunner.Confirmer = { title, detail in
+            await toolConfirmation.confirm(title: title, detail: detail)
+        }
         let skillRunner = SkillRunner(
             notes: noteStore,
             openURL: openURL,
             startTimer: startTimer,
             callWebhook: callWebhook,
-            capture: captureStep
+            capture: captureStep,
+            confirm: skillConfirm
         )
 
         // Meeting capture: transcription (Whisper) + summary/action-item extraction.
@@ -223,7 +236,10 @@ public final class AppContainer {
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
         var tools: [any Tool] = [
-            WebSearchTool(),
+            WebSearchTool(
+                isEnabled: { await settingsStore.webSearchEnabled() },
+                onUsage: { usage.recordResponsesCall() }
+            ),
             WeatherTool(),
             CreateReminderTool(),
             ListCalendarEventsTool(),
@@ -244,7 +260,8 @@ public final class AppContainer {
                 frameCapture: capture,
                 ocr: ocr,
                 store: visualStore,
-                workspaceId: { await workspaceStore.active()?.id }
+                workspaceId: { await workspaceStore.active()?.id },
+                isEnabled: { await settingsStore.visualMemoryEnabled() }
             ),
             StartMeetingTool(recorder: recorder),
             EndMeetingTool(
@@ -252,7 +269,8 @@ public final class AppContainer {
                 store: recordingStore,
                 transcriber: transcriber,
                 summarizer: meetingSummarizer,
-                notes: noteStore
+                notes: noteStore,
+                cloudEnabled: { await settingsStore.meetingCloudProcessingEnabled() }
             ),
             RunSkillTool(skills: { await skillStore.all() }, runner: skillRunner),
             SearchKnowledgeTool(search: knowledgeSearch),
@@ -266,7 +284,13 @@ public final class AppContainer {
             PlayMusicTool(openURL: openURL, haBaseURL: ha?.baseURL, haToken: ha?.token),
             OpenURLTool(openURL: openURL),
             // Claude's programming tools (Claude Code + Cursor via the Nova Bridge).
-            RunClaudeCodeTool(bridge: bridge),
+            ListReposTool(bridge: bridge),
+            SelectRepoTool(bridge: bridge, settings: settingsStore),
+            CloneRepoTool(bridge: bridge, settings: settingsStore),
+            RepoStatusTool(bridge: bridge, settings: settingsStore),
+            RepoDiffTool(bridge: bridge, settings: settingsStore),
+            PublishRepoTool(bridge: bridge, settings: settingsStore),
+            RunClaudeCodeTool(bridge: bridge, settings: settingsStore),
             PushToCursorTool(bridge: bridge, settings: settingsStore),
             ListCursorSessionsTool(bridge: bridge),
             // Max's workout + plan tools.
@@ -294,6 +318,15 @@ public final class AppContainer {
         tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
         let router = ToolRouter(tools: tools)
         self.toolRouter = router
+        Task {
+            await router.setConfirmationHandler { request in
+                let detail = String(request.argumentsJSON.prefix(280))
+                return await toolConfirmation.confirm(
+                    title: "Allow \(request.name)?",
+                    detail: detail.isEmpty ? "This tool can change files or devices." : detail
+                )
+            }
+        }
 
         // Injected each session: active-workspace context + skill catalog.
         let contextProvider: @Sendable () async -> String = {
@@ -338,6 +371,8 @@ public final class AppContainer {
             digestStore: digestStore,
             memoryCompactor: memoryCompactor,
             spokenFollowUps: { await settingsStore.spokenFollowUps() },
+            followUpSuggestionsEnabled: { await settingsStore.followUpSuggestionsEnabled() },
+            isVisionReady: { await session.isRegistered() },
             agentsProvider: { await agentStore.all() },
             activeAgentProvider: { await agentStore.active() },
             persistActiveAgent: { id in await agentStore.setActive(id: id) },
@@ -371,15 +406,32 @@ public final class AppContainer {
         self.orchestrator = orchestrator
 
         self.sessionVM = SessionViewModel(session: session)
-        self.conversationVM = ConversationViewModel(orchestrator: orchestrator, metrics: metrics)
+        self.conversationVM = ConversationViewModel(
+            orchestrator: orchestrator,
+            metrics: metrics,
+            settings: settingsStore,
+            usage: usage
+        )
         self.notesVM = NotesViewModel(store: noteStore)
         self.workspacesVM = WorkspacesViewModel(store: workspaceStore)
         self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
-        self.codingVM = CodingViewModel(bridge: bridge, settings: settingsStore)
-        self.settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)
+        let codingVM = CodingViewModel(bridge: bridge, settings: settingsStore)
+        codingVM.onSpokenProgress = { [weak orchestrator] line in
+            guard let orchestrator else { return }
+            let agent = await orchestrator.currentAgent
+            guard agent?.id == Agent.SeedID.claude else { return }
+            await orchestrator.announce(line)
+        }
+        codingVM.confirmPublish = { [toolConfirmation] title, detail in
+            await toolConfirmation.confirm(title: title, detail: detail)
+        }
+        self.codingVM = codingVM
+        let settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)
+        settingsVM.realtimeUsesBridge = usesBridgeRealtime
+        self.settingsVM = settingsVM
         // Starting a recording ensures the mic loop is live (no-op if already
         // running) so button-initiated captures record even when idle.
         self.recordingVM = RecordingViewModel(
@@ -395,6 +447,16 @@ public final class AppContainer {
             orchestrator: orchestrator,
             bandwidth: bandwidth
         )
+
+        // Retention prune (best-effort) on launch.
+        Task {
+            let voiceDays = await settingsStore.voiceRetentionDays()
+            let videoDays = await settingsStore.videoRetentionDays()
+            let visualDays = await settingsStore.visualMemoryRetentionDays()
+            _ = await recordingStore.pruneOlderThan(days: voiceDays)
+            _ = await videoStore.pruneOlderThan(days: videoDays)
+            _ = await visualStore.pruneOlderThan(days: visualDays)
+        }
     }
 }
 

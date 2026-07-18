@@ -8,17 +8,23 @@ import {
   normalizeSdkMessage,
   type CodingEvent,
 } from "./cursor-stream.js";
+import { bootstrapCursorRipgrep } from "./bootstrap-ripgrep.js";
+import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js";
 
 /**
  * Nova Bridge — implements the wire contract the Nova iOS app's `NovaBridgeClient`
  * expects (all JSON, bearer-authenticated):
  *   POST /realtime/token           { model? }               → { value, expires_at }
- *   POST /claude-code              { prompt, cwd? }
- *   POST /cursor/command           { command, sessionId? }  (blocking; prefer /cursor/runs)
- *   POST /cursor/runs              { command, sessionId?, cwd? }  → SSE stream
+ *   POST /claude-code              { prompt, repoId?, cwd? }
+ *   POST /cursor/command           { command, sessionId?, repoId? }
+ *   POST /cursor/runs              { command, sessionId?, repoId? }  → SSE stream
  *   POST /cursor/runs/:runId/cancel
  *   GET  /cursor/sessions
  *   GET  /cursor/sessions/:id/messages
+ *   GET  /repos
+ *   POST /repos/clone | /repos/select
+ *   GET  /repos/:repoId/status | /diff
+ *   POST /repos/:repoId/publish
  *   GET  /health                   (unauthenticated liveness check)
  */
 
@@ -44,6 +50,9 @@ function loadEnv(): void {
 }
 loadEnv();
 
+// Must run before any Agent.create/resume — SDK scans gitignore via ripgrep.
+const RIPGREP_PATH = bootstrapCursorRipgrep();
+
 const PORT = Number(process.env.PORT ?? 8787);
 const TOKEN = process.env.NOVA_BRIDGE_TOKEN ?? "";
 const CURSOR_API_KEY = process.env.CURSOR_API_KEY ?? "";
@@ -56,6 +65,7 @@ const DEFAULT_CWD = process.env.NOVA_BRIDGE_WORKDIR || process.cwd();
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_ARGS = (process.env.CLAUDE_ARGS ?? "").trim();
 const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 600_000);
+const repos = new RepoService({ defaultWorkdir: DEFAULT_CWD });
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -68,22 +78,111 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   }
   const header = req.get("authorization") ?? "";
   const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (provided !== TOKEN) {
+  if (!provided || !timingSafeTokenEqual(provided, TOKEN)) {
     res.status(401).json({ ok: false, error: "unauthorized" });
     return;
   }
   next();
 }
 
+function sendRepoError(res: Response, err: unknown): void {
+  if (err instanceof RepoError) {
+    res.status(err.status).json({ ok: false, error: err.code, detail: err.message });
+    return;
+  }
+  res.status(500).json({ ok: false, error: describe(err) });
+}
+
+function resolveRequestCwd(body: { repoId?: unknown; cwd?: unknown }): string {
+  const repoId = typeof body.repoId === "string" ? body.repoId.trim() : "";
+  const legacyCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
+  return repos.resolveCwd(repoId || null, legacyCwd || null);
+}
+
 // --- Health (no auth) -------------------------------------------------------
 app.get("/health", (_req, res) => {
+  const ready = repos.readiness();
   res.json({
     ok: true,
     service: "nova-bridge",
     cursorConfigured: CURSOR_API_KEY.length > 0,
     openaiConfigured: OPENAI_API_KEY.length > 0,
-    defaultCwd: DEFAULT_CWD,
+    gitReady: ready.gitReady,
+    ghReady: ready.ghReady,
+    repoRootCount: ready.rootCount,
+    selectedRepoId: repos.listRepos().selectedRepoId,
   });
+});
+
+// --- Repositories -----------------------------------------------------------
+app.get("/repos", requireAuth, (_req, res) => {
+  try {
+    const { repos: list, selectedRepoId } = repos.listRepos();
+    res.json({ ok: true, selectedRepoId, repos: list, ...repos.readiness() });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/clone", requireAuth, async (req, res) => {
+  try {
+    const url = String(req.body?.url ?? "").trim();
+    const rootLabel = String(req.body?.rootLabel ?? "").trim() || undefined;
+    const summary = await repos.clone(url, rootLabel);
+    res.json({ ok: true, repo: summary, selectedRepoId: summary.id });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/select", requireAuth, (req, res) => {
+  try {
+    const repoId = String(req.body?.repoId ?? "").trim();
+    if (!repoId) {
+      res.status(400).json({ ok: false, error: "missing_repo_id" });
+      return;
+    }
+    const summary = repos.selectRepo(repoId);
+    res.json({ ok: true, repo: summary, selectedRepoId: summary.id });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.get("/repos/:repoId/status", requireAuth, async (req, res) => {
+  try {
+    const status = await repos.status(String(req.params.repoId ?? ""));
+    res.json({ ok: true, status });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.get("/repos/:repoId/diff", requireAuth, async (req, res) => {
+  try {
+    const diff = await repos.diff(String(req.params.repoId ?? ""));
+    res.json({ ok: true, ...diff });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/repos/:repoId/publish", requireAuth, async (req, res) => {
+  try {
+    const result = await repos.publish(String(req.params.repoId ?? ""), {
+      statusToken: String(req.body?.statusToken ?? ""),
+      branchName: typeof req.body?.branchName === "string" ? req.body.branchName : undefined,
+      commitMessage: String(req.body?.commitMessage ?? ""),
+      prTitle: String(req.body?.prTitle ?? ""),
+      prBody: typeof req.body?.prBody === "string" ? req.body.prBody : undefined,
+      paths: Array.isArray(req.body?.paths)
+        ? req.body.paths.filter((p: unknown): p is string => typeof p === "string")
+        : undefined,
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
 });
 
 // --- OpenAI Realtime ephemeral token ---------------------------------------
@@ -137,9 +236,15 @@ app.post("/realtime/token", requireAuth, async (req, res) => {
 // --- Claude Code ------------------------------------------------------------
 app.post("/claude-code", requireAuth, async (req, res) => {
   const prompt = String(req.body?.prompt ?? "").trim();
-  const cwd = String(req.body?.cwd ?? "").trim() || DEFAULT_CWD;
   if (!prompt) {
     res.status(400).json({ ok: false, error: "missing_prompt" });
+    return;
+  }
+  let cwd: string;
+  try {
+    cwd = resolveRequestCwd(req.body ?? {});
+  } catch (err) {
+    sendRepoError(res, err);
     return;
   }
   try {
@@ -202,13 +307,19 @@ const activeRuns = new Map<
 app.post("/cursor/command", requireAuth, async (req, res) => {
   const command = String(req.body?.command ?? "").trim();
   const sessionId = String(req.body?.sessionId ?? "").trim();
-  const cwd = String(req.body?.cwd ?? "").trim() || DEFAULT_CWD;
   if (!command) {
     res.status(400).json({ ok: false, error: "missing_command" });
     return;
   }
   if (!CURSOR_API_KEY) {
     res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
+    return;
+  }
+  let cwd: string;
+  try {
+    cwd = resolveRequestCwd(req.body ?? {});
+  } catch (err) {
+    sendRepoError(res, err);
     return;
   }
   try {
@@ -241,13 +352,20 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
 app.post("/cursor/runs", requireAuth, async (req, res) => {
   const command = String(req.body?.command ?? "").trim();
   const sessionId = String(req.body?.sessionId ?? "").trim();
-  const cwd = String(req.body?.cwd ?? "").trim() || DEFAULT_CWD;
   if (!command) {
     res.status(400).json({ ok: false, error: "missing_command" });
     return;
   }
   if (!CURSOR_API_KEY) {
     res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
+    return;
+  }
+
+  let cwd: string;
+  try {
+    cwd = resolveRequestCwd(req.body ?? {});
+  } catch (err) {
+    sendRepoError(res, err);
     return;
   }
 
@@ -268,7 +386,13 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   let resolvedSessionId = sessionId;
 
   try {
-    const { Agent } = await import("@cursor/sdk");
+    const { Agent, configureCursorSdk } = await import("@cursor/sdk");
+    // NordVPN / some Windows stacks break HTTP/2 agent streams → empty UI.
+    try {
+      configureCursorSdk({ local: { useHttp1ForAgent: true } });
+    } catch {
+      /* older SDKs may not accept this */
+    }
     agent = sessionId
       ? await Agent.resume(sessionId, { apiKey: CURSOR_API_KEY })
       : await Agent.create({
@@ -292,11 +416,25 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       sessionId: resolvedSessionId,
     });
 
+    let sawAssistant = false;
     for await (const msg of run.stream()) {
-      for (const event of normalizeSdkMessage(msg)) write(event);
+      const events = normalizeSdkMessage(msg);
+      if (events.length === 0) {
+        const t = (msg as { type?: string } | null)?.type ?? typeof msg;
+        console.log(`[cursor/runs] unmapped stream message type=${t}`);
+      }
+      for (const event of events) {
+        if (event.type === "assistant_delta") sawAssistant = true;
+        write(event);
+      }
     }
 
     const result = await run.wait();
+    // If the stream produced no assistant deltas but wait() has a final result,
+    // surface it so the Coding tab isn't blank.
+    if (!sawAssistant && result.result?.trim()) {
+      write({ type: "assistant_delta", text: result.result.trim() });
+    }
     write({
       type: "done",
       sessionId: resolvedSessionId,
@@ -421,9 +559,14 @@ function describe(err: unknown): string {
 }
 
 app.listen(PORT, () => {
+  const ready = repos.readiness();
   console.log(`Nova Bridge listening on http://0.0.0.0:${PORT}`);
   console.log(`  token set:       ${TOKEN ? "yes" : "NO (set NOVA_BRIDGE_TOKEN)"}`);
   console.log(`  cursor api key:  ${CURSOR_API_KEY ? "yes" : "no"}`);
   console.log(`  openai api key:  ${OPENAI_API_KEY ? "yes" : "no (realtime token endpoint disabled)"}`);
+  console.log(`  ripgrep:         ${RIPGREP_PATH ?? "MISSING — Coding agents may hang with empty output"}`);
+  console.log(`  git:             ${ready.gitBin ?? "MISSING"}`);
+  console.log(`  gh:              ${ready.ghBin ?? "MISSING"}`);
+  console.log(`  repo roots:      ${ready.rootCount}`);
   console.log(`  default cwd:     ${DEFAULT_CWD}`);
 });

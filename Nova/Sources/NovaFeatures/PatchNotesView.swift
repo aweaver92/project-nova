@@ -49,6 +49,48 @@ public extension PatchNote {
     /// The changelog. Newest first — add a new entry at the top for each build.
     static let all: [PatchNote] = [
         PatchNote(
+            version: "0.6.0",
+            date: "Jul 17, 2026",
+            summary: "Reliability pack, Coding companion v2, cost/privacy controls, Skills 2.0, vision unlock path.",
+            entries: [
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Settings shows Bridge Realtime/Cursor readiness; Listen warns if OPENAI_API_KEY is missing on the bridge.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Diagnostics latency gate (mic→WS / schedule budgets) plus a rough session spend estimate.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Coding: working directory in Settings, spoken progress when Claude is active, confirm before Claude Code / Cursor / Home Assistant writes.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Cost & privacy toggles (web search, follow-ups, visual memory, meetings) and retention days for media.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .feature,
+                    text: "Skills support variables, conditions, retries, confirmations; built-in Capture → OCR → note skill.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Vision “What’s this?” appears after Meta glasses register; analyze() waits for the real multimodal answer.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Assistant can hide/show the chat transcript from the toolbar bubble button.",
+                    testable: true
+                ),
+            ]
+        ),
+        PatchNote(
             version: "0.5.0",
             date: "Jul 17, 2026",
             summary: "Power-user shell: five tabs, denser Assistant HUD, Bridge and diagnostics in Settings.",

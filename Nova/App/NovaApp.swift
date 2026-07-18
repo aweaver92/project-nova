@@ -53,7 +53,8 @@ struct NovaApp: App {
                 visualMemory: container.visualMemoryVM,
                 agents: container.agentsVM,
                 coding: container.codingVM,
-                settings: container.settingsVM
+                settings: container.settingsVM,
+                toolConfirmation: container.toolConfirmation
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.

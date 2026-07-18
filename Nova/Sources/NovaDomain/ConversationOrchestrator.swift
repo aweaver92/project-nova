@@ -40,6 +40,10 @@ public actor ConversationOrchestrator {
     private let memoryCompactor: (any MemoryCompacting)?
     // When true, Nova also offers one follow-up out loud (default off).
     private let spokenFollowUps: (@Sendable () async -> Bool)?
+    // When false, skip paid follow-up suggestion generation entirely.
+    private let followUpSuggestionsEnabled: (@Sendable () async -> Bool)?
+    // Glasses DAT registration ready for camera / vision turns.
+    private let isVisionReady: (@Sendable () async -> Bool)?
     // Supplies the agent roster (master Nova + specialists) for switching.
     private let agentsProvider: (@Sendable () async -> [Agent])?
     // Supplies the initially-active agent (persisted selection).
@@ -119,6 +123,8 @@ public actor ConversationOrchestrator {
         digestStore: (any MemoryDigestStoring)? = nil,
         memoryCompactor: (any MemoryCompacting)? = nil,
         spokenFollowUps: (@Sendable () async -> Bool)? = nil,
+        followUpSuggestionsEnabled: (@Sendable () async -> Bool)? = nil,
+        isVisionReady: (@Sendable () async -> Bool)? = nil,
         agentsProvider: (@Sendable () async -> [Agent])? = nil,
         activeAgentProvider: (@Sendable () async -> Agent?)? = nil,
         persistActiveAgent: (@Sendable (UUID) async -> Void)? = nil,
@@ -144,10 +150,20 @@ public actor ConversationOrchestrator {
         self.digestStore = digestStore
         self.memoryCompactor = memoryCompactor
         self.spokenFollowUps = spokenFollowUps
+        self.followUpSuggestionsEnabled = followUpSuggestionsEnabled
+        self.isVisionReady = isVisionReady
         self.agentsProvider = agentsProvider
         self.activeAgentProvider = activeAgentProvider
         self.persistActiveAgent = persistActiveAgent
         self.agentContextProvider = agentContextProvider
+    }
+
+    /// Speak a short system note when the stream is open (coding progress, etc.).
+    public func announce(_ note: String) async {
+        guard streaming, !note.isEmpty else { return }
+        await ai.sendUserText(
+            "[System note: Coding update — tell the user in one short spoken sentence: \"\(note)\"]"
+        )
     }
 
     /// Register a handler notified whenever the active agent changes.
@@ -608,11 +624,11 @@ public actor ConversationOrchestrator {
         if frame.age > StreamBandwidthPolicy.default.maxFrameAgeSeconds {
             throw NovaError.vision("Frame too stale (\(Int(frame.age))s); recapture required")
         }
-        let answer = try await ai.analyze(image: frame, prompt: prompt)
-        await memory?.append(ConversationTurn(role: .user, text: prompt))
-        await memory?.append(ConversationTurn(role: .assistant, text: answer))
+        // User prompt is not spoken input — surface it once. Assistant text streams
+        // via `.outputTranscript` while `analyze` awaits completion.
         onTranscript?(prompt, .user)
-        onTranscript?(answer, .assistant)
+        await memory?.append(ConversationTurn(role: .user, text: prompt, workspaceId: await memoryScopeId()))
+        let answer = try await ai.analyze(image: frame, prompt: prompt)
         return answer
     }
 
@@ -889,6 +905,7 @@ public actor ConversationOrchestrator {
         // Skip the response that a spoken offer itself produced (avoids a loop).
         if skipFollowUpOnce { skipFollowUpOnce = false; return }
         guard let followUpSuggester, !lastAssistantText.isEmpty else { return }
+        if let enabled = followUpSuggestionsEnabled, await enabled() == false { return }
         let user = lastUserText
         let assistant = lastAssistantText
         let callback = onSuggestions
@@ -953,6 +970,12 @@ public actor ConversationOrchestrator {
         case .converse:
             await ai.createResponse()
         case .vision(let prompt):
+            if let isVisionReady, await isVisionReady() == false {
+                await ai.sendUserText(
+                    "[System note: Glasses are not registered with Meta AI yet, so camera vision is unavailable. Tell the user to open Glasses & diagnostics and tap Connect Meta glasses, then try again.]"
+                )
+                return
+            }
             guard let frameCapture else {
                 // No camera wired in this runtime — answer by voice instead.
                 await ai.createResponse()

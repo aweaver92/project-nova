@@ -18,14 +18,60 @@ public struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    Toggle("Follow-up suggestion chips", isOn: Binding(
+                        get: { settings.followUpSuggestionsEnabled },
+                        set: { value in Task { await settings.setFollowUpSuggestionsEnabled(value) } }
+                    ))
                     Toggle("Speak follow-up suggestions", isOn: Binding(
                         get: { settings.spokenFollowUps },
                         set: { value in Task { await settings.setSpokenFollowUps(value) } }
                     ))
+                    .disabled(!settings.followUpSuggestionsEnabled)
+                    Toggle("Web search", isOn: Binding(
+                        get: { settings.webSearchEnabled },
+                        set: { value in Task { await settings.setWebSearchEnabled(value) } }
+                    ))
+                    Toggle("Local wake word first (save Realtime cost)", isOn: Binding(
+                        get: { settings.useLocalWakeWord },
+                        set: { value in Task { await settings.setUseLocalWakeWord(value) } }
+                    ))
+                    Toggle("Visual memory", isOn: Binding(
+                        get: { settings.visualMemoryEnabled },
+                        set: { value in Task { await settings.setVisualMemoryEnabled(value) } }
+                    ))
+                    Toggle("Meeting cloud transcription", isOn: Binding(
+                        get: { settings.meetingCloudProcessingEnabled },
+                        set: { value in Task { await settings.setMeetingCloudProcessingEnabled(value) } }
+                    ))
                 } header: {
-                    Text("Conversation")
+                    Text("Cost & privacy")
                 } footer: {
-                    Text("When on, after each reply Nova also offers one suggested next step out loud. Chips still appear either way.")
+                    Text("Disabling follow-ups or web search avoids paid API calls. Local wake word keeps Realtime closed until you say Nova.")
+                }
+
+                Section {
+                    Stepper(value: $settings.voiceRetentionDays, in: 0...365) {
+                        Text(settings.voiceRetentionDays == 0
+                              ? "Voice recordings: keep forever"
+                              : "Voice recordings: \(settings.voiceRetentionDays) days")
+                    }
+                    Stepper(value: $settings.videoRetentionDays, in: 0...365) {
+                        Text(settings.videoRetentionDays == 0
+                              ? "Video recordings: keep forever"
+                              : "Video recordings: \(settings.videoRetentionDays) days")
+                    }
+                    Stepper(value: $settings.visualMemoryRetentionDays, in: 0...365) {
+                        Text(settings.visualMemoryRetentionDays == 0
+                              ? "Visual memory: keep forever"
+                              : "Visual memory: \(settings.visualMemoryRetentionDays) days")
+                    }
+                    Button("Save retention") {
+                        Task { await settings.saveRetention() }
+                    }
+                } header: {
+                    Text("Retention")
+                } footer: {
+                    Text("Older items are pruned on next app launch after you save.")
                 }
 
                 Section {
@@ -51,13 +97,37 @@ public struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if let openai = settings.openaiConfigured {
+                        LabeledContent("Realtime mint") {
+                            Text(openai ? "Ready" : "Missing key")
+                                .foregroundStyle(openai ? .green : .red)
+                        }
+                    }
+                    if let cursor = settings.cursorConfigured {
+                        LabeledContent("Cursor") {
+                            Text(cursor ? "Ready" : "Missing key")
+                                .foregroundStyle(cursor ? .green : .orange)
+                        }
+                    }
                 } header: {
                     Text("Nova Bridge")
                 } footer: {
-                    Text("Claude Code, Cursor, and Realtime token minting go through the bridge on your machine. Use a full URL (http:// or https://) and the token from the bridge .env.")
+                    Text("Claude Code, Cursor, Realtime tokens, and repository clone/status/PR flow go through the bridge. Pick repositories in the Coding tab (opaque repo ids) — do not send absolute paths from the phone.")
                 }
 
                 Section {
+                    HStack {
+                        Text("Latency gate")
+                        Spacer()
+                        Text(conversation.latencyGateStatus)
+                            .foregroundStyle(gateColor)
+                            .fontWeight(.semibold)
+                    }
+                    if !conversation.latencyGateDetail.isEmpty {
+                        Text(conversation.latencyGateDetail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     if conversation.latencyHint.isEmpty {
                         Text("No samples yet — start a conversation to collect timing.")
                             .font(.caption)
@@ -67,8 +137,14 @@ public struct SettingsView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .textSelection(.enabled)
                     }
+                    if !conversation.usageHint.isEmpty {
+                        Text(conversation.usageHint)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                     Button("Refresh") {
                         conversation.refreshLatency()
+                        conversation.refreshUsage()
                     }
                     #if DEBUG
                     Button("Copy latency JSON") {
@@ -83,7 +159,7 @@ public struct SettingsView: View {
                 } header: {
                     Text("Diagnostics")
                 } footer: {
-                    Text("Mic→WS, speech-end→first audio, schedule, barge-in, plus drop/reconnect counters.")
+                    Text("Gate: mic→WS p95 < 40ms and schedule p95 < 50ms (needs ≥5 samples each). Spend is an estimate only.")
                 }
 
                 Section("About") {
@@ -103,6 +179,14 @@ public struct SettingsView: View {
                 }
             }
             .task { await settings.load() }
+        }
+    }
+
+    private var gateColor: Color {
+        switch conversation.latencyGateStatus {
+        case "Pass": return .green
+        case "Fail": return .red
+        default: return .secondary
         }
     }
 }

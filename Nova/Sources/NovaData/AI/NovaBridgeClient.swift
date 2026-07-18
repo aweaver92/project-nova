@@ -28,15 +28,14 @@ public enum NovaBridgeConfig {
 }
 
 /// HTTP client for the "Nova Bridge" — a small service the user runs on their dev
-/// machine that executes Claude Code and forwards commands to active Cursor
-/// sessions. Reads its config lazily so Settings changes take effect immediately.
+/// machine that executes Claude Code, Cursor agents, and allowlisted Git/GitHub
+/// repository lifecycle operations. Reads its config lazily so Settings changes
+/// take effect immediately.
 ///
 /// Wire contract (bearer-authenticated):
-/// - `POST {base}/claude-code` `{ "prompt": String, "cwd": String? }`
-/// - `POST {base}/cursor/command` `{ "command": String, "sessionId": String? }`
-/// - `POST {base}/cursor/runs` → SSE CodingStreamEvent payloads
-/// - `GET  {base}/cursor/sessions`
-/// - `GET  {base}/cursor/sessions/{id}/messages`
+/// - `POST {base}/claude-code` `{ "prompt", "repoId?", "cwd?" }`
+/// - `POST {base}/cursor/command` / `cursor/runs` with `repoId?`
+/// - `GET  {base}/repos` / status / diff; `POST` clone / select / publish
 ///
 /// Unconfigured instances never throw — they return an actionable message the
 /// model can speak, so Claude can still explain how to enable the bridge.
@@ -61,15 +60,32 @@ public actor NovaBridgeClient: AgentBridging {
         await send(path: "health", method: "GET", body: nil, timeout: 15)
     }
 
-    public func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
+    public func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         var body: [String: Any] = ["prompt": prompt]
-        if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        // Legacy cwd is only sent when no repoId is available (bridge validates containment).
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
         return await post(path: "claude-code", body: body)
     }
 
-    public func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+    public func pushToCursor(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?
+    ) async -> BridgeResult {
         var body: [String: Any] = ["command": command]
         if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
         return await post(path: "cursor/command", body: body)
     }
 
@@ -91,6 +107,7 @@ public actor NovaBridgeClient: AgentBridging {
         command: String,
         sessionId: String?,
         workingDirectory: String?,
+        repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
         let (base, token) = await configProvider()
@@ -98,7 +115,12 @@ public actor NovaBridgeClient: AgentBridging {
 
         var body: [String: Any] = ["command": command]
         if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
-        if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
 
         var request = URLRequest(url: Self.url(base: base, path: "cursor/runs"))
         request.httpMethod = "POST"
@@ -190,10 +212,49 @@ public actor NovaBridgeClient: AgentBridging {
         )
     }
 
+    // MARK: - Repositories
+
+    public func listRepos() async -> BridgeResult {
+        await send(path: "repos", method: "GET", body: nil, timeout: 30)
+    }
+
+    public func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult {
+        var body: [String: Any] = ["url": url]
+        if let rootLabel, !rootLabel.isEmpty { body["rootLabel"] = rootLabel }
+        return await post(path: "repos/clone", body: body, timeout: 320)
+    }
+
+    public func selectRepository(repoId: String) async -> BridgeResult {
+        await post(path: "repos/select", body: ["repoId": repoId])
+    }
+
+    public func repositoryStatus(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await send(path: "repos/\(escaped)/status", method: "GET", body: nil, timeout: 60)
+    }
+
+    public func repositoryDiff(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await send(path: "repos/\(escaped)/diff", method: "GET", body: nil, timeout: 60)
+    }
+
+    public func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        var body: [String: Any] = [
+            "statusToken": request.statusToken,
+            "commitMessage": request.commitMessage,
+            "prTitle": request.prTitle,
+        ]
+        if let branchName = request.branchName, !branchName.isEmpty { body["branchName"] = branchName }
+        if let prBody = request.prBody { body["prBody"] = prBody }
+        if let paths = request.paths { body["paths"] = paths }
+        return await post(path: "repos/\(escaped)/publish", body: body, timeout: 320)
+    }
+
     // MARK: - Transport
 
-    private func post(path: String, body: [String: Any]) async -> BridgeResult {
-        await send(path: path, method: "POST", body: body, timeout: 60)
+    private func post(path: String, body: [String: Any], timeout: TimeInterval = 60) async -> BridgeResult {
+        await send(path: path, method: "POST", body: body, timeout: timeout)
     }
 
     private func send(
@@ -228,7 +289,7 @@ public actor NovaBridgeClient: AgentBridging {
             let escaped = Self.escape(payload)
             return BridgeResult(
                 ok: ok,
-                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)"}"#
+                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)","error":"non_json_response"}"#
             )
         } catch {
             let escaped = Self.escape(String(describing: error))

@@ -8,6 +8,9 @@ public struct CodingView: View {
     @Bindable var coding: CodingViewModel
     var embedded: Bool
     @State private var showSessions = false
+    @State private var showRepos = false
+    @State private var showClone = false
+    @State private var showPublish = false
 
     public init(coding: CodingViewModel, embedded: Bool = false) {
         self.coding = coding
@@ -28,6 +31,8 @@ public struct CodingView: View {
 
     private var content: some View {
         VStack(spacing: 0) {
+            repoStatusCard
+            Divider()
             transcript
             Divider()
             composer
@@ -53,15 +58,25 @@ public struct CodingView: View {
                             .textCase(.uppercase)
                         if coding.isRunning { ProgressView().controlSize(.mini) }
                     }
+                    Text(coding.selectedRepoName)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    Button("Repositories…") { showRepos = true }
+                    Button("Clone GitHub repo…") { showClone = true }
                     Button("New session") {
                         Task { await coding.startNewSession() }
                     }
                     Button("Refresh") {
-                        Task { await coding.refreshSessions() }
+                        Task {
+                            await coding.refreshSessions()
+                            await coding.refreshRepositories()
+                            await coding.refreshRepoStatusAndDiff()
+                        }
                     }
                     if let full = coding.pinnedSessionId {
                         Button("Copy session id") {
@@ -80,17 +95,120 @@ public struct CodingView: View {
                 }
             }
         }
-        .sheet(isPresented: $showSessions) {
-            sessionPicker
-        }
+        .sheet(isPresented: $showSessions) { sessionPicker }
+        .sheet(isPresented: $showRepos) { repoPicker }
+        .sheet(isPresented: $showClone) { cloneSheet }
+        .sheet(isPresented: $showPublish) { publishSheet }
         .task { await coding.load() }
+    }
+
+    @ViewBuilder
+    private var repoStatusCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Button {
+                    showRepos = true
+                } label: {
+                    Label(coding.selectedRepoName, systemImage: "folder")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button {
+                    Task { await coding.refreshRepoStatusAndDiff() }
+                } label: {
+                    if coding.isRefreshingRepo {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .disabled(coding.selectedRepoId == nil || coding.isRefreshingRepo)
+            }
+
+            if let status = coding.repoStatus {
+                HStack(spacing: 8) {
+                    Text(status.branch)
+                        .font(.caption.monospaced())
+                    if let upstream = status.upstream {
+                        Text("↑\(status.ahead) ↓\(status.behind) · \(upstream)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Text(status.clean ? "Clean" : "\(status.changedFiles.count) changed")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(status.clean ? .secondary : .orange)
+                }
+                if !status.changedFiles.isEmpty {
+                    Text(status.changedFiles.prefix(6).map(\.path).joined(separator: ", "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                HStack {
+                    Button(coding.showDiff ? "Hide diff" : "Review diff") {
+                        coding.toggleShowDiff()
+                    }
+                    .font(.caption)
+                    .disabled(coding.repoDiff?.diff.isEmpty != false && status.clean)
+                    Spacer()
+                    Button("Create pull request") {
+                        coding.preparePublishDraft()
+                        showPublish = true
+                    }
+                    .font(.caption.weight(.semibold))
+                    .disabled(status.clean || coding.isPublishing)
+                }
+            } else if coding.selectedRepoId == nil {
+                Text("Pick or clone a GitHub repository to code against.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if coding.showDiff, let diff = coding.repoDiff {
+                ScrollView {
+                    Text(diff.diff.isEmpty ? "(no textual diff — untracked files only)" : diff.diff)
+                        .font(.system(.caption2, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .frame(maxHeight: 160)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                if diff.truncated {
+                    Text("Diff truncated for review.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            if let pr = coding.lastPublishResult {
+                if let url = URL(string: pr.prUrl) {
+                    Link("Opened \(pr.prUrl)", destination: url)
+                        .font(.caption)
+                } else {
+                    Text(pr.prUrl)
+                        .font(.caption)
+                }
+            }
+
+            if !coding.statusMessage.isEmpty {
+                Text(coding.statusMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color(.tertiarySystemBackground))
     }
 
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if !coding.statusMessage.isEmpty && coding.items.isEmpty {
+                    if !coding.statusMessage.isEmpty && coding.items.isEmpty && coding.repoStatus == nil {
                         Text(coding.statusMessage)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -203,6 +321,147 @@ public struct CodingView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private var repoPicker: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button("Clone GitHub repo…") {
+                        showRepos = false
+                        showClone = true
+                    }
+                }
+                Section("Allowlisted repositories") {
+                    if coding.repositories.isEmpty {
+                        Text("No local repos under bridge roots yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(coding.repositories) { repo in
+                            Button {
+                                Task {
+                                    await coding.selectRepository(repo.id)
+                                    showRepos = false
+                                }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(repo.name)
+                                            .foregroundStyle(.primary)
+                                        Text("\(repo.rootLabel)/\(repo.relativePath)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if repo.id == coding.selectedRepoId {
+                                        Image(systemName: "checkmark.circle.fill")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Repositories")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { showRepos = false }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await coding.refreshRepositories() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+            }
+            .task { await coding.refreshRepositories() }
+        }
+    }
+
+    private var cloneSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("https://github.com/owner/repo", text: $coding.cloneURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                } footer: {
+                    Text("Uses the bridge PC’s existing GitHub CLI authentication. Only https://github.com/owner/repo URLs are accepted.")
+                }
+            }
+            .navigationTitle("Clone repo")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showClone = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Clone") {
+                        Task {
+                            await coding.cloneRepository()
+                            if coding.selectedRepoId != nil {
+                                showClone = false
+                            }
+                        }
+                    }
+                    .disabled(coding.cloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || coding.isRefreshingRepo)
+                }
+            }
+        }
+    }
+
+    private var publishSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Review") {
+                    if let status = coding.repoStatus {
+                        LabeledContent("Branch now", value: status.branch)
+                        ForEach(status.changedFiles) { file in
+                            Text("\(file.status) \(file.path)")
+                                .font(.caption.monospaced())
+                        }
+                    }
+                }
+                Section("Pull request") {
+                    TextField("nova/branch-name", text: $coding.publishBranchName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("Commit message", text: $coding.publishCommitMessage, axis: .vertical)
+                        .lineLimit(2...4)
+                    TextField("PR title", text: $coding.publishPRTitle, axis: .vertical)
+                        .lineLimit(1...3)
+                    TextField("PR body", text: $coding.publishPRBody, axis: .vertical)
+                        .lineLimit(3...8)
+                }
+                if let pr = coding.lastPublishResult, let url = URL(string: pr.prUrl) {
+                    Section("Result") {
+                        Link(pr.prUrl, destination: url)
+                    }
+                }
+            }
+            .navigationTitle("Create PR")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showPublish = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(coding.isPublishing ? "Publishing…" : "Confirm") {
+                        Task {
+                            await coding.publishPullRequest()
+                            if coding.lastPublishResult != nil {
+                                // Keep sheet open so the PR link is tappable.
+                            }
+                        }
+                    }
+                    .disabled(coding.isPublishing || coding.repoStatus?.clean == true)
+                }
+            }
+            .onAppear { coding.preparePublishDraft() }
+        }
     }
 
     private var sessionPicker: some View {

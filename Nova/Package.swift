@@ -58,6 +58,11 @@ let package = Package(
             name: "NovaDataTests",
             dependencies: ["NovaData", "NovaDomain", "NovaCore"],
             path: "Tests/NovaDataTests"
+        ),
+        .testTarget(
+            name: "NovaFeaturesTests",
+            dependencies: ["NovaFeatures", "NovaDomain", "NovaCore"],
+            path: "Tests/NovaFeaturesTests"
         )
     ]
 )

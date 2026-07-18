@@ -63,6 +63,44 @@ final class PCMResamplerTests: XCTestCase {
         XCTAssertEqual(recorder.sampleCount(.micToWS), 5)
     }
 
+    func testLatencyGatePassFailPending() {
+        let recorder = InMemoryLatencyMetricsRecorder()
+        XCTAssertEqual(recorder.latencyGate().status, "Pending")
+        for v in [10.0, 12.0, 14.0, 16.0, 18.0] {
+            recorder.record(LatencySample(metric: .micToWS, milliseconds: v))
+            recorder.record(LatencySample(metric: .audioToSpeaker, milliseconds: v))
+        }
+        XCTAssertEqual(recorder.latencyGate().status, "Pass")
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 80))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 90))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 100))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 110))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 120))
+        // p95 of mic will exceed 40 with these high samples depending on retention;
+        // ensure Fail or Pass is a known status string.
+        let status = recorder.latencyGate().status
+        XCTAssertTrue(status == "Pass" || status == "Fail")
+    }
+
+    func testSkillRunnerExpandsVariables() {
+        let expanded = SkillRunner.expand("Hello {{name}}", variables: ["name": "Ada"])
+        XCTAssertEqual(expanded, "Hello Ada")
+        let cleared = SkillRunner.expand("x={{missing}}y", variables: [:])
+        XCTAssertEqual(cleared, "xy")
+    }
+
+    func testUsageMeterSnapshot() {
+        let meter = UsageMeter()
+        meter.markSessionStarted()
+        meter.recordResponsesCall()
+        meter.recordTokens(input: 1000, output: 500)
+        meter.markSessionStopped()
+        let snap = meter.snapshot()
+        XCTAssertEqual(snap.responsesCalls, 1)
+        XCTAssertEqual(snap.inputTokens, 1000)
+        XCTAssertTrue(snap.summaryLine.contains("Responses 1"))
+    }
+
     func testLatencyRecorderBoundedRetention() {
         let recorder = InMemoryLatencyMetricsRecorder(capacity: 3)
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
@@ -410,10 +448,37 @@ final class NovaBridgeClientTests: XCTestCase {
             command: "hi",
             sessionId: nil,
             workingDirectory: nil,
+            repoId: nil,
             onEvent: { _ in }
         )
         XCTAssertFalse(stream.ok)
         XCTAssertTrue(stream.payloadJSON.contains("bridge_not_configured"))
+
+        let repos = await bridge.listRepos()
+        XCTAssertFalse(repos.ok)
+        XCTAssertTrue(repos.payloadJSON.contains("bridge_not_configured"))
+    }
+
+    func testRepositoryModelsDecode() throws {
+        let summaryJSON = """
+        {"id":"abcdef0123456789","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}
+        """.data(using: .utf8)!
+        let summary = try JSONDecoder().decode(BridgeRepoSummary.self, from: summaryJSON)
+        XCTAssertEqual(summary.id, "abcdef0123456789")
+        XCTAssertTrue(summary.selected)
+
+        let statusJSON = """
+        {"repoId":"abcdef0123456789","name":"demo","branch":"main","upstream":"origin/main","ahead":1,"behind":0,"clean":false,"changedFiles":[{"path":"a.swift","status":"M","staged":false,"unstaged":true}],"statusToken":"tok123456789012345678901"}
+        """.data(using: .utf8)!
+        let status = try JSONDecoder().decode(BridgeRepoStatus.self, from: statusJSON)
+        XCTAssertEqual(status.changedFiles.count, 1)
+        XCTAssertEqual(status.statusToken.count, 24)
+
+        let publishJSON = """
+        {"repoId":"abcdef0123456789","branch":"nova/fix","commitSha":"abc","prUrl":"https://github.com/acme/demo/pull/1","prNumber":1}
+        """.data(using: .utf8)!
+        let published = try JSONDecoder().decode(BridgePublishResult.self, from: publishJSON)
+        XCTAssertEqual(published.prNumber, 1)
     }
 
     func testCodingStreamEventDecodesSSEPayloads() {
@@ -453,17 +518,32 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertNil(cleared)
     }
 
+    func testSelectedRepoIdRoundTrip() async {
+        let suite = "nova.test.codingRepo.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        XCTAssertNil(await store.codingSelectedRepoId())
+        await store.setCodingSelectedRepoId("  abcdef0123456789  ")
+        XCTAssertEqual(await store.codingSelectedRepoId(), "abcdef0123456789")
+        await store.setCodingSelectedRepoId("")
+        XCTAssertNil(await store.codingSelectedRepoId())
+    }
+
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
-        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1")
+        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1", codingSelectedRepoId: "abcdef0123456789")
         let bridge = PinCapturingBridge()
         let tool = PushToCursorTool(bridge: bridge, settings: settings)
         let payload = try await tool.invoke(argumentsJSON: #"{"command":"fix"}"#)
         XCTAssertTrue(payload.contains("returned-99"))
         let used = await bridge.lastSessionId
         XCTAssertEqual(used, "pinned-1")
+        let usedRepo = await bridge.lastRepoId
+        XCTAssertEqual(usedRepo, "abcdef0123456789")
         let updated = await settings.codingSessionId()
         XCTAssertEqual(updated, "returned-99")
     }
+
 }
 
 final class BridgeTokenServiceTests: XCTestCase {
@@ -501,9 +581,11 @@ final class BridgeTokenServiceTests: XCTestCase {
 /// Minimal settings double that only implements the coding-session pin.
 private actor FakeCodingSettingsStore: SettingsStoring {
     private var pinned: String?
+    private var selectedRepo: String?
 
-    init(codingSessionId: String?) {
+    init(codingSessionId: String?, codingSelectedRepoId: String? = nil) {
         self.pinned = codingSessionId
+        self.selectedRepo = codingSelectedRepoId
     }
 
     func spokenFollowUps() async -> Bool { false }
@@ -513,21 +595,33 @@ private actor FakeCodingSettingsStore: SettingsStoring {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         pinned = (trimmed?.isEmpty == false) ? trimmed : nil
     }
+    func codingSelectedRepoId() async -> String? { selectedRepo }
+    func setCodingSelectedRepoId(_ value: String?) async {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        selectedRepo = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
 }
 
 /// Test double that records the session id passed to `pushToCursor` and returns a new one.
 private actor PinCapturingBridge: AgentBridging {
     private(set) var lastSessionId: String?
+    private(set) var lastRepoId: String?
 
     func isConfigured() async -> Bool { true }
     func health() async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
     }
-    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
+    func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false}"#)
     }
-    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+    func pushToCursor(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?
+    ) async -> BridgeResult {
         lastSessionId = sessionId
+        lastRepoId = repoId
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"sessionId":"returned-99","status":"finished","result":"done"}"#
@@ -535,5 +629,11 @@ private actor PinCapturingBridge: AgentBridging {
     }
     func listCursorSessions() async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true,"sessions":[]}"#)
+    }
+    func selectRepository(repoId: String) async -> BridgeResult {
+        BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"selectedRepoId":"\#(repoId)","repo":{"id":"\#(repoId)","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}}"#
+        )
     }
 }

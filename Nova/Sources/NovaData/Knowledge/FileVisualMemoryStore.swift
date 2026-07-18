@@ -58,6 +58,15 @@ public actor FileVisualMemoryStore: VisualMemoryStoring {
         persist()
     }
 
+    @discardableResult
+    public func pruneOlderThan(days: Int) -> Int {
+        guard days > 0 else { return 0 }
+        let cutoff = Date().addingTimeInterval(-TimeInterval(days) * 86_400)
+        let stale = items.filter { $0.createdAt < cutoff }
+        for item in stale { delete(id: item.id) }
+        return stale.count
+    }
+
     private func pruneIfNeeded() {
         guard items.count > maxItems else { return }
         let overflow = items.count - maxItems

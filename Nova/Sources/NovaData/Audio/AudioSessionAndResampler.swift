@@ -13,13 +13,24 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
             // `.voiceChat` routes capture/playback through the system voice-processing
             // path (echo cancellation, noise suppression, automatic gain control),
             // which materially improves intelligibility on the narrowband HFP link.
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .duckOthers])
+            // `.defaultToSpeaker` matters when glasses/HFP disconnect: without it,
+            // playAndRecord + voiceChat lands on the quiet earpiece instead of the
+            // loud speaker. Bluetooth HFP still takes precedence when present.
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetooth, .defaultToSpeaker, .duckOthers]
+            )
             try session.setActive(true, options: .notifyOthersOnDeactivation)
             if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
                 try session.setPreferredInput(hfp)
+                // Clear any speaker override so HFP owns the route.
+                try? session.overrideOutputAudioPort(.none)
                 NovaLog.audio.info("HFP preferred input: \(hfp.portName, privacy: .public)")
             } else {
-                NovaLog.audio.warning("No bluetoothHFP input yet; continuing with current route")
+                // No glasses: force the loud speaker (not the receiver/earpiece).
+                try? session.overrideOutputAudioPort(.speaker)
+                NovaLog.audio.warning("No bluetoothHFP input; routing playback to phone speaker")
             }
             // Prefer wideband HFP (mSBC, 16 kHz) over narrowband (CVSD, 8 kHz).
             // Modern Bluetooth headsets — including the Meta glasses — negotiate

@@ -47,6 +47,12 @@ public final class SessionViewModel {
         errorMessage = nil
         do {
             try await session.register()
+        } catch let error as NovaError {
+            if case .wearable(let message) = error {
+                errorMessage = message
+            } else {
+                errorMessage = String(describing: error)
+            }
         } catch {
             errorMessage = String(describing: error)
         }
@@ -74,18 +80,30 @@ public final class ConversationViewModel {
     public private(set) var isAssistantSpeaking = false
     public private(set) var errorMessage: String?
     public private(set) var latencyHint: String = ""
+    public private(set) var latencyGateStatus: String = "Pending"
+    public private(set) var latencyGateDetail: String = ""
+    public private(set) var usageHint: String = ""
     /// Tappable follow-up suggestions from the last exchange.
     public private(set) var suggestions: [String] = []
 
     private let orchestrator: ConversationOrchestrator
     private let metrics: InMemoryLatencyMetricsRecorder
+    private let settings: (any SettingsStoring)?
+    private let usage: UsageMeter?
     // Role of the line currently being appended to, so streamed word-by-word
     // deltas coalesce into a single line per turn instead of one line per word.
     private var currentTranscriptRole: ConversationTurn.Role?
 
-    public init(orchestrator: ConversationOrchestrator, metrics: InMemoryLatencyMetricsRecorder) {
+    public init(
+        orchestrator: ConversationOrchestrator,
+        metrics: InMemoryLatencyMetricsRecorder,
+        settings: (any SettingsStoring)? = nil,
+        usage: UsageMeter? = nil
+    ) {
         self.orchestrator = orchestrator
         self.metrics = metrics
+        self.settings = settings
+        self.usage = usage
     }
 
     public func start() async {
@@ -121,9 +139,15 @@ public final class ConversationViewModel {
             }
         }
         do {
-            try await orchestrator.start()
+            var config = AISessionConfig()
+            if let settings {
+                config.useLocalWakeWord = await settings.useLocalWakeWord()
+            }
+            try await orchestrator.start(config: config)
             isRunning = true
+            usage?.markSessionStarted()
             refreshLatency()
+            refreshUsage()
         } catch {
             errorMessage = String(describing: error)
             isRunning = false
@@ -151,7 +175,9 @@ public final class ConversationViewModel {
         await orchestrator.stop()
         isRunning = false
         isAssistantSpeaking = false
+        usage?.markSessionStopped()
         refreshLatency()
+        refreshUsage()
     }
 
     public func bargeIn() async {
@@ -163,6 +189,13 @@ public final class ConversationViewModel {
         latencyHint = metrics.summaryLine(
             metrics: [.micToWS, .speechEndToFirstAudio, .audioToSpeaker, .bargeInCancel]
         )
+        let gate = metrics.latencyGate()
+        latencyGateStatus = gate.status
+        latencyGateDetail = gate.detail
+    }
+
+    public func refreshUsage() {
+        usageHint = usage?.snapshot().summaryLine ?? ""
     }
 
     /// DEBUG/diagnostics: JSON snapshot of latency samples + counters.
@@ -566,11 +599,27 @@ public final class SkillsViewModel {
 @Observable
 public final class SettingsViewModel {
     public private(set) var spokenFollowUps: Bool = false
+    public private(set) var followUpSuggestionsEnabled: Bool = true
+    public private(set) var webSearchEnabled: Bool = true
+    public private(set) var useLocalWakeWord: Bool = false
+    public private(set) var visualMemoryEnabled: Bool = true
+    public private(set) var meetingCloudProcessingEnabled: Bool = true
+    public var voiceRetentionDays: Int = 0
+    public var videoRetentionDays: Int = 0
+    public var visualMemoryRetentionDays: Int = 0
     /// Nova Bridge connection fields (Settings → Bridge).
     public var bridgeBaseURL: String = ""
     public var bridgeToken: String = ""
+    public var codingWorkingDirectory: String = ""
     public private(set) var bridgeStatus: String = ""
     public private(set) var bridgeChecking = false
+    public private(set) var openaiConfigured: Bool?
+    public private(set) var cursorConfigured: Bool?
+    public private(set) var gitReady: Bool?
+    public private(set) var ghReady: Bool?
+    public private(set) var bridgeDefaultCwd: String?
+    /// When true, Realtime tokens come from the bridge (no baked-in OpenAI key).
+    public var realtimeUsesBridge: Bool = true
 
     private let store: any SettingsStoring
     private let bridge: any AgentBridging
@@ -580,10 +629,25 @@ public final class SettingsViewModel {
         self.bridge = bridge
     }
 
+    /// True when Listen will fail because bridge Realtime minting lacks OPENAI_API_KEY.
+    public var realtimeMintBlocked: Bool {
+        realtimeUsesBridge && openaiConfigured == false
+    }
+
     public func load() async {
         spokenFollowUps = await store.spokenFollowUps()
+        followUpSuggestionsEnabled = await store.followUpSuggestionsEnabled()
+        webSearchEnabled = await store.webSearchEnabled()
+        useLocalWakeWord = await store.useLocalWakeWord()
+        visualMemoryEnabled = await store.visualMemoryEnabled()
+        meetingCloudProcessingEnabled = await store.meetingCloudProcessingEnabled()
+        voiceRetentionDays = await store.voiceRetentionDays()
+        videoRetentionDays = await store.videoRetentionDays()
+        visualMemoryRetentionDays = await store.visualMemoryRetentionDays()
         bridgeBaseURL = await store.bridgeBaseURL() ?? ""
         bridgeToken = await store.bridgeToken() ?? ""
+        codingWorkingDirectory = await store.codingWorkingDirectory() ?? ""
+        await refreshBridgeHealth()
     }
 
     public func setSpokenFollowUps(_ enabled: Bool) async {
@@ -591,14 +655,50 @@ public final class SettingsViewModel {
         await store.setSpokenFollowUps(enabled)
     }
 
+    public func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {
+        followUpSuggestionsEnabled = enabled
+        await store.setFollowUpSuggestionsEnabled(enabled)
+    }
+
+    public func setWebSearchEnabled(_ enabled: Bool) async {
+        webSearchEnabled = enabled
+        await store.setWebSearchEnabled(enabled)
+    }
+
+    public func setUseLocalWakeWord(_ enabled: Bool) async {
+        useLocalWakeWord = enabled
+        await store.setUseLocalWakeWord(enabled)
+    }
+
+    public func setVisualMemoryEnabled(_ enabled: Bool) async {
+        visualMemoryEnabled = enabled
+        await store.setVisualMemoryEnabled(enabled)
+    }
+
+    public func setMeetingCloudProcessingEnabled(_ enabled: Bool) async {
+        meetingCloudProcessingEnabled = enabled
+        await store.setMeetingCloudProcessingEnabled(enabled)
+    }
+
+    public func saveRetention() async {
+        await store.setVoiceRetentionDays(max(0, voiceRetentionDays))
+        await store.setVideoRetentionDays(max(0, videoRetentionDays))
+        await store.setVisualMemoryRetentionDays(max(0, visualMemoryRetentionDays))
+    }
+
     /// Persist bridge settings and probe `/health`.
     public func saveBridge() async {
         let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         await store.setBridgeBaseURL(trimmedURL)
         await store.setBridgeToken(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines))
+        await store.setCodingWorkingDirectory(
+            codingWorkingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
 
         if trimmedURL.isEmpty {
             bridgeStatus = "Saved. No URL set — enter your bridge URL (including http:// or https://)."
+            openaiConfigured = nil
+            cursorConfigured = nil
             return
         }
         guard trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") else {
@@ -608,13 +708,45 @@ public final class SettingsViewModel {
 
         bridgeChecking = true
         bridgeStatus = "Saved. Checking connection…"
-        let result = await bridge.health()
+        await refreshBridgeHealth()
         bridgeChecking = false
+    }
+
+    public func refreshBridgeHealth() async {
+        let result = await bridge.health()
         if result.ok {
-            bridgeStatus = "Saved. Bridge reachable."
-        } else {
-            bridgeStatus = "Saved, but couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
+            applyHealthPayload(result.payloadJSON)
+            var parts = ["Bridge reachable"]
+            if let openaiConfigured {
+                parts.append(openaiConfigured ? "Realtime ready" : "Realtime unavailable (OPENAI_API_KEY missing on bridge)")
+            }
+            if let cursorConfigured {
+                parts.append(cursorConfigured ? "Cursor ready" : "Cursor key missing")
+            }
+            if let gitReady {
+                parts.append(gitReady ? "git ready" : "git missing")
+            }
+            if let ghReady {
+                parts.append(ghReady ? "gh ready" : "gh missing")
+            }
+            bridgeStatus = parts.joined(separator: " · ")
+        } else if !(await store.bridgeBaseURL() ?? "").isEmpty {
+            bridgeStatus = "Couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
+            openaiConfigured = nil
+            cursorConfigured = nil
+            gitReady = nil
+            ghReady = nil
         }
+    }
+
+    private func applyHealthPayload(_ payloadJSON: String) {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        openaiConfigured = obj["openaiConfigured"] as? Bool
+        cursorConfigured = obj["cursorConfigured"] as? Bool
+        gitReady = obj["gitReady"] as? Bool
+        ghReady = obj["ghReady"] as? Bool
+        bridgeDefaultCwd = obj["defaultCwd"] as? String
     }
 
     private static func summarize(_ payloadJSON: String) -> String {
@@ -684,6 +816,15 @@ public struct CodingSessionInfo: Identifiable, Equatable, Sendable {
 public final class CodingViewModel {
     public private(set) var sessions: [CodingSessionInfo] = []
     public private(set) var pinnedSessionId: String?
+    public private(set) var workingDirectory: String = ""
+    public private(set) var selectedRepoId: String?
+    public private(set) var repositories: [BridgeRepoSummary] = []
+    public private(set) var repoStatus: BridgeRepoStatus?
+    public private(set) var repoDiff: BridgeRepoDiff?
+    public private(set) var showDiff = false
+    public private(set) var lastPublishResult: BridgePublishResult?
+    public private(set) var isRefreshingRepo = false
+    public private(set) var isPublishing = false
     public private(set) var items: [CodingTranscriptItem] = []
     public private(set) var runStatus: String = "idle"
     public private(set) var activeRunId: String?
@@ -691,11 +832,21 @@ public final class CodingViewModel {
     public private(set) var isLoading = false
     public private(set) var statusMessage: String = ""
     public var draft: String = ""
+    public var cloneURL: String = ""
+    public var publishBranchName: String = ""
+    public var publishCommitMessage: String = ""
+    public var publishPRTitle: String = ""
+    public var publishPRBody: String = ""
+    /// Optional spoken progress (wired when Claude is active + Realtime open).
+    public var onSpokenProgress: ((String) async -> Void)?
+    /// Optional confirmation gate for publish (Create PR).
+    public var confirmPublish: ((String, String) async -> Bool)?
 
     private let bridge: any AgentBridging
     private let settings: any SettingsStoring
     private var streamingAssistantId: UUID?
     private var streamingThinkingId: UUID?
+    private var lastSpokenAt: Date = .distantPast
 
     public init(bridge: any AgentBridging, settings: any SettingsStoring) {
         self.bridge = bridge
@@ -708,12 +859,193 @@ public final class CodingViewModel {
         return String(id.prefix(8)) + "…" + String(id.suffix(4))
     }
 
+    public var selectedRepoName: String {
+        if let selected = repositories.first(where: { $0.id == selectedRepoId }) {
+            return selected.name
+        }
+        return selectedRepoId?.isEmpty == false ? "Repository" : "No repo"
+    }
+
+    public var shortWorkingDirectory: String {
+        if !selectedRepoName.isEmpty, selectedRepoName != "No repo" {
+            return selectedRepoName
+        }
+        guard !workingDirectory.isEmpty else { return "" }
+        let parts = workingDirectory.split(separator: "/").map(String.init)
+        if parts.count <= 2 { return workingDirectory }
+        return "…/" + parts.suffix(2).joined(separator: "/")
+    }
+
     public func load() async {
         pinnedSessionId = await settings.codingSessionId()
+        workingDirectory = await settings.codingWorkingDirectory() ?? ""
+        selectedRepoId = await settings.codingSelectedRepoId()
+        await refreshRepositories()
         await refreshSessions()
         if let id = pinnedSessionId {
             await loadMessages(sessionId: id)
         }
+        if selectedRepoId != nil {
+            await refreshRepoStatusAndDiff()
+        }
+    }
+
+    public func refreshRepositories() async {
+        let result = await bridge.listRepos()
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(ReposListPayload.self, from: data)
+        else {
+            repositories = []
+            if !result.ok {
+                statusMessage = Self.summarize(result.payloadJSON)
+            }
+            return
+        }
+        repositories = decoded.repos
+        if let selected = decoded.selectedRepoId, !selected.isEmpty {
+            selectedRepoId = selected
+            await settings.setCodingSelectedRepoId(selected)
+        } else if let local = selectedRepoId,
+                  !repositories.contains(where: { $0.id == local })
+        {
+            selectedRepoId = nil
+            await settings.setCodingSelectedRepoId(nil)
+        }
+    }
+
+    public func selectRepository(_ repoId: String) async {
+        let trimmed = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let result = await bridge.selectRepository(repoId: trimmed)
+        guard result.ok else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        selectedRepoId = trimmed
+        await settings.setCodingSelectedRepoId(trimmed)
+        // Resumed Cursor sessions keep their original cwd — start fresh.
+        await startNewSession()
+        await refreshRepositories()
+        await refreshRepoStatusAndDiff()
+        statusMessage = "Selected \(selectedRepoName). New Cursor session for this repo."
+    }
+
+    public func cloneRepository() async {
+        let url = cloneURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty else { return }
+        isRefreshingRepo = true
+        defer { isRefreshingRepo = false }
+        let result = await bridge.cloneRepository(url: url, rootLabel: nil)
+        guard result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let obj = try? JSONDecoder().decode(RepoMutationPayload.self, from: data),
+              let repo = obj.repo
+        else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        cloneURL = ""
+        selectedRepoId = repo.id
+        await settings.setCodingSelectedRepoId(repo.id)
+        await startNewSession()
+        await refreshRepositories()
+        await refreshRepoStatusAndDiff()
+        statusMessage = "Cloned \(repo.name)."
+    }
+
+    public func refreshRepoStatusAndDiff() async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else {
+            repoStatus = nil
+            repoDiff = nil
+            return
+        }
+        isRefreshingRepo = true
+        defer { isRefreshingRepo = false }
+
+        let statusResult = await bridge.repositoryStatus(repoId: repoId)
+        if statusResult.ok,
+           let data = statusResult.payloadJSON.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(RepoStatusPayload.self, from: data)
+        {
+            repoStatus = payload.status
+        } else if !statusResult.ok {
+            statusMessage = Self.summarize(statusResult.payloadJSON)
+        }
+
+        let diffResult = await bridge.repositoryDiff(repoId: repoId)
+        if diffResult.ok,
+           let data = diffResult.payloadJSON.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(BridgeRepoDiff.self, from: data)
+        {
+            repoDiff = payload
+        } else if diffResult.ok,
+                  let data = diffResult.payloadJSON.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let diff = obj["diff"] as? String,
+                  let token = obj["statusToken"] as? String
+        {
+            repoDiff = BridgeRepoDiff(
+                repoId: (obj["repoId"] as? String) ?? repoId,
+                diff: diff,
+                truncated: (obj["truncated"] as? Bool) ?? false,
+                statusToken: token
+            )
+        }
+    }
+
+    public func toggleShowDiff() {
+        showDiff.toggle()
+    }
+
+    public func preparePublishDraft() {
+        let branchHint = repoStatus?.branch.hasPrefix("nova/") == true
+            ? (repoStatus?.branch ?? "")
+            : "fix-\(ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-").prefix(16))"
+        if publishBranchName.isEmpty { publishBranchName = String(branchHint) }
+        if publishCommitMessage.isEmpty {
+            publishCommitMessage = "Nova: update \(repoStatus?.changedFiles.count ?? 0) file(s)"
+        }
+        if publishPRTitle.isEmpty { publishPRTitle = publishCommitMessage }
+    }
+
+    public func publishPullRequest() async {
+        guard let repoId = selectedRepoId, let status = repoStatus else {
+            statusMessage = "Select a repository with changes first."
+            return
+        }
+        preparePublishDraft()
+        let detail = """
+        Branch: \(publishBranchName)
+        Commit: \(publishCommitMessage)
+        PR: \(publishPRTitle)
+        Files: \(status.changedFiles.map(\.path).joined(separator: ", "))
+        """
+        if let confirmPublish {
+            let allowed = await confirmPublish("Create pull request?", detail)
+            guard allowed else {
+                statusMessage = "Publish cancelled."
+                return
+            }
+        }
+        isPublishing = true
+        defer { isPublishing = false }
+        let request = BridgePublishRequest(
+            statusToken: status.statusToken,
+            branchName: publishBranchName,
+            commitMessage: publishCommitMessage,
+            prTitle: publishPRTitle,
+            prBody: publishPRBody.isEmpty ? publishCommitMessage : publishPRBody,
+            paths: status.changedFiles.map(\.path)
+        )
+        let result = await bridge.publishRepository(repoId: repoId, request: request)
+        guard result.ok, let published = Self.decodePublishResult(result.payloadJSON) else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        lastPublishResult = published
+        statusMessage = "Opened PR \(published.prUrl)"
+        await refreshRepoStatusAndDiff()
     }
 
     public func refreshSessions() async {
@@ -795,10 +1127,15 @@ public final class CodingViewModel {
         streamingAssistantId = nil
         streamingThinkingId = nil
 
+        let repoId = selectedRepoId ?? await settings.codingSelectedRepoId()
+        selectedRepoId = repoId
+        let cwd = await settings.codingWorkingDirectory()
+        workingDirectory = cwd ?? ""
         let result = await bridge.streamCursorRun(
             command: command,
             sessionId: pinnedSessionId,
-            workingDirectory: nil
+            workingDirectory: repoId == nil ? cwd : nil,
+            repoId: repoId
         ) { [weak self] event in
             await self?.apply(event: event)
         }
@@ -822,6 +1159,7 @@ public final class CodingViewModel {
             runStatus = "idle"
         }
         await refreshSessions()
+        await refreshRepoStatusAndDiff()
     }
 
     public func cancel() async {
@@ -874,6 +1212,7 @@ public final class CodingViewModel {
                 detail: event.summary,
                 diff: nil
             ))
+            speakProgress(Self.spokenToolLine(name: name, path: event.path, ended: false))
         case "tool_end":
             streamingAssistantId = nil
             streamingThinkingId = nil
@@ -893,6 +1232,7 @@ public final class CodingViewModel {
                     diff: event.diff
                 ))
             }
+            speakProgress(Self.spokenToolLine(name: name, path: event.path, ended: true))
         case "status":
             if let status = event.status {
                 runStatus = status.lowercased()
@@ -918,9 +1258,27 @@ public final class CodingViewModel {
             runStatus = (event.status ?? "finished").lowercased()
             streamingAssistantId = nil
             streamingThinkingId = nil
+            speakProgress(runStatus == "error" ? "Coding run failed." : "Coding run finished.")
         default:
             break
         }
+    }
+
+    private func speakProgress(_ line: String) {
+        guard !line.isEmpty else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastSpokenAt) >= 4 else { return }
+        lastSpokenAt = now
+        let speak = onSpokenProgress
+        Task { await speak?(line) }
+    }
+
+    private static func spokenToolLine(name: String, path: String?, ended: Bool) -> String {
+        let file = path.map { ($0 as NSString).lastPathComponent } ?? ""
+        if ended {
+            return file.isEmpty ? "Finished \(name)." : "Finished \(name) on \(file)."
+        }
+        return file.isEmpty ? "Running \(name)." : "Editing \(file)."
     }
 
     private static func string(_ payloadJSON: String, key: String) -> String? {
@@ -939,8 +1297,45 @@ public final class CodingViewModel {
         }
         if let hint = obj["hint"] as? String { return hint }
         if let error = obj["error"] as? String { return error }
+        if let detail = obj["detail"] as? String { return detail }
         return payloadJSON
     }
+
+    private static func decodePublishResult(_ payloadJSON: String) -> BridgePublishResult? {
+        guard let data = payloadJSON.data(using: .utf8) else { return nil }
+        if let direct = try? JSONDecoder().decode(BridgePublishResult.self, from: data) {
+            return direct
+        }
+        struct Flat: Decodable {
+            let repoId: String
+            let branch: String
+            let commitSha: String
+            let prUrl: String
+            let prNumber: Int?
+        }
+        guard let flat = try? JSONDecoder().decode(Flat.self, from: data) else { return nil }
+        return BridgePublishResult(
+            repoId: flat.repoId,
+            branch: flat.branch,
+            commitSha: flat.commitSha,
+            prUrl: flat.prUrl,
+            prNumber: flat.prNumber
+        )
+    }
+}
+
+private struct ReposListPayload: Decodable {
+    let repos: [BridgeRepoSummary]
+    let selectedRepoId: String?
+}
+
+private struct RepoMutationPayload: Decodable {
+    let repo: BridgeRepoSummary?
+    let selectedRepoId: String?
+}
+
+private struct RepoStatusPayload: Decodable {
+    let status: BridgeRepoStatus
 }
 
 @MainActor

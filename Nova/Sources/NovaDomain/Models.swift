@@ -185,6 +185,28 @@ public struct Workspace: Sendable, Identifiable, Codable, Equatable {
 /// A single action within a Skill. A flat shape (rather than an enum with
 /// associated values) keeps it trivially Codable and easy to edit in the UI; only
 /// the fields relevant to `kind` are used.
+/// Optional per-step guard: run the step only when `variables[variable] == equals`.
+public struct SkillCondition: Sendable, Codable, Equatable {
+    public var variable: String
+    public var equals: String
+
+    public init(variable: String, equals: String) {
+        self.variable = variable
+        self.equals = equals
+    }
+}
+
+/// Retry policy for flaky deterministic steps (e.g. webhooks).
+public struct SkillRetryPolicy: Sendable, Codable, Equatable {
+    public var maxAttempts: Int
+    public var delaySeconds: Int
+
+    public init(maxAttempts: Int = 2, delaySeconds: Int = 1) {
+        self.maxAttempts = max(1, maxAttempts)
+        self.delaySeconds = max(0, delaySeconds)
+    }
+}
+
 public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
     public enum Kind: String, Sendable, Codable, CaseIterable {
         case reminder       // text = title, dateISO = optional due
@@ -208,6 +230,14 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
     public var seconds: Int?
     /// HTTP method for `.webhook` steps (defaults to GET when nil).
     public var httpMethod: String?
+    /// When set, stores the step's primary output (OCR text, webhook ok/fail, etc.) under this name.
+    public var outputVariable: String?
+    /// Skip the step unless the named variable equals `equals`.
+    public var condition: SkillCondition?
+    /// Retry failed webhook/timer-like steps.
+    public var retryPolicy: SkillRetryPolicy?
+    /// Ask the user before running (webhook / HA-style side effects).
+    public var requiresConfirmation: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -217,7 +247,11 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         durationMinutes: Int? = nil,
         url: String? = nil,
         seconds: Int? = nil,
-        httpMethod: String? = nil
+        httpMethod: String? = nil,
+        outputVariable: String? = nil,
+        condition: SkillCondition? = nil,
+        retryPolicy: SkillRetryPolicy? = nil,
+        requiresConfirmation: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -227,6 +261,10 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         self.url = url
         self.seconds = seconds
         self.httpMethod = httpMethod
+        self.outputVariable = outputVariable
+        self.condition = condition
+        self.retryPolicy = retryPolicy
+        self.requiresConfirmation = requiresConfirmation
     }
 }
 
@@ -683,7 +721,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 3
+    static let seedCapabilitiesVersion = 4
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -726,8 +764,9 @@ public extension Agent {
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Prefer run_claude_code for repo edits and investigation on their machine; use push_to_cursor / list_cursor_sessions to drive Cursor agents — when pushing to Cursor, omit session_id so the pinned Coding-tab session is used (the user can preview that session live). Use start_meeting / end_meeting for spoken standups you later turn into notes or tickets. Use draft_message or create_reminder for follow-ups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
+                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. When the user says work on a repo, call list_repos / select_repo or clone_repo first (HTTPS GitHub URLs only), then run coding tools against that selection — never invent filesystem paths. Prefer run_claude_code for repo edits and investigation; use push_to_cursor / list_cursor_sessions to drive Cursor (omit session_id to use the pinned Coding-tab session). Before shipping, call repo_status and repo_diff, then publish_repo to open a pull request on a nova/* branch — never push directly to main/master. Use start_meeting / end_meeting for spoken standups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence. Confirm before clone/select/publish and any irreversible action. Keep spoken answers concise.",
                 toolNames: [
+                    "list_repos", "select_repo", "clone_repo", "repo_status", "repo_diff", "publish_repo",
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
                     "web_search", "search_knowledge", "save_note", "list_notes",
                     "remember_fact", "recall_facts", "create_reminder", "draft_message",
@@ -812,6 +851,31 @@ public extension Agent {
                 steps: [
                     SkillStep(kind: .say, text: "We'll do one box-breathing round: inhale, hold, exhale, hold — four seconds each."),
                     SkillStep(kind: .timer, text: "Box breathing round", seconds: 16)
+                ]
+            ),
+            // Ready for DAT camera; OCR text lands in `ocr` for the freeform step.
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B3")!,
+                name: "Capture → OCR → note",
+                triggerPhrases: ["capture this", "read this", "save what I'm looking at", "ocr this"],
+                steps: [
+                    SkillStep(
+                        kind: .capture,
+                        text: "document",
+                        outputVariable: "ocr"
+                    ),
+                    SkillStep(
+                        kind: .note,
+                        text: "Glasses capture:\n{{ocr}}"
+                    ),
+                    SkillStep(
+                        kind: .say,
+                        text: "Saved what I could read to your notes."
+                    ),
+                    SkillStep(
+                        kind: .freeform,
+                        text: "Briefly summarize the captured text for the user if useful: {{ocr}}"
+                    )
                 ]
             ),
         ]

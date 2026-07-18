@@ -226,18 +226,18 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
 }
 
-/// Plays PCM16 mono over the active HFP route.
+/// Plays PCM16 mono over the active audio route (glasses HFP or phone speaker).
 public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let lock = NSLock()
     private var started = false
 
-    /// Digital make-up gain applied to the assistant voice before playback. The
-    /// HFP call-audio path is quieter than A2DP media, so we lift the level to be
-    /// closer to Meta AI. Values above ~2.5 risk audible clipping on loud
-    /// syllables; each sample is hard-limited to the Int16 range regardless.
-    private static let outputGain: Float = 2.2
+    /// Make-up gain on the Bluetooth HFP call path (quieter than media/A2DP).
+    private static let hfpGain: Float = 2.2
+    /// Higher make-up when playback is on the built-in speaker/receiver — the
+    /// voiceChat path is still quieter than normal media playback on phone.
+    private static let speakerGain: Float = 4.5
 
     public init() {}
 
@@ -255,8 +255,8 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
         buffer.frameLength = frameCount
 
-        // Apply make-up gain with hard limiting into the destination buffer.
-        let gain = Self.outputGain
+        // Apply route-aware make-up gain with hard limiting into the destination.
+        let gain = Self.currentOutputGain()
         let lo = Float(Int16.min), hi = Float(Int16.max)
         let dst = buffer.int16ChannelData![0]
         chunk.pcm.withUnsafeBytes { raw in
@@ -282,6 +282,18 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
         started = false
     }
 
+    /// HFP / Bluetooth outputs keep the milder boost; built-in speaker/receiver
+    /// get a stronger lift so phone-only listening is usable.
+    private static func currentOutputGain() -> Float {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let onBluetooth = outputs.contains {
+            $0.portType == .bluetoothHFP
+                || $0.portType == .bluetoothA2DP
+                || $0.portType == .bluetoothLE
+        }
+        return onBluetooth ? hfpGain : speakerGain
+    }
+
     private func ensureStarted(sampleRate: Int) {
         lock.lock()
         defer { lock.unlock() }
@@ -294,6 +306,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
             interleaved: true
         )!
         engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = 1.0
         try? engine.start()
         player.play()
         started = true

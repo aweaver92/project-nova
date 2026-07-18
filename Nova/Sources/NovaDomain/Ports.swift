@@ -192,6 +192,37 @@ public protocol SettingsStoring: Sendable {
     /// Pinned Cursor agent session id shared by the Coding tab and `push_to_cursor`.
     func codingSessionId() async -> String?
     func setCodingSessionId(_ value: String?) async
+    /// Absolute project/repo path forwarded as `cwd` on bridge coding runs.
+    /// Prefer `codingSelectedRepoId` — the phone should not send arbitrary paths.
+    func codingWorkingDirectory() async -> String?
+    func setCodingWorkingDirectory(_ value: String?) async
+    /// Opaque bridge repository id selected in the Coding tab.
+    func codingSelectedRepoId() async -> String?
+    func setCodingSelectedRepoId(_ value: String?) async
+    /// Generate follow-up suggestion chips (paid Responses call). Default on.
+    func followUpSuggestionsEnabled() async -> Bool
+    func setFollowUpSuggestionsEnabled(_ enabled: Bool) async
+    /// Allow the `web_search` tool. Default on.
+    func webSearchEnabled() async -> Bool
+    func setWebSearchEnabled(_ enabled: Bool) async
+    /// Prefer on-device wake word before opening Realtime (saves cost). Default off.
+    func useLocalWakeWord() async -> Bool
+    func setUseLocalWakeWord(_ enabled: Bool) async
+    /// Persist glasses stills + OCR into visual memory. Default on.
+    func visualMemoryEnabled() async -> Bool
+    func setVisualMemoryEnabled(_ enabled: Bool) async
+    /// Allow cloud transcription/summarization for meetings. Default on.
+    func meetingCloudProcessingEnabled() async -> Bool
+    func setMeetingCloudProcessingEnabled(_ enabled: Bool) async
+    /// Auto-delete voice recordings older than N days (`0` = keep forever).
+    func voiceRetentionDays() async -> Int
+    func setVoiceRetentionDays(_ days: Int) async
+    /// Auto-delete video recordings older than N days (`0` = keep forever).
+    func videoRetentionDays() async -> Int
+    func setVideoRetentionDays(_ days: Int) async
+    /// Auto-delete visual memory older than N days (`0` = keep forever).
+    func visualMemoryRetentionDays() async -> Int
+    func setVisualMemoryRetentionDays(_ days: Int) async
 }
 
 public extension SettingsStoring {
@@ -202,6 +233,26 @@ public extension SettingsStoring {
     func setBridgeToken(_ value: String?) async {}
     func codingSessionId() async -> String? { nil }
     func setCodingSessionId(_ value: String?) async {}
+    func codingWorkingDirectory() async -> String? { nil }
+    func setCodingWorkingDirectory(_ value: String?) async {}
+    func codingSelectedRepoId() async -> String? { nil }
+    func setCodingSelectedRepoId(_ value: String?) async {}
+    func followUpSuggestionsEnabled() async -> Bool { true }
+    func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {}
+    func webSearchEnabled() async -> Bool { true }
+    func setWebSearchEnabled(_ enabled: Bool) async {}
+    func useLocalWakeWord() async -> Bool { false }
+    func setUseLocalWakeWord(_ enabled: Bool) async {}
+    func visualMemoryEnabled() async -> Bool { true }
+    func setVisualMemoryEnabled(_ enabled: Bool) async {}
+    func meetingCloudProcessingEnabled() async -> Bool { true }
+    func setMeetingCloudProcessingEnabled(_ enabled: Bool) async {}
+    func voiceRetentionDays() async -> Int { 0 }
+    func setVoiceRetentionDays(_ days: Int) async {}
+    func videoRetentionDays() async -> Int { 0 }
+    func setVideoRetentionDays(_ days: Int) async {}
+    func visualMemoryRetentionDays() async -> Int { 0 }
+    func setVisualMemoryRetentionDays(_ days: Int) async {}
 }
 
 /// User-managed roster of agents plus the currently-active selection. There is
@@ -300,6 +351,127 @@ public struct BridgeResult: Sendable, Equatable {
     }
 }
 
+/// Allowlisted local Git repository exposed by the Nova Bridge.
+public struct BridgeRepoSummary: Sendable, Equatable, Codable, Identifiable {
+    public let id: String
+    public let name: String
+    public let relativePath: String
+    public let rootLabel: String
+    public let selected: Bool
+
+    public init(id: String, name: String, relativePath: String, rootLabel: String, selected: Bool) {
+        self.id = id
+        self.name = name
+        self.relativePath = relativePath
+        self.rootLabel = rootLabel
+        self.selected = selected
+    }
+}
+
+public struct BridgeChangedFile: Sendable, Equatable, Codable, Identifiable {
+    public var id: String { path }
+    public let path: String
+    public let status: String
+    public let staged: Bool
+    public let unstaged: Bool
+
+    public init(path: String, status: String, staged: Bool, unstaged: Bool) {
+        self.path = path
+        self.status = status
+        self.staged = staged
+        self.unstaged = unstaged
+    }
+}
+
+public struct BridgeRepoStatus: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let name: String
+    public let branch: String
+    public let upstream: String?
+    public let ahead: Int
+    public let behind: Int
+    public let clean: Bool
+    public let changedFiles: [BridgeChangedFile]
+    public let statusToken: String
+
+    public init(
+        repoId: String,
+        name: String,
+        branch: String,
+        upstream: String?,
+        ahead: Int,
+        behind: Int,
+        clean: Bool,
+        changedFiles: [BridgeChangedFile],
+        statusToken: String
+    ) {
+        self.repoId = repoId
+        self.name = name
+        self.branch = branch
+        self.upstream = upstream
+        self.ahead = ahead
+        self.behind = behind
+        self.clean = clean
+        self.changedFiles = changedFiles
+        self.statusToken = statusToken
+    }
+}
+
+public struct BridgeRepoDiff: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let diff: String
+    public let truncated: Bool
+    public let statusToken: String
+
+    public init(repoId: String, diff: String, truncated: Bool, statusToken: String) {
+        self.repoId = repoId
+        self.diff = diff
+        self.truncated = truncated
+        self.statusToken = statusToken
+    }
+}
+
+public struct BridgePublishRequest: Sendable, Equatable, Codable {
+    public let statusToken: String
+    public let branchName: String?
+    public let commitMessage: String
+    public let prTitle: String
+    public let prBody: String?
+    public let paths: [String]?
+
+    public init(
+        statusToken: String,
+        branchName: String? = nil,
+        commitMessage: String,
+        prTitle: String,
+        prBody: String? = nil,
+        paths: [String]? = nil
+    ) {
+        self.statusToken = statusToken
+        self.branchName = branchName
+        self.commitMessage = commitMessage
+        self.prTitle = prTitle
+        self.prBody = prBody
+        self.paths = paths
+    }
+}
+
+public struct BridgePublishResult: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let branch: String
+    public let commitSha: String
+    public let prUrl: String
+    public let prNumber: Int?
+
+    public init(repoId: String, branch: String, commitSha: String, prUrl: String, prNumber: Int?) {
+        self.repoId = repoId
+        self.branch = branch
+        self.commitSha = commitSha
+        self.prUrl = prUrl
+        self.prNumber = prNumber
+    }
+}
+
 /// One normalized SSE event from `POST /cursor/runs` (Coding tab preview).
 public struct CodingStreamEvent: Sendable, Equatable, Codable {
     public let type: String
@@ -355,8 +527,8 @@ public protocol AgentBridging: Sendable {
     /// Surfaces whether the configured URL is reachable, so the UI can give the
     /// user real feedback instead of failing silently on the first coding task.
     func health() async -> BridgeResult
-    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult
-    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult
+    func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult
+    func pushToCursor(command: String, sessionId: String?, workingDirectory: String?, repoId: String?) async -> BridgeResult
     func listCursorSessions() async -> BridgeResult
     /// Transcript history for a Cursor agent session (`GET /cursor/sessions/:id/messages`).
     func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult
@@ -365,15 +537,43 @@ public protocol AgentBridging: Sendable {
         command: String,
         sessionId: String?,
         workingDirectory: String?,
+        repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult
     func cancelCursorRun(runId: String) async -> BridgeResult
+
+    func listRepos() async -> BridgeResult
+    func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult
+    func selectRepository(repoId: String) async -> BridgeResult
+    func repositoryStatus(repoId: String) async -> BridgeResult
+    func repositoryDiff(repoId: String) async -> BridgeResult
+    func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
 }
 
 public extension AgentBridging {
     // Default keeps mocks/older conformers source-compatible.
     func health() async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
+        await runClaudeCode(prompt: prompt, workingDirectory: workingDirectory, repoId: nil)
+    }
+    func pushToCursor(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?
+    ) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+        await pushToCursor(command: command, sessionId: sessionId, workingDirectory: nil, repoId: nil)
+    }
+    func pushToCursor(command: String, sessionId: String?, workingDirectory: String?) async -> BridgeResult {
+        await pushToCursor(command: command, sessionId: sessionId, workingDirectory: workingDirectory, repoId: nil)
     }
     func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
@@ -384,9 +584,42 @@ public extension AgentBridging {
         workingDirectory: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: nil,
+            onEvent: onEvent
+        )
+    }
+    func streamCursorRun(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func cancelCursorRun(runId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func listRepos() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func selectRepository(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func repositoryStatus(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func repositoryDiff(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
 }
@@ -445,6 +678,13 @@ public protocol RecordingStoring: Sendable {
     func all() async -> [VoiceRecording]
     func delete(id: UUID) async
     func clear() async
+    /// Deletes recordings older than `days` (`<= 0` = no-op). Returns count removed.
+    @discardableResult
+    func pruneOlderThan(days: Int) async -> Int
+}
+
+public extension RecordingStoring {
+    func pruneOlderThan(days: Int) async -> Int { 0 }
 }
 
 /// Records video from the glasses camera to a movie file on the device. Unlike
@@ -470,6 +710,12 @@ public protocol VideoRecordingStoring: Sendable {
     func all() async -> [VideoRecording]
     func delete(id: UUID) async
     func clear() async
+    @discardableResult
+    func pruneOlderThan(days: Int) async -> Int
+}
+
+public extension VideoRecordingStoring {
+    func pruneOlderThan(days: Int) async -> Int { 0 }
 }
 
 /// On-device optical character recognition. Returns the text read from an image
@@ -487,6 +733,12 @@ public protocol VisualMemoryStoring: Sendable {
     func all() async -> [VisualMemoryItem]
     func delete(id: UUID) async
     func clear() async
+    @discardableResult
+    func pruneOlderThan(days: Int) async -> Int
+}
+
+public extension VisualMemoryStoring {
+    func pruneOlderThan(days: Int) async -> Int { 0 }
 }
 
 /// Transcribes a recorded audio file to text (e.g. OpenAI Whisper).

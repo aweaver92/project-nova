@@ -55,6 +55,63 @@ final class SkillRunnerWebhookDelayTests: XCTestCase {
         XCTAssertEqual(waited, TimeInterval(SkillRunner.maxDelaySeconds))
         XCTAssertTrue(result.summaryLines.contains { $0.contains("waited") })
     }
+
+    func testVariableInterpolationAndConditionSkip() async {
+        let notesURL = FileManager.default.temporaryDirectory.appendingPathComponent("p4-notes-var-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: notesURL) }
+        let notes = FileNoteStore(url: notesURL)
+        let attempts = CounterBox()
+        let runner = SkillRunner(
+            notes: notes,
+            callWebhook: { _ in
+                await attempts.inc()
+                return true
+            },
+            sleep: { _ in }
+        )
+        let skill = Skill(name: "Vars", steps: [
+            SkillStep(kind: .say, text: "hi", outputVariable: "greet"),
+            SkillStep(
+                kind: .note,
+                text: "Said {{greet}}"
+            ),
+            SkillStep(
+                kind: .webhook,
+                url: "https://example.com/skip",
+                condition: SkillCondition(variable: "greet", equals: "nope")
+            ),
+            SkillStep(
+                kind: .webhook,
+                url: "https://example.com/ok",
+                retryPolicy: SkillRetryPolicy(maxAttempts: 2, delaySeconds: 0)
+            )
+        ])
+        let result = await runner.run(skill)
+        XCTAssertTrue(result.summaryLines.contains("saved a note"))
+        XCTAssertTrue(result.summaryLines.contains { $0.contains("skipped") })
+        XCTAssertEqual(await attempts.value, 1)
+        let saved = await notes.all()
+        XCTAssertTrue(saved.contains { $0.text.contains("Said hi") })
+    }
+
+    func testConfirmationDenialSkipsStep() async {
+        let notes = FileNoteStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("p4-notes-conf-\(UUID().uuidString).json"))
+        let runner = SkillRunner(
+            notes: notes,
+            callWebhook: { _ in true },
+            confirm: { _, _ in false }
+        )
+        let skill = Skill(name: "Confirm", steps: [
+            SkillStep(kind: .webhook, url: "https://example.com", requiresConfirmation: true)
+        ])
+        let result = await runner.run(skill)
+        XCTAssertTrue(result.summaryLines.contains { $0.contains("denied") })
+    }
+}
+
+private actor CounterBox {
+    private(set) var value = 0
+    func inc() { value += 1 }
 }
 
 private actor RequestBox {

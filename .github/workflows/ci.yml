@@ -40,6 +40,28 @@ jobs:
               - 'nova-bridge/**'
               - 'nova-sim/**'
 
+  nova-bridge:
+    name: nova-bridge (Linux)
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.bridge == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nova-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install deps
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+
   nova-sim:
     name: nova-sim harness (Linux)
     needs: changes

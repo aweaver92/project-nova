@@ -9,6 +9,16 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         static let bridgeBaseURL = "nova.settings.bridgeBaseURL"
         static let bridgeToken = "nova.settings.bridgeToken"
         static let codingSessionId = "nova.settings.codingSessionId"
+        static let codingWorkingDirectory = "nova.settings.codingWorkingDirectory"
+        static let codingSelectedRepoId = "nova.settings.codingSelectedRepoId"
+        static let followUpSuggestionsEnabled = "nova.settings.followUpSuggestionsEnabled"
+        static let webSearchEnabled = "nova.settings.webSearchEnabled"
+        static let useLocalWakeWord = "nova.settings.useLocalWakeWord"
+        static let visualMemoryEnabled = "nova.settings.visualMemoryEnabled"
+        static let meetingCloudProcessingEnabled = "nova.settings.meetingCloudProcessingEnabled"
+        static let voiceRetentionDays = "nova.settings.voiceRetentionDays"
+        static let videoRetentionDays = "nova.settings.videoRetentionDays"
+        static let visualMemoryRetentionDays = "nova.settings.visualMemoryRetentionDays"
     }
 
     public init(defaults: UserDefaults = .standard) {
@@ -45,6 +55,91 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
 
     public func setCodingSessionId(_ value: String?) async {
         setOptionalString(normalized(value), forKey: Keys.codingSessionId)
+    }
+
+    public func codingWorkingDirectory() async -> String? {
+        normalized(defaults.string(forKey: Keys.codingWorkingDirectory))
+    }
+
+    public func setCodingWorkingDirectory(_ value: String?) async {
+        setOptionalString(normalized(value), forKey: Keys.codingWorkingDirectory)
+    }
+
+    public func codingSelectedRepoId() async -> String? {
+        normalized(defaults.string(forKey: Keys.codingSelectedRepoId))
+    }
+
+    public func setCodingSelectedRepoId(_ value: String?) async {
+        setOptionalString(normalized(value), forKey: Keys.codingSelectedRepoId)
+    }
+
+    public func followUpSuggestionsEnabled() async -> Bool {
+        bool(forKey: Keys.followUpSuggestionsEnabled, default: true)
+    }
+
+    public func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.followUpSuggestionsEnabled)
+    }
+
+    public func webSearchEnabled() async -> Bool {
+        bool(forKey: Keys.webSearchEnabled, default: true)
+    }
+
+    public func setWebSearchEnabled(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.webSearchEnabled)
+    }
+
+    public func useLocalWakeWord() async -> Bool {
+        defaults.bool(forKey: Keys.useLocalWakeWord)
+    }
+
+    public func setUseLocalWakeWord(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.useLocalWakeWord)
+    }
+
+    public func visualMemoryEnabled() async -> Bool {
+        bool(forKey: Keys.visualMemoryEnabled, default: true)
+    }
+
+    public func setVisualMemoryEnabled(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.visualMemoryEnabled)
+    }
+
+    public func meetingCloudProcessingEnabled() async -> Bool {
+        bool(forKey: Keys.meetingCloudProcessingEnabled, default: true)
+    }
+
+    public func setMeetingCloudProcessingEnabled(_ enabled: Bool) async {
+        defaults.set(enabled, forKey: Keys.meetingCloudProcessingEnabled)
+    }
+
+    public func voiceRetentionDays() async -> Int {
+        defaults.integer(forKey: Keys.voiceRetentionDays)
+    }
+
+    public func setVoiceRetentionDays(_ days: Int) async {
+        defaults.set(max(0, days), forKey: Keys.voiceRetentionDays)
+    }
+
+    public func videoRetentionDays() async -> Int {
+        defaults.integer(forKey: Keys.videoRetentionDays)
+    }
+
+    public func setVideoRetentionDays(_ days: Int) async {
+        defaults.set(max(0, days), forKey: Keys.videoRetentionDays)
+    }
+
+    public func visualMemoryRetentionDays() async -> Int {
+        defaults.integer(forKey: Keys.visualMemoryRetentionDays)
+    }
+
+    public func setVisualMemoryRetentionDays(_ days: Int) async {
+        defaults.set(max(0, days), forKey: Keys.visualMemoryRetentionDays)
+    }
+
+    private func bool(forKey key: String, default defaultValue: Bool) -> Bool {
+        if defaults.object(forKey: key) == nil { return defaultValue }
+        return defaults.bool(forKey: key)
     }
 
     private func setOptionalString(_ value: String?, forKey key: String) {

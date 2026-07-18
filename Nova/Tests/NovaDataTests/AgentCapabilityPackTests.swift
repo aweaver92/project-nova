@@ -23,6 +23,8 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(sage.toolNames!.contains("daily_briefing"))
         XCTAssertTrue(scholar.toolNames!.contains("start_quiz"))
         XCTAssertTrue(claude.toolNames!.contains("push_to_cursor"))
+        XCTAssertTrue(claude.toolNames!.contains("list_repos"))
+        XCTAssertTrue(claude.toolNames!.contains("publish_repo"))
         XCTAssertTrue(claude.toolNames!.contains("draft_message"))
     }
 

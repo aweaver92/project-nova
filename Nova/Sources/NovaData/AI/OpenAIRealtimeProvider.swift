@@ -39,17 +39,23 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     private static let sessionReadyTimeout: Duration = .seconds(8)
     /// Newest-event bound so a stalled UI/orchestrator cannot grow unboundedly.
     private static let eventBufferCapacity = 256
+    /// When set, `analyze` awaits the matching response transcript instead of returning a placeholder.
+    private var analyzeWait: CheckedContinuation<String, Error>?
+    private var analyzeBuffer = ""
+    private let usage: UsageMeter?
 
     public init(
         tokenService: any TokenService,
         tokenStore: any SecureTokenStore,
         metrics: (any LatencyMetricsRecorder)? = nil,
+        usage: UsageMeter? = nil,
         model: String = "gpt-realtime",
         url: URL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime")!
     ) {
         self.tokenService = tokenService
         self.tokenStore = tokenStore
         self.metrics = metrics
+        self.usage = usage
         self.model = model
         self.url = url
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -286,7 +292,6 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func analyze(image: CapturedFrame, prompt: String) async throws -> String {
-        // Realtime image input varies by model revision; Phase 2 uses a REST fallback path via chat completions style payload over WS item create when available.
         // Downscale/recompress before base64 so the WebSocket payload (and the
         // model's decode time) stays small — this is the dominant, tunable slice
         // of end-to-end vision latency. base64 also inflates bytes ~33%.
@@ -297,6 +302,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         NovaLog.vision.info(
             "vision upload prep: \(image.imageData.count, privacy: .public)B → \(data.count, privacy: .public)B in \(encodeMs, privacy: .public)ms"
         )
+        if let prior = analyzeWait {
+            analyzeWait = nil
+            prior.resume(throwing: NovaError.cancelled)
+        }
+        analyzeBuffer = ""
         try await sendJSON([
             "type": "conversation.item.create",
             "item": [
@@ -313,7 +323,41 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         ])
         ttfaMark = .now
         try await sendJSON(["type": "response.create"])
-        return "(multimodal response streaming via events)"
+        // Await the correlated transcript while the receive loop still streams
+        // `.outputTranscript` events for live UI. Cap wait so a stuck socket cannot
+        // hang the vision path forever.
+        do {
+            return try await withThrowingTaskGroup(of: String.self) { group in
+                group.addTask { [weak self] in
+                    guard let self else { throw NovaError.cancelled }
+                    return try await self.waitForAnalyzeResult()
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(45))
+                    throw NovaError.vision("Vision analysis timed out")
+                }
+                let answer = try await group.next()!
+                group.cancelAll()
+                return answer
+            }
+        } catch {
+            failAnalyzeWait(error)
+            throw error
+        }
+    }
+
+    private func waitForAnalyzeResult() async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            analyzeWait = cont
+        }
+    }
+
+    private func failAnalyzeWait(_ error: Error) {
+        if let wait = analyzeWait {
+            analyzeWait = nil
+            analyzeBuffer = ""
+            wait.resume(throwing: error)
+        }
     }
 
     /// Shrinks a captured still to a model-friendly size and re-encodes as JPEG.
@@ -463,6 +507,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             }
         case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
             if let delta = json["delta"] as? String {
+                if analyzeWait != nil { analyzeBuffer += delta }
                 eventsContinuation?.yield(.outputTranscript(delta: delta))
             }
         case "conversation.item.input_audio_transcription.delta":
@@ -498,6 +543,21 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             // a later unrelated response cannot inherit a stale speech-end time.
             if ttfaMark != nil {
                 ttfaMark = nil
+            }
+            if let usageObj = (json["response"] as? [String: Any])?["usage"] as? [String: Any] {
+                let input = usageObj["input_tokens"] as? Int
+                    ?? usageObj["prompt_tokens"] as? Int
+                    ?? 0
+                let output = usageObj["output_tokens"] as? Int
+                    ?? usageObj["completion_tokens"] as? Int
+                    ?? 0
+                usage?.recordTokens(input: input, output: output)
+            }
+            if let wait = analyzeWait {
+                analyzeWait = nil
+                let answer = analyzeBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                wait.resume(returning: answer.isEmpty ? "(no spoken answer)" : answer)
+                analyzeBuffer = ""
             }
             eventsContinuation?.yield(.responseEnded)
         case "response.function_call_arguments.done":

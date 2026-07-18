@@ -9,6 +9,10 @@ public actor ToolRouter {
         self.tools = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
     }
 
+    public func setConfirmationHandler(_ handler: (@Sendable (ToolCallRequest) async -> Bool)?) {
+        confirmationHandler = handler
+    }
+
     public func register(_ tool: any Tool) {
         tools[tool.name] = tool
     }

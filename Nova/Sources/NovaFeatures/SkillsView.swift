@@ -349,8 +349,63 @@ private struct SkillStepEditor: View {
             case .capture:
                 TextField("Label (optional, e.g. 'receipt')", text: $step.text)
             }
+            TextField("Output variable (optional)", text: bind(\.outputVariable))
+                .textInputAutocapitalization(.never)
+            TextField("Only if variable", text: conditionVariableBinding)
+                .textInputAutocapitalization(.never)
+            TextField("Equals", text: conditionEqualsBinding)
+            Stepper(
+                "Retries: \(step.retryPolicy?.maxAttempts ?? 1)",
+                value: retryAttemptsBinding,
+                in: 1...5
+            )
+            Toggle("Require confirmation", isOn: confirmationBinding)
         }
         .padding(.vertical, 2)
+    }
+
+    private var conditionVariableBinding: Binding<String> {
+        Binding(
+            get: { step.condition?.variable ?? "" },
+            set: { newValue in
+                let equals = step.condition?.equals ?? ""
+                step.condition = newValue.isEmpty ? nil : SkillCondition(variable: newValue, equals: equals)
+            }
+        )
+    }
+
+    private var conditionEqualsBinding: Binding<String> {
+        Binding(
+            get: { step.condition?.equals ?? "" },
+            set: { newValue in
+                let variable = step.condition?.variable ?? ""
+                if variable.isEmpty, newValue.isEmpty {
+                    step.condition = nil
+                } else {
+                    step.condition = SkillCondition(variable: variable, equals: newValue)
+                }
+            }
+        )
+    }
+
+    private var retryAttemptsBinding: Binding<Int> {
+        Binding(
+            get: { step.retryPolicy?.maxAttempts ?? 1 },
+            set: { newValue in
+                if newValue <= 1 {
+                    step.retryPolicy = nil
+                } else {
+                    step.retryPolicy = SkillRetryPolicy(maxAttempts: newValue, delaySeconds: step.retryPolicy?.delaySeconds ?? 1)
+                }
+            }
+        )
+    }
+
+    private var confirmationBinding: Binding<Bool> {
+        Binding(
+            get: { step.requiresConfirmation == true },
+            set: { step.requiresConfirmation = $0 ? true : nil }
+        )
     }
 
     /// Bridges an optional String field to a non-optional TextField binding.

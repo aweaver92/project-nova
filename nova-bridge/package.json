@@ -11,7 +11,9 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test:stream": "tsx src/cursor-stream.test.ts"
+    "test:stream": "tsx src/cursor-stream.test.ts",
+    "test:repos": "tsx src/repo-service.test.ts",
+    "test": "npm run test:stream && npm run test:repos"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.23",
@@ -22,5 +24,8 @@
     "@types/node": "^20.14.0",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
+  },
+  "optionalDependencies": {
+    "@cursor/sdk-win32-x64": "^1.0.23"
   }
 }
