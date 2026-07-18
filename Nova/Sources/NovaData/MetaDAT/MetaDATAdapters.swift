@@ -77,6 +77,16 @@ public actor MetaDATWearableSession: WearableSession {
                 _ = try await Wearables.shared.startRegistration()
                 diag("startRegistration() returned; awaiting Meta AI callback")
             } catch {
+                // Meta AI only allows one Developer Mode app at a time. If Nova is
+                // already linked, `startRegistration` throws instead of succeeding —
+                // treat that as connected so Connect is not stuck on an error.
+                if Self.isAlreadyRegistered(error) {
+                    diag("Already registered with Meta AI — treating as connected")
+                    setReg(.registered)
+                    setState(.ready)
+                    NovaLog.session.info("DAT already registered; synced as connected")
+                    return
+                }
                 let mapped = Self.mapRegistrationError(error)
                 diag("startRegistration() threw: \(mapped)")
                 setReg(.failed)
@@ -96,6 +106,16 @@ public actor MetaDATWearableSession: WearableSession {
         setState(.ready)
         diag("[mock] registered")
         NovaLog.session.info("DAT mock registration complete")
+    }
+
+    /// Start mirroring the SDK registration stream so a prior Meta AI link is
+    /// reflected in the UI without requiring another Register tap.
+    public func syncRegistrationFromSDK() async {
+        #if canImport(MWDATCore) && os(iOS)
+        guard !useMock else { return }
+        observeRegistration()
+        diag("Observing Meta AI registration state")
+        #endif
     }
 
     public func start() async throws {
@@ -189,6 +209,14 @@ public actor MetaDATWearableSession: WearableSession {
             return "\(tip)\n\(String(describing: reg))\n\n\(checklist)"
         }
         return "Registration failed: \(String(describing: error))\n\n\(checklist)"
+    }
+
+    private static func isAlreadyRegistered(_ error: Error) -> Bool {
+        if let reg = error as? RegistrationError, case .alreadyRegistered = reg {
+            return true
+        }
+        let text = String(describing: error).lowercased()
+        return text.contains("alreadyregistered") || text.contains("already registered")
     }
     #endif
 }

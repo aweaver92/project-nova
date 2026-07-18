@@ -235,6 +235,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             ttfaMark = speechEndMark ?? .now
         }
         do {
+            // A prior reply (or coding announce) still marked active will make the
+            // server reject a new response.create — cancel first so voice turns
+            // and agent hand-offs are not silently dropped.
+            if responseActive {
+                await interrupt()
+            }
             try await sendJSON(["type": "response.create"])
         } catch {
             metrics?.increment(.sendFailures)
@@ -263,6 +269,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     public func sendUserText(_ text: String) async {
         guard connected else { return }
         do {
+            if responseActive {
+                await interrupt()
+            }
             try await sendJSON([
                 "type": "conversation.item.create",
                 "item": [
