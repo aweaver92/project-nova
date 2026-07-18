@@ -23,18 +23,31 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(remy.toolNames!.contains("scan_fridge"))
         XCTAssertTrue(remy.toolNames!.contains("start_cooking"))
         XCTAssertTrue(remy.toolNames!.contains("get_nutrition_profile"))
+        XCTAssertTrue(remy.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(sage.toolNames!.contains("log_wellness_checkin"))
         XCTAssertTrue(sage.toolNames!.contains("daily_briefing"))
+        XCTAssertTrue(sage.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(scholar.toolNames!.contains("start_quiz"))
         XCTAssertTrue(scholar.toolNames!.contains("reveal_card"))
         XCTAssertTrue(scholar.toolNames!.contains("list_study_cards"))
         XCTAssertTrue(scholar.toolNames!.contains("update_study_card"))
         XCTAssertTrue(scholar.toolNames!.contains("delete_study_card"))
+        XCTAssertTrue(scholar.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(claude.toolNames!.contains("push_to_cursor"))
         XCTAssertTrue(claude.toolNames!.contains("list_repos"))
         XCTAssertTrue(claude.toolNames!.contains("create_web_project"))
         XCTAssertTrue(claude.toolNames!.contains("publish_repo"))
         XCTAssertTrue(claude.toolNames!.contains("draft_message"))
+        XCTAssertTrue(claude.toolNames!.contains("open_app_screen"))
+        XCTAssertTrue(max.toolNames!.contains("open_app_screen"))
+
+        // Specialists share OpenAI's recommended Realtime voices (marin/cedar).
+        // Legacy ash/sage/ballad/verse sound quieter and less clear than Nova.
+        for agent in [nova, claude, max, sage, remy, scholar] {
+            let voice = RealtimeVoice(rawValue: agent.voice)
+            XCTAssertNotNil(voice, agent.name)
+            XCTAssertTrue(voice!.isRecommendedQuality, "\(agent.name) voice \(agent.voice)")
+        }
     }
 
     func testSeedCapabilitiesRefreshUpdatesAllowlists() async throws {

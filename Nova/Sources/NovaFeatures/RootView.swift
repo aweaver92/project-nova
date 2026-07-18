@@ -31,6 +31,7 @@ public struct RootView: View {
     @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
+    var appNavigation: AppNavigationBridge
     @State private var selectedTab: RootTab = .assistant
     @State private var showSettings = false
     @State private var showGlassesDetails = false
@@ -57,7 +58,8 @@ public struct RootView: View {
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         settings: SettingsViewModel,
-        toolConfirmation: ToolConfirmationCoordinator
+        toolConfirmation: ToolConfirmationCoordinator,
+        appNavigation: AppNavigationBridge
     ) {
         self.session = session
         self.conversation = conversation
@@ -77,6 +79,7 @@ public struct RootView: View {
         self.study = study
         self.settings = settings
         self.toolConfirmation = toolConfirmation
+        self.appNavigation = appNavigation
     }
 
     public var body: some View {
@@ -109,6 +112,8 @@ public struct RootView: View {
                 .tabItem { Label("Media", systemImage: "photo.on.rectangle") }
                 .tag(RootTab.media)
         }
+        // Tap outside the software keyboard (and scroll) dismisses it.
+        .dismissKeyboardOnTap()
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings, conversation: conversation)
         }
@@ -183,6 +188,7 @@ public struct RootView: View {
                 moreSection
             }
             .listSectionSpacing(.compact)
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Nova")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -220,6 +226,18 @@ public struct RootView: View {
                 Text("Bridge health reports OPENAI_API_KEY missing. Restart nova-bridge after adding the key, or open Settings to re-test.")
             }
             .task {
+                appNavigation.onOpen = { [agents, kitchen] routeKey, kitchenSection in
+                    if let kitchenSection,
+                       let section = RemyKitchenViewModel.Section(rawValue: kitchenSection)
+                    {
+                        kitchen.selectedSection = section
+                    }
+                    if let route = AgentsPendingRoute(rawValue: routeKey) {
+                        agents.clearPendingRoute()
+                        agents.requestRoute(route)
+                    }
+                    selectedTab = .agents
+                }
                 await recording.load()
                 await workspaces.load()
                 await agents.load()

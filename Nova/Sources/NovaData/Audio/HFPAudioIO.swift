@@ -285,10 +285,10 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     private var started = false
 
     /// Make-up gain on the Bluetooth HFP call path (quieter than media/A2DP).
-    private static let hfpGain: Float = 2.2
+    private static let hfpGain: Float = 2.6
     /// Higher make-up when playback is on the built-in speaker/receiver — the
     /// voiceChat path is still quieter than normal media playback on phone.
-    private static let speakerGain: Float = 4.5
+    private static let speakerGain: Float = 5.2
 
     public init() {}
 

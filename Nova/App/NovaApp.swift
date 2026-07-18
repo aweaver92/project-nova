@@ -58,7 +58,8 @@ struct NovaApp: App {
                 kitchen: container.kitchenVM,
                 study: container.studyVM,
                 settings: container.settingsVM,
-                toolConfirmation: container.toolConfirmation
+                toolConfirmation: container.toolConfirmation,
+                appNavigation: container.appNavigation
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.

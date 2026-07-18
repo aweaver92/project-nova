@@ -52,6 +52,7 @@ public final class AppContainer {
     public let kitchenVM: RemyKitchenViewModel
     public let studyVM: StudyViewModel
     public let settingsVM: SettingsViewModel
+    public let appNavigation: AppNavigationBridge
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
     ///   in-memory state machine (Simulator / no hardware). Set to `false` on a
@@ -259,14 +260,23 @@ public final class AppContainer {
         // Tools advertised to the model. Home Assistant is enabled only when a
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
-        // Bound after the orchestrator exists so voice can call switch_agent.
+        // Bound after the orchestrator exists so voice can call switch_agent /
+        // open_app_screen.
         let switchAgentSink = SwitchAgentSink()
+        let openAppScreenSink = OpenAppScreenSink()
+        let appNavigation = AppNavigationBridge()
+        self.appNavigation = appNavigation
         var tools: [any Tool] = [
             WebSearchTool(
                 isEnabled: { await settingsStore.webSearchEnabled() },
                 onUsage: { usage.recordResponsesCall() }
             ),
             SwitchAgentTool(perform: { name in await switchAgentSink.switchTo(named: name) }),
+            OpenAppScreenTool(
+                activeAgentId: { await openAppScreenSink.activeAgentId() },
+                activeAgentName: { await openAppScreenSink.activeAgentName() },
+                open: { target in await openAppScreenSink.open(target) }
+            ),
             InspectNovaCodebaseTool(bridge: bridge),
             WeatherTool(),
             CreateReminderTool(),
@@ -482,6 +492,7 @@ public final class AppContainer {
         )
         self.orchestrator = orchestrator
         switchAgentSink.bind(orchestrator)
+        openAppScreenSink.bind(orchestrator: orchestrator, navigation: appNavigation)
 
         self.sessionVM = SessionViewModel(session: session)
         self.conversationVM = ConversationViewModel(
@@ -594,5 +605,43 @@ private final class SwitchAgentSink: @unchecked Sendable {
             return #"{"ok":false,"error":"switch_not_ready"}"#
         }
         return await orch.switchToAgent(named: name)
+    }
+}
+
+/// Late-binds `open_app_screen` → active agent + RootView navigation.
+private final class OpenAppScreenSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var orchestrator: ConversationOrchestrator?
+    private var navigation: AppNavigationBridge?
+
+    func bind(orchestrator: ConversationOrchestrator, navigation: AppNavigationBridge) {
+        lock.lock()
+        self.orchestrator = orchestrator
+        self.navigation = navigation
+        lock.unlock()
+    }
+
+    func activeAgentId() async -> UUID? {
+        lock.lock()
+        let orch = orchestrator
+        lock.unlock()
+        return await orch?.currentAgent?.id
+    }
+
+    func activeAgentName() async -> String? {
+        lock.lock()
+        let orch = orchestrator
+        lock.unlock()
+        return await orch?.currentAgent?.name
+    }
+
+    func open(_ target: AppScreenTarget) async -> Bool {
+        lock.lock()
+        let nav = navigation
+        lock.unlock()
+        guard let nav else { return false }
+        return await MainActor.run {
+            nav.open(routeKey: target.routeKey, kitchenSection: target.kitchenSection)
+        }
     }
 }
