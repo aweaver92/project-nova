@@ -85,8 +85,9 @@ final class PCMResamplerTests: XCTestCase {
     func testSkillRunnerExpandsVariables() {
         let expanded = SkillRunner.expand("Hello {{name}}", variables: ["name": "Ada"])
         XCTAssertEqual(expanded, "Hello Ada")
-        let cleared = SkillRunner.expand("x={{missing}}y", variables: [:])
+        let cleared = SkillRunner.expand("x{{missing}}y", variables: [:])
         XCTAssertEqual(cleared, "xy")
+        XCTAssertEqual(SkillRunner.expand("x={{missing}}y", variables: [:]), "x=y")
     }
 
     func testUsageMeterSnapshot() {
