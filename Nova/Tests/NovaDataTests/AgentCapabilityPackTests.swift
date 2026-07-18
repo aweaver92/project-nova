@@ -170,7 +170,8 @@ final class AgentCapabilityPackTests: XCTestCase {
         )
         XCTAssertTrue(graded.contains("\"ok\":true"))
         XCTAssertTrue(graded.contains("\"user_answer\":\"1776\""))
-        XCTAssertGreaterThan((await store.card(id: card.id))!.dueAt, Date())
+        let gradedCard = await store.card(id: card.id)
+        XCTAssertGreaterThan(gradedCard!.dueAt, Date())
     }
 
     func testUpdateAndDeleteStudyCardTools() async throws {
@@ -191,7 +192,8 @@ final class AgentCapabilityPackTests: XCTestCase {
         let del = DeleteStudyCardTool(store: store)
         let deleted = try await del.invoke(argumentsJSON: #"{"id":"\#(card.id.uuidString)"}"#)
         XCTAssertTrue(deleted.contains("\"ok\":true"))
-        XCTAssertNil(await store.card(id: card.id))
+        let remaining = await store.card(id: card.id)
+        XCTAssertNil(remaining)
     }
 
     func testPlayMusicResolvesSpotifySearch() {

@@ -112,7 +112,8 @@ final class RemyKitchenTests: XCTestCase {
         let status = await store.cookingSummary()
         XCTAssertTrue(status.contains("Cook pasta"))
         _ = await store.endCooking()
-        XCTAssertNil(await store.activeCookingSession())
+        let active = await store.activeCookingSession()
+        XCTAssertNil(active)
     }
 
     func testShoppingAndMealPlanAndNutrition() async throws {
@@ -130,7 +131,8 @@ final class RemyKitchenTests: XCTestCase {
         var bread = await shopping.all().first!
         bread.checked = true
         _ = await shopping.upsert(bread)
-        XCTAssertEqual(await shopping.clearChecked(), 1)
+        let cleared = await shopping.clearChecked()
+        XCTAssertEqual(cleared, 1)
 
         let meals = FileMealPlanStore(url: mealURL)
         _ = await meals.setSlot(dayOffset: 0, kind: .dinner, recipeId: nil, note: "Tacos")
@@ -144,8 +146,10 @@ final class RemyKitchenTests: XCTestCase {
         profile.staples = ["Eggs", "Rice"]
         _ = await nutrition.updateProfile(profile)
         _ = await nutrition.logMeal(description: "Rice bowl", recipeId: nil)
-        XCTAssertEqual(await nutrition.recentMeals(limit: 5).count, 1)
-        XCTAssertTrue(await nutrition.profileSummary().contains("Peanuts"))
+        let meals5 = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(meals5.count, 1)
+        let profileSummary = await nutrition.profileSummary()
+        XCTAssertTrue(profileSummary.contains("Peanuts"))
     }
 
     func testCookingToolsRoundTrip() async throws {
@@ -164,6 +168,7 @@ final class RemyKitchenTests: XCTestCase {
         XCTAssertTrue(advanced.contains("Cook"))
         let end = EndCookingTool(store: store)
         _ = try await end.invoke(argumentsJSON: "{}")
-        XCTAssertNil(await store.activeCookingSession())
+        let activeAfterEnd = await store.activeCookingSession()
+        XCTAssertNil(activeAfterEnd)
     }
 }
