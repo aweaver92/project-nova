@@ -25,9 +25,6 @@ public struct RootView: View {
     @Bindable var visualMemory: VisualMemoryViewModel
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
-    @Bindable var training: TrainingViewModel
-    @Bindable var kitchen: RemyKitchenViewModel
-    @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
     @State private var selectedTab: RootTab = .assistant
@@ -49,9 +46,6 @@ public struct RootView: View {
         visualMemory: VisualMemoryViewModel,
         agents: AgentsViewModel,
         coding: CodingViewModel,
-        training: TrainingViewModel,
-        kitchen: RemyKitchenViewModel,
-        study: StudyViewModel,
         settings: SettingsViewModel,
         toolConfirmation: ToolConfirmationCoordinator
     ) {
@@ -67,9 +61,6 @@ public struct RootView: View {
         self.visualMemory = visualMemory
         self.agents = agents
         self.coding = coding
-        self.training = training
-        self.kitchen = kitchen
-        self.study = study
         self.settings = settings
         self.toolConfirmation = toolConfirmation
     }
@@ -80,14 +71,7 @@ public struct RootView: View {
                 .tabItem { Label("Assistant", systemImage: "waveform") }
                 .tag(RootTab.assistant)
 
-            AgentsView(
-                agents: agents,
-                coding: coding,
-                training: training,
-                kitchen: kitchen,
-                study: study,
-                showSettings: { showSettings = true }
-            )
+            AgentsView(agents: agents, coding: coding, showSettings: { showSettings = true })
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
                 .tag(RootTab.agents)
 
@@ -127,15 +111,6 @@ public struct RootView: View {
                 listenSection
                 if agents.isClaudeActive, coding.pinnedSessionId != nil {
                     codingResumeSection
-                }
-                if agents.isMaxActive, training.hasActiveSession {
-                    trainingResumeSection
-                }
-                if agents.isRemyActive, kitchen.cookingSession != nil {
-                    kitchenResumeSection
-                }
-                if agents.isScholarActive {
-                    scholarStudySection
                 }
                 if session.registrationState == .registered {
                     visionSection
@@ -182,9 +157,6 @@ public struct RootView: View {
                 await workspaces.load()
                 await agents.load()
                 await coding.load()
-                await training.load()
-                await kitchen.load()
-                await study.load()
                 await settings.load()
                 await startListeningIfReady()
             }
@@ -255,80 +227,6 @@ public struct RootView: View {
             }
         } footer: {
             Text("Opens Coding under Agents with the pinned Cursor session.")
-        }
-    }
-
-    private var trainingResumeSection: some View {
-        Section {
-            Button {
-                selectedTab = .agents
-            } label: {
-                Label(
-                    "Open workout · \(training.activeSession?.title ?? "Live")",
-                    systemImage: "figure.strengthtraining.traditional"
-                )
-            }
-        } footer: {
-            Text("Opens Training under Agents for live sets and rest.")
-        }
-    }
-
-    private var kitchenResumeSection: some View {
-        Section {
-            Button {
-                kitchen.selectedSection = .recipes
-                selectedTab = .agents
-            } label: {
-                Label(
-                    "Open Kitchen · \(kitchen.cookingSession?.recipeTitle ?? "Cooking")",
-                    systemImage: "fork.knife"
-                )
-            }
-        } footer: {
-            Text("Opens Kitchen under Agents for cook mode and pantry.")
-        }
-    }
-
-    private var scholarStudySection: some View {
-        Section {
-            HStack(spacing: 8) {
-                NovaUI.StatusChip(
-                    title: "Study",
-                    value: study.dueTotal > 0 ? "\(study.dueTotal) due" : "0 due",
-                    color: study.dueTotal > 0 ? .orange : .secondary
-                )
-                Spacer(minLength: 0)
-            }
-            if study.dueTotal > 0 {
-                Button {
-                    study.requestStartReview()
-                    selectedTab = .agents
-                } label: {
-                    Label("Review due", systemImage: "rectangle.on.rectangle.angled")
-                }
-            }
-            Button {
-                Task { await conversation.sendSuggestion("Start a quiz on my due cards") }
-            } label: {
-                Label("Quiz me", systemImage: "questionmark.circle")
-            }
-            Button {
-                Task { await conversation.sendSuggestion("Turn the last explanation into study cards") }
-            } label: {
-                Label("Make flashcards", systemImage: "rectangle.stack.badge.plus")
-            }
-            if study.hasDecks || study.dueTotal > 0 {
-                Button {
-                    study.requestOpenStudy()
-                    selectedTab = .agents
-                } label: {
-                    Label("Open Study", systemImage: "text.book.closed")
-                }
-            }
-        } header: {
-            Text("Scholar")
-        } footer: {
-            Text("Review opens Study under Agents. Quiz and flashcards go through Scholar by voice.")
         }
     }
 
