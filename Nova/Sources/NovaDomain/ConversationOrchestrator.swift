@@ -798,12 +798,10 @@ public actor ConversationOrchestrator {
             await handleUserUtterance(partial)
             return
         }
-        // Whisper/STT sometimes yields an empty completion even though VAD already
-        // committed the user's audio. Ask the model anyway so "Nova …" is not
-        // dropped into silence.
-        NovaLog.session.info("STT empty after speech; creating response from committed audio")
+        // Empty STT: VAD already auto-started a response when create_response is
+        // on — do not call createResponse again. Keep the listening window open.
+        NovaLog.session.info("STT empty after speech; relying on VAD auto-response")
         lastEngagement = .now
-        await ai.createResponse()
     }
 
     /// Wake-word gate: with requireWakeWord on, the server transcribes but does
@@ -864,9 +862,12 @@ public actor ConversationOrchestrator {
             listeningSuspended = false
         }
         if case .ignore = intent {
-            // Drop ignored / background speech so it cannot contaminate the next
-            // addressed turn's memory or transcript.
+            // Drop ignored / background speech and cancel the VAD auto-reply so
+            // Nova stays quiet unless addressed (or inside the grace window).
             inputTranscript = ""
+            await ai.interrupt()
+            await egress.flush()
+            assistantSpeaking = false
             return
         }
 
@@ -1015,6 +1016,10 @@ public actor ConversationOrchestrator {
             // switch stays exhaustive and correct if act(on:) is called directly.
             await handleStopCommand()
         case .converse:
+            // Server VAD already requested a response (create_response: true).
+            // Still call createResponse for unit-test providers and as a no-op
+            // retry when the auto-response was missed; duplicate creates are
+            // ignored by the Realtime error filter.
             await ai.createResponse()
         case .vision(let prompt):
             if let isVisionReady, await isVisionReady() == false {

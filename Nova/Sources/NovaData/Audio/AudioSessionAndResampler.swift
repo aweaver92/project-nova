@@ -22,15 +22,27 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
                 options: [.allowBluetooth, .defaultToSpeaker, .duckOthers]
             )
             try session.setActive(true, options: .notifyOthersOnDeactivation)
-            if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+            // Prefer the phone microphone for Realtime capture. Meta glasses often
+            // advertise a Bluetooth HFP input that is silent for third-party apps,
+            // which leaves Listen "green" while every utterance is empty → no reply.
+            // Playback can still route to HFP/speaker below.
+            if let builtIn = session.availableInputs?.first(where: {
+                $0.portType == .builtInMic
+            }) {
+                try session.setPreferredInput(builtIn)
+                NovaLog.audio.info("Preferred input: built-in mic (\(builtIn.portName, privacy: .public))")
+            } else if let hfp = session.availableInputs?.first(where: {
+                $0.portType == .bluetoothHFP
+            }) {
                 try session.setPreferredInput(hfp)
-                // Clear any speaker override so HFP owns the route.
+                NovaLog.audio.info("Preferred input: HFP \(hfp.portName, privacy: .public)")
+            }
+            if session.availableInputs?.contains(where: { $0.portType == .bluetoothHFP }) == true {
+                // Glasses/headset present: let the system keep HFP for playback.
                 try? session.overrideOutputAudioPort(.none)
-                NovaLog.audio.info("HFP preferred input: \(hfp.portName, privacy: .public)")
             } else {
-                // No glasses: force the loud speaker (not the receiver/earpiece).
                 try? session.overrideOutputAudioPort(.speaker)
-                NovaLog.audio.warning("No bluetoothHFP input; routing playback to phone speaker")
+                NovaLog.audio.warning("No bluetoothHFP route; playback on phone speaker")
             }
             // Prefer wideband HFP (mSBC, 16 kHz) over narrowband (CVSD, 8 kHz).
             // Modern Bluetooth headsets — including the Meta glasses — negotiate

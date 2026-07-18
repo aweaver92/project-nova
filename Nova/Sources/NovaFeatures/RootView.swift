@@ -129,37 +129,43 @@ public struct RootView: View {
             List {
                 hudSection
                 listenSection
-                if agents.isClaudeActive, coding.pinnedSessionId != nil {
+                if coding.pinnedSessionId != nil {
                     codingResumeSection
                 }
-                if agents.isMaxActive, training.hasActiveSession {
+                if training.hasActiveSession {
                     specialistResumeSection(
                         title: "Open workout · \(training.activeSession?.title ?? "Live")",
                         systemImage: "figure.strengthtraining.traditional",
-                        footer: "Opens Training under Agents for live sets and rest."
+                        footer: "Opens Training under Agents for live sets and rest.",
+                        route: .training
                     )
                 }
-                if agents.isSageActive {
+                if wellness.hasResumeSignal {
                     specialistResumeSection(
-                        title: "Open Wellness",
+                        title: "Open Wellness · \(wellness.resumeSubtitle)",
                         systemImage: "leaf",
-                        footer: "Opens Wellness under Agents for check-ins and breath timers."
+                        footer: "Opens Wellness under Agents for check-ins and breath timers.",
+                        route: .wellness
                     )
                 }
-                if agents.isRemyActive {
+                if agents.isRemyActive || kitchen.cookingSession != nil {
                     specialistResumeSection(
                         title: kitchen.cookingSession == nil
                             ? "Open Kitchen"
                             : "Open Kitchen · cooking",
                         systemImage: "fork.knife",
-                        footer: "Opens Kitchen under Agents for pantry, recipes, and cook mode."
+                        footer: "Opens Kitchen under Agents for pantry, recipes, and cook mode.",
+                        route: .kitchen
                     )
                 }
-                if agents.isScholarActive {
+                if study.isReviewing || study.dueTotal > 0 {
                     specialistResumeSection(
-                        title: study.dueTotal > 0 ? "Open Study · \(study.dueTotal) due" : "Open Study",
+                        title: study.isReviewing
+                            ? "Open Study · \(study.reviewProgressLabel)"
+                            : "Open Study · \(study.dueTotal) due",
                         systemImage: "text.book.closed",
-                        footer: "Opens Study under Agents for decks and review."
+                        footer: "Opens Study under Agents for decks and review.",
+                        route: .study
                     )
                 }
                 if session.registrationState == .registered {
@@ -272,6 +278,7 @@ public struct RootView: View {
     private var codingResumeSection: some View {
         Section {
             Button {
+                agents.requestRoute(.coding)
                 selectedTab = .agents
             } label: {
                 Label(
@@ -284,9 +291,15 @@ public struct RootView: View {
         }
     }
 
-    private func specialistResumeSection(title: String, systemImage: String, footer: String) -> some View {
+    private func specialistResumeSection(
+        title: String,
+        systemImage: String,
+        footer: String,
+        route: AgentsPendingRoute
+    ) -> some View {
         Section {
             Button {
+                agents.requestRoute(route)
                 selectedTab = .agents
             } label: {
                 Label(title, systemImage: systemImage)
@@ -374,7 +387,7 @@ public struct RootView: View {
                 ContentUnavailableView {
                     Label("Waiting", systemImage: "text.bubble")
                 } description: {
-                    Text("Say “Nova …” or tap Listen.")
+                    Text("Say “Nova …” toward the phone mic while Listen is on.")
                 }
                 .listRowBackground(Color.clear)
             } else {

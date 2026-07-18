@@ -102,20 +102,15 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     // `near_field` suits the close-talking glasses mic and
                     // improves turn detection and perceived input quality.
                     "noise_reduction": ["type": "near_field"],
-                    // With a wake word required, the server still detects
-                    // turns and transcribes, but must NOT auto-reply — the
-                    // orchestrator decides whether "Nova" was addressed.
+                    // Always let VAD start a reply. Wake-word gating cancels
+                    // non-addressed turns in the orchestrator (see handleUserUtterance).
+                    // Waiting for STT before response.create caused Listen-green
+                    // silence when the transcript was late/empty.
                     "turn_detection": config.enableServerVAD ? [
                         "type": "semantic_vad",
-                        "create_response": !config.requireWakeWord,
-                        // When the user starts talking over Nova, cancel the
-                        // in-flight reply (barge-in) instead of leaving two
-                        // responses fighting on the wire.
+                        "create_response": true,
                         "interrupt_response": true
                     ] as [String: Any] : NSNull(),
-                    // gpt-4o-mini-transcribe is the current conversation-session
-                    // STT model; whisper-1 often yields no completed transcripts
-                    // on GA Realtime, which leaves wake-word gating silent.
                     "transcription": [
                         "model": "gpt-4o-mini-transcribe",
                         "language": "en"
@@ -580,7 +575,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             // Benign under server VAD barge-in: a cancel can race with the response
             // completing, so the server reports no active response to cancel.
             let lowered = message.lowercased()
-            if lowered.contains("no active response") || lowered.contains("cancellation failed") {
+            if lowered.contains("no active response") || lowered.contains("cancellation failed")
+                || lowered.contains("active response")
+            {
                 break
             }
             // Auth failure: clear cached secret so the next connect remints.
