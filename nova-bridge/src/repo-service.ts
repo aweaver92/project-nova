@@ -4,6 +4,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -31,6 +32,12 @@ const SKIP_DIR_NAMES = new Set([
 const MAX_STDOUT = 512_000;
 const MAX_DIFF = 200_000;
 const MAX_STATUS_FILES = 200;
+const MAX_CODE_FILE_BYTES = 256_000;
+const MAX_CODE_SEARCH_FILES = 4_000;
+const MAX_CODE_SEARCH_ENTRIES = 20_000;
+const MAX_CODE_SEARCH_MATCHES = 5_000;
+const MAX_CODE_SEARCH_RESULTS = 24;
+const MAX_CODE_READ_LINES = 240;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const CLONE_TIMEOUT_MS = 300_000;
 const PUBLISH_TIMEOUT_MS = 180_000;
@@ -61,6 +68,32 @@ export type RepoFileListing = {
   repoId: string;
   path: string;
   entries: RepoFileEntry[];
+};
+
+export type CodeSearchMatch = {
+  path: string;
+  line: number;
+  snippet: string;
+  matchedTerms: string[];
+};
+
+export type CodeSearchResult = {
+  repoId: string;
+  repoName: string;
+  query: string;
+  matches: CodeSearchMatch[];
+  truncated: boolean;
+};
+
+export type CodeReadResult = {
+  repoId: string;
+  repoName: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  content: string;
+  truncated: boolean;
 };
 
 export type ResolvedRepoPath = {
@@ -630,6 +663,206 @@ export class RepoService {
       return a.name.localeCompare(b.name);
     });
     return { repoId: resolved.repoId, path: resolved.relativePath, entries };
+  }
+
+  /**
+   * Locate Nova's own monorepo independently of the Coding-tab selection.
+   * This prevents a user-selected project from becoming the source of truth for
+   * questions such as "can Nova record video?".
+   */
+  resolveNovaRepo(): { id: string; path: string; name: string; root: RootEntry } {
+    const candidates = this.discoverSync();
+    for (const summary of candidates) {
+      const repo = this.resolveRepo(summary.id);
+      if (
+        existsSync(join(repo.path, "Nova", "Package.swift")) &&
+        existsSync(join(repo.path, "nova-bridge", "package.json"))
+      ) {
+        return repo;
+      }
+    }
+    throw new RepoError(
+      "nova_repo_not_found",
+      "Nova source repository is not under an allowlisted bridge root",
+      404,
+    );
+  }
+
+  /** Bounded, literal multi-keyword search over Nova's readable source files. */
+  searchNovaCode(query: string): CodeSearchResult {
+    const normalized = query.trim();
+    if (!normalized) {
+      throw new RepoError("invalid_query", "query_required", 400);
+    }
+    if (normalized.length > 300) {
+      throw new RepoError("invalid_query", "query_too_long", 400);
+    }
+    const repo = this.resolveNovaRepo();
+    const terms = this.codeSearchTerms(normalized);
+    if (terms.length === 0) {
+      throw new RepoError("invalid_query", "no_searchable_terms", 400);
+    }
+
+    const matches: Array<CodeSearchMatch & { score: number }> = [];
+    let visited = 0;
+    let entriesVisited = 0;
+    let scanTruncated = false;
+    const walk = (directory: string, relativeDirectory: string): void => {
+      if (scanTruncated) return;
+      for (const name of readdirSync(directory).sort((a, b) => a.localeCompare(b))) {
+        entriesVisited += 1;
+        if (
+          entriesVisited >= MAX_CODE_SEARCH_ENTRIES ||
+          visited >= MAX_CODE_SEARCH_FILES ||
+          matches.length >= MAX_CODE_SEARCH_MATCHES
+        ) {
+          scanTruncated = true;
+          return;
+        }
+        if (name.startsWith(".") || this.isSkippableDir(name)) continue;
+        const absolute = join(directory, name);
+        const relative = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+        let stat;
+        try {
+          stat = lstatSync(absolute);
+        } catch {
+          continue;
+        }
+        if (stat.isSymbolicLink()) continue;
+        if (stat.isDirectory()) {
+          walk(absolute, relative);
+          continue;
+        }
+        if (!stat.isFile() || !this.isReadableCodePath(relative, stat.size)) continue;
+        visited += 1;
+        let text: string;
+        try {
+          text = readFileSync(absolute, "utf8");
+        } catch {
+          continue;
+        }
+        if (text.includes("\u0000")) continue;
+        const lines = text.split(/\r?\n/);
+        let matchesInFile = 0;
+        for (let index = 0; index < lines.length; index += 1) {
+          const lowered = lines[index]!.toLowerCase();
+          const matchedTerms = terms.filter((term) => lowered.includes(term));
+          if (matchedTerms.length === 0) continue;
+          const pathBoost = terms.filter((term) => relative.toLowerCase().includes(term)).length;
+          matches.push({
+            path: relative.replace(/\\/g, "/"),
+            line: index + 1,
+            snippet: lines[index]!.trim().slice(0, 360),
+            matchedTerms,
+            score: matchedTerms.length * 10 + pathBoost * 3,
+          });
+          matchesInFile += 1;
+          if (matchesInFile >= 3 || matches.length >= MAX_CODE_SEARCH_MATCHES) break;
+        }
+      }
+    };
+    walk(repo.path, "");
+    matches.sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.path.localeCompare(b.path) ||
+        a.line - b.line,
+    );
+    const limited = matches.slice(0, MAX_CODE_SEARCH_RESULTS);
+    return {
+      repoId: repo.id,
+      repoName: repo.name,
+      query: normalized,
+      matches: limited.map(({ score: _score, ...match }) => match),
+      truncated: scanTruncated || matches.length > limited.length,
+    };
+  }
+
+  /** Read an exact, bounded line range from a non-sensitive Nova source file. */
+  readNovaCode(
+    requestedPath: string,
+    startLine = 1,
+    endLine = startLine + 119,
+  ): CodeReadResult {
+    const repo = this.resolveNovaRepo();
+    const resolved = this.resolveRepoPath(repo.id, requestedPath);
+    if (resolved.kind !== "file") {
+      throw new RepoError("invalid_path", "path_is_not_file", 400);
+    }
+    const size = statSync(resolved.absolutePath).size;
+    if (!this.isReadableCodePath(resolved.relativePath, size)) {
+      throw new RepoError("forbidden_file", "file_not_readable_as_source", 403);
+    }
+    const text = readFileSync(resolved.absolutePath, "utf8");
+    if (text.includes("\u0000")) {
+      throw new RepoError("forbidden_file", "binary_file_rejected", 403);
+    }
+    const lines = text.split(/\r?\n/);
+    if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) {
+      throw new RepoError("invalid_lines", "line_numbers_must_be_finite", 400);
+    }
+    const start = Math.min(lines.length, Math.max(1, Math.floor(startLine)));
+    const requestedEnd = Math.max(start, Math.floor(endLine));
+    const end = Math.min(lines.length, requestedEnd, start + MAX_CODE_READ_LINES - 1);
+    return {
+      repoId: repo.id,
+      repoName: repo.name,
+      path: resolved.relativePath.replace(/\\/g, "/"),
+      startLine: start,
+      endLine: end,
+      totalLines: lines.length,
+      content: lines.slice(start - 1, end).join("\n"),
+      truncated: requestedEnd > end,
+    };
+  }
+
+  private codeSearchTerms(query: string): string[] {
+    const stop = new Set([
+      "about", "does", "from", "have", "into", "nova", "that", "the", "this",
+      "what", "when", "where", "which", "with", "would", "could", "should",
+    ]);
+    return Array.from(
+      new Set(
+        query
+          .toLowerCase()
+          .replace(/[^a-z0-9_./-]+/g, " ")
+          .split(/\s+/)
+          .map((term) => term.trim())
+          .filter((term) => term.length >= 2 && !stop.has(term)),
+      ),
+    ).slice(0, 10);
+  }
+
+  private isReadableCodePath(relativePath: string, size: number): boolean {
+    if (size > MAX_CODE_FILE_BYTES) return false;
+    const normalized = relativePath.replace(/\\/g, "/").toLowerCase();
+    const inGroundingScope =
+      normalized.startsWith("nova/sources/") ||
+      normalized.startsWith("nova/app/") ||
+      normalized.startsWith("nova/tests/") ||
+      normalized.startsWith("nova-bridge/src/") ||
+      normalized.startsWith("docs/") ||
+      normalized === "nova/package.swift" ||
+      normalized === "nova/project.yml" ||
+      normalized === "nova-bridge/package.json";
+    if (!inGroundingScope) return false;
+    const parts = normalized.split("/");
+    const name = parts.at(-1) ?? "";
+    if (
+      parts.some((part) => part.startsWith(".")) ||
+      parts.some((part) => this.isSkippableDir(part)) ||
+      name === ".env" ||
+      name.includes("secret") ||
+      name.includes("credential") ||
+      name.endsWith(".ipa") ||
+      name.endsWith(".xcarchive")
+    ) {
+      return false;
+    }
+    return [
+      ".swift", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".yml", ".yaml",
+      ".toml", ".html", ".css",
+    ].some((extension) => name.endsWith(extension));
   }
 
   /** Snapshot every currently-dirty path before an agent run. */

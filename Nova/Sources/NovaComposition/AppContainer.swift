@@ -264,6 +264,7 @@ public final class AppContainer {
                 isEnabled: { await settingsStore.webSearchEnabled() },
                 onUsage: { usage.recordResponsesCall() }
             ),
+            InspectNovaCodebaseTool(bridge: bridge),
             WeatherTool(),
             CreateReminderTool(),
             ListCalendarEventsTool(),

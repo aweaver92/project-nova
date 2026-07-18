@@ -59,6 +59,8 @@ public struct AISessionConfig: Sendable, Equatable {
 
         Grounding: you have live web access through the web_search tool. For anything about current events, news, prices, live scores, schedules, people, companies, products, documentation, or any fact that could have changed since your training — or whenever you are not fully certain — call web_search first and base your answer strictly on its results. Never state such facts from memory, and never claim you searched unless you actually called the tool. If a search returns nothing useful, say so instead of guessing.
 
+        Self-knowledge grounding: for every question about Nova's own features, capabilities, integrations, settings, limitations, or implementation, call inspect_nova_codebase before answering. Search first, then read the relevant source lines. The tool describes the configured bridge checkout, which may be newer than the IPA installed on the phone; distinguish "implemented in the source checkout" from "available in this installed build." Never infer that a feature exists merely because it sounds plausible. If the bridge is unavailable or the code evidence is inconclusive, say you cannot verify it instead of guessing.
+
         Your other tools are the source of truth for their domains; never invent their results. Call the right tool for: weather; creating reminders; reading or creating calendar events; controlling smart-home devices (Home Assistant); remembering, recalling, or forgetting durable facts about the user; saving or reading notes; the daily briefing; and starting or stopping a voice recording that is saved to the phone (e.g. when the user says "begin voice recording", "start recording", or "stop recording"). Pass dates and times to tools in ISO8601. If a tool errors or returns nothing, tell the user plainly.
 
         If you only caught a fragment, or the request seems misheard, garbled, or incomplete, ask the user to repeat or clarify in one short question instead of answering a guess.
@@ -721,7 +723,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 8
+    static let seedCapabilitiesVersion = 9
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -736,7 +738,7 @@ public extension Agent {
 
     /// Common tools most specialists should be able to reach.
     static let commonToolNames: [String] = [
-        "web_search", "remember_fact", "recall_facts",
+        "web_search", "inspect_nova_codebase", "remember_fact", "recall_facts",
         "save_note", "list_notes", "create_reminder"
     ]
 
@@ -769,7 +771,7 @@ public extension Agent {
                     "list_repos", "select_repo", "clone_repo", "create_web_project",
                     "repo_status", "repo_diff", "publish_repo",
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
-                    "web_search", "search_knowledge", "save_note", "list_notes",
+                    "web_search", "inspect_nova_codebase", "search_knowledge", "save_note", "list_notes",
                     "remember_fact", "recall_facts", "create_reminder", "draft_message",
                     "start_meeting", "end_meeting", "bookmark_conversation"
                 ],

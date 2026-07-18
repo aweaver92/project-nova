@@ -28,6 +28,7 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /repos
  *   POST /repos/clone | /repos/create | /repos/select
  *   GET  /repos/:repoId/status | /diff | /files?path=
+ *   POST /self-code/search | /self-code/read       → read-only Nova grounding
  *   POST /repos/:repoId/publish
  *   POST /repos/:repoId/baselines                 → create pre-run snapshot
  *   GET  /repos/:repoId/baselines/:id/review      → agent-only file diffs
@@ -211,6 +212,55 @@ app.get("/repos/:repoId/files", requireAuth, (req, res) => {
       typeof req.query.path === "string" ? req.query.path.trim() : "";
     const listing = repos.listFiles(String(req.params.repoId ?? ""), requestedPath);
     res.json({ ok: true, ...listing });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+// --- Nova self-knowledge (read-only) ---------------------------------------
+app.post("/self-code/search", requireAuth, (req, res) => {
+  try {
+    const query = String(req.body?.query ?? "").trim();
+    const result = repos.searchNovaCode(query);
+    res.json({
+      ok: true,
+      ...result,
+      guidance:
+        "These matches describe the configured source checkout, which may differ from the installed IPA. Use them only as leads; read relevant lines before making a claim.",
+    });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/self-code/read", requireAuth, (req, res) => {
+  try {
+    const path = String(req.body?.path ?? "").trim();
+    const startLine = Number(req.body?.startLine ?? 1);
+    const endLine = Number(req.body?.endLine ?? startLine + 119);
+    if (!path) {
+      res.status(400).json({ ok: false, error: "path_required" });
+      return;
+    }
+    if (
+      !Number.isFinite(startLine) ||
+      !Number.isFinite(endLine) ||
+      !Number.isInteger(startLine) ||
+      !Number.isInteger(endLine) ||
+      startLine < 1 ||
+      endLine < startLine
+    ) {
+      res.status(400).json({ ok: false, error: "invalid_line_range" });
+      return;
+    }
+    const result = repos.readNovaCode(path, startLine, endLine);
+    res.json({
+      ok: true,
+      ...result,
+      citation: `${result.path}:${result.startLine}-${result.endLine}`,
+      guidance:
+        "Answer from this checkout evidence and cite it. Do not claim installed-build availability unless separately established. If evidence is insufficient, search/read more or say so.",
+    });
   } catch (err) {
     sendRepoError(res, err);
   }

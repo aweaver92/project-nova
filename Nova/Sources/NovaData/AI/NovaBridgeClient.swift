@@ -383,6 +383,22 @@ public actor NovaBridgeClient: AgentBridging {
         }
     }
 
+    public func searchNovaCode(query: String) async -> BridgeResult {
+        await post(path: "self-code/search", body: ["query": query], timeout: 30)
+    }
+
+    public func readNovaCode(path: String, startLine: Int, endLine: Int) async -> BridgeResult {
+        await post(
+            path: "self-code/read",
+            body: [
+                "path": path,
+                "startLine": max(1, startLine),
+                "endLine": max(startLine, endLine),
+            ],
+            timeout: 30
+        )
+    }
+
     public func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
         let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
         var body: [String: Any] = [

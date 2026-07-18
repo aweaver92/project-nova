@@ -217,6 +217,16 @@ async function realGitIntegration(): Promise<void> {
     run(["config", "user.email", "nova@test.local"]);
     run(["config", "user.name", "Nova Test"]);
     writeFileSync(join(base, "README.md"), "hello\n");
+    mkdirSync(join(base, "Nova"), { recursive: true });
+    mkdirSync(join(base, "nova-bridge"), { recursive: true });
+    writeFileSync(
+      join(base, "Nova", "Package.swift"),
+      "let capabilities = [\"voice\", \"videoRecording\"]\n",
+    );
+    writeFileSync(
+      join(base, "nova-bridge", "package.json"),
+      JSON.stringify({ name: "nova-bridge" }),
+    );
     run(["add", "README.md"]);
     run(["commit", "-m", "init"]);
     writeFileSync(join(base, "README.md"), "hello world\n");
@@ -247,6 +257,22 @@ async function realGitIntegration(): Promise<void> {
     assert.equal(file.kind, "file");
     assert.throws(() => svc.resolveRepoPath(repoId, "../outside"), RepoError);
     assert.throws(() => svc.resolveRepoPath(repoId, ".git/config"), RepoError);
+
+    section("bounded Nova self-code search + read");
+    const selfRepo = svc.resolveNovaRepo();
+    assert.equal(selfRepo.id, repoId);
+    const search = svc.searchNovaCode("video recording capability");
+    assert.ok(search.matches.some((match) => match.path === "Nova/Package.swift"));
+    const source = svc.readNovaCode("Nova/Package.swift", 1, 20);
+    assert.equal(source.path, "Nova/Package.swift");
+    assert.ok(source.content.includes("videoRecording"));
+    assert.throws(() => svc.searchNovaCode("x".repeat(301)), RepoError);
+    assert.throws(() => svc.searchNovaCode("what does Nova have"), RepoError);
+    assert.throws(() => svc.readNovaCode("Nova/Package.swift", Number.NaN, 10), RepoError);
+    assert.throws(
+      () => svc.readNovaCode(".env", 1, 10),
+      (error: unknown) => error instanceof RepoError,
+    );
 
     const status = await svc.status(repoId);
     assert.equal(status.clean, false);

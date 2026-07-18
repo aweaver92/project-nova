@@ -949,6 +949,10 @@ public protocol AgentBridging: Sendable {
     func repositoryStatus(repoId: String) async -> BridgeResult
     func repositoryDiff(repoId: String) async -> BridgeResult
     func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult
+    /// Read-only retrieval against Nova's own source repository, independent of
+    /// the Coding-tab repository selection.
+    func searchNovaCode(query: String) async -> BridgeResult
+    func readNovaCode(path: String, startLine: Int, endLine: Int) async -> BridgeResult
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
     func createBaseline(repoId: String) async -> BridgeResult
     func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult
@@ -1063,6 +1067,12 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func searchNovaCode(query: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func readNovaCode(path: String, startLine: Int, endLine: Int) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
