@@ -1,4 +1,5 @@
 import SwiftUI
+import NovaCore
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -184,8 +185,9 @@ public struct SettingsView: View {
                     } label: {
                         Label("Patch Notes", systemImage: "sparkles")
                     }
-                    LabeledContent("Version", value: PatchNotesView.bundleVersion())
-                    Text("If Listen fails, paste this Version line in chat so we know which IPA is installed.")
+                    LabeledContent("Build", value: NovaBuildStamp.id)
+                    LabeledContent("Bundle", value: PatchNotesView.bundleVersion())
+                    Text("Paste the Build line in chat when reporting Listen issues. (AltStore often rewrites Bundle to 1.0.)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

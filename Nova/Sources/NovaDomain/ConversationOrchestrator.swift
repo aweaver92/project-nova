@@ -123,6 +123,12 @@ public actor ConversationOrchestrator {
     private var micBytesSent = 0
     private var micPeakHeard: Float = 0
     private var outboundPeakHeard: Float = 0
+    private var outboundRmsHeard: Float = 0
+    private var outboundZcrHeard: Float = 0
+    /// Local energy VAD — used when cloud `speech_started` never arrives.
+    private var clientSpeechActive = false
+    private var clientSpeechQuietSince: ContinuousClock.Instant?
+    private var didClientCommitFallback = false
     private var lastMicEnergyAt: ContinuousClock.Instant?
     private var lastChunkAt: ContinuousClock.Instant?
     private var userTranscriptChars = 0
@@ -677,6 +683,11 @@ public actor ConversationOrchestrator {
         micBytesSent = 0
         micPeakHeard = 0
         outboundPeakHeard = 0
+        outboundRmsHeard = 0
+        outboundZcrHeard = 0
+        clientSpeechActive = false
+        clientSpeechQuietSince = nil
+        didClientCommitFallback = false
         lastMicEnergyAt = nil
         lastChunkAt = nil
         userTranscriptChars = 0
@@ -738,7 +749,7 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
-                await self.noteOutboundPeak(pcm24)
+                await self.noteOutboundAudio(pcm24)
                 guard await self.isCurrentStream(gen) else { return }
                 let sent = await self.ai.appendAudio(pcm24)
                 await self.noteAppendResult(sent: sent)
@@ -812,9 +823,25 @@ public actor ConversationOrchestrator {
         }
     }
 
-    private func noteOutboundPeak(_ pcm24: Data) {
-        let peak = Self.pcmPeak(pcm24)
-        if peak > outboundPeakHeard { outboundPeakHeard = peak }
+    private func noteOutboundAudio(_ pcm24: Data) {
+        let stats = Self.pcmStats(pcm24)
+        if stats.peak > outboundPeakHeard { outboundPeakHeard = stats.peak }
+        if stats.rms > outboundRmsHeard { outboundRmsHeard = stats.rms }
+        // EMA of zero-crossing rate — speech is typically ≫ 0.02; DC/noise ≈ 0.
+        outboundZcrHeard = outboundZcrHeard * 0.85 + stats.zcr * 0.15
+
+        // Client-side energy VAD (cloud fallback). Require some zero-crossings so
+        // a stuck DC bias (high peak, no speech) cannot trigger commits.
+        if stats.peak >= 0.05, stats.zcr >= 0.015 {
+            clientSpeechActive = true
+            clientSpeechQuietSince = nil
+        } else if clientSpeechActive {
+            if stats.peak < 0.025 {
+                if clientSpeechQuietSince == nil { clientSpeechQuietSince = .now }
+            } else {
+                clientSpeechQuietSince = nil
+            }
+        }
     }
 
     private func noteAppendResult(sent: Bool) {
@@ -918,6 +945,38 @@ public actor ConversationOrchestrator {
         }
 
         if heardRecently || micPeakHeard >= 0.02 {
+            // Cloud VAD fallback: local speech ended, cloud never started.
+            // Commit the input buffer so STT + create_response still run.
+            if cloudVadSpeechEvents == 0,
+               !didClientCommitFallback,
+               !assistantSpeaking,
+               clientSpeechActive,
+               let quietSince = clientSpeechQuietSince,
+               now - quietSince >= .milliseconds(550),
+               outboundPeakHeard >= 0.08,
+               outboundZcrHeard >= 0.01
+            {
+                didClientCommitFallback = true
+                clientSpeechActive = false
+                clientSpeechQuietSince = nil
+                NovaLog.session.warning(
+                    "Cloud VAD silent after local speech; committing input buffer (client fallback) zcr=\(self.outboundZcrHeard)"
+                )
+                onTranscript?(
+                    "[diag] Cloud VAD silent — forcing commit (\(NovaBuildStamp.id))",
+                    .system
+                )
+                await ai.commitInputAudio()
+                await ai.createResponse()
+                publishListenHealth(
+                    phase: .hearingYou,
+                    micLevel: liveLevel,
+                    inputRoute: route,
+                    detail: "Client commit fallback — waiting for transcript…"
+                )
+                return
+            }
+
             if userTranscriptChars == 0,
                let energyAt = lastMicEnergyAt,
                now - energyAt > .seconds(5),
@@ -928,9 +987,12 @@ public actor ConversationOrchestrator {
                     ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
                     : "Cloud VAD never fired — check noise reduction / input sample rate (ws appends alone are not enough)"
                 let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
-                let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard))"
+                let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard)) rms=\(String(format: "%.3f", outboundRmsHeard)) zcr=\(String(format: "%.3f", outboundZcrHeard))"
+                let shapeHint = outboundZcrHeard < 0.01
+                    ? " Audio looks like DC/noise (zcr≈0), not speech — mic converter suspect."
+                    : ""
                 let message = """
-                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
+                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks).\(shapeHint) Build \(NovaBuildStamp.id). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
                 """
                 lastError = message
                 onError?(message)
@@ -983,16 +1045,39 @@ public actor ConversationOrchestrator {
     }
 
     private static func pcmPeak(_ pcm16: Data) -> Float {
-        guard pcm16.count >= 2 else { return 0 }
+        pcmStats(pcm16).peak
+    }
+
+    /// Peak / RMS / zero-crossing rate for outbound PCM16 mono.
+    /// High peak + ~0 ZCR usually means DC bias or stuck converter output — not speech.
+    private static func pcmStats(_ pcm16: Data) -> (peak: Float, rms: Float, zcr: Float) {
+        guard pcm16.count >= 4 else { return (0, 0, 0) }
         var peak: Int16 = 0
+        var sumSquares: Float = 0
+        var crossings = 0
+        var prev: Int16 = 0
+        var count = 0
         pcm16.withUnsafeBytes { raw in
             let samples = raw.bindMemory(to: Int16.self)
             for s in samples {
                 let a = s == Int16.min ? Int16.max : abs(s)
                 if a > peak { peak = a }
+                let f = Float(s)
+                sumSquares += f * f
+                if count > 0 {
+                    if (prev >= 0 && s < 0) || (prev < 0 && s >= 0) {
+                        crossings += 1
+                    }
+                }
+                prev = s
+                count += 1
             }
         }
-        return Float(peak) / Float(Int16.max)
+        guard count > 1 else { return (0, 0, 0) }
+        let peakN = Float(peak) / Float(Int16.max)
+        let rms = (sumSquares / Float(count)).squareRoot() / Float(Int16.max)
+        let zcr = Float(crossings) / Float(count - 1)
+        return (peakN, rms, zcr)
     }
 
     /// Only relevant in wake-word-gated mode: after `streamIdleTimeout` of silence
@@ -1114,6 +1199,9 @@ public actor ConversationOrchestrator {
             onMetricsTick?()
         case .speechStarted:
             cloudVadSpeechEvents += 1
+            didClientCommitFallback = false
+            clientSpeechActive = false
+            clientSpeechQuietSince = nil
             if userTranscriptChars == 0 {
                 publishListenHealth(
                     phase: .hearingYou,

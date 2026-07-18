@@ -1,4 +1,5 @@
 import SwiftUI
+import NovaCore
 import NovaDomain
 #if canImport(UIKit)
 import UIKit
@@ -438,7 +439,7 @@ public struct RootView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text("Build \(PatchNotesView.bundleVersion())")
+                    Text("Build \(NovaBuildStamp.id)")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }

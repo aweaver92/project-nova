@@ -130,9 +130,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     // rejects the whole session.update.
                     "turn_detection": config.enableServerVAD ? [
                         "type": "server_vad",
-                        "threshold": 0.25,
+                        // 0.125 is binary-exact (1/8) and more sensitive than 0.5,
+                        // without the "never ends" sticky behavior of threshold 0.0.
+                        "threshold": 0.125,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        "silence_duration_ms": 400,
                         "create_response": true,
                         "interrupt_response": true
                     ] as [String: Any] : NSNull(),
@@ -250,6 +252,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             // A failed send often means the socket is half-open — kick reconnect.
             if connected { await reconnect() }
             return false
+        }
+    }
+
+    public func commitInputAudio() async {
+        guard connected else { return }
+        do {
+            try await sendJSON(["type": "input_audio_buffer.commit"])
+        } catch {
+            metrics?.increment(.sendFailures)
+            NovaLog.ai.error("commitInputAudio failed: \(String(describing: error), privacy: .public)")
         }
     }
 

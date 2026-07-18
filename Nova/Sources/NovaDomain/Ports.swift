@@ -8,6 +8,8 @@ public protocol ConversationalAIProvider: Sendable {
     /// connected or a transport write failed) so callers can count drops/failures.
     @discardableResult
     func appendAudio(_ pcm16_24k: Data) async -> Bool
+    /// Manually commit the input audio buffer (client-side VAD / cloud-VAD fallback).
+    func commitInputAudio() async
     /// Explicitly ask the model to generate a reply to the committed input.
     func createResponse() async
     func interrupt() async
@@ -22,6 +24,7 @@ public protocol ConversationalAIProvider: Sendable {
 
 public extension ConversationalAIProvider {
     // Defaults keep older conformers (fakes/mocks) source-compatible.
+    func commitInputAudio() async {}
     func sendToolOutput(callId: String, outputJSON: String) async {}
     func sendUserText(_ text: String) async {}
 }

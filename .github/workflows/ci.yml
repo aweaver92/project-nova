@@ -170,9 +170,21 @@ jobs:
           STAMP=$(date -u +%m%d-%H%M)
           BUILD="${SHORT}-${STAMP}"
           echo "Stamping CURRENT_PROJECT_VERSION=$BUILD"
-          # XcodeGen picks this up as CFBundleVersion — visible in Settings → About.
+          # Info.plist version (AltStore often overwrites this on resign).
           sed -i '' "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"${BUILD}\"/" project.yml
+          # Compiled-in stamp that AltStore cannot rewrite — shown on Listen + Settings.
+          cat > Sources/NovaCore/NovaBuildStamp.swift <<EOF
+          import Foundation
+
+          /// Build identity baked into the binary at IPA compile time.
+          /// AltStore/SideStore often rewrite \`CFBundleVersion\` to \`1.0 (1)\`, so the
+          /// Listen banner and Settings must prefer this constant over the Info.plist.
+          public enum NovaBuildStamp {
+              public static let id = "${BUILD}"
+          }
+          EOF
           echo "NOVA_BUILD_STAMP=${BUILD}" >> "$GITHUB_ENV"
+          grep -n 'static let id' Sources/NovaCore/NovaBuildStamp.swift
       - name: Generate app project
         run: xcodegen generate
 

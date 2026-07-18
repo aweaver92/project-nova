@@ -1,11 +1,11 @@
-// Realtime cloud-path self-test.
+﻿// Realtime cloud-path self-test.
 //
 // Reproduces the Nova iOS app's OpenAI Realtime session END-TO-END from a dev
 // machine so we can validate the cloud path WITHOUT building/sideloading an IPA.
 //
 // It:
 //   1. Loads secrets from nova-bridge/.env.
-//   2. Generates REAL speech audio via OpenAI TTS (24 kHz mono PCM16) — synthetic
+//   2. Generates REAL speech audio via OpenAI TTS (24 kHz mono PCM16) â€” synthetic
 //      tones don't reliably trip server VAD, so we use actual spoken words.
 //   3. Mints an ephemeral Realtime secret through the bridge when it's running
 //      (exercising the real auth path); otherwise falls back to the raw key.
@@ -41,12 +41,12 @@ function loadEnv() {
 }
 
 function fail(msg) {
-  console.error(`\n❌ FAIL: ${msg}`);
+  console.error(`\nâŒ FAIL: ${msg}`);
   process.exit(1);
 }
 
 function ok(msg) {
-  console.log(`✅ ${msg}`);
+  console.log(`âœ… ${msg}`);
 }
 
 // Session shape MUST mirror OpenAIRealtimeProvider.openSocketUnrestricted.
@@ -65,9 +65,9 @@ function appSessionUpdate({ voice = "marin", instructions = "You are Nova." } = 
           noise_reduction: null,
           turn_detection: {
             type: "server_vad",
-            threshold: 0.25,
+            threshold: 0.125,
             prefix_padding_ms: 300,
-            silence_duration_ms: 500,
+            silence_duration_ms: 400,
             create_response: true,
             interrupt_response: true,
           },
@@ -83,7 +83,7 @@ function appSessionUpdate({ voice = "marin", instructions = "You are Nova." } = 
 }
 
 async function synthesizeSpeechPCM(apiKey, text) {
-  // response_format "pcm" → 24 kHz, 16-bit signed, mono, little-endian.
+  // response_format "pcm" â†’ 24 kHz, 16-bit signed, mono, little-endian.
   const res = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -126,7 +126,7 @@ async function mintEphemeral(env) {
     const j = await res.json();
     return j.value || null;
   } catch {
-    return null; // bridge not running — fall back to raw key
+    return null; // bridge not running â€” fall back to raw key
   }
 }
 
@@ -161,7 +161,7 @@ function runRealtime(authToken, pcm) {
       // too, or speech_stopped/commit/transcription never arrive).
       const bytesPerChunk = Math.floor(SAMPLE_RATE * 0.02) * 2;
       const silence = Buffer.alloc(bytesPerChunk);
-      const trailingSilenceChunks = 60; // 60 × 20 ms = 1.2 s
+      const trailingSilenceChunks = 80; // 60 Ã— 20 ms = 1.2 s
       let off = 0;
       let silenceLeft = trailingSilenceChunks;
       const iv = setInterval(() => {
@@ -246,7 +246,7 @@ async function main() {
   const apiKey = env.OPENAI_API_KEY;
   if (!apiKey) fail("OPENAI_API_KEY missing in nova-bridge/.env");
 
-  console.log("→ Generating real speech via OpenAI TTS…");
+  console.log("â†’ Generating real speech via OpenAI TTSâ€¦");
   const pcm = await synthesizeSpeechPCM(apiKey, SPOKEN_PROMPT);
   ok(`Speech ready: ${(pcm.length / 2 / SAMPLE_RATE).toFixed(2)}s of 24 kHz PCM16`);
 
@@ -255,10 +255,10 @@ async function main() {
   ok(
     ephemeral
       ? "Minted ephemeral secret via bridge (real auth path)"
-      : "Bridge not reachable — using raw API key"
+      : "Bridge not reachable â€” using raw API key"
   );
 
-  console.log("→ Opening Realtime socket with the app's session shape…");
+  console.log("â†’ Opening Realtime socket with the app's session shapeâ€¦");
   const r = await runRealtime(authToken, pcm);
 
   console.log("\n--- Results ---");
@@ -274,8 +274,9 @@ async function main() {
   if (!r.transcript) fail("No transcript produced");
   ok(`Transcript: "${r.transcript}"`);
 
-  console.log("\n🎉 PASS: cloud path healthy (VAD + transcription working).");
+  console.log("\nðŸŽ‰ PASS: cloud path healthy (VAD + transcription working).");
   process.exit(0);
 }
 
 main().catch((e) => fail(String(e?.stack || e)));
+
