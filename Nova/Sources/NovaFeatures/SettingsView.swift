@@ -185,6 +185,9 @@ public struct SettingsView: View {
                         Label("Patch Notes", systemImage: "sparkles")
                     }
                     LabeledContent("Version", value: PatchNotesView.bundleVersion())
+                    Text("If Listen fails, paste this Version line in chat so we know which IPA is installed.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("Settings")

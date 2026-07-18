@@ -62,10 +62,10 @@ function appSessionUpdate({ voice = "marin", instructions = "You are Nova." } = 
       audio: {
         input: {
           format: { type: "audio/pcm", rate: SAMPLE_RATE },
-          noise_reduction: { type: "near_field" },
+          noise_reduction: null,
           turn_detection: {
             type: "server_vad",
-            threshold: 0.5,
+            threshold: 0.25,
             prefix_padding_ms: 300,
             silence_duration_ms: 500,
             create_response: true,

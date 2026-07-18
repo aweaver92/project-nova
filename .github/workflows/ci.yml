@@ -164,6 +164,15 @@ jobs:
 
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Stamp build identity into the app version
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          STAMP=$(date -u +%m%d-%H%M)
+          BUILD="${SHORT}-${STAMP}"
+          echo "Stamping CURRENT_PROJECT_VERSION=$BUILD"
+          # XcodeGen picks this up as CFBundleVersion — visible in Settings → About.
+          sed -i '' "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"${BUILD}\"/" project.yml
+          echo "NOVA_BUILD_STAMP=${BUILD}" >> "$GITHUB_ENV"
       - name: Generate app project
         run: xcodegen generate
 
@@ -188,6 +197,8 @@ jobs:
             ls -R build/Build/Products || true
             exit 1
           fi
+          # Echo the stamped version so the Actions log matches Settings → About.
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" || true
           rm -rf Payload NovaApp.ipa
           mkdir Payload
           cp -R "$APP" Payload/

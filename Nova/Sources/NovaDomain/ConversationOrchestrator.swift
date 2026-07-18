@@ -122,6 +122,7 @@ public actor ConversationOrchestrator {
     private var micChunksAppendFailed = 0
     private var micBytesSent = 0
     private var micPeakHeard: Float = 0
+    private var outboundPeakHeard: Float = 0
     private var lastMicEnergyAt: ContinuousClock.Instant?
     private var lastChunkAt: ContinuousClock.Instant?
     private var userTranscriptChars = 0
@@ -675,6 +676,7 @@ public actor ConversationOrchestrator {
         micChunksAppendFailed = 0
         micBytesSent = 0
         micPeakHeard = 0
+        outboundPeakHeard = 0
         lastMicEnergyAt = nil
         lastChunkAt = nil
         userTranscriptChars = 0
@@ -736,6 +738,7 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
+                await self.noteOutboundPeak(pcm24)
                 guard await self.isCurrentStream(gen) else { return }
                 let sent = await self.ai.appendAudio(pcm24)
                 await self.noteAppendResult(sent: sent)
@@ -807,6 +810,11 @@ public actor ConversationOrchestrator {
                 publishListenHealth(phase: .hearingYou, detail: "Local mic energy detected")
             }
         }
+    }
+
+    private func noteOutboundPeak(_ pcm24: Data) {
+        let peak = Self.pcmPeak(pcm24)
+        if peak > outboundPeakHeard { outboundPeakHeard = peak }
     }
 
     private func noteAppendResult(sent: Bool) {
@@ -920,8 +928,9 @@ public actor ConversationOrchestrator {
                     ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
                     : "Cloud VAD never fired — check noise reduction / input sample rate (ws appends alone are not enough)"
                 let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
+                let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard))"
                 let message = """
-                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
+                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
                 """
                 lastError = message
                 onError?(message)

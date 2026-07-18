@@ -121,24 +121,21 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Phone mic / HFP close-talk is near-field. far_field NR was
-                    // suppressing speech so local energy looked fine but cloud VAD
-                    // never fired (ws appends OK, speech_started never arrived).
-                    "noise_reduction": ["type": "near_field"],
-                    // server_vad keys off energy and reliably emits speech_started;
-                    // semantic_vad can stay quiet on short/phone-mic turns.
+                    // Phone/HFP close-talk already has Voice Processing NS on-device.
+                    // Extra cloud NR was a common cause of "local energy, no VAD".
+                    "noise_reduction": NSNull(),
+                    // server_vad keys off energy and reliably emits speech_started.
+                    // threshold MUST be a binary-exact Double (0.25 / 0.5 / …) —
+                    // values like 0.35 JSON-encode with excess decimals and OpenAI
+                    // rejects the whole session.update.
                     "turn_detection": config.enableServerVAD ? [
                         "type": "server_vad",
-                        // Use a binary-exact Double (0.5). Values like 0.35 serialize
-                        // as long floats and OpenAI rejects them ("max decimal places").
-                        "threshold": 0.5,
+                        "threshold": 0.25,
                         "prefix_padding_ms": 300,
                         "silence_duration_ms": 500,
                         "create_response": true,
                         "interrupt_response": true
                     ] as [String: Any] : NSNull(),
-                    // gpt-4o-mini-transcribe is the GA-friendly Realtime input STT;
-                    // whisper-1 still works but mini has been more consistent here.
                     "transcription": [
                         "model": "gpt-4o-mini-transcribe",
                         "language": "en"

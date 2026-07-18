@@ -436,7 +436,11 @@ public struct RootView: View {
                         Text(conversation.listenHealth.detail)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    Text("Build \(PatchNotesView.bundleVersion())")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
                 }
                 .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
             }
