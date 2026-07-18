@@ -42,6 +42,8 @@ public enum NovaBridgeConfig {
 public actor NovaBridgeClient: AgentBridging {
     private let configProvider: @Sendable () async -> (url: URL?, token: String?)
     private let session: URLSession
+    /// Dedicated session for the live SSE run so Stop can invalidate it before a runId exists.
+    private var streamSession: URLSession?
     private static let streamTimeout: TimeInterval = 600
 
     public init(
@@ -158,14 +160,35 @@ public actor NovaBridgeClient: AgentBridging {
         request.timeoutInterval = Self.streamTimeout
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Avoid any intermediary treating this like a cached document download.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 120 // idle between SSE chunks / keepalives
+        config.timeoutIntervalForResource = Self.streamTimeout
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.waitsForConnectivity = false
+        let streamSession = URLSession(configuration: config)
+        self.streamSession = streamSession
+
         do {
-            let (bytes, response) = try await session.bytes(for: request)
+            let (bytes, response) = try await streamSession.bytes(for: request)
+            // Headers received — UI can leave the pre-connect spinner even before
+            // the first SSE data frame is parsed.
+            await onEvent(CodingStreamEvent(type: "status", status: "CONNECTED"))
+            await onEvent(CodingStreamEvent(
+                type: "activity",
+                text: "Bridge connected — starting agent…",
+                phase: "status",
+                done: false
+            ))
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 var data = Data()
                 for try await byte in bytes { data.append(byte) }
+                self.streamSession = nil
+                streamSession.finishTasksAndInvalidate()
                 let payload = String(decoding: data, as: UTF8.self)
                 if payload.first == "{" {
                     return BridgeResult(ok: false, payloadJSON: payload)
@@ -200,7 +223,7 @@ public actor NovaBridgeClient: AgentBridging {
                 }
                 if line.hasPrefix(":") { continue } // SSE comment / keepalive
                 if line.hasPrefix("data:") {
-                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
                     if !buffer.isEmpty { buffer += "\n" }
                     buffer += payload
                 }
@@ -217,6 +240,9 @@ public actor NovaBridgeClient: AgentBridging {
                 }
             }
 
+            self.streamSession = nil
+            streamSession.finishTasksAndInvalidate()
+
             let ok = sawDone && lastStatus == "finished"
             let payload: [String: Any] = [
                 "ok": ok,
@@ -228,6 +254,8 @@ public actor NovaBridgeClient: AgentBridging {
             let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             return BridgeResult(ok: ok, payloadJSON: String(decoding: data, as: UTF8.self))
         } catch {
+            self.streamSession = nil
+            streamSession.invalidateAndCancel()
             return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
         }
     }
@@ -240,6 +268,15 @@ public actor NovaBridgeClient: AgentBridging {
             body: [:],
             timeout: 30
         )
+    }
+
+    public func cancelActiveStream() async -> BridgeResult {
+        guard let streamSession else {
+            return BridgeResult(ok: true, payloadJSON: #"{"ok":true,"cancelled":false}"#)
+        }
+        self.streamSession = nil
+        streamSession.invalidateAndCancel()
+        return BridgeResult(ok: true, payloadJSON: #"{"ok":true,"cancelled":true}"#)
     }
 
     // MARK: - Repositories

@@ -686,6 +686,9 @@ public protocol AgentBridging: Sendable {
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult
     func cancelCursorRun(runId: String) async -> BridgeResult
+    /// Abort the in-flight SSE `/cursor/runs` HTTP stream (if any), even when we
+    /// do not yet have a Cursor `runId` (e.g. stuck before the first RUNNING event).
+    func cancelActiveStream() async -> BridgeResult
 
     func listRepos() async -> BridgeResult
     func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult
@@ -774,6 +777,9 @@ public extension AgentBridging {
     }
     func cancelCursorRun(runId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func cancelActiveStream() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"cancelled":false}"#)
     }
     func listRepos() async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)

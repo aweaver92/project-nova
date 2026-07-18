@@ -750,7 +750,22 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     })();
 
     console.log(`[cursor/runs] waiting for run ${runId}`);
-    const result = await run.wait();
+    // Heartbeat while wait() can sit silent for a long time (tools / thinking).
+    const waitHeartbeat = setInterval(() => {
+      write({
+        type: "activity",
+        phase: "status",
+        text: "Still working…",
+        detail: runId,
+        done: false,
+      });
+    }, 15_000);
+    let result: Awaited<ReturnType<typeof run.wait>>;
+    try {
+      result = await withTimeout("run_wait", run.wait(), 10 * 60_000);
+    } finally {
+      clearInterval(waitHeartbeat);
+    }
     await streamDrain.catch(() => undefined);
     console.log(`[cursor/runs] run ${runId} finished status=${result.status}`);
 
@@ -776,7 +791,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     console.log(`[cursor/runs] error: ${message}`);
     const friendly =
       message.includes("timeout_after_")
-        ? `Cursor agent setup timed out (${message}). Try New session, or restart nova-bridge if Dropbox/VPN is busy.`
+        ? `Cursor agent timed out (${message}). Tap New session and try again.`
         : message;
     write({ type: "error", error: friendly });
     write({

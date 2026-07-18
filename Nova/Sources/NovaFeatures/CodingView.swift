@@ -294,7 +294,6 @@ public struct CodingView: View {
                         Task { await coding.cancel() }
                     }
                     .font(.caption.weight(.semibold))
-                    .disabled(coding.activeRunId == nil)
                 }
             }
 

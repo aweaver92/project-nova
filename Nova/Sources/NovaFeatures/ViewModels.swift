@@ -1381,15 +1381,29 @@ public final class CodingViewModel {
         selectedRepoId = repoId
         let cwd = await settings.codingWorkingDirectory()
         workingDirectory = cwd ?? ""
+
+        // Relay SSE events onto MainActor via AsyncStream so the bridge actor's
+        // read loop never awaits MainActor directly (that deadlocks: send() is
+        // already waiting on streamCursorRun, so apply() never runs and the UI
+        // stays on "Connecting to bridge…").
+        let (eventStream, eventContinuation) = AsyncStream<CodingStreamEvent>.makeStream()
+        let applyTask = Task { [weak self] in
+            for await event in eventStream {
+                await self?.apply(event: event)
+            }
+        }
+
         let result = await bridge.streamCursorRun(
             command: effectiveCommand,
             images: images,
             sessionId: pinnedSessionId,
             workingDirectory: repoId == nil ? cwd : nil,
             repoId: repoId
-        ) { [weak self] event in
-            await self?.apply(event: event)
+        ) { event in
+            eventContinuation.yield(event)
         }
+        eventContinuation.finish()
+        await applyTask.value
 
         isRunning = false
         runStartedAt = nil
@@ -1407,6 +1421,11 @@ public final class CodingViewModel {
         } else if !result.ok {
             runStatus = "error"
             statusMessage = Self.summarize(result.payloadJSON)
+            // Surface transport failures in the transcript when no SSE error arrived.
+            if !items.contains(where: { $0.kind == .error }) {
+                items.append(CodingTranscriptItem(kind: .error, text: statusMessage))
+            }
+            upsertActivity(phase: "status", text: "Failed", detail: statusMessage, done: true)
         } else {
             runStatus = "idle"
         }
@@ -1415,8 +1434,12 @@ public final class CodingViewModel {
     }
 
     public func cancel() async {
-        guard let runId = activeRunId else { return }
-        _ = await bridge.cancelCursorRun(runId: runId)
+        // Always abort the HTTP stream first — activeRunId is only set after the
+        // first RUNNING event, which never arrives if SSE apply is wedged.
+        _ = await bridge.cancelActiveStream()
+        if let runId = activeRunId {
+            _ = await bridge.cancelCursorRun(runId: runId)
+        }
         runStatus = "cancelled"
         isRunning = false
         runStartedAt = nil
