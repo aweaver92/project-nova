@@ -160,76 +160,88 @@ public actor NovaBridgeClient: AgentBridging {
         request.timeoutInterval = Self.streamTimeout
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Avoid any intermediary treating this like a cached document download.
         request.cachePolicy = .reloadIgnoringLocalCacheData
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
+        // URLSession.bytes(for:) buffers the entire SSE body on device until the
+        // connection closes, which left Coding stuck on "Bridge connected…".
+        // A data-delegate session yields each TCP chunk immediately.
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 120 // idle between SSE chunks / keepalives
+        config.timeoutIntervalForRequest = 120
         config.timeoutIntervalForResource = Self.streamTimeout
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.waitsForConnectivity = false
-        let streamSession = URLSession(configuration: config)
+        config.httpAdditionalHeaders = ["Accept": "text/event-stream", "Cache-Control": "no-cache"]
+
+        let pump = SSEURLSessionPump()
+        let streamSession = URLSession(configuration: config, delegate: pump, delegateQueue: nil)
         self.streamSession = streamSession
+        let chunks = pump.chunks
+        streamSession.dataTask(with: request).resume()
 
         do {
-            let (bytes, response) = try await streamSession.bytes(for: request)
-            // Headers received — UI can leave the pre-connect spinner even before
-            // the first SSE data frame is parsed.
-            await onEvent(CodingStreamEvent(type: "status", status: "CONNECTED"))
-            await onEvent(CodingStreamEvent(
-                type: "activity",
-                text: "Bridge connected — starting agent…",
-                phase: "status",
-                done: false
-            ))
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                var data = Data()
-                for try await byte in bytes { data.append(byte) }
-                self.streamSession = nil
-                streamSession.finishTasksAndInvalidate()
-                let payload = String(decoding: data, as: UTF8.self)
-                if payload.first == "{" {
-                    return BridgeResult(ok: false, payloadJSON: payload)
-                }
-                return BridgeResult(
-                    ok: false,
-                    payloadJSON: #"{"ok":false,"error":"http_\#(http.statusCode)"}"#
-                )
-            }
-
-            var buffer = ""
+            var lineBuffer = ""
+            var eventBuffer = ""
             var lastSessionId = sessionId ?? ""
             var lastRunId = ""
             var lastStatus = "running"
             var lastResult = ""
             var sawDone = false
+            var sawHeaders = false
 
-            for try await line in bytes.lines {
-                if line.isEmpty {
-                    if let event = Self.parseSSEBuffer(buffer) {
-                        await onEvent(event)
-                        if event.type == "done" {
-                            sawDone = true
-                            lastSessionId = event.sessionId ?? lastSessionId
-                            lastRunId = event.runId ?? lastRunId
-                            lastStatus = event.status ?? lastStatus
-                            lastResult = event.result ?? lastResult
+            for try await chunk in chunks {
+                switch chunk {
+                case .response(let http):
+                    sawHeaders = true
+                    await onEvent(CodingStreamEvent(type: "status", status: "CONNECTED"))
+                    await onEvent(CodingStreamEvent(
+                        type: "activity",
+                        text: "Bridge connected — starting agent…",
+                        phase: "status",
+                        done: false
+                    ))
+                    if !(200..<300).contains(http.statusCode) {
+                        lastStatus = "http_error"
+                        lastResult = "http_\(http.statusCode)"
+                    }
+                case .data(let data):
+                    if lastStatus == "http_error" {
+                        lastResult += String(decoding: data, as: UTF8.self)
+                        continue
+                    }
+                    lineBuffer += String(decoding: data, as: UTF8.self)
+                    while let newline = lineBuffer.firstIndex(of: "\n") {
+                        var line = String(lineBuffer[..<newline])
+                        lineBuffer = String(lineBuffer[lineBuffer.index(after: newline)...])
+                        if line.hasSuffix("\r") { line.removeLast() }
+
+                        if line.isEmpty {
+                            if let event = Self.parseSSEBuffer(eventBuffer) {
+                                await onEvent(event)
+                                if event.type == "done" {
+                                    sawDone = true
+                                    lastSessionId = event.sessionId ?? lastSessionId
+                                    lastRunId = event.runId ?? lastRunId
+                                    lastStatus = event.status ?? lastStatus
+                                    lastResult = event.result ?? lastResult
+                                }
+                            }
+                            eventBuffer = ""
+                            continue
+                        }
+                        if line.hasPrefix(":") { continue }
+                        if line.hasPrefix("data:") {
+                            let payload = String(line.dropFirst(5))
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !eventBuffer.isEmpty { eventBuffer += "\n" }
+                            eventBuffer += payload
                         }
                     }
-                    buffer = ""
-                    continue
-                }
-                if line.hasPrefix(":") { continue } // SSE comment / keepalive
-                if line.hasPrefix("data:") {
-                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !buffer.isEmpty { buffer += "\n" }
-                    buffer += payload
                 }
             }
-            // Flush trailing buffer if the stream ended without a blank line.
-            if let event = Self.parseSSEBuffer(buffer) {
+
+            if let event = Self.parseSSEBuffer(eventBuffer) {
                 await onEvent(event)
                 if event.type == "done" {
                     sawDone = true
@@ -242,6 +254,21 @@ public actor NovaBridgeClient: AgentBridging {
 
             self.streamSession = nil
             streamSession.finishTasksAndInvalidate()
+
+            if lastStatus == "http_error" {
+                let body = lastResult
+                if let brace = body.firstIndex(of: "{") {
+                    return BridgeResult(ok: false, payloadJSON: String(body[brace...]))
+                }
+                let code = body.split(separator: "\n").first.map(String.init) ?? "http_error"
+                return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(code)"}"#)
+            }
+            if !sawHeaders {
+                return BridgeResult(
+                    ok: false,
+                    payloadJSON: #"{"ok":false,"error":"bridge_no_response","hint":"Bridge opened a socket but sent no HTTP response."}"#
+                )
+            }
 
             let ok = sawDone && lastStatus == "finished"
             let payload: [String: Any] = [
@@ -456,5 +483,85 @@ public actor NovaBridgeClient: AgentBridging {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
+    }
+}
+
+/// Incremental SSE reader. `URLSession.bytes` buffers the full body on iOS until
+/// the connection ends; this delegate yields each `didReceive data:` chunk so
+/// Coding can update while the agent is still running.
+private final class SSEURLSessionPump: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    enum Chunk: Sendable {
+        case response(HTTPURLResponse)
+        case data(Data)
+    }
+
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<Chunk, Error>.Continuation?
+    private var hasFinished = false
+
+    lazy var chunks: AsyncThrowingStream<Chunk, Error> = {
+        AsyncThrowingStream { continuation in
+            self.lock.lock()
+            self.continuation = continuation
+            self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.continuation = nil
+                self.lock.unlock()
+            }
+        }
+    }()
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        if let http = response as? HTTPURLResponse {
+            yield(.response(http))
+            completionHandler(.allow)
+        } else {
+            finish(throwing: URLError(.badServerResponse))
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !data.isEmpty else { return }
+        yield(.data(data))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        if let error {
+            finish(throwing: error)
+        } else {
+            finish(throwing: nil)
+        }
+    }
+
+    private func yield(_ chunk: Chunk) {
+        lock.lock()
+        let cont = continuation
+        lock.unlock()
+        cont?.yield(chunk)
+    }
+
+    private func finish(throwing error: (any Error)?) {
+        lock.lock()
+        guard !hasFinished else {
+            lock.unlock()
+            return
+        }
+        hasFinished = true
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        if let error {
+            cont?.finish(throwing: error)
+        } else {
+            cont?.finish()
+        }
     }
 }
