@@ -862,14 +862,9 @@ public actor ConversationOrchestrator {
         lastOutboundZcr = outboundZcrHeard
         let now = ContinuousClock.Instant.now
 
-        if assistantSpeaking {
-            return clientVAD.observeBargeIn(
-                peak: stats.peak,
-                zcr: outboundZcrHeard,
-                now: now
-            )
-        }
-
+        // Core turn VAD — ALWAYS runs (identical to the working build). Commit is
+        // gated on `!assistantSpeaking` at the health monitor and cleared on
+        // responseEnded, so this can never be starved by the barge-in path.
         if clientVAD.observe(
             peak: stats.peak,
             zcr: outboundZcrHeard,
@@ -877,6 +872,16 @@ public actor ConversationOrchestrator {
             now: now
         ) == .commit {
             pendingClientCommit = true
+        }
+
+        // Voice barge-in is purely additive: sustained mic energy while the
+        // assistant is talking (AEC removes Nova's own voice from the mic).
+        if assistantSpeaking {
+            return clientVAD.observeBargeIn(
+                peak: stats.peak,
+                zcr: outboundZcrHeard,
+                now: now
+            )
         }
         return false
     }
@@ -916,21 +921,9 @@ public actor ConversationOrchestrator {
 
         let now = ContinuousClock.Instant.now
         if assistantSpeaking {
-            // Health poll is a backup barge-in path when chunk timing is sparse.
-            if clientVAD.observeBargeIn(
-                peak: max(liveLevel, lastOutboundPeak),
-                zcr: lastOutboundZcr,
-                now: now
-            ) {
-                await handleBargeIn()
-                publishListenHealth(
-                    phase: .hearingYou,
-                    micLevel: liveLevel,
-                    inputRoute: route,
-                    detail: "Voice barge-in — listening…"
-                )
-                return
-            }
+            // Barge-in is driven from the per-chunk ingress path (accurate mic
+            // energy). The health poll only reports state so it cannot false-fire
+            // on a stale level and cut Nova off.
             publishListenHealth(
                 phase: .speaking,
                 micLevel: liveLevel,
