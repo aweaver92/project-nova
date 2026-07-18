@@ -476,7 +476,8 @@ final class WakeWordTests: XCTestCase {
         try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
         let connected = await waitUntil { await provider.connectCount == 1 }
         XCTAssertTrue(connected)
-        XCTAssertTrue(await orch.isStreaming)
+        let streamingBefore = await orch.isStreaming
+        XCTAssertTrue(streamingBefore)
 
         await provider.emit(.error(message: "Realtime disconnected (reconnect attempts exhausted)"))
         let stopped = await waitUntil { await orch.isStreaming == false }
