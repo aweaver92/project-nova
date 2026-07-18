@@ -129,7 +129,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     // semantic_vad can stay quiet on short/phone-mic turns.
                     "turn_detection": config.enableServerVAD ? [
                         "type": "server_vad",
-                        "threshold": 0.35,
+                        // Use a binary-exact Double (0.5). Values like 0.35 serialize
+                        // as long floats and OpenAI rejects them ("max decimal places").
+                        "threshold": 0.5,
                         "prefix_padding_ms": 300,
                         "silence_duration_ms": 500,
                         "create_response": true,
