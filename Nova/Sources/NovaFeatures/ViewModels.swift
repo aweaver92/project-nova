@@ -1612,9 +1612,9 @@ public final class CodingViewModel {
         // already waiting on streamCursorRun, so apply() never runs and the UI
         // stays on "Connecting to bridge…").
         let (eventStream, eventContinuation) = AsyncStream<CodingStreamEvent>.makeStream()
-        let applyTask = Task { [weak self] in
+        let applyTask = Task { @MainActor [weak self] in
             for await event in eventStream {
-                await self?.apply(event: event, generation: generation)
+                self?.apply(event: event, generation: generation)
             }
         }
 
