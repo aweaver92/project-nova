@@ -171,7 +171,9 @@ public struct RootView: View {
                 if session.registrationState == .registered {
                     visionSection
                 }
-                if showTranscript {
+                // Always show live transcript while Listen is on so mic/STT
+                // failures are visible without hunting for the bubble toggle.
+                if showTranscript || conversation.isRunning {
                     conversationSection
                     suggestionsSection
                 }
@@ -189,10 +191,16 @@ public struct RootView: View {
                         .accessibilityHidden(true)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showTranscript.toggle() } label: {
-                        Image(systemName: showTranscript ? "text.bubble.fill" : "text.bubble")
+                    Button {
+                        if conversation.isRunning {
+                            showTranscript = true
+                        } else {
+                            showTranscript.toggle()
+                        }
+                    } label: {
+                        Image(systemName: (showTranscript || conversation.isRunning) ? "text.bubble.fill" : "text.bubble")
                     }
-                    .accessibilityLabel(showTranscript ? "Hide chat transcript" : "Show chat transcript")
+                    .accessibilityLabel("Show chat transcript")
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                     }
@@ -344,6 +352,7 @@ public struct RootView: View {
                         } else if settings.realtimeMintBlocked {
                             showRealtimeWarning = true
                         } else {
+                            showTranscript = true
                             await conversation.start()
                         }
                     }
@@ -378,26 +387,88 @@ public struct RootView: View {
                 .accessibilityLabel(recording.isRecording ? "Stop voice recording" : "Begin voice recording")
             }
             .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+
+            if conversation.isRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Circle()
+                            .fill(listenHealthColor)
+                            .frame(width: 8, height: 8)
+                        Text(conversation.listenHealth.statusLabel)
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        Text(conversation.listenHealth.inputRoute)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.secondary.opacity(0.15))
+                            Capsule()
+                                .fill(listenHealthColor.opacity(0.85))
+                                .frame(width: max(4, geo.size.width * CGFloat(min(1, conversation.listenHealth.micLevel * 4))))
+                        }
+                    }
+                    .frame(height: 8)
+                    if !conversation.listenHealth.detail.isEmpty {
+                        Text(conversation.listenHealth.detail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
+            }
+
+            if let error = conversation.errorMessage, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+        } footer: {
+            if conversation.isRunning {
+                Text("Watch the mic meter and transcript below. If the meter stays flat, Nova cannot hear. If the meter moves but no You: line appears, cloud STT is stuck.")
+            }
+        }
+    }
+
+    private var listenHealthColor: Color {
+        switch conversation.listenHealth.phase {
+        case .hearingYou, .speaking: return .green
+        case .waitingForSpeech, .connecting: return .orange
+        case .micSilent, .streamStalled, .cloudQuiet, .error: return .red
+        case .idle: return .secondary
         }
     }
 
     private var conversationSection: some View {
         Section {
-            if conversation.transcriptLines.isEmpty {
+            if conversation.transcript.isEmpty {
                 ContentUnavailableView {
-                    Label("Waiting", systemImage: "text.bubble")
+                    Label(conversation.isRunning ? "Listening…" : "Conversation", systemImage: "text.bubble")
                 } description: {
-                    Text("Listen is on — speak toward the phone mic. Wake word is optional in this mode.")
+                    Text(
+                        conversation.isRunning
+                            ? "Speak now. Your words should appear here as You: …"
+                            : "Tap Listen, then speak. Transcripts stay visible so you can verify the mic."
+                    )
                 }
                 .listRowBackground(Color.clear)
             } else {
-                ForEach(Array(conversation.transcriptLines.enumerated()), id: \.offset) { _, line in
-                    transcriptBubble(for: line)
+                ForEach(conversation.transcript) { line in
+                    transcriptBubble(line)
                         .listRowSeparator(.hidden)
+                }
+                if conversation.isRunning {
+                    Button("Clear transcript") {
+                        conversation.clearTranscript()
+                    }
+                    .font(.caption)
                 }
             }
         } header: {
-            Text("Conversation")
+            Text("Live transcript")
         }
     }
 
@@ -505,22 +576,28 @@ public struct RootView: View {
     // MARK: - Transcript
 
     @ViewBuilder
-    private func transcriptBubble(for line: String) -> some View {
-        let parts = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-        let role = parts.first.map { String($0).trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
-        let text = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : line
-        let isAssistant = role.hasPrefix("assistant") || role.hasPrefix("system")
-        HStack(alignment: .top) {
-            if !isAssistant { Spacer(minLength: 40) }
-            Text(text)
-                .font(.caption)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    isAssistant ? Color.gray.opacity(0.15) : Color.accentColor.opacity(0.18),
-                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                )
-            if isAssistant { Spacer(minLength: 40) }
+    private func transcriptBubble(_ line: ConversationTranscriptLine) -> some View {
+        let isAssistant = line.role == .assistant
+        let isSystem = line.role == .system
+        VStack(alignment: isAssistant || isSystem ? .leading : .trailing, spacing: 2) {
+            Text(isSystem ? "Diag" : (isAssistant ? "Nova" : "You"))
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(isSystem ? .orange : (isAssistant ? .secondary : .accentColor))
+            HStack(alignment: .top) {
+                if !isAssistant && !isSystem { Spacer(minLength: 36) }
+                Text(line.text)
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        isSystem
+                            ? Color.orange.opacity(0.12)
+                            : (isAssistant ? Color.gray.opacity(0.15) : Color.accentColor.opacity(0.18)),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    )
+                if isAssistant || isSystem { Spacer(minLength: 36) }
+            }
         }
     }
 

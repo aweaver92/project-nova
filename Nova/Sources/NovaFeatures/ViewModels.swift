@@ -75,10 +75,26 @@ public final class SessionViewModel {
     public func endSession() async { await session.stop() }
 }
 
+public struct ConversationTranscriptLine: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let role: ConversationTurn.Role
+    public var text: String
+
+    public init(id: UUID = UUID(), role: ConversationTurn.Role, text: String) {
+        self.id = id
+        self.role = role
+        self.text = text
+    }
+
+    public var legacyLine: String { "\(role.rawValue): \(text)" }
+}
+
 @MainActor
 @Observable
 public final class ConversationViewModel {
-    public private(set) var transcriptLines: [String] = []
+    public private(set) var transcript: [ConversationTranscriptLine] = []
+    /// Compatibility mirror of `transcript` for older call sites.
+    public var transcriptLines: [String] { transcript.map(\.legacyLine) }
     public private(set) var isRunning = false
     public private(set) var isAssistantSpeaking = false
     public private(set) var errorMessage: String?
@@ -86,6 +102,7 @@ public final class ConversationViewModel {
     public private(set) var latencyGateStatus: String = "Pending"
     public private(set) var latencyGateDetail: String = ""
     public private(set) var usageHint: String = ""
+    public private(set) var listenHealth = ListenHealth()
     /// Tappable follow-up suggestions from the last exchange.
     public private(set) var suggestions: [String] = []
 
@@ -141,6 +158,11 @@ public final class ConversationViewModel {
                 self?.refreshLatency()
             }
         }
+        await orchestrator.setListenHealthHandler { health in
+            Task { @MainActor [weak self] in
+                self?.listenHealth = health
+            }
+        }
         do {
             var config = AISessionConfig()
             if let settings {
@@ -152,6 +174,7 @@ public final class ConversationViewModel {
             if !config.useLocalWakeWord {
                 config.requireWakeWord = false
             }
+            listenHealth = ListenHealth(phase: .connecting, detail: "Starting Realtime…")
             try await orchestrator.start(config: config)
             isRunning = true
             usage?.markSessionStarted()
@@ -159,17 +182,19 @@ public final class ConversationViewModel {
             refreshUsage()
         } catch {
             errorMessage = String(describing: error)
+            listenHealth = ListenHealth(phase: .error, detail: String(describing: error))
             isRunning = false
         }
     }
 
     private func appendTranscript(_ text: String, role: ConversationTurn.Role) {
-        if currentTranscriptRole == role, let last = transcriptLines.last {
-            transcriptLines[transcriptLines.count - 1] = last + text
+        if currentTranscriptRole == role, var last = transcript.last, last.role == role {
+            last.text += text
+            transcript[transcript.count - 1] = last
         } else {
             // A fresh user turn invalidates the previous reply's suggestions.
             if role == .user { suggestions = [] }
-            transcriptLines.append("\(role.rawValue): \(text)")
+            transcript.append(ConversationTranscriptLine(role: role, text: text))
             currentTranscriptRole = role
         }
     }
@@ -184,9 +209,16 @@ public final class ConversationViewModel {
         await orchestrator.stop()
         isRunning = false
         isAssistantSpeaking = false
+        listenHealth = ListenHealth(phase: .idle, detail: "Listen stopped")
         usage?.markSessionStopped()
         refreshLatency()
         refreshUsage()
+    }
+
+    public func clearTranscript() {
+        transcript = []
+        currentTranscriptRole = nil
+        suggestions = []
     }
 
     public func bargeIn() async {

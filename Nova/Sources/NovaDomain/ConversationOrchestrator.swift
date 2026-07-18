@@ -97,14 +97,26 @@ public actor ConversationOrchestrator {
     /// fallbacks don't double-trigger a response.
     private var utteranceEpoch = 0
     private var speechStoppedFallbackTask: Task<Void, Never>?
+    private var listenHealthTask: Task<Void, Never>?
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
     private var onError: (@Sendable (String) -> Void)?
     private var onMetricsTick: (@Sendable () -> Void)?
+    private var onListenHealth: (@Sendable (ListenHealth) -> Void)?
 
     /// Last transport/session error surfaced to the UI (nil while healthy).
     public private(set) var lastError: String?
+    public private(set) var listenHealth = ListenHealth()
+    private var micChunksSent = 0
+    private var micBytesSent = 0
+    private var micPeakHeard: Float = 0
+    private var lastMicEnergyAt: ContinuousClock.Instant?
+    private var lastChunkAt: ContinuousClock.Instant?
+    private var userTranscriptChars = 0
+    private var didFailoverMicRoute = false
+    private var didAnnounceMicSilent = false
+    private var didAnnounceCloudQuiet = false
 
     public init(
         ai: any ConversationalAIProvider,
@@ -197,6 +209,10 @@ public actor ConversationOrchestrator {
     /// Invoked after meaningful latency samples (completed turns, barge-in, transport events).
     public func setMetricsTickHandler(_ handler: (@Sendable () -> Void)?) {
         onMetricsTick = handler
+    }
+
+    public func setListenHealthHandler(_ handler: (@Sendable (ListenHealth) -> Void)?) {
+        onListenHealth = handler
     }
 
     /// Inject a user-authored text turn (e.g. a tapped follow-up suggestion) and
@@ -536,12 +552,26 @@ public actor ConversationOrchestrator {
         }
         streaming = true
         lastActivity = .now
+        micChunksSent = 0
+        micBytesSent = 0
+        micPeakHeard = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = nil
+        userTranscriptChars = 0
+        didFailoverMicRoute = false
+        didAnnounceMicSilent = false
+        didAnnounceCloudQuiet = false
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            detail: "Realtime connected — speak naturally."
+        )
 
         ingressTask = Task { [weak self] in
             guard let self else { return }
             for await chunk in await self.ingress.chunks {
                 // Queue wait: time from capture callback to orchestrator processing.
                 await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
+                await self.noteMicChunk(chunk)
 
                 // Recording is best-effort and must not stall the mic→WS path.
                 if let voiceRecorder = self.voiceRecorder {
@@ -567,6 +597,7 @@ public actor ConversationOrchestrator {
             }
         }
 
+        startListenHealthMonitor()
         startIdleMonitorIfNeeded()
 
         // NB: we deliberately do NOT pre-warm the glasses camera here. The camera
@@ -587,9 +618,11 @@ public actor ConversationOrchestrator {
         ingressTask?.cancel()
         idleTask?.cancel()
         speechStoppedFallbackTask?.cancel()
+        listenHealthTask?.cancel()
         ingressTask = nil
         idleTask = nil
         speechStoppedFallbackTask = nil
+        listenHealthTask = nil
         await ingress.stop()
         await egress.stop()
         await ai.disconnect()
@@ -602,6 +635,186 @@ public actor ConversationOrchestrator {
         streaming = false
         toolTask?.cancel()
         toolTask = nil
+        publishListenHealth(phase: .idle, detail: "Listen stopped")
+    }
+
+    private func noteMicChunk(_ chunk: AudioChunk) {
+        lastChunkAt = .now
+        micChunksSent += 1
+        micBytesSent += chunk.pcm.count
+        let peak = Self.pcmPeak(chunk.pcm)
+        if peak > micPeakHeard { micPeakHeard = peak }
+        if peak >= 0.02 {
+            lastMicEnergyAt = .now
+            if listenHealth.phase == .waitingForSpeech || listenHealth.phase == .micSilent {
+                publishListenHealth(phase: .hearingYou, detail: "Local mic energy detected")
+            }
+        }
+    }
+
+    private func startListenHealthMonitor() {
+        listenHealthTask?.cancel()
+        listenHealthTask = Task { [weak self] in
+            guard let self else { return }
+            // Give the session a moment to settle after connect.
+            try? await Task.sleep(for: .seconds(2))
+            while !Task.isCancelled {
+                await self.evaluateListenHealth()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
+
+    private func evaluateListenHealth() async {
+        guard streaming, isRunning else { return }
+        let route: String
+        let liveLevel: Float
+        if let mic = ingress as? any MicRouteControlling {
+            route = await mic.inputRouteLabel()
+            liveLevel = await mic.peakLevel()
+        } else {
+            route = "unknown"
+            liveLevel = micPeakHeard
+        }
+
+        let now = ContinuousClock.Instant.now
+        if assistantSpeaking {
+            publishListenHealth(
+                phase: .speaking,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Playing assistant audio"
+            )
+            return
+        }
+
+        if micChunksSent == 0 || lastChunkAt == nil {
+            publishListenHealth(
+                phase: .streamStalled,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "No mic chunks yet — check Mic permission and audio route."
+            )
+            return
+        }
+
+        if let lastChunkAt, now - lastChunkAt > .seconds(1.5) {
+            publishListenHealth(
+                phase: .streamStalled,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Mic stream stalled after \(micChunksSent) chunks on \(route)."
+            )
+            return
+        }
+
+        let heardRecently = lastMicEnergyAt.map { now - $0 < .seconds(1.2) } ?? false
+        if !heardRecently, micPeakHeard < 0.02, now - (lastChunkAt ?? now) < .seconds(1) {
+            // Chunks flowing but digital silence — try alternate input once.
+            if !didFailoverMicRoute, let mic = ingress as? any MicRouteControlling {
+                didFailoverMicRoute = true
+                onTranscript?(
+                    "[diag] Mic is open but silent on \(route). Switching input and retrying…",
+                    .system
+                )
+                await mic.flipPreferredInput()
+                publishListenHealth(
+                    phase: .micSilent,
+                    micLevel: liveLevel,
+                    inputRoute: await mic.inputRouteLabel(),
+                    detail: "Silent input — flipped mic route. Speak again."
+                )
+                return
+            }
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                let message = """
+                Mic route \(route) is open but silent. Speak louder, check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
+            publishListenHealth(
+                phase: .micSilent,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Chunks=\(micChunksSent) peak=\(String(format: "%.3f", micPeakHeard)) — no speech energy."
+            )
+            return
+        }
+
+        if heardRecently || micPeakHeard >= 0.02 {
+            if userTranscriptChars == 0,
+               let energyAt = lastMicEnergyAt,
+               now - energyAt > .seconds(5),
+               !didAnnounceCloudQuiet
+            {
+                didAnnounceCloudQuiet = true
+                let message = """
+                Hearing you on \(route), but no cloud transcript yet. Realtime STT may be stuck — Stop and Listen again. Bridge token mint is OK if Listen stayed green.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+                publishListenHealth(
+                    phase: .cloudQuiet,
+                    micLevel: liveLevel,
+                    inputRoute: route,
+                    detail: message
+                )
+                return
+            }
+            publishListenHealth(
+                phase: userTranscriptChars > 0 ? .hearingYou : .hearingYou,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: userTranscriptChars > 0
+                    ? "Transcript active (\(userTranscriptChars) chars)"
+                    : "Local energy OK — waiting for transcript…"
+            )
+            return
+        }
+
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            micLevel: liveLevel,
+            inputRoute: route,
+            detail: "Route \(route) · chunks \(micChunksSent)"
+        )
+    }
+
+    private func publishListenHealth(
+        phase: ListenHealth.Phase,
+        micLevel: Float? = nil,
+        inputRoute: String? = nil,
+        detail: String
+    ) {
+        var next = listenHealth
+        next.phase = phase
+        next.micLevel = micLevel ?? next.micLevel
+        next.peakHeard = micPeakHeard
+        next.inputRoute = inputRoute ?? next.inputRoute
+        next.chunksSent = micChunksSent
+        next.bytesSent = micBytesSent
+        next.userTranscriptChars = userTranscriptChars
+        next.detail = detail
+        listenHealth = next
+        onListenHealth?(next)
+        onMetricsTick?()
+    }
+
+    private static func pcmPeak(_ pcm16: Data) -> Float {
+        guard pcm16.count >= 2 else { return 0 }
+        var peak: Int16 = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+            }
+        }
+        return Float(peak) / Float(Int16.max)
     }
 
     /// Only relevant in wake-word-gated mode: after `streamIdleTimeout` of silence
@@ -657,11 +870,24 @@ public actor ConversationOrchestrator {
         switch event {
         case .inputTranscript(let delta):
             inputTranscript += delta
+            userTranscriptChars += delta.count
             onTranscript?(delta, .user)
+            if listenHealth.phase != .hearingYou && listenHealth.phase != .speaking {
+                publishListenHealth(phase: .hearingYou, detail: "Cloud transcript arriving")
+            }
         case .inputTranscriptionCompleted(let transcript):
             utteranceEpoch &+= 1
             speechStoppedFallbackTask?.cancel()
             speechStoppedFallbackTask = nil
+            userTranscriptChars += transcript.count
+            if !transcript.isEmpty {
+                // Completed events sometimes arrive without deltas — surface the
+                // full turn so the UI is never blank when STT succeeded.
+                if inputTranscript.isEmpty {
+                    onTranscript?(transcript, .user)
+                }
+                publishListenHealth(phase: .hearingYou, detail: "Heard: \(transcript.prefix(80))")
+            }
             await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
             outputTranscript += delta

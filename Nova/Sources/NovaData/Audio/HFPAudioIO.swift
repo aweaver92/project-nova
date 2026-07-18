@@ -5,7 +5,7 @@ import NovaDomain
 
 #if os(iOS)
 /// Captures mono PCM from the active HFP route (glasses mic when preferred).
-public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
+public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @unchecked Sendable {
     /// ~1s of newest audio at ~20 ms/chunk; older chunks are dropped under backpressure.
     public static let chunkBufferCapacity = 48
 
@@ -17,6 +17,8 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private var running = false
     private var recoveryGeneration = 0
+    private var lastPeak: Float = 0
+    private var flippedOnce = false
 
     // Recreated on every `start()` so the mic feed can be torn down and brought
     // back within a single app run (e.g. switching agents reconnects the stream).
@@ -30,9 +32,40 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         self.continuation = cont
     }
 
+    public func peakLevel() async -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPeak
+    }
+
+    public func inputRouteLabel() async -> String {
+        AudioSessionCoordinator.currentInputDescription()
+    }
+
+    public func flipPreferredInput() async {
+        lock.lock()
+        if flippedOnce {
+            lock.unlock()
+            return
+        }
+        flippedOnce = true
+        lock.unlock()
+        let next = !coordinator.preferBuiltInMicEnabled()
+        coordinator.setPreferBuiltInMic(next)
+        NovaLog.audio.warning(
+            "Silent mic failover → preferBuiltIn=\(next, privacy: .public); restarting capture"
+        )
+        recover()
+    }
+
     public func start() async throws {
         lock.lock()
         running = true
+        flippedOnce = false
+        lastPeak = 0
+        // Each Listen session starts HFP-first (early working default). Silence
+        // diagnostics may flip once to the built-in mic during the session.
+        coordinator.setPreferBuiltInMic(false)
         // A fresh stream per engage. `stop()` finishes the previous continuation,
         // and yielding into a finished continuation silently drops audio — which
         // previously killed transcription for good after the first teardown
@@ -47,20 +80,21 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         try await coordinator.activateConversationalHFP()
         try installTapAndStartEngine()
         registerObservers()
-        NovaLog.audio.info("HFP ingress started")
+        NovaLog.audio.info("HFP ingress started (\(AudioSessionCoordinator.currentInputDescription(), privacy: .public))")
     }
 
     private func installTapAndStartEngine() throws {
         let input = engine.inputNode
-        // Voice-Processing AEC can mute far-field speech when capture is on the
-        // phone mic (our preferred route with glasses HFP often silent). Keep VP
-        // off so Listen actually hears the user; server-side NR handles noise.
-        if input.isVoiceProcessingEnabled {
+        // Enable the Voice-Processing I/O unit (AEC + noise suppression + AGC).
+        // Must be toggled while the engine is stopped; guard against redundant
+        // re-enables on route-change/interruption recovery. Early working builds
+        // used VP on the HFP path.
+        if !input.isVoiceProcessingEnabled {
             do {
-                try input.setVoiceProcessingEnabled(false)
-                NovaLog.audio.info("Voice processing disabled for phone-mic capture")
+                try input.setVoiceProcessingEnabled(true)
+                NovaLog.audio.info("Voice processing (AEC/NS/AGC) enabled")
             } catch {
-                NovaLog.audio.warning("Could not disable voice processing: \(String(describing: error), privacy: .public)")
+                NovaLog.audio.warning("Voice processing unavailable: \(String(describing: error), privacy: .public)")
             }
         }
         input.removeTap(onBus: 0)
@@ -200,14 +234,31 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
 
     private func emit(_ data: Data, capturedAt: ContinuousClock.Instant) {
         guard !data.isEmpty else { return }
+        let peak = Self.peakLevel(of: data)
         lock.lock()
         let sink = continuation
         let alive = running
+        // Smooth the meter so UI isn't flicker-y, but keep peaks responsive.
+        lastPeak = max(peak, lastPeak * 0.85)
         lock.unlock()
         guard alive, let sink else { return }
         // bufferingNewest drops oldest under backpressure; yield's discarded
         // value isn't exposed, so queue lag is observed via t_mic_queue_wait.
         sink.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
+    }
+
+    /// Peak absolute sample as 0...1 for the mic meter.
+    private static func peakLevel(of pcm16: Data) -> Float {
+        guard pcm16.count >= 2 else { return 0 }
+        var peak: Int16 = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+            }
+        }
+        return Float(peak) / Float(Int16.max)
     }
 
     private static func int16Data(from buffer: AVAudioPCMBuffer) -> Data {
@@ -313,7 +364,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     }
 }
 #else
-public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
+public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @unchecked Sendable {
     public let chunks: AsyncStream<AudioChunk>
     private let continuation: AsyncStream<AudioChunk>.Continuation
     public init(coordinator: AudioSessionCoordinator, metrics: (any LatencyMetricsRecorder)? = nil) {
@@ -323,6 +374,9 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
     public func start() async throws {}
     public func stop() async { continuation.finish() }
+    public func peakLevel() async -> Float { 0 }
+    public func inputRouteLabel() async -> String { "unavailable" }
+    public func flipPreferredInput() async {}
 }
 
 public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
