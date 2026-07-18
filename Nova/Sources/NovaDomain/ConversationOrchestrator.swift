@@ -87,9 +87,16 @@ public actor ConversationOrchestrator {
     // One-shot guard so a spoken follow-up offer doesn't itself trigger another
     // round of follow-up generation (which would loop).
     private var skipFollowUpOnce = false
+    // Serializes tool dispatch without blocking the provider event loop.
+    private var toolTask: Task<Void, Never>?
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
+    private var onError: (@Sendable (String) -> Void)?
+    private var onMetricsTick: (@Sendable () -> Void)?
+
+    /// Last transport/session error surfaced to the UI (nil while healthy).
+    public private(set) var lastError: String?
 
     public init(
         ai: any ConversationalAIProvider,
@@ -163,6 +170,15 @@ public actor ConversationOrchestrator {
         onSuggestions = handler
     }
 
+    public func setErrorHandler(_ handler: (@Sendable (String) -> Void)?) {
+        onError = handler
+    }
+
+    /// Invoked after meaningful latency samples (completed turns, barge-in, transport events).
+    public func setMetricsTickHandler(_ handler: (@Sendable () -> Void)?) {
+        onMetricsTick = handler
+    }
+
     /// Inject a user-authored text turn (e.g. a tapped follow-up suggestion) and
     /// let the model reply. No-op while the cloud stream is closed.
     public func sendUserText(_ text: String) async {
@@ -173,35 +189,59 @@ public actor ConversationOrchestrator {
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
         guard !isRunning else { return }
         isRunning = true
+        lastError = nil
         sessionConfig = config
         lastEngagement = nil
         listeningSuspended = false
-        await loadAgentRoster()
-        let activeWake = activeAgent?.wakeWord ?? config.wakeWord
-        detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
+        do {
+            await loadAgentRoster()
+            let activeWake = activeAgent?.wakeWord ?? config.wakeWord
+            detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
 
-        // Single, long-lived consumer of provider events. It must outlive
-        // individual engage/disengage cycles because the provider's event stream
-        // supports only one consumer and persists across reconnects.
-        eventTask = Task { [weak self] in
-            guard let self else { return }
-            for await event in await self.ai.events {
-                await self.handle(event)
+            // Single, long-lived consumer of provider events. It must outlive
+            // individual engage/disengage cycles because the provider's event stream
+            // supports only one consumer and persists across reconnects.
+            eventTask = Task { [weak self] in
+                guard let self else { return }
+                for await event in await self.ai.events {
+                    await self.handle(event)
+                }
             }
-        }
 
-        // On-device wake-word gating: stay off the cloud until "Nova" is heard.
-        // Falls back to always-on streaming if no listener is wired or if the
-        // local listener fails to start.
-        if config.useLocalWakeWord, let listener = wakeWordListener {
-            do {
-                try await beginLocalListening(listener)
-                return
-            } catch {
-                NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+            // On-device wake-word gating: stay off the cloud until "Nova" is heard.
+            // Falls back to always-on streaming if no listener is wired or if the
+            // local listener fails to start.
+            if config.useLocalWakeWord, let listener = wakeWordListener {
+                do {
+                    try await beginLocalListening(listener)
+                    return
+                } catch {
+                    NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+                }
             }
+            try await beginStreaming(config)
+        } catch {
+            await cleanupFailedStart()
+            throw error
         }
-        try await beginStreaming(config)
+    }
+
+    /// Reset `isRunning` and tear down partial state so a subsequent `start()`
+    /// can retry after a credential/mic/connect failure.
+    private func cleanupFailedStart() async {
+        metrics.increment(.sessionFailures)
+        let message = "Voice session failed to start"
+        lastError = message
+        onError?(message)
+        isRunning = false
+        detectionTask?.cancel()
+        detectionTask = nil
+        await wakeWordListener?.stop()
+        await teardownStreaming()
+        eventTask?.cancel()
+        eventTask = nil
+        toolTask?.cancel()
+        toolTask = nil
     }
 
     public func stop() async {
@@ -464,27 +504,42 @@ public actor ConversationOrchestrator {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
         }
         try await ai.connect(config: effective)
-        try await ingress.start()
+        do {
+            try await ingress.start()
+        } catch {
+            await ai.disconnect()
+            throw error
+        }
         streaming = true
         lastActivity = .now
 
         ingressTask = Task { [weak self] in
             guard let self else { return }
             for await chunk in await self.ingress.chunks {
-                let t0 = chunk.capturedAt
-                // Tee the untouched mic feed to the voice recorder first (no-op
-                // while idle) so a saved memo matches what the glasses heard.
+                // Queue wait: time from capture callback to orchestrator processing.
+                await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
+
+                // Recording is best-effort and must not stall the mic→WS path.
                 if let voiceRecorder = self.voiceRecorder {
-                    await voiceRecorder.append(chunk)
+                    let tee = chunk
+                    Task { await voiceRecorder.append(tee) }
                 }
+
                 let pcm24: Data
                 if chunk.sampleRate == 24_000 {
                     pcm24 = chunk.pcm
                 } else {
+                    let resampleStart = ContinuousClock.Instant.now
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
+                    await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
-                await self.ai.appendAudio(pcm24)
-                await self.metrics.mark(.micToWS, startedAt: t0)
+                let sent = await self.ai.appendAudio(pcm24)
+                if sent {
+                    // End-to-end: capture → socket send completion.
+                    await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
+                } else {
+                    await self.metrics.increment(.droppedMicChunks)
+                }
             }
         }
 
@@ -519,6 +574,8 @@ public actor ConversationOrchestrator {
         }
         assistantSpeaking = false
         streaming = false
+        toolTask?.cancel()
+        toolTask = nil
     }
 
     /// Only relevant in wake-word-gated mode: after `streamIdleTimeout` of silence
@@ -615,6 +672,7 @@ public actor ConversationOrchestrator {
                 inputTranscript = ""
             }
             await requestFollowUps()
+            onMetricsTick?()
         case .speechStarted:
             // Anchor the grace window at the start of the user's turn. If we were
             // already inside the listening window, the user beginning a new turn
@@ -630,20 +688,58 @@ public actor ConversationOrchestrator {
         case .speechStopped:
             break
         case .toolCall(let id, let name, let argumentsJSON):
-            guard let toolRouter else { break }
-            let request = ToolCallRequest(id: id, name: name, argumentsJSON: argumentsJSON)
-            let result = await toolRouter.dispatch(request)
-            NovaLog.ai.info("tool \(name, privacy: .public) ok=\(result.ok)")
-            await memory?.append(ConversationTurn(
-                role: .system,
-                text: "tool:\(name) → \(result.payloadJSON)"
-            ))
-            // Return the result so the model can speak an answer that uses it.
-            await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+            guard toolRouter != nil else { break }
+            // Chain onto a serial tool queue so slow tools cannot starve audio /
+            // speech / error handling on the event loop, while preserving order.
+            let previous = toolTask
+            toolTask = Task { [weak self] in
+                _ = await previous?.value
+                await self?.dispatchTool(id: id, name: name, argumentsJSON: argumentsJSON)
+            }
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
+            lastError = message
+            onError?(message)
+            if message.localizedCaseInsensitiveContains("reconnect attempts exhausted") {
+                await handleTransportExhausted()
+            }
+            onMetricsTick?()
         case .reconnected:
+            lastError = nil
             NovaLog.session.info("AI stream reconnected")
+            onMetricsTick?()
+        }
+    }
+
+    private func dispatchTool(id: String, name: String, argumentsJSON: String) async {
+        guard let toolRouter else { return }
+        let t0 = ContinuousClock.Instant.now
+        let request = ToolCallRequest(id: id, name: name, argumentsJSON: argumentsJSON)
+        let result = await toolRouter.dispatch(request)
+        metrics.mark(.toolDispatch, startedAt: t0)
+        NovaLog.ai.info("tool \(name, privacy: .public) ok=\(result.ok)")
+        await memory?.append(ConversationTurn(
+            role: .system,
+            text: "tool:\(name) → \(result.payloadJSON)"
+        ))
+        await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+        onMetricsTick?()
+    }
+
+    /// Reconnect attempts exhausted: leave the half-dead streaming state and
+    /// restore local wake-word listening when available so the user can retry.
+    private func handleTransportExhausted() async {
+        metrics.increment(.sessionFailures)
+        await teardownStreaming()
+        if sessionConfig.useLocalWakeWord, let listener = wakeWordListener, isRunning {
+            try? await beginLocalListening(listener)
+        } else {
+            // Always-on streaming mode: fully stand down so `start()` can retry.
+            isRunning = false
+            eventTask?.cancel()
+            eventTask = nil
+            detectionTask?.cancel()
+            detectionTask = nil
         }
     }
 
@@ -704,7 +800,12 @@ public actor ConversationOrchestrator {
             // The wake word was spoken explicitly — resume normal listening.
             listeningSuspended = false
         }
-        if case .ignore = intent { return }
+        if case .ignore = intent {
+            // Drop ignored / background speech so it cannot contaminate the next
+            // addressed turn's memory or transcript.
+            inputTranscript = ""
+            return
+        }
 
         // "Nova, stop": halt speech and stand down until re-addressed by name.
         if case .stop = intent {
@@ -878,6 +979,7 @@ public actor ConversationOrchestrator {
         await egress.flush()
         assistantSpeaking = false
         metrics.mark(.bargeInCancel, startedAt: t0)
+        onMetricsTick?()
     }
 }
 

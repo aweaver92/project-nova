@@ -91,7 +91,7 @@ public final class AppContainer {
 
         let ingress: any AudioIngress = useSilentMic
             ? SilentAudioIngress()
-            : HFPGlassesAudioIngress(coordinator: coordinator)
+            : HFPGlassesAudioIngress(coordinator: coordinator, metrics: metrics)
         let egress: any AudioEgress = HFPGlassesAudioEgress()
 
         // On-device wake-word gating: only wire the Speech listener for real
@@ -377,9 +377,9 @@ public final class AppContainer {
         self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
-        self.agentsVM = AgentsViewModel(store: agentStore, settings: settingsStore, bridge: bridge, orchestrator: orchestrator)
+        self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
         self.codingVM = CodingViewModel(bridge: bridge, settings: settingsStore)
-        self.settingsVM = SettingsViewModel(store: settingsStore)
+        self.settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)
         // Starting a recording ensures the mic loop is live (no-op if already
         // running) so button-initiated captures record even when idle.
         self.recordingVM = RecordingViewModel(

@@ -12,6 +12,7 @@ public struct LibraryView: View {
     @Bindable var notes: NotesViewModel
     @Bindable var knowledge: KnowledgeViewModel
     @Bindable var visual: VisualMemoryViewModel
+    @State private var confirmClearSightings = false
 
     public init(notes: NotesViewModel, knowledge: KnowledgeViewModel, visual: VisualMemoryViewModel) {
         self.notes = notes
@@ -36,7 +37,11 @@ public struct LibraryView: View {
                 Task { await knowledge.runSearch() }
             }
             .onChange(of: knowledge.query) { _, newValue in
-                if newValue.isEmpty { knowledge.clearSearch() }
+                if newValue.isEmpty {
+                    knowledge.clearSearch()
+                } else {
+                    Task { await knowledge.scheduleSearch() }
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -61,6 +66,13 @@ public struct LibraryView: View {
                 await knowledge.load()
                 await visual.load()
             }
+            .novaConfirmClear(
+                isPresented: $confirmClearSightings,
+                title: "Clear all sightings?",
+                message: "This permanently removes saved glasses stills and their OCR text."
+            ) {
+                Task { await visual.clear() }
+            }
         }
     }
 
@@ -70,9 +82,12 @@ public struct LibraryView: View {
     private var notesSection: some View {
         Section("Notes") {
             if notes.notes.isEmpty {
-                Text("Tap the compose button, or say “Nova, take a note …”.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                ContentUnavailableView {
+                    Label("No Notes", systemImage: "note.text")
+                } description: {
+                    Text("Compose here, or say “Nova, take a note …”.")
+                }
+                .listRowBackground(Color.clear)
             } else {
                 ForEach(notes.notes) { note in
                     NavigationLink {
@@ -92,22 +107,25 @@ public struct LibraryView: View {
     private var bookmarksSection: some View {
         Section("Bookmarks") {
             if knowledge.bookmarks.isEmpty {
-                Text("Say “Nova, bookmark this” after an answer to save it here.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                ContentUnavailableView {
+                    Label("No Bookmarks", systemImage: "bookmark")
+                } description: {
+                    Text("Say “Nova, bookmark this” after an answer.")
+                }
+                .listRowBackground(Color.clear)
             } else {
                 ForEach(knowledge.bookmarks) { bookmark in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(bookmark.title).font(.body).lineLimit(1)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(bookmark.title).font(.subheadline).lineLimit(1)
                         Text(bookmark.text)
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(3)
+                            .lineLimit(2)
                         Text(bookmark.createdAt.formatted(date: .abbreviated, time: .shortened))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 1)
                 }
                 .onDelete { offsets in
                     Task { await knowledge.delete(at: offsets) }
@@ -144,7 +162,7 @@ public struct LibraryView: View {
                 Spacer()
                 if !visual.items.isEmpty {
                     Button(role: .destructive) {
-                        Task { await visual.clear() }
+                        confirmClearSightings = true
                     } label: {
                         Text("Clear").font(.caption)
                     }

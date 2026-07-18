@@ -424,6 +424,89 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testStartFailureAllowsRetry() async throws {
+        let provider = MockProvider()
+        await provider.setConnectShouldFail(true)
+        let orch = makeOrchestrator(provider: provider)
+        do {
+            try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+            XCTFail("expected start to throw")
+        } catch {
+            // expected
+        }
+        let runningAfterFail = await orch.isStreaming
+        XCTAssertFalse(runningAfterFail)
+
+        await provider.setConnectShouldFail(false)
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        let connected = await waitUntil { await provider.connectCount >= 1 }
+        XCTAssertTrue(connected)
+        await orch.stop()
+    }
+
+    func testSlowToolDoesNotBlockSubsequentEvents() async throws {
+        let provider = MockProvider()
+        let router = ToolRouter(tools: [SlowEchoTool(delayMs: 250)])
+        let metrics = InMemoryLatencyMetricsRecorder()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: metrics,
+            toolRouter: router
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        await provider.emit(.toolCall(id: "slow", name: "slow_echo", argumentsJSON: #"{"text":"hi"}"#))
+        // While the slow tool is in flight, speech/audio events must still be handled.
+        await provider.emit(.speechStarted)
+        await provider.emit(.responseStarted)
+        await provider.emit(.outputAudio(pcm16_24k: Data(count: 32)))
+        let spoken = await waitUntil { await provider.interruptCount == 0 && metrics.sampleCount(.audioToSpeaker) >= 1 }
+        XCTAssertTrue(spoken, "event loop must keep processing audio while a tool runs")
+        let returned = await waitUntil(timeout: 3) { await provider.toolOutputCount == 1 }
+        XCTAssertTrue(returned)
+        XCTAssertGreaterThanOrEqual(metrics.sampleCount(.toolDispatch), 1)
+        await orch.stop()
+    }
+
+    func testTransportExhaustionTearsDownStreaming() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        let connected = await waitUntil { await provider.connectCount == 1 }
+        XCTAssertTrue(connected)
+        XCTAssertTrue(await orch.isStreaming)
+
+        await provider.emit(.error(message: "Realtime disconnected (reconnect attempts exhausted)"))
+        let stopped = await waitUntil { await orch.isStreaming == false }
+        XCTAssertTrue(stopped)
+        let disconnects = await provider.disconnectCount
+        XCTAssertGreaterThanOrEqual(disconnects, 1)
+        let err = await orch.lastError
+        XCTAssertTrue(err?.contains("reconnect") == true)
+        await orch.stop()
+    }
+
+    func testFailedAppendIncrementsDropCounter() async throws {
+        let provider = MockProvider()
+        await provider.setAppendShouldSucceed(false)
+        let ingress = ControllableIngress()
+        let metrics = InMemoryLatencyMetricsRecorder()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: metrics
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+        ingress.emit(AudioChunk(pcm: Data(count: 320), sampleRate: 8_000))
+        let dropped = await waitUntil { metrics.counters()[.droppedMicChunks] ?? 0 >= 1 }
+        XCTAssertTrue(dropped)
+        await orch.stop()
+    }
+
     // MARK: - Helpers
 
     private func makeOrchestrator(
@@ -466,6 +549,8 @@ private actor MockProvider: ConversationalAIProvider {
     private(set) var lastVoice = ""
     private(set) var lastToolDefinitions: [ToolDefinition] = []
     private(set) var toolOutputs: [(callId: String, output: String)] = []
+    private var connectShouldFail = false
+    private var appendShouldSucceed = true
     var toolOutputCount: Int { toolOutputs.count }
 
     init() {
@@ -474,17 +559,24 @@ private actor MockProvider: ConversationalAIProvider {
         continuation = cont
     }
 
+    func setConnectShouldFail(_ value: Bool) { connectShouldFail = value }
+    func setAppendShouldSucceed(_ value: Bool) { appendShouldSucceed = value }
+
     func connect(config: AISessionConfig) async throws {
         connectCount += 1
         lastInstructions = config.instructions
         lastVoice = config.voice
         lastToolDefinitions = config.toolDefinitions
+        if connectShouldFail {
+            throw NovaError.aiProvider("mock connect failed")
+        }
     }
     // Mirrors the real provider: the events stream is long-lived and survives
     // reconnects (disconnect does NOT finish it), so agent switching can tear the
     // stream down and reopen it while the orchestrator keeps its single consumer.
     func disconnect() async { disconnectCount += 1 }
-    func appendAudio(_ pcm16_24k: Data) async {}
+    @discardableResult
+    func appendAudio(_ pcm16_24k: Data) async -> Bool { appendShouldSucceed }
     func createResponse() async { createResponseCount += 1 }
     func interrupt() async { interruptCount += 1 }
     func analyze(image: CapturedFrame, prompt: String) async throws -> String {
@@ -509,6 +601,36 @@ private struct EchoTool: Tool {
         let a = try JSONDecoder().decode(A.self, from: Data(argumentsJSON.utf8))
         return #"{"echo":"\#(a.text)"}"#
     }
+}
+
+private struct SlowEchoTool: Tool {
+    let name = "slow_echo"
+    let description = "Echo after a delay."
+    let requiresConfirmation = false
+    let delayMs: UInt64
+    var parametersJSON: String {
+        #"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}"#
+    }
+    func invoke(argumentsJSON: String) async throws -> String {
+        try await Task.sleep(nanoseconds: delayMs * 1_000_000)
+        return #"{"echo":"slow"}"#
+    }
+}
+
+/// Ingress that can push chunks on demand for mic-path tests.
+private final class ControllableIngress: AudioIngress, @unchecked Sendable {
+    private let continuation: AsyncStream<AudioChunk>.Continuation
+    let chunks: AsyncStream<AudioChunk>
+
+    init() {
+        var cont: AsyncStream<AudioChunk>.Continuation!
+        chunks = AsyncStream(bufferingPolicy: .bufferingNewest(8)) { cont = $0 }
+        continuation = cont
+    }
+
+    func start() async throws {}
+    func stop() async { continuation.finish() }
+    func emit(_ chunk: AudioChunk) { continuation.yield(chunk) }
 }
 
 private actor MockFrameCapture: FrameCapture {

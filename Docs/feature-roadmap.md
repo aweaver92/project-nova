@@ -100,7 +100,7 @@ See [`ios-without-a-mac.md`](ios-without-a-mac.md) and the risk notes in
 
 - **Reliability:** keep the reconnect/backoff + audio-interruption handling green as features grow.
 - **Cost control:** the Responses-API calls (web search, follow-ups) add spend; add metering + a per-feature on/off setting.
-- **Tab consolidation:** ✅ done — merged Notes + Knowledge into a single **Library** tab (browse notes/bookmarks; unified search) and moved **Patch Notes** under **Settings → About**. The app is now 6 tabs (Assistant, Workspaces, Skills, Library, Recordings, Settings).
+- **Tab consolidation:** ✅ power-user shell — five primary tabs (**Assistant**, **Agents**, **Studio**, **Library**, **Media**). Settings is a toolbar sheet (Bridge + Diagnostics + About). Coding is a push destination under Agents when Claude is active. Studio = Workspaces \| Skills; Media = Voice \| Video. Notes + Knowledge remain in Library.
 - **Testing:** extend the unit suite as stores/tools evolve; add UI smoke tests once the tab set stabilizes.
 
 ---

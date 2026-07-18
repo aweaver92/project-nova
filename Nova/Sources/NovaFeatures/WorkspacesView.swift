@@ -1,57 +1,70 @@
 import SwiftUI
 import NovaDomain
 
-/// Workspaces tab: create/edit projects, set the active one, and edit the context
-/// notes that get injected into Nova's instructions for that project.
+/// Workspaces list: create/edit projects and set the active one.
+/// When `embedded` is true, omits its own `NavigationStack` (used inside Studio).
 public struct WorkspacesView: View {
     @Bindable var workspaces: WorkspacesViewModel
+    var embedded: Bool
 
-    public init(workspaces: WorkspacesViewModel) {
+    public init(workspaces: WorkspacesViewModel, embedded: Bool = false) {
         self.workspaces = workspaces
+        self.embedded = embedded
     }
 
     public var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    ForEach(workspaces.workspaces) { ws in
-                        NavigationLink {
-                            WorkspaceEditorView(workspace: ws, workspaces: workspaces)
-                        } label: {
-                            WorkspaceRow(
-                                workspace: ws,
-                                isActive: ws.id == workspaces.active?.id
-                            )
-                        }
-                        .swipeActions(edge: .leading) {
-                            Button {
-                                Task { await workspaces.setActive(ws) }
-                            } label: {
-                                Label("Activate", systemImage: "checkmark.circle")
-                            }
-                            .tint(.green)
-                        }
-                    }
-                    .onDelete { offsets in
-                        Task { await workspaces.delete(at: offsets) }
-                    }
-                } footer: {
-                    Text("The active workspace's context notes are given to Nova each session, so it remembers the project without you re-explaining it. Say “Nova, switch to my … workspace” to change it hands-free.")
+        Group {
+            if embedded {
+                content
+            } else {
+                NavigationStack {
+                    content
+                        .navigationTitle("Workspaces")
                 }
             }
-            .navigationTitle("Workspaces")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    NavigationLink {
-                        WorkspaceEditorView(workspace: nil, workspaces: workspaces)
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("New workspace")
-                }
-            }
-            .task { await workspaces.load() }
         }
+    }
+
+    private var content: some View {
+        List {
+            Section {
+                ForEach(workspaces.workspaces) { ws in
+                    NavigationLink {
+                        WorkspaceEditorView(workspace: ws, workspaces: workspaces)
+                    } label: {
+                        WorkspaceRow(
+                            workspace: ws,
+                            isActive: ws.id == workspaces.active?.id
+                        )
+                    }
+                    .swipeActions(edge: .leading) {
+                        Button {
+                            Task { await workspaces.setActive(ws) }
+                        } label: {
+                            Label("Activate", systemImage: "checkmark.circle")
+                        }
+                        .tint(.green)
+                    }
+                }
+                .onDelete { offsets in
+                    Task { await workspaces.delete(at: offsets) }
+                }
+            } footer: {
+                Text("Active workspace context is injected each session. Say “Nova, switch to my … workspace” hands-free.")
+                    .font(.caption2)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                NavigationLink {
+                    WorkspaceEditorView(workspace: nil, workspaces: workspaces)
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("New workspace")
+            }
+        }
+        .task { await workspaces.load() }
     }
 }
 

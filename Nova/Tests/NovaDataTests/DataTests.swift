@@ -57,7 +57,44 @@ final class PCMResamplerTests: XCTestCase {
         for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
             recorder.record(LatencySample(metric: .micToWS, milliseconds: v))
         }
+        // Nearest-rank: ceil(0.5 * 5) = 3 → 30; ceil(0.95 * 5) = 5 → 50.
         XCTAssertEqual(recorder.percentile(.micToWS, p: 0.5), 30.0)
+        XCTAssertEqual(recorder.percentile(.micToWS, p: 0.95), 50.0)
+        XCTAssertEqual(recorder.sampleCount(.micToWS), 5)
+    }
+
+    func testLatencyRecorderBoundedRetention() {
+        let recorder = InMemoryLatencyMetricsRecorder(capacity: 3)
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            recorder.record(LatencySample(metric: .resample, milliseconds: v))
+        }
+        XCTAssertEqual(recorder.sampleCount(.resample), 3)
+        XCTAssertEqual(recorder.snapshot()[.resample], [3.0, 4.0, 5.0])
+    }
+
+    func testLatencyCountersAndExport() throws {
+        let recorder = InMemoryLatencyMetricsRecorder()
+        recorder.increment(.droppedMicChunks, by: 2)
+        recorder.increment(.sendFailures)
+        recorder.record(LatencySample(metric: .tokenMint, milliseconds: 12))
+        let counters = recorder.counters()
+        XCTAssertEqual(counters[.droppedMicChunks], 2)
+        XCTAssertEqual(counters[.sendFailures], 1)
+        let json = recorder.exportJSON()
+        let obj = try JSONSerialization.jsonObject(with: json) as? [String: Any]
+        XCTAssertNotNil(obj?["metrics"])
+        XCTAssertNotNil(obj?["counters"])
+        let summary = recorder.summaryLine()
+        XCTAssertTrue(summary.contains("drops=2"))
+        recorder.reset()
+        XCTAssertEqual(recorder.sampleCount(.tokenMint), 0)
+        XCTAssertTrue(recorder.counters().isEmpty)
+    }
+
+    func testNearestRankPercentileHelpers() {
+        XCTAssertNil(LatencyMetrics.nearestRankPercentile([], p: 0.5))
+        XCTAssertEqual(LatencyMetrics.nearestRankPercentile([7], p: 0.95), 7)
+        XCTAssertEqual(LatencyMetrics.nearestRankPercentile([1, 2, 3, 4], p: 1.0), 4)
     }
 
     func testMetaSessionMockRegister() async throws {

@@ -6,83 +6,84 @@ import UIKit
 
 public struct CodingView: View {
     @Bindable var coding: CodingViewModel
+    var embedded: Bool
     @State private var showSessions = false
 
-    public init(coding: CodingViewModel) {
+    public init(coding: CodingViewModel, embedded: Bool = false) {
         self.coding = coding
+        self.embedded = embedded
     }
 
     public var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                header
-                Divider()
-                transcript
-                Divider()
-                composer
-            }
-            .navigationTitle("Coding")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        showSessions = true
-                    } label: {
-                        Label("Sessions", systemImage: "list.bullet")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("New session") {
-                            Task { await coding.startNewSession() }
-                        }
-                        Button("Refresh") {
-                            Task { await coding.refreshSessions() }
-                        }
-                        if coding.isRunning {
-                            Button("Cancel run", role: .destructive) {
-                                Task { await coding.cancel() }
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
+        Group {
+            if embedded {
+                content
+            } else {
+                NavigationStack {
+                    content
                 }
             }
-            .sheet(isPresented: $showSessions) {
-                sessionPicker
-            }
-            .task { await coding.load() }
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(coding.shortSessionId)
-                    .font(.headline.monospaced())
-                Text(coding.runStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-            }
-            Spacer()
-            if coding.isRunning {
-                ProgressView()
-            }
-            if let full = coding.pinnedSessionId {
+    private var content: some View {
+        VStack(spacing: 0) {
+            transcript
+            Divider()
+            composer
+        }
+        .navigationTitle("Coding")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
                 Button {
-                    #if canImport(UIKit)
-                    UIPasteboard.general.string = full
-                    #endif
+                    showSessions = true
                 } label: {
-                    Image(systemName: "doc.on.doc")
+                    Label("Sessions", systemImage: "list.bullet")
                 }
-                .accessibilityLabel("Copy session id")
+            }
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(coding.shortSessionId)
+                        .font(.caption.monospaced().weight(.semibold))
+                    HStack(spacing: 6) {
+                        Text(coding.runStatus)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                        if coding.isRunning { ProgressView().controlSize(.mini) }
+                    }
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button("New session") {
+                        Task { await coding.startNewSession() }
+                    }
+                    Button("Refresh") {
+                        Task { await coding.refreshSessions() }
+                    }
+                    if let full = coding.pinnedSessionId {
+                        Button("Copy session id") {
+                            #if canImport(UIKit)
+                            UIPasteboard.general.string = full
+                            #endif
+                        }
+                    }
+                    if coding.isRunning {
+                        Button("Cancel run", role: .destructive) {
+                            Task { await coding.cancel() }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
+        .sheet(isPresented: $showSessions) {
+            sessionPicker
+        }
+        .task { await coding.load() }
     }
 
     private var transcript: some View {
@@ -135,49 +136,51 @@ public struct CodingView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal)
         case .tool:
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 Button {
                     coding.toggleExpand(item)
                 } label: {
-                    HStack {
+                    HStack(spacing: 6) {
                         Image(systemName: "wrench.and.screwdriver")
+                            .font(.caption)
                         Text(item.text)
-                            .font(.subheadline.weight(.medium))
+                            .font(.caption.weight(.semibold))
                         Spacer()
                         if item.diff != nil {
                             Image(systemName: item.isExpanded ? "chevron.up" : "chevron.down")
-                                .font(.caption)
+                                .font(.caption2)
                         }
                     }
                 }
                 .buttonStyle(.plain)
                 if let detail = item.detail, !detail.isEmpty {
                     Text(detail)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
                 if item.isExpanded, let diff = item.diff, !diff.isEmpty {
                     ScrollView(.horizontal) {
                         Text(diff)
-                            .font(.system(.caption, design: .monospaced))
-                            .padding(8)
+                            .font(.system(.caption2, design: .monospaced))
+                            .padding(6)
                     }
                     .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
-            .padding(10)
+            .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.tertiarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             .padding(.horizontal)
         case .status:
             Text(item.text)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
         case .error:
             Text(item.text)
+                .font(.footnote)
                 .foregroundStyle(.red)
                 .padding(.horizontal)
         }
@@ -186,7 +189,7 @@ public struct CodingView: View {
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("Prompt Cursor…", text: $coding.draft, axis: .vertical)
-                .lineLimit(1...5)
+                .lineLimit(1...4)
                 .textFieldStyle(.roundedBorder)
                 .disabled(coding.isRunning)
             Button {
@@ -197,7 +200,9 @@ public struct CodingView: View {
             }
             .disabled(coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || coding.isRunning)
         }
-        .padding()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
     }
 
     private var sessionPicker: some View {

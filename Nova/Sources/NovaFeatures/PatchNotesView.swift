@@ -49,6 +49,33 @@ public extension PatchNote {
     /// The changelog. Newest first — add a new entry at the top for each build.
     static let all: [PatchNote] = [
         PatchNote(
+            version: "0.5.0",
+            date: "Jul 17, 2026",
+            summary: "Power-user shell: five tabs, denser Assistant HUD, Bridge and diagnostics in Settings.",
+            entries: [
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Tab bar is now Assistant, Agents, Studio, Library, and Media — nothing buried under More.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Assistant opens on a compact status HUD + Listen controls with the transcript first; glasses/diagnostics are folded away.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Settings (gear) holds Nova Bridge URL/token, latency diagnostics, and Patch Notes. Coding opens from Agents when Claude is active.",
+                    testable: true
+                ),
+                PatchNoteEntry(
+                    kind: .improvement,
+                    text: "Studio combines Workspaces and Skills; Media combines Voice and Video recordings.",
+                    testable: true
+                ),
+            ]
+        ),
+        PatchNote(
             version: "0.4.0",
             date: "Jul 17, 2026",
             summary: "Voice recording: capture memos hands-free and save them to your iPhone.",

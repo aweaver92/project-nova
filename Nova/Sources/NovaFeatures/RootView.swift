@@ -1,25 +1,21 @@
 import SwiftUI
 import NovaDomain
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public enum RootTab: Hashable {
     case assistant
-    case workspaces
     case agents
-    case coding
-    case skills
+    case studio
     case library
-    case recordings
-    case videos
-    case settings
+    case media
 }
 
 public struct RootView: View {
     @Bindable var session: SessionViewModel
     @Bindable var conversation: ConversationViewModel
-    // Vision (in-app camera / "what am I looking at?") is intentionally kept in the
-    // composition graph but hidden from the UI: those capabilities are handled
-    // natively by "Hey Meta", so Nova acts as a voice companion rather than a
-    // replacement. Keep this wired so the feature can be re-enabled easily.
+    // Vision remains wired but hidden — "Hey Meta" owns camera UX for now.
     @Bindable var vision: VisionViewModel
     @Bindable var notes: NotesViewModel
     @Bindable var recording: RecordingViewModel
@@ -32,6 +28,8 @@ public struct RootView: View {
     @Bindable var coding: CodingViewModel
     @Bindable var settings: SettingsViewModel
     @State private var selectedTab: RootTab = .assistant
+    @State private var showSettings = false
+    @State private var showGlassesDetails = false
 
     public init(
         session: SessionViewModel,
@@ -63,74 +61,60 @@ public struct RootView: View {
         self.settings = settings
     }
 
-    private var isClaudeActive: Bool {
-        agents.activeAgent?.id == Agent.SeedID.claude
-    }
-
     public var body: some View {
         TabView(selection: $selectedTab) {
             assistantTab
                 .tabItem { Label("Assistant", systemImage: "waveform") }
                 .tag(RootTab.assistant)
 
-            WorkspacesView(workspaces: workspaces)
-                .tabItem { Label("Workspaces", systemImage: "square.stack.3d.up") }
-                .tag(RootTab.workspaces)
-
-            AgentsView(agents: agents)
+            AgentsView(agents: agents, coding: coding, showSettings: { showSettings = true })
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
                 .tag(RootTab.agents)
 
-            if isClaudeActive {
-                CodingView(coding: coding)
-                    .tabItem { Label("Coding", systemImage: "chevron.left.forwardslash.chevron.right") }
-                    .tag(RootTab.coding)
-            }
-
-            SkillsView(skills: skills)
-                .tabItem { Label("Skills", systemImage: "wand.and.stars") }
-                .tag(RootTab.skills)
+            StudioView(workspaces: workspaces, skills: skills)
+                .tabItem { Label("Studio", systemImage: "slider.horizontal.3") }
+                .tag(RootTab.studio)
 
             LibraryView(notes: notes, knowledge: knowledge, visual: visualMemory)
                 .tabItem { Label("Library", systemImage: "books.vertical") }
                 .tag(RootTab.library)
 
-            RecordingsView(recording: recording)
-                .tabItem { Label("Recordings", systemImage: "waveform.circle") }
-                .tag(RootTab.recordings)
-
-            VideoRecordingsView(video: video)
-                .tabItem { Label("Videos", systemImage: "video") }
-                .tag(RootTab.videos)
-
-            SettingsView(settings: settings)
-                .tabItem { Label("Settings", systemImage: "gearshape") }
-                .tag(RootTab.settings)
+            MediaView(recording: recording, video: video)
+                .tabItem { Label("Media", systemImage: "photo.on.rectangle") }
+                .tag(RootTab.media)
         }
-        .onChange(of: isClaudeActive) { _, claudeActive in
-            if !claudeActive, selectedTab == .coding {
-                selectedTab = .assistant
-            }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(settings: settings, conversation: conversation)
         }
     }
 
     private var assistantTab: some View {
         NavigationStack {
             List {
-                headerSection
-                primaryControlSection
-                statusSection
-                glassesSection
+                hudSection
+                listenSection
                 conversationSection
                 suggestionsSection
-                recordingSection
+                moreSection
             }
             .listSectionSpacing(.compact)
             .navigationTitle("Nova")
             .navigationBarTitleDisplayMode(.inline)
-            // Auto-start listening when Nova opens so you can pocket the phone
-            // and use the wake word hands-free (the `audio` background mode keeps
-            // the glasses mic session alive while the screen is locked).
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Image("logo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 28, height: 28)
+                        .accessibilityHidden(true)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showSettings = true } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
+                }
+            }
             .task {
                 await recording.load()
                 await workspaces.load()
@@ -142,221 +126,193 @@ public struct RootView: View {
         }
     }
 
-    // MARK: - Sections
+    // MARK: - Assistant sections
 
-    private var headerSection: some View {
+    private var hudSection: some View {
         Section {
-            // Logo asset ships in the app bundle (App/Assets.xcassets),
-            // so it resolves against Bundle.main from this package view.
-            VStack(spacing: 4) {
-                Image("logo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxHeight: 200)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                    .accessibilityLabel("Nova")
-                Label("Talking to \(agents.activeName)", systemImage: "person.wave.2")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Label("Workspace: \(workspaces.activeName)", systemImage: "square.stack.3d.up")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
-        }
-    }
-
-    @ViewBuilder
-    private var suggestionsSection: some View {
-        if !conversation.suggestions.isEmpty {
-            Section("Suggested follow-ups") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Text(agents.activeName)
+                        .font(.subheadline.weight(.semibold))
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                    Text(workspaces.activeName)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if recording.isRecording {
+                        NovaUI.StatusChip(title: "Rec", value: "ON", color: .red)
+                    }
+                }
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(conversation.suggestions, id: \.self) { suggestion in
-                            Button {
-                                Task { await conversation.sendSuggestion(suggestion) }
-                            } label: {
-                                Text(suggestion)
-                                    .font(.footnote)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(
-                                        Color.accentColor.opacity(0.15),
-                                        in: Capsule()
-                                    )
-                            }
-                            .buttonStyle(.plain)
+                    HStack(spacing: 6) {
+                        NovaUI.StatusChip(title: "Glasses", value: registrationLabel, color: registrationColor)
+                        NovaUI.StatusChip(title: "Session", value: sessionLabel, color: sessionColor)
+                        NovaUI.StatusChip(title: "Voice", value: voiceLabel, color: voiceColor)
+                        if !conversation.latencyHint.isEmpty {
+                            NovaUI.StatusChip(
+                                title: "Lat",
+                                value: latencyChipSummary,
+                                color: .orange
+                            )
                         }
                     }
-                    .padding(.vertical, 2)
                 }
-                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                if let error = conversation.errorMessage {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
             }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
         }
     }
 
-    private var primaryControlSection: some View {
+    private var listenSection: some View {
         Section {
-            Button {
-                Task {
-                    if conversation.isRunning { await conversation.stop() }
-                    else { await conversation.start() }
-                }
-            } label: {
-                Label(
-                    conversation.isRunning ? "Stop listening" : "Start listening",
-                    systemImage: conversation.isRunning ? "stop.circle.fill" : "mic.circle.fill"
-                )
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .tint(conversation.isRunning ? .red : .accentColor)
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
-        }
-    }
-
-    private var statusSection: some View {
-        Section("Status") {
-            LabeledContent("Glasses") {
-                StatusIndicator(label: registrationLabel, color: registrationColor)
-            }
-            LabeledContent("Session") {
-                StatusIndicator(label: sessionLabel, color: sessionColor)
-            }
-            LabeledContent("Voice") {
-                StatusIndicator(label: voiceLabel, color: voiceColor)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var glassesSection: some View {
-        Section("Meta glasses") {
-            if session.registrationState != .registered {
+            HStack(spacing: 10) {
                 Button {
-                    Task { await session.register() }
+                    Task {
+                        if conversation.isRunning { await conversation.stop() }
+                        else { await conversation.start() }
+                    }
                 } label: {
-                    Label("Connect Meta glasses", systemImage: "link")
+                    Label(
+                        conversation.isRunning ? "Stop" : "Listen",
+                        systemImage: conversation.isRunning ? "stop.circle.fill" : "mic.circle.fill"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
-            } else {
-                switch session.sessionState {
-                case .active:
-                    Button { Task { await session.pause() } } label: {
-                        Label("Pause session", systemImage: "pause.circle")
-                    }
-                    Button(role: .destructive) { Task { await session.endSession() } } label: {
-                        Label("End session", systemImage: "stop.circle")
-                    }
-                case .paused:
-                    Button { Task { await session.resume() } } label: {
-                        Label("Resume session", systemImage: "play.circle")
-                    }
-                    Button(role: .destructive) { Task { await session.endSession() } } label: {
-                        Label("End session", systemImage: "stop.circle")
-                    }
-                default:
-                    Button { Task { await session.startSession() } } label: {
-                        Label("Start session", systemImage: "play.circle")
-                    }
+                .buttonStyle(.borderedProminent)
+                .tint(conversation.isRunning ? .red : .accentColor)
+
+                Button {
+                    Task { await conversation.bargeIn() }
+                } label: {
+                    Label("Interrupt", systemImage: "hand.raised")
+                        .labelStyle(.iconOnly)
+                        .frame(minWidth: 44, minHeight: 34)
                 }
-            }
-            if let error = session.errorMessage {
-                Text(error).font(.caption).foregroundStyle(.red)
-            }
-            if !session.registrationDiagnostics.isEmpty {
-                DisclosureGroup("Registration diagnostics") {
-                    Text(session.registrationDiagnostics)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                .buttonStyle(.bordered)
+                .disabled(!conversation.isRunning)
+
+                Button {
+                    Task { await recording.toggle() }
+                } label: {
+                    Image(systemName: recording.isRecording ? "record.circle.fill" : "record.circle")
+                        .frame(minWidth: 44, minHeight: 34)
                 }
+                .buttonStyle(.bordered)
+                .tint(recording.isRecording ? .red : .accentColor)
+                .accessibilityLabel(recording.isRecording ? "Stop voice recording" : "Begin voice recording")
             }
+            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
         }
     }
 
     private var conversationSection: some View {
         Section {
             if conversation.transcriptLines.isEmpty {
-                Text("Say “Nova …” or tap Start listening to begin a conversation.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                ContentUnavailableView {
+                    Label("Waiting", systemImage: "text.bubble")
+                } description: {
+                    Text("Say “Nova …” or tap Listen.")
+                }
+                .listRowBackground(Color.clear)
             } else {
                 ForEach(Array(conversation.transcriptLines.enumerated()), id: \.offset) { _, line in
                     transcriptBubble(for: line)
                         .listRowSeparator(.hidden)
                 }
             }
-            Button { Task { await conversation.bargeIn() } } label: {
-                Label("Interrupt Nova", systemImage: "hand.raised")
-            }
-            .disabled(!conversation.isRunning)
-            if let error = conversation.errorMessage {
-                Text(error).font(.caption).foregroundStyle(.red)
-            }
         } header: {
             Text("Conversation")
-        } footer: {
-            if !conversation.latencyHint.isEmpty {
-                Text(conversation.latencyHint).font(.caption2)
-            }
         }
     }
 
-    private var recordingSection: some View {
-        Section {
-            Button {
-                Task { await recording.toggle() }
-            } label: {
-                Label(
-                    recording.isRecording ? "Stop voice recording" : "Begin voice recording",
-                    systemImage: recording.isRecording ? "stop.circle.fill" : "record.circle"
-                )
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .tint(recording.isRecording ? .red : .accentColor)
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
-
-            if recording.isRecording, let startedAt = recording.startedAt {
-                TimelineView(.periodic(from: startedAt, by: 1)) { context in
-                    Label(
-                        "Recording… \(Self.elapsed(from: startedAt, to: context.date))",
-                        systemImage: "waveform"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.red)
+    @ViewBuilder
+    private var suggestionsSection: some View {
+        if !conversation.suggestions.isEmpty {
+            Section("Follow-ups") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(conversation.suggestions, id: \.self) { suggestion in
+                            Button {
+                                Task { await conversation.sendSuggestion(suggestion) }
+                            } label: {
+                                Text(suggestion)
+                                    .font(.caption)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
-                .frame(maxWidth: .infinity)
-                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
             }
-
-            if let error = recording.errorMessage {
-                Text(error).font(.caption).foregroundStyle(.red)
-            }
-        } header: {
-            Text("Voice recording")
-        } footer: {
-            Text("Say “Nova, begin voice recording” or tap the button. Recordings are saved to this iPhone — find them in the Recordings tab or the Files app.")
-                .font(.caption2)
         }
     }
 
-    /// mm:ss elapsed between two dates, for the live recording timer.
-    static func elapsed(from start: Date, to now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(start)))
-        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    private var moreSection: some View {
+        Section {
+            DisclosureGroup("Glasses & diagnostics", isExpanded: $showGlassesDetails) {
+                glassesControls
+                if !conversation.latencyHint.isEmpty {
+                    Text(conversation.latencyHint)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Button("Open Settings") { showSettings = true }
+            }
+        }
     }
 
-    // MARK: - Transcript rendering
+    @ViewBuilder
+    private var glassesControls: some View {
+        if session.registrationState != .registered {
+            Button {
+                Task { await session.register() }
+            } label: {
+                Label("Connect Meta glasses", systemImage: "link")
+            }
+        } else {
+            switch session.sessionState {
+            case .active:
+                Button { Task { await session.pause() } } label: {
+                    Label("Pause session", systemImage: "pause.circle")
+                }
+                Button(role: .destructive) { Task { await session.endSession() } } label: {
+                    Label("End session", systemImage: "stop.circle")
+                }
+            case .paused:
+                Button { Task { await session.resume() } } label: {
+                    Label("Resume session", systemImage: "play.circle")
+                }
+                Button(role: .destructive) { Task { await session.endSession() } } label: {
+                    Label("End session", systemImage: "stop.circle")
+                }
+            default:
+                Button { Task { await session.startSession() } } label: {
+                    Label("Start session", systemImage: "play.circle")
+                }
+            }
+        }
+        if let error = session.errorMessage {
+            Text(error).font(.caption2).foregroundStyle(.red)
+        }
+        if !session.registrationDiagnostics.isEmpty {
+            Text(session.registrationDiagnostics)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+    }
+
+    // MARK: - Transcript
 
     @ViewBuilder
     private func transcriptBubble(for line: String) -> some View {
@@ -365,27 +321,36 @@ public struct RootView: View {
         let text = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : line
         let isAssistant = role.hasPrefix("assistant") || role.hasPrefix("system")
         HStack(alignment: .top) {
-            if !isAssistant { Spacer(minLength: 32) }
+            if !isAssistant { Spacer(minLength: 40) }
             Text(text)
-                .font(.footnote)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
                 .background(
                     isAssistant ? Color.gray.opacity(0.15) : Color.accentColor.opacity(0.18),
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
                 )
-            if isAssistant { Spacer(minLength: 32) }
+            if isAssistant { Spacer(minLength: 40) }
         }
     }
 
-    // MARK: - Status labels & colors
+    // MARK: - Status helpers
+
+    /// Short chip text from the first metric in the latency summary.
+    private var latencyChipSummary: String {
+        let first = conversation.latencyHint.split(separator: "·").first.map(String.init) ?? ""
+        if let p50Range = first.range(of: #"p50=\d+ms"#, options: .regularExpression) {
+            return String(first[p50Range]).replacingOccurrences(of: "p50=", with: "")
+        }
+        return "…"
+    }
 
     private var registrationLabel: String {
         switch session.registrationState {
-        case .registered: return "Connected"
-        case .unregistered: return "Not connected"
-        case .unknown: return "Checking…"
-        case .failed: return "Failed"
+        case .registered: return "OK"
+        case .unregistered: return "Off"
+        case .unknown: return "…"
+        case .failed: return "Fail"
         }
     }
 
@@ -401,12 +366,12 @@ public struct RootView: View {
     private var sessionLabel: String {
         switch session.sessionState {
         case .idle: return "Idle"
-        case .registering: return "Connecting…"
+        case .registering: return "…"
         case .ready: return "Ready"
-        case .active: return "Active"
-        case .paused: return "Paused"
-        case .ending: return "Ending…"
-        case .failed: return "Failed"
+        case .active: return "On"
+        case .paused: return "Pause"
+        case .ending: return "…"
+        case .failed: return "Fail"
         }
     }
 
@@ -422,27 +387,11 @@ public struct RootView: View {
 
     private var voiceLabel: String {
         guard conversation.isRunning else { return "Off" }
-        return conversation.isAssistantSpeaking ? "Speaking" : "Listening"
+        return conversation.isAssistantSpeaking ? "Talk" : "Listen"
     }
 
     private var voiceColor: Color {
         guard conversation.isRunning else { return .gray }
         return conversation.isAssistantSpeaking ? .blue : .green
-    }
-}
-
-/// A small colored dot + caption used to summarize a connection/activity state.
-private struct StatusIndicator: View {
-    let label: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-            Text(label)
-                .foregroundStyle(.secondary)
-        }
     }
 }

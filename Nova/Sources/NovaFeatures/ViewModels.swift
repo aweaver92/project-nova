@@ -103,12 +103,30 @@ public final class ConversationViewModel {
                 self?.suggestions = items
             }
         }
+        await orchestrator.setErrorHandler { message in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.errorMessage = message
+                // Transport exhaustion tears the stream down; reflect that in the UI
+                // so Start can be tapped again without a manual Stop.
+                if message.localizedCaseInsensitiveContains("reconnect attempts exhausted") {
+                    self.isRunning = false
+                    self.isAssistantSpeaking = false
+                }
+            }
+        }
+        await orchestrator.setMetricsTickHandler {
+            Task { @MainActor [weak self] in
+                self?.refreshLatency()
+            }
+        }
         do {
             try await orchestrator.start()
             isRunning = true
             refreshLatency()
         } catch {
             errorMessage = String(describing: error)
+            isRunning = false
         }
     }
 
@@ -142,14 +160,14 @@ public final class ConversationViewModel {
     }
 
     public func refreshLatency() {
-        func fmt(_ m: LatencyMetric) -> String {
-            guard let p50 = metrics.percentile(m, p: 0.5),
-                  let p95 = metrics.percentile(m, p: 0.95) else { return "\(m.rawValue): —" }
-            return "\(m.rawValue) p50=\(Int(p50))ms p95=\(Int(p95))ms"
-        }
-        latencyHint = [LatencyMetric.micToWS, .wsToFirstAudio, .audioToSpeaker, .bargeInCancel]
-            .map(fmt)
-            .joined(separator: " · ")
+        latencyHint = metrics.summaryLine(
+            metrics: [.micToWS, .speechEndToFirstAudio, .audioToSpeaker, .bargeInCancel]
+        )
+    }
+
+    /// DEBUG/diagnostics: JSON snapshot of latency samples + counters.
+    public func exportLatencyJSON() -> Data {
+        metrics.exportJSON()
     }
 }
 
@@ -548,20 +566,65 @@ public final class SkillsViewModel {
 @Observable
 public final class SettingsViewModel {
     public private(set) var spokenFollowUps: Bool = false
+    /// Nova Bridge connection fields (Settings → Bridge).
+    public var bridgeBaseURL: String = ""
+    public var bridgeToken: String = ""
+    public private(set) var bridgeStatus: String = ""
+    public private(set) var bridgeChecking = false
 
     private let store: any SettingsStoring
+    private let bridge: any AgentBridging
 
-    public init(store: any SettingsStoring) {
+    public init(store: any SettingsStoring, bridge: any AgentBridging) {
         self.store = store
+        self.bridge = bridge
     }
 
     public func load() async {
         spokenFollowUps = await store.spokenFollowUps()
+        bridgeBaseURL = await store.bridgeBaseURL() ?? ""
+        bridgeToken = await store.bridgeToken() ?? ""
     }
 
     public func setSpokenFollowUps(_ enabled: Bool) async {
         spokenFollowUps = enabled
         await store.setSpokenFollowUps(enabled)
+    }
+
+    /// Persist bridge settings and probe `/health`.
+    public func saveBridge() async {
+        let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        await store.setBridgeBaseURL(trimmedURL)
+        await store.setBridgeToken(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        if trimmedURL.isEmpty {
+            bridgeStatus = "Saved. No URL set — enter your bridge URL (including http:// or https://)."
+            return
+        }
+        guard trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") else {
+            bridgeStatus = "Saved, but the URL is missing a scheme. Use http://host:8787 or https://host."
+            return
+        }
+
+        bridgeChecking = true
+        bridgeStatus = "Saved. Checking connection…"
+        let result = await bridge.health()
+        bridgeChecking = false
+        if result.ok {
+            bridgeStatus = "Saved. Bridge reachable."
+        } else {
+            bridgeStatus = "Saved, but couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
+        }
+    }
+
+    private static func summarize(_ payloadJSON: String) -> String {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return payloadJSON
+        }
+        if let hint = obj["hint"] as? String { return hint }
+        if let error = obj["error"] as? String { return error }
+        return payloadJSON
     }
 }
 
@@ -885,28 +948,15 @@ public final class CodingViewModel {
 public final class AgentsViewModel {
     public private(set) var agents: [Agent] = []
     public private(set) var activeAgent: Agent?
-    /// Nova Bridge connection fields (editable in the Agents tab).
-    public var bridgeBaseURL: String = ""
-    public var bridgeToken: String = ""
-    /// User-facing result of the last save / connection test. Empty until acted on.
-    public private(set) var bridgeStatus: String = ""
-    /// True while a save + health check is in flight (drives a spinner/disable).
-    public private(set) var bridgeChecking = false
 
     private let store: any AgentStoring
-    private let settings: any SettingsStoring
-    private let bridge: any AgentBridging
     private let orchestrator: ConversationOrchestrator
 
     public init(
         store: any AgentStoring,
-        settings: any SettingsStoring,
-        bridge: any AgentBridging,
         orchestrator: ConversationOrchestrator
     ) {
         self.store = store
-        self.settings = settings
-        self.bridge = bridge
         self.orchestrator = orchestrator
         // Reflect voice-driven switches ("Nova, let me talk to Claude") live.
         Task { [weak self] in
@@ -921,11 +971,13 @@ public final class AgentsViewModel {
     /// Available OpenAI Realtime voices for the picker.
     public var voices: [RealtimeVoice] { RealtimeVoice.allCases }
 
+    public var isClaudeActive: Bool {
+        activeAgent?.id == Agent.SeedID.claude
+    }
+
     public func load() async {
         agents = await store.all()
         activeAgent = await store.active()
-        bridgeBaseURL = await settings.bridgeBaseURL() ?? ""
-        bridgeToken = await settings.bridgeToken() ?? ""
     }
 
     /// Make an agent active now (reconnects with its voice if a session is live).
@@ -951,45 +1003,6 @@ public final class AgentsViewModel {
         let targets = offsets.map { agents[$0] }.filter { !$0.isMaster }
         for agent in targets { await store.delete(id: agent.id) }
         await load()
-    }
-
-    /// Persist the bridge settings, then immediately verify the URL is reachable
-    /// via the unauthenticated `/health` endpoint so the user gets real feedback
-    /// (saved + reachable, saved-but-unreachable, or not configured).
-    public func saveBridge() async {
-        let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        await settings.setBridgeBaseURL(trimmedURL)
-        await settings.setBridgeToken(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines))
-
-        if trimmedURL.isEmpty {
-            bridgeStatus = "Saved. No URL set — enter your bridge URL (including http:// or https://)."
-            return
-        }
-        guard trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") else {
-            bridgeStatus = "Saved, but the URL is missing a scheme. Use http://host:8787 or https://host."
-            return
-        }
-
-        bridgeChecking = true
-        bridgeStatus = "Saved. Checking connection…"
-        let result = await bridge.health()
-        bridgeChecking = false
-        if result.ok {
-            bridgeStatus = "Saved. Bridge reachable."
-        } else {
-            bridgeStatus = "Saved, but couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
-        }
-    }
-
-    /// Pull a short, human-readable reason out of the bridge's JSON payload.
-    private static func summarize(_ payloadJSON: String) -> String {
-        guard let data = payloadJSON.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return payloadJSON
-        }
-        if let hint = obj["hint"] as? String { return hint }
-        if let error = obj["error"] as? String { return error }
-        return payloadJSON
     }
 }
 
@@ -1019,6 +1032,18 @@ public final class KnowledgeViewModel {
         isSearching = true
         results = await search.search(trimmed, limit: 12)
         isSearching = false
+    }
+
+    /// Debounced live search for as-you-type Library querying.
+    public func scheduleSearch(debounceNanoseconds: UInt64 = 280_000_000) async {
+        let snapshot = query
+        try? await Task.sleep(nanoseconds: debounceNanoseconds)
+        guard query == snapshot else { return }
+        if snapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            results = []
+            return
+        }
+        await runSearch()
     }
 
     public func clearSearch() {

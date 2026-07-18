@@ -9,51 +9,71 @@ import NovaDomain
 /// the button.
 public struct RecordingsView: View {
     @Bindable var recording: RecordingViewModel
+    var embedded: Bool
     @State private var player = RecordingPlayer()
+    @State private var confirmClear = false
 
-    public init(recording: RecordingViewModel) {
+    public init(recording: RecordingViewModel, embedded: Bool = false) {
         self.recording = recording
+        self.embedded = embedded
     }
 
     public var body: some View {
-        NavigationStack {
-            Group {
-                if recording.recordings.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Recordings", systemImage: "waveform")
-                    } description: {
-                        Text("Tap the record button on the Assistant tab, or say “Nova, begin voice recording”.")
-                    }
-                } else {
-                    List {
-                        ForEach(recording.recordings) { item in
-                            RecordingRow(item: item, url: recording.fileURL(for: item), player: player)
-                        }
-                        .onDelete { offsets in
-                            let ids = offsets.map { recording.recordings[$0].id }
-                            if let playing = player.playingID, ids.contains(playing) { player.stop() }
-                            Task { await recording.delete(at: offsets) }
-                        }
-                    }
+        Group {
+            if embedded {
+                content
+            } else {
+                NavigationStack {
+                    content
+                        .navigationTitle("Recordings")
                 }
             }
-            .navigationTitle("Recordings")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    if !recording.recordings.isEmpty {
-                        Button(role: .destructive) {
-                            player.stop()
-                            Task { await recording.clear() }
-                        } label: {
-                            Image(systemName: "trash")
-                        }
-                        .accessibilityLabel("Delete all recordings")
-                    }
-                }
-            }
-            .task { await recording.load() }
-            .onDisappear { player.stop() }
         }
+    }
+
+    private var content: some View {
+        Group {
+            if recording.recordings.isEmpty {
+                ContentUnavailableView {
+                    Label("No Recordings", systemImage: "waveform")
+                } description: {
+                    Text("Record from Assistant, or say “Nova, begin voice recording”.")
+                }
+            } else {
+                List {
+                    ForEach(recording.recordings) { item in
+                        RecordingRow(item: item, url: recording.fileURL(for: item), player: player)
+                    }
+                    .onDelete { offsets in
+                        let ids = offsets.map { recording.recordings[$0].id }
+                        if let playing = player.playingID, ids.contains(playing) { player.stop() }
+                        Task { await recording.delete(at: offsets) }
+                    }
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if !recording.recordings.isEmpty {
+                    Button(role: .destructive) {
+                        confirmClear = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .accessibilityLabel("Delete all recordings")
+                }
+            }
+        }
+        .novaConfirmClear(
+            isPresented: $confirmClear,
+            title: "Delete all recordings?",
+            message: "This permanently removes every voice memo from this iPhone."
+        ) {
+            player.stop()
+            Task { await recording.clear() }
+        }
+        .task { await recording.load() }
+        .onDisappear { player.stop() }
     }
 }
 

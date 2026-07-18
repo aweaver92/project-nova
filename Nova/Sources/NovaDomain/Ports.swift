@@ -4,7 +4,10 @@ import NovaCore
 public protocol ConversationalAIProvider: Sendable {
     func connect(config: AISessionConfig) async throws
     func disconnect() async
-    func appendAudio(_ pcm16_24k: Data) async
+    /// Append mic PCM. Returns `false` when the chunk could not be sent (not
+    /// connected or a transport write failed) so callers can count drops/failures.
+    @discardableResult
+    func appendAudio(_ pcm16_24k: Data) async -> Bool
     /// Explicitly ask the model to generate a reply to the committed input.
     func createResponse() async
     func interrupt() async

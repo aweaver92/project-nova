@@ -1,62 +1,74 @@
 import SwiftUI
 import NovaDomain
 
-/// Skills tab: teach Nova reusable voice macros. Each skill has trigger phrases
-/// (spoken to run it hands-free) and an ordered list of steps.
+/// Skills list: reusable voice macros with trigger phrases and steps.
+/// When `embedded` is true, omits its own `NavigationStack` (used inside Studio).
 public struct SkillsView: View {
     @Bindable var skills: SkillsViewModel
+    var embedded: Bool
     @State private var showImport = false
 
-    public init(skills: SkillsViewModel) {
+    public init(skills: SkillsViewModel, embedded: Bool = false) {
         self.skills = skills
+        self.embedded = embedded
     }
 
     public var body: some View {
-        NavigationStack {
-            Group {
-                if skills.skills.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Skills", systemImage: "wand.and.stars")
-                    } description: {
-                        Text("Create a skill to teach Nova a reusable command, e.g. “start my workday”.")
-                    }
-                } else {
-                    List {
-                        ForEach(skills.skills) { skill in
-                            NavigationLink {
-                                SkillEditorView(skill: skill, skills: skills)
-                            } label: {
-                                SkillRow(skill: skill)
-                            }
-                        }
-                        .onDelete { offsets in
-                            Task { await skills.delete(at: offsets) }
-                        }
-                    }
+        Group {
+            if embedded {
+                content
+            } else {
+                NavigationStack {
+                    content
+                        .navigationTitle("Skills")
                 }
             }
-            .navigationTitle("Skills")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { showImport = true } label: {
-                        Image(systemName: "square.and.arrow.down")
-                    }
-                    .accessibilityLabel("Import skill")
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    NavigationLink {
-                        SkillEditorView(skill: nil, skills: skills)
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("New skill")
-                }
-            }
-            .sheet(isPresented: $showImport) {
-                ImportSkillSheet(skills: skills)
-            }
-            .task { await skills.load() }
         }
+    }
+
+    private var content: some View {
+        Group {
+            if skills.skills.isEmpty {
+                ContentUnavailableView {
+                    Label("No Skills", systemImage: "wand.and.stars")
+                } description: {
+                    Text("Create a skill to teach Nova a reusable command, e.g. “start my workday”.")
+                }
+            } else {
+                List {
+                    ForEach(skills.skills) { skill in
+                        NavigationLink {
+                            SkillEditorView(skill: skill, skills: skills)
+                        } label: {
+                            SkillRow(skill: skill)
+                        }
+                    }
+                    .onDelete { offsets in
+                        Task { await skills.delete(at: offsets) }
+                    }
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { showImport = true } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }
+                .accessibilityLabel("Import skill")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                NavigationLink {
+                    SkillEditorView(skill: nil, skills: skills)
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("New skill")
+            }
+        }
+        .sheet(isPresented: $showImport) {
+            ImportSkillSheet(skills: skills)
+        }
+        .task { await skills.load() }
     }
 }
 

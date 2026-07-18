@@ -6,34 +6,40 @@ import NovaDomain
 #if os(iOS)
 /// Captures mono PCM from the active HFP route (glasses mic when preferred).
 public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
+    /// ~1s of newest audio at ~20 ms/chunk; older chunks are dropped under backpressure.
+    public static let chunkBufferCapacity = 48
+
     private let coordinator: AudioSessionCoordinator
+    private let metrics: (any LatencyMetricsRecorder)?
     private let engine = AVAudioEngine()
     private var continuation: AsyncStream<AudioChunk>.Continuation?
     private let lock = NSLock()
     private var observers: [NSObjectProtocol] = []
     private var running = false
+    private var recoveryGeneration = 0
 
     // Recreated on every `start()` so the mic feed can be torn down and brought
     // back within a single app run (e.g. switching agents reconnects the stream).
     public private(set) var chunks: AsyncStream<AudioChunk>
 
-    public init(coordinator: AudioSessionCoordinator) {
+    public init(coordinator: AudioSessionCoordinator, metrics: (any LatencyMetricsRecorder)? = nil) {
         self.coordinator = coordinator
+        self.metrics = metrics
         var cont: AsyncStream<AudioChunk>.Continuation?
-        self.chunks = AsyncStream { cont = $0 }
+        self.chunks = AsyncStream(bufferingPolicy: .bufferingNewest(Self.chunkBufferCapacity)) { cont = $0 }
         self.continuation = cont
     }
 
     public func start() async throws {
+        lock.lock()
         running = true
         // A fresh stream per engage. `stop()` finishes the previous continuation,
         // and yielding into a finished continuation silently drops audio — which
         // previously killed transcription for good after the first teardown
         // (e.g. the first agent switch). Rebuild it before the tap emits.
-        lock.lock()
         let previous = continuation
         var cont: AsyncStream<AudioChunk>.Continuation?
-        chunks = AsyncStream { cont = $0 }
+        chunks = AsyncStream(bufferingPolicy: .bufferingNewest(Self.chunkBufferCapacity)) { cont = $0 }
         continuation = cont
         lock.unlock()
         previous?.finish()
@@ -124,8 +130,13 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         case .ended:
             let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
                 .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
-            guard options.contains(.shouldResume) else { return }
-            NovaLog.audio.info("Audio interruption ended; resuming engine")
+            // Prefer `.shouldResume`, but still attempt recovery while we believe
+            // the session is active — missing the flag previously left capture muted.
+            if !options.contains(.shouldResume) {
+                NovaLog.audio.info("Audio interruption ended without shouldResume; attempting recovery anyway")
+            } else {
+                NovaLog.audio.info("Audio interruption ended; resuming engine")
+            }
             recover()
         @unknown default:
             break
@@ -145,35 +156,45 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
 
     /// Reactivate the HFP session and restart the capture tap after an
-    /// interruption or route change.
+    /// interruption or route change. Coalesces overlapping recoveries.
     private func recover() {
+        lock.lock()
+        recoveryGeneration &+= 1
+        let generation = recoveryGeneration
+        let alive = running
+        lock.unlock()
+        guard alive else { return }
         Task { [weak self] in
             guard let self else { return }
-            self.lock.lock(); let alive = self.running; self.lock.unlock()
-            guard alive else { return }
+            // Debounce rapid route flaps.
+            try? await Task.sleep(for: .milliseconds(80))
+            self.lock.lock()
+            let stillCurrent = self.recoveryGeneration == generation && self.running
+            self.lock.unlock()
+            guard stillCurrent else { return }
             do {
                 try await self.coordinator.activateConversationalHFP()
                 try self.installTapAndStartEngine()
             } catch {
                 NovaLog.audio.error("HFP recovery failed: \(String(describing: error), privacy: .public)")
+                self.metrics?.increment(.sessionFailures)
             }
         }
     }
 
     public func stop() async {
-        running = false
         lock.lock()
+        running = false
+        recoveryGeneration &+= 1
         let toRemove = observers
         observers = []
+        let sink = continuation
+        continuation = nil
         lock.unlock()
         toRemove.forEach { NotificationCenter.default.removeObserver($0) }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         await coordinator.deactivate()
-        lock.lock()
-        let sink = continuation
-        continuation = nil
-        lock.unlock()
         sink?.finish()
     }
 
@@ -181,8 +202,12 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         guard !data.isEmpty else { return }
         lock.lock()
         let sink = continuation
+        let alive = running
         lock.unlock()
-        sink?.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
+        guard alive, let sink else { return }
+        // bufferingNewest drops oldest under backpressure; yield's discarded
+        // value isn't exposed, so queue lag is observed via t_mic_queue_wait.
+        sink.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
     }
 
     private static func int16Data(from buffer: AVAudioPCMBuffer) -> Data {
@@ -278,9 +303,9 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
 public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     public let chunks: AsyncStream<AudioChunk>
     private let continuation: AsyncStream<AudioChunk>.Continuation
-    public init(coordinator: AudioSessionCoordinator) {
+    public init(coordinator: AudioSessionCoordinator, metrics: (any LatencyMetricsRecorder)? = nil) {
         var cont: AsyncStream<AudioChunk>.Continuation!
-        chunks = AsyncStream { cont = $0 }
+        chunks = AsyncStream(bufferingPolicy: .bufferingNewest(48)) { cont = $0 }
         continuation = cont
     }
     public func start() async throws {}
@@ -303,7 +328,7 @@ public final class SilentAudioIngress: AudioIngress, @unchecked Sendable {
 
     public init() {
         var cont: AsyncStream<AudioChunk>.Continuation!
-        chunks = AsyncStream { cont = $0 }
+        chunks = AsyncStream(bufferingPolicy: .bufferingNewest(48)) { cont = $0 }
         continuation = cont
     }
 

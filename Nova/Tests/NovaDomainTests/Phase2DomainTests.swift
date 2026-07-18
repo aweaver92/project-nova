@@ -180,7 +180,8 @@ private actor P2Provider: ConversationalAIProvider {
         lastInstructions = config.instructions
     }
     func disconnect() async { continuation.finish() }
-    func appendAudio(_ pcm16_24k: Data) async {}
+    @discardableResult
+    func appendAudio(_ pcm16_24k: Data) async -> Bool { true }
     func createResponse() async {}
     func interrupt() async {}
     func analyze(image: CapturedFrame, prompt: String) async throws -> String { "ok" }

@@ -1,19 +1,48 @@
 import SwiftUI
 import NovaDomain
 
-/// Agents tab: Nova (master) plus specialist sub-agents. Tap an agent to talk to
-/// it now; switch hands-free by saying "Nova, let me talk to <name>". Each agent
-/// has its own voice, personality, and toolset.
+/// Agents tab: Nova (master) plus specialists. Coding opens as a push destination
+/// when Claude is active. Bridge configuration lives in Settings.
 public struct AgentsView: View {
     @Bindable var agents: AgentsViewModel
+    @Bindable var coding: CodingViewModel
+    var showSettings: () -> Void
 
-    public init(agents: AgentsViewModel) {
+    public init(
+        agents: AgentsViewModel,
+        coding: CodingViewModel,
+        showSettings: @escaping () -> Void = {}
+    ) {
         self.agents = agents
+        self.coding = coding
+        self.showSettings = showSettings
     }
 
     public var body: some View {
         NavigationStack {
             List {
+                if agents.isClaudeActive {
+                    Section {
+                        NavigationLink {
+                            CodingView(coding: coding, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Coding")
+                                    Text(coding.pinnedSessionId == nil ? "Cursor session preview" : coding.shortSessionId)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .monospaced()
+                                }
+                            } icon: {
+                                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                            }
+                        }
+                    } header: {
+                        Text("Claude")
+                    }
+                }
+
                 Section {
                     ForEach(agents.agents) { agent in
                         AgentRow(
@@ -35,13 +64,18 @@ public struct AgentsView: View {
                 } header: {
                     Text("Talking to \(agents.activeName)")
                 } footer: {
-                    Text("Say “Nova, let me talk to Claude” to switch hands-free. Say “Nova, end the conversation” to come back to Nova. Only Nova can switch specialists.")
+                    Text("“Nova, let me talk to Claude” switches hands-free. “Nova, end the conversation” returns to Nova.")
+                        .font(.caption2)
                 }
-
-                bridgeSection
             }
             .navigationTitle("Agents")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(action: showSettings) {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
+                }
                 ToolbarItem(placement: .primaryAction) {
                     NavigationLink {
                         AgentEditorView(agent: nil, agents: agents)
@@ -51,38 +85,10 @@ public struct AgentsView: View {
                     .accessibilityLabel("New agent")
                 }
             }
-            .task { await agents.load() }
-        }
-    }
-
-    private var bridgeSection: some View {
-        Section {
-            TextField("http://your-mac.local:8787", text: $agents.bridgeBaseURL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
-            SecureField("Bridge token", text: $agents.bridgeToken)
-            Button {
-                Task { await agents.saveBridge() }
-            } label: {
-                HStack {
-                    Text("Save & test connection")
-                    if agents.bridgeChecking {
-                        Spacer()
-                        ProgressView()
-                    }
-                }
+            .task {
+                await agents.load()
+                await coding.load()
             }
-            .disabled(agents.bridgeChecking)
-            if !agents.bridgeStatus.isEmpty {
-                Text(agents.bridgeStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        } header: {
-            Text("Claude — Nova Bridge")
-        } footer: {
-            Text("Claude runs Claude Code and pushes commands to your active Cursor sessions through a small bridge service you run on your dev machine. Enter the full URL including http:// or https:// (e.g. http://192.168.1.50:8787), plus the token from your bridge's .env.")
         }
     }
 }
@@ -94,10 +100,10 @@ private struct AgentRow: View {
 
     var body: some View {
         Button(action: activate) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Image(systemName: agent.isMaster ? "crown.fill" : "person.wave.2.fill")
                     .foregroundStyle(isActive ? Color.accentColor : .secondary)
-                    .frame(width: 24)
+                    .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(agent.name).font(.body)
@@ -111,7 +117,10 @@ private struct AgentRow: View {
                             Text("off").font(.caption2).foregroundStyle(.secondary)
                         }
                     }
-                    Text(agent.role).font(.caption).foregroundStyle(.secondary)
+                    Text("\(agent.role) · \(agent.wakeWord) · \(agent.voice)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
                 if isActive {
