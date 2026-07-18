@@ -25,6 +25,10 @@ public struct RootView: View {
     @Bindable var visualMemory: VisualMemoryViewModel
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
+    @Bindable var training: TrainingViewModel
+    @Bindable var wellness: SageWellnessViewModel
+    @Bindable var kitchen: RemyKitchenViewModel
+    @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
     @State private var selectedTab: RootTab = .assistant
@@ -46,6 +50,10 @@ public struct RootView: View {
         visualMemory: VisualMemoryViewModel,
         agents: AgentsViewModel,
         coding: CodingViewModel,
+        training: TrainingViewModel,
+        wellness: SageWellnessViewModel,
+        kitchen: RemyKitchenViewModel,
+        study: StudyViewModel,
         settings: SettingsViewModel,
         toolConfirmation: ToolConfirmationCoordinator
     ) {
@@ -61,6 +69,10 @@ public struct RootView: View {
         self.visualMemory = visualMemory
         self.agents = agents
         self.coding = coding
+        self.training = training
+        self.wellness = wellness
+        self.kitchen = kitchen
+        self.study = study
         self.settings = settings
         self.toolConfirmation = toolConfirmation
     }
@@ -71,7 +83,15 @@ public struct RootView: View {
                 .tabItem { Label("Assistant", systemImage: "waveform") }
                 .tag(RootTab.assistant)
 
-            AgentsView(agents: agents, coding: coding, showSettings: { showSettings = true })
+            AgentsView(
+                agents: agents,
+                coding: coding,
+                training: training,
+                wellness: wellness,
+                kitchen: kitchen,
+                study: study,
+                showSettings: { showSettings = true }
+            )
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
                 .tag(RootTab.agents)
 
@@ -111,6 +131,36 @@ public struct RootView: View {
                 listenSection
                 if agents.isClaudeActive, coding.pinnedSessionId != nil {
                     codingResumeSection
+                }
+                if agents.isMaxActive, training.hasActiveSession {
+                    specialistResumeSection(
+                        title: "Open workout · \(training.activeSession?.title ?? "Live")",
+                        systemImage: "figure.strengthtraining.traditional",
+                        footer: "Opens Training under Agents for live sets and rest."
+                    )
+                }
+                if agents.isSageActive {
+                    specialistResumeSection(
+                        title: "Open Wellness",
+                        systemImage: "leaf",
+                        footer: "Opens Wellness under Agents for check-ins and breath timers."
+                    )
+                }
+                if agents.isRemyActive {
+                    specialistResumeSection(
+                        title: kitchen.cookingSession == nil
+                            ? "Open Kitchen"
+                            : "Open Kitchen · cooking",
+                        systemImage: "fork.knife",
+                        footer: "Opens Kitchen under Agents for pantry, recipes, and cook mode."
+                    )
+                }
+                if agents.isScholarActive {
+                    specialistResumeSection(
+                        title: study.dueTotal > 0 ? "Open Study · \(study.dueTotal) due" : "Open Study",
+                        systemImage: "text.book.closed",
+                        footer: "Opens Study under Agents for decks and review."
+                    )
                 }
                 if session.registrationState == .registered {
                     visionSection
@@ -157,6 +207,10 @@ public struct RootView: View {
                 await workspaces.load()
                 await agents.load()
                 await coding.load()
+                await training.load()
+                await wellness.load()
+                await kitchen.load()
+                await study.load()
                 await settings.load()
                 await startListeningIfReady()
             }
@@ -227,6 +281,18 @@ public struct RootView: View {
             }
         } footer: {
             Text("Opens Coding under Agents with the pinned Cursor session.")
+        }
+    }
+
+    private func specialistResumeSection(title: String, systemImage: String, footer: String) -> some View {
+        Section {
+            Button {
+                selectedTab = .agents
+            } label: {
+                Label(title, systemImage: systemImage)
+            }
+        } footer: {
+            Text(footer)
         }
     }
 

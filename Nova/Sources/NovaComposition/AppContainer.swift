@@ -47,6 +47,10 @@ public final class AppContainer {
     public let visualMemoryVM: VisualMemoryViewModel
     public let agentsVM: AgentsViewModel
     public let codingVM: CodingViewModel
+    public let trainingVM: TrainingViewModel
+    public let wellnessVM: SageWellnessViewModel
+    public let kitchenVM: RemyKitchenViewModel
+    public let studyVM: StudyViewModel
     public let settingsVM: SettingsViewModel
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
@@ -180,11 +184,28 @@ public final class AppContainer {
         self.workouts = workoutStore
         let workoutPlanStore = FileWorkoutPlanStore()
         let pantryStore = FilePantryStore()
+        let recipeStore = FileRecipeStore()
+        let shoppingStore = FileShoppingStore()
+        let mealPlanStore = FileMealPlanStore()
+        let nutritionStore = FileNutritionStore()
         let wellnessStore = FileWellnessStore()
         let studyStore = FileStudyDeckStore()
         let timerService = LocalTimerService()
+        self.trainingVM = TrainingViewModel(
+            workouts: workoutStore,
+            plans: workoutPlanStore,
+            timers: timerService
+        )
+        self.wellnessVM = SageWellnessViewModel(store: wellnessStore, timers: timerService)
+        self.studyVM = StudyViewModel(store: studyStore)
         let bridge = NovaBridgeClient(configProvider: bridgeConfig)
         self.bridge = bridge
+
+        let session = MetaDATWearableSession(useMock: useMockGlasses)
+        self.wearableSession = session
+        if !useMockGlasses {
+            Task { await session.syncRegistrationFromSDK() }
+        }
 
         // App-layer callbacks skills/drafting need (opening links, local timers).
         var openURL: SkillRunner.URLOpener?
@@ -305,17 +326,48 @@ public final class AppContainer {
             SaveWorkoutPlanTool(store: workoutPlanStore),
             ListWorkoutPlansTool(store: workoutPlanStore),
             StartWorkoutFromPlanTool(plans: workoutPlanStore, workouts: workoutStore),
-            // Remy's pantry tools.
+            // Remy's pantry + kitchen tools.
             AddPantryItemTool(store: pantryStore),
+            UpdatePantryItemTool(store: pantryStore),
             ListPantryTool(store: pantryStore),
             RemovePantryItemTool(store: pantryStore),
+            ScanFridgeTool(
+                frameCapture: capture,
+                ai: ai,
+                pantry: pantryStore,
+                nutrition: nutritionStore,
+                isVisionReady: { await session.isRegistered() }
+            ),
+            SaveRecipeTool(store: recipeStore),
+            ListRecipesTool(store: recipeStore),
+            GetRecipeTool(store: recipeStore),
+            StartCookingTool(store: recipeStore),
+            CookingNextStepTool(store: recipeStore),
+            CookingPreviousStepTool(store: recipeStore),
+            CookingStatusTool(store: recipeStore),
+            EndCookingTool(store: recipeStore),
+            AddShoppingItemTool(store: shoppingStore),
+            ListShoppingTool(store: shoppingStore),
+            CheckShoppingItemTool(store: shoppingStore),
+            ClearCheckedShoppingTool(store: shoppingStore),
+            SetMealPlanSlotTool(store: mealPlanStore),
+            GetMealPlanTool(store: mealPlanStore),
+            ClearMealPlanSlotTool(store: mealPlanStore),
+            GetNutritionProfileTool(store: nutritionStore),
+            UpdateNutritionProfileTool(store: nutritionStore),
+            LogMealTool(store: nutritionStore),
+            RecentMealsTool(store: nutritionStore),
             // Sage's wellness tools.
             LogWellnessCheckinTool(store: wellnessStore),
             WellnessHistoryTool(store: wellnessStore),
             // Scholar's study tools.
             AddStudyCardTool(store: studyStore),
             ListStudyDecksTool(store: studyStore),
+            ListStudyCardsTool(store: studyStore),
+            UpdateStudyCardTool(store: studyStore),
+            DeleteStudyCardTool(store: studyStore),
             StartQuizTool(store: studyStore),
+            RevealCardTool(store: studyStore),
             GradeCardTool(store: studyStore)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
@@ -349,12 +401,6 @@ public final class AppContainer {
                 parts.append("The user's saved skills you can run with the run_skill tool: \(list).")
             }
             return parts.joined(separator: "\n")
-        }
-
-        let session = MetaDATWearableSession(useMock: useMockGlasses)
-        self.wearableSession = session
-        if !useMockGlasses {
-            Task { await session.syncRegistrationFromSDK() }
         }
 
         let orchestrator = ConversationOrchestrator(
@@ -397,6 +443,26 @@ public final class AppContainer {
                 }
                 if names.contains("list_pantry") {
                     let s = await pantryStore.summary()
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("list_recipes") {
+                    let s = await recipeStore.summary(limit: 8)
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("cooking_status") {
+                    let s = await recipeStore.cookingSummary()
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("list_shopping") {
+                    let s = await shoppingStore.summary()
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("get_meal_plan") {
+                    let s = await mealPlanStore.summary()
+                    if !s.isEmpty { parts.append(s) }
+                }
+                if names.contains("get_nutrition_profile") {
+                    let s = await nutritionStore.profileSummary()
                     if !s.isEmpty { parts.append(s) }
                 }
                 if names.contains("wellness_history") {
@@ -450,6 +516,22 @@ public final class AppContainer {
             #endif
         }
         self.codingVM = codingVM
+        self.kitchenVM = RemyKitchenViewModel(
+            pantry: pantryStore,
+            recipes: recipeStore,
+            shopping: shoppingStore,
+            meals: mealPlanStore,
+            nutrition: nutritionStore,
+            analyzeImage: { [orchestrator] frame, prompt in
+                try await orchestrator.askAboutFrame(frame, prompt: prompt)
+            },
+            captureStill: { [capture] in
+                try await capture.captureStill()
+            },
+            isVisionReady: { [session] in
+                await session.isRegistered()
+            }
+        )
         let settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)
         settingsVM.realtimeUsesBridge = usesBridgeRealtime
         self.settingsVM = settingsVM

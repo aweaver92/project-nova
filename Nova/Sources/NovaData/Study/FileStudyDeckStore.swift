@@ -21,9 +21,17 @@ public actor FileStudyDeckStore: StudyDeckStoring {
         Array(Set(cards.map(\.deck))).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
-    public func due(limit: Int) -> [StudyCard] {
+    public func due(deck: String?, limit: Int) -> [StudyCard] {
         let now = Date()
-        return Array(cards.filter { $0.dueAt <= now }.sorted { $0.dueAt < $1.dueAt }.prefix(max(0, limit)))
+        var due = cards.filter { $0.dueAt <= now }
+        if let deck, !deck.isEmpty {
+            due = due.filter { $0.deck.localizedCaseInsensitiveCompare(deck) == .orderedSame }
+        }
+        return Array(due.sorted { $0.dueAt < $1.dueAt }.prefix(max(0, limit)))
+    }
+
+    public func card(id: UUID) -> StudyCard? {
+        cards.first { $0.id == id }
     }
 
     @discardableResult
@@ -53,7 +61,7 @@ public actor FileStudyDeckStore: StudyDeckStoring {
     }
 
     public func summary(dueLimit: Int) -> String {
-        let dueCards = due(limit: dueLimit)
+        let dueCards = due(deck: nil, limit: dueLimit)
         let deckNames = decks()
         guard !dueCards.isEmpty || !deckNames.isEmpty else { return "" }
         var lines: [String] = []

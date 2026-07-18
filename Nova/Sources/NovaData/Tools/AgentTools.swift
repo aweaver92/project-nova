@@ -315,7 +315,7 @@ public struct StartWorkoutSessionTool: Tool {
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let title: String? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(title: nil)
-        let session = await store.startSession(title: args.title ?? "Workout")
+        let session = await store.startSession(title: args.title ?? "Workout", planId: nil)
         return #"{"ok":true,"session_id":"\#(session.id.uuidString)","title":"\#(session.title)"}"#
     }
 }

@@ -24,13 +24,16 @@ public actor FileWorkoutStore: WorkoutStoring {
     }
 
     @discardableResult
-    public func startSession(title: String) -> WorkoutSession {
+    public func startSession(title: String, planId: UUID? = nil) -> WorkoutSession {
         // If one is already in progress, keep coaching that one.
         if let existing = sessions.first(where: { $0.isActive }) {
             return existing
         }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let session = WorkoutSession(title: trimmed.isEmpty ? "Workout" : trimmed)
+        let session = WorkoutSession(
+            title: trimmed.isEmpty ? "Workout" : trimmed,
+            planId: planId
+        )
         sessions.append(session)
         persist()
         return session

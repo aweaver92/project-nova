@@ -721,7 +721,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 5
+    static let seedCapabilitiesVersion = 8
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -780,7 +780,7 @@ public extension Agent {
                 name: "Max",
                 voice: RealtimeVoice.ash.rawValue,
                 role: "a personal trainer and strength coach",
-                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy.",
+                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy. The user may have the Training screen open to log sets or skip rest on the phone — say the cue and assume they may tap Log instead of asking you to log every set.",
                 toolNames: [
                     "start_workout_session", "log_workout_set", "end_workout_session",
                     "workout_history", "save_workout_plan", "list_workout_plans",
@@ -810,10 +810,17 @@ public extension Agent {
                 name: "Remy",
                 voice: RealtimeVoice.ballad.rawValue,
                 role: "a chef and nutrition assistant",
-                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Suggest recipes from the pantry (list_pantry / add_pantry_item) and what the user sees (remember_visual for fridge/labels). Use set_timer for cook times and announce when they fire. Keep steps short for hands-free cooking; ask before assuming pantry stock. Optional play_music while cooking.",
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. Suggest and save recipes; for hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
                 toolNames: Agent.commonToolNames + [
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
-                    "remember_visual", "add_pantry_item", "list_pantry", "remove_pantry_item",
+                    "remember_visual",
+                    "add_pantry_item", "list_pantry", "remove_pantry_item", "update_pantry_item",
+                    "scan_fridge",
+                    "save_recipe", "list_recipes", "get_recipe",
+                    "start_cooking", "cooking_next_step", "cooking_previous_step", "cooking_status", "end_cooking",
+                    "add_shopping_item", "list_shopping", "check_shopping_item", "clear_checked_shopping",
+                    "set_meal_plan_slot", "get_meal_plan", "clear_meal_plan_slot",
+                    "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals",
                     "search_knowledge", "web_search"
                 ],
                 builtIn: true
@@ -823,10 +830,12 @@ public extension Agent {
                 name: "Scholar",
                 voice: RealtimeVoice.verse.rawValue,
                 role: "a patient tutor",
-                personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. Use add_study_card / start_quiz / grade_card for spaced-repetition drills, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
+                personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. For drills: start_quiz (fronts only) → wait for the learner's answer → reveal_card → discuss briefly → grade_card (again/hard/good/easy). Use add_study_card / list_study_decks / list_study_cards / update_study_card / delete_study_card to manage decks, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
                 toolNames: Agent.commonToolNames + [
-                    "search_knowledge", "add_study_card", "list_study_decks",
-                    "start_quiz", "grade_card", "bookmark_conversation", "web_search"
+                    "search_knowledge", "add_study_card", "list_study_decks", "list_study_cards",
+                    "update_study_card", "delete_study_card",
+                    "start_quiz", "reveal_card", "grade_card",
+                    "bookmark_conversation", "web_search"
                 ],
                 builtIn: true
             ),
@@ -879,6 +888,17 @@ public extension Agent {
                     )
                 ]
             ),
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B4")!,
+                name: "Remy next step",
+                triggerPhrases: ["next step", "what's next", "remy next"],
+                steps: [
+                    SkillStep(
+                        kind: .freeform,
+                        text: "If a cooking session is active, call cooking_next_step and speak only the new step briefly. If none is active, say so and offer to start_cooking from a saved recipe."
+                    )
+                ]
+            ),
         ]
     }
 }
@@ -925,6 +945,8 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
     public var endedAt: Date?
     public var sets: [WorkoutSet]
     public var notes: String?
+    /// When started from a saved plan, links the session so the Training HUD can show next-up.
+    public var planId: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -932,7 +954,8 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
         startedAt: Date = Date(),
         endedAt: Date? = nil,
         sets: [WorkoutSet] = [],
-        notes: String? = nil
+        notes: String? = nil,
+        planId: UUID? = nil
     ) {
         self.id = id
         self.title = title
@@ -940,9 +963,91 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
         self.endedAt = endedAt
         self.sets = sets
         self.notes = notes
+        self.planId = planId
     }
 
     public var isActive: Bool { endedAt == nil }
+}
+
+/// Derived progress through a plan given logged sets (case-insensitive exercise names).
+public struct WorkoutPlanProgress: Sendable, Equatable {
+    public let current: PlannedExercise?
+    public let next: PlannedExercise?
+    public let completedSetsForCurrent: Int
+    public let targetSetsForCurrent: Int?
+
+    public init(
+        current: PlannedExercise?,
+        next: PlannedExercise?,
+        completedSetsForCurrent: Int,
+        targetSetsForCurrent: Int?
+    ) {
+        self.current = current
+        self.next = next
+        self.completedSetsForCurrent = completedSetsForCurrent
+        self.targetSetsForCurrent = targetSetsForCurrent
+    }
+
+    /// First planned exercise whose logged set count is below its target (default 1 when unset).
+    public static func derive(plan: WorkoutPlan?, sets: [WorkoutSet]) -> WorkoutPlanProgress {
+        guard let plan, !plan.exercises.isEmpty else {
+            return WorkoutPlanProgress(current: nil, next: nil, completedSetsForCurrent: 0, targetSetsForCurrent: nil)
+        }
+        for (index, exercise) in plan.exercises.enumerated() {
+            let target = max(1, exercise.sets ?? 1)
+            let done = sets.filter { $0.exercise.localizedCaseInsensitiveCompare(exercise.name) == .orderedSame }.count
+            if done < target {
+                let next = index + 1 < plan.exercises.count ? plan.exercises[index + 1] : nil
+                return WorkoutPlanProgress(
+                    current: exercise,
+                    next: next,
+                    completedSetsForCurrent: done,
+                    targetSetsForCurrent: target
+                )
+            }
+        }
+        return WorkoutPlanProgress(
+            current: nil,
+            next: nil,
+            completedSetsForCurrent: 0,
+            targetSetsForCurrent: nil
+        )
+    }
+}
+
+/// Max weight (lb) seen for each exercise across sessions — lightweight PR strip.
+public struct ExercisePR: Sendable, Identifiable, Equatable {
+    public var id: String { exercise }
+    public let exercise: String
+    public let weight: Double
+
+    public init(exercise: String, weight: Double) {
+        self.exercise = exercise
+        self.weight = weight
+    }
+
+    public static func from(history: [WorkoutSession], limit: Int = 8) -> [ExercisePR] {
+        var best: [String: Double] = [:]
+        var displayName: [String: String] = [:]
+        for session in history {
+            for set in session.sets {
+                guard let w = set.weight, w > 0 else { continue }
+                let key = set.exercise.lowercased()
+                if best[key] == nil || w > best[key]! {
+                    best[key] = w
+                    displayName[key] = set.exercise
+                }
+            }
+        }
+        return best.keys
+            .compactMap { key -> ExercisePR? in
+                guard let name = displayName[key], let w = best[key] else { return nil }
+                return ExercisePR(exercise: name, weight: w)
+            }
+            .sorted { $0.weight > $1.weight }
+            .prefix(max(0, limit))
+            .map { $0 }
+    }
 }
 
 /// One exercise line inside a reusable workout plan.
@@ -1027,12 +1132,38 @@ public struct ActiveTimer: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+public enum PantryCategory: String, Sendable, Codable, CaseIterable {
+    case produce
+    case dairy
+    case protein
+    case pantry
+    case frozen
+    case other
+}
+
+public enum PantryLocation: String, Sendable, Codable, CaseIterable {
+    case fridge
+    case freezer
+    case pantry
+    case counter
+}
+
+public enum StockLevel: String, Sendable, Codable, CaseIterable {
+    case ok
+    case low
+    case out
+}
+
 /// A pantry / fridge inventory item for Remy.
 public struct PantryItem: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
     public var name: String
     public var quantity: String?
     public var notes: String?
+    public var category: PantryCategory
+    public var location: PantryLocation
+    public var stockLevel: StockLevel
+    public var expiresAt: Date?
     public var updatedAt: Date
 
     public init(
@@ -1040,13 +1171,315 @@ public struct PantryItem: Sendable, Identifiable, Codable, Equatable {
         name: String,
         quantity: String? = nil,
         notes: String? = nil,
+        category: PantryCategory = .other,
+        location: PantryLocation = .pantry,
+        stockLevel: StockLevel = .ok,
+        expiresAt: Date? = nil,
         updatedAt: Date = Date()
     ) {
         self.id = id
         self.name = name
         self.quantity = quantity
         self.notes = notes
+        self.category = category
+        self.location = location
+        self.stockLevel = stockLevel
+        self.expiresAt = expiresAt
         self.updatedAt = updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        quantity = try c.decodeIfPresent(String.self, forKey: .quantity)
+        notes = try c.decodeIfPresent(String.self, forKey: .notes)
+        category = try c.decodeIfPresent(PantryCategory.self, forKey: .category) ?? .other
+        location = try c.decodeIfPresent(PantryLocation.self, forKey: .location) ?? .pantry
+        stockLevel = try c.decodeIfPresent(StockLevel.self, forKey: .stockLevel) ?? .ok
+        expiresAt = try c.decodeIfPresent(Date.self, forKey: .expiresAt)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+public struct RecipeIngredient: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var pantryItemId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        pantryItemId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.pantryItemId = pantryItemId
+    }
+}
+
+/// A saved recipe for Remy.
+public struct Recipe: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var title: String
+    public var servings: Int?
+    public var ingredients: [RecipeIngredient]
+    public var steps: [String]
+    public var tags: [String]
+    public var sourceNote: String?
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        servings: Int? = nil,
+        ingredients: [RecipeIngredient] = [],
+        steps: [String] = [],
+        tags: [String] = [],
+        sourceNote: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.servings = servings
+        self.ingredients = ingredients
+        self.steps = steps
+        self.tags = tags
+        self.sourceNote = sourceNote
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Live cook-mode session for Remy.
+public struct CookingSession: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var recipeId: UUID
+    public var recipeTitle: String
+    public var currentStepIndex: Int
+    public var startedAt: Date
+    public var endedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        recipeId: UUID,
+        recipeTitle: String,
+        currentStepIndex: Int = 0,
+        startedAt: Date = Date(),
+        endedAt: Date? = nil
+    ) {
+        self.id = id
+        self.recipeId = recipeId
+        self.recipeTitle = recipeTitle
+        self.currentStepIndex = max(0, currentStepIndex)
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+    }
+
+    public var isActive: Bool { endedAt == nil }
+}
+
+public struct ShoppingListItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var fromRecipeId: UUID?
+    public var checked: Bool
+    public var category: String?
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        fromRecipeId: UUID? = nil,
+        checked: Bool = false,
+        category: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.fromRecipeId = fromRecipeId
+        self.checked = checked
+        self.category = category
+        self.updatedAt = updatedAt
+    }
+}
+
+public enum MealSlotKind: String, Sendable, Codable, CaseIterable {
+    case breakfast
+    case lunch
+    case dinner
+    case snack
+}
+
+public struct MealPlanSlot: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// 0 = Monday … 6 = Sunday relative to `MealPlan.weekStart`.
+    public var dayOffset: Int
+    public var kind: MealSlotKind
+    public var recipeId: UUID?
+    public var note: String?
+
+    public init(
+        id: UUID = UUID(),
+        dayOffset: Int,
+        kind: MealSlotKind,
+        recipeId: UUID? = nil,
+        note: String? = nil
+    ) {
+        self.id = id
+        self.dayOffset = min(6, max(0, dayOffset))
+        self.kind = kind
+        self.recipeId = recipeId
+        self.note = note
+    }
+
+    public var isEmpty: Bool {
+        (note?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) && recipeId == nil
+    }
+}
+
+public struct MealPlan: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var weekStart: Date
+    public var slots: [MealPlanSlot]
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        weekStart: Date,
+        slots: [MealPlanSlot] = [],
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.weekStart = weekStart
+        self.slots = slots
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct NutritionProfile: Sendable, Codable, Equatable {
+    public var dietStyle: String?
+    public var allergens: [String]
+    public var goals: [String]
+    public var preferredCuisines: [String]
+    public var staples: [String]
+    public var notes: String?
+    public var updatedAt: Date
+
+    public init(
+        dietStyle: String? = nil,
+        allergens: [String] = [],
+        goals: [String] = [],
+        preferredCuisines: [String] = [],
+        staples: [String] = NutritionProfile.defaultStaples,
+        notes: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.dietStyle = dietStyle
+        self.allergens = allergens
+        self.goals = goals
+        self.preferredCuisines = preferredCuisines
+        self.staples = staples
+        self.notes = notes
+        self.updatedAt = updatedAt
+    }
+
+    public static let defaultStaples: [String] = [
+        "Eggs", "Milk", "Butter", "Bread", "Rice", "Pasta",
+        "Olive oil", "Salt", "Onions", "Garlic", "Chicken", "Cheese"
+    ]
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dietStyle = try c.decodeIfPresent(String.self, forKey: .dietStyle)
+        allergens = try c.decodeIfPresent([String].self, forKey: .allergens) ?? []
+        goals = try c.decodeIfPresent([String].self, forKey: .goals) ?? []
+        preferredCuisines = try c.decodeIfPresent([String].self, forKey: .preferredCuisines) ?? []
+        staples = try c.decodeIfPresent([String].self, forKey: .staples) ?? NutritionProfile.defaultStaples
+        notes = try c.decodeIfPresent(String.self, forKey: .notes)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var description: String
+    public var at: Date
+    public var recipeId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        description: String,
+        at: Date = Date(),
+        recipeId: UUID? = nil
+    ) {
+        self.id = id
+        self.description = description
+        self.at = at
+        self.recipeId = recipeId
+    }
+}
+
+public struct FridgeScanDetectedItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var stockLevel: StockLevel
+    public var confidence: Double?
+    public var matchedPantryItemId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        stockLevel: StockLevel = .ok,
+        confidence: Double? = nil,
+        matchedPantryItemId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.stockLevel = stockLevel
+        self.confidence = confidence
+        self.matchedPantryItemId = matchedPantryItemId
+    }
+}
+
+/// Result of a fridge / pantry photo analysis for Remy.
+public struct FridgeScanResult: Sendable, Codable, Equatable {
+    public var detected: [FridgeScanDetectedItem]
+    public var lowOrUnclear: [FridgeScanDetectedItem]
+    public var missingStaples: [String]
+    public var notes: String?
+    public var scannedAt: Date
+
+    public init(
+        detected: [FridgeScanDetectedItem] = [],
+        lowOrUnclear: [FridgeScanDetectedItem] = [],
+        missingStaples: [String] = [],
+        notes: String? = nil,
+        scannedAt: Date = Date()
+    ) {
+        self.detected = detected
+        self.lowOrUnclear = lowOrUnclear
+        self.missingStaples = missingStaples
+        self.notes = notes
+        self.scannedAt = scannedAt
+    }
+
+    public var summaryLine: String {
+        let have = detected.map(\.name)
+        let low = lowOrUnclear.map(\.name)
+        var parts: [String] = []
+        if !have.isEmpty { parts.append("Seen: \(have.joined(separator: ", "))") }
+        if !low.isEmpty { parts.append("Low/unclear: \(low.joined(separator: ", "))") }
+        if !missingStaples.isEmpty { parts.append("Missing staples: \(missingStaples.joined(separator: ", "))") }
+        return parts.isEmpty ? "Fridge scan: nothing clear." : "Fridge scan — \(parts.joined(separator: ". "))."
     }
 }
 

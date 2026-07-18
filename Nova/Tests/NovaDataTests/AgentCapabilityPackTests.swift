@@ -17,11 +17,19 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(max.toolNames!.contains("set_timer"))
         XCTAssertTrue(max.toolNames!.contains("play_music"))
         XCTAssertTrue(max.toolNames!.contains("save_workout_plan"))
+        XCTAssertTrue(max.personality.contains("Training screen"))
         XCTAssertTrue(remy.toolNames!.contains("list_pantry"))
         XCTAssertTrue(remy.toolNames!.contains("remember_visual"))
+        XCTAssertTrue(remy.toolNames!.contains("scan_fridge"))
+        XCTAssertTrue(remy.toolNames!.contains("start_cooking"))
+        XCTAssertTrue(remy.toolNames!.contains("get_nutrition_profile"))
         XCTAssertTrue(sage.toolNames!.contains("log_wellness_checkin"))
         XCTAssertTrue(sage.toolNames!.contains("daily_briefing"))
         XCTAssertTrue(scholar.toolNames!.contains("start_quiz"))
+        XCTAssertTrue(scholar.toolNames!.contains("reveal_card"))
+        XCTAssertTrue(scholar.toolNames!.contains("list_study_cards"))
+        XCTAssertTrue(scholar.toolNames!.contains("update_study_card"))
+        XCTAssertTrue(scholar.toolNames!.contains("delete_study_card"))
         XCTAssertTrue(claude.toolNames!.contains("push_to_cursor"))
         XCTAssertTrue(claude.toolNames!.contains("list_repos"))
         XCTAssertTrue(claude.toolNames!.contains("create_web_project"))
@@ -86,6 +94,7 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(json.contains(saved.id.uuidString))
         let active = await workouts.activeSession()
         XCTAssertEqual(active?.title, "Legs")
+        XCTAssertEqual(active?.planId, saved.id)
     }
 
     func testPantryUpsertByName() async {
@@ -124,6 +133,65 @@ final class AgentCapabilityPackTests: XCTestCase {
         let quizJSON = try await quiz.invoke(argumentsJSON: #"{"deck":"Swift"}"#)
         // Just graded "good" → not due anymore.
         XCTAssertTrue(quizJSON.contains("\"count\":0"))
+    }
+
+    func testDueFiltersByDeckBeforeLimit() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("study-due-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = FileStudyDeckStore(url: url)
+        for i in 0..<12 {
+            _ = await store.upsert(StudyCard(deck: "A", front: "A\(i)", back: "a"))
+        }
+        let target = await store.upsert(StudyCard(deck: "B", front: "Only B", back: "b"))
+        let dueB = await store.due(deck: "B", limit: 5)
+        XCTAssertEqual(dueB.count, 1)
+        XCTAssertEqual(dueB.first?.id, target.id)
+
+        let quiz = StartQuizTool(store: store)
+        let quizJSON = try! await quiz.invoke(argumentsJSON: #"{"deck":"B","limit":5}"#)
+        XCTAssertTrue(quizJSON.contains("\"count\":1"))
+        XCTAssertTrue(quizJSON.contains("Only B"))
+        XCTAssertFalse(quizJSON.contains("\"back\""))
+    }
+
+    func testRevealThenGradeFlow() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("study-reveal-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = FileStudyDeckStore(url: url)
+        let card = await store.upsert(StudyCard(deck: "Hist", front: "Year?", back: "1776"))
+
+        let reveal = RevealCardTool(store: store)
+        let revealed = try await reveal.invoke(argumentsJSON: #"{"id":"\#(card.id.uuidString)"}"#)
+        XCTAssertTrue(revealed.contains("\"back\":\"1776\""))
+
+        let grade = GradeCardTool(store: store)
+        let graded = try await grade.invoke(
+            argumentsJSON: #"{"id":"\#(card.id.uuidString)","grade":"good","user_answer":"1776"}"#
+        )
+        XCTAssertTrue(graded.contains("\"ok\":true"))
+        XCTAssertTrue(graded.contains("\"user_answer\":\"1776\""))
+        XCTAssertGreaterThan((await store.card(id: card.id))!.dueAt, Date())
+    }
+
+    func testUpdateAndDeleteStudyCardTools() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("study-crud-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = FileStudyDeckStore(url: url)
+        let card = await store.upsert(StudyCard(deck: "Old", front: "Q", back: "A"))
+
+        let update = UpdateStudyCardTool(store: store)
+        let updated = try await update.invoke(
+            argumentsJSON: #"{"id":"\#(card.id.uuidString)","deck":"New","front":"Q2","back":"A2"}"#
+        )
+        XCTAssertTrue(updated.contains("\"ok\":true"))
+        let listed = try await ListStudyCardsTool(store: store).invoke(argumentsJSON: #"{"deck":"New"}"#)
+        XCTAssertTrue(listed.contains("Q2"))
+        XCTAssertTrue(listed.contains("A2"))
+
+        let del = DeleteStudyCardTool(store: store)
+        let deleted = try await del.invoke(argumentsJSON: #"{"id":"\#(card.id.uuidString)"}"#)
+        XCTAssertTrue(deleted.contains("\"ok\":true"))
+        XCTAssertNil(await store.card(id: card.id))
     }
 
     func testPlayMusicResolvesSpotifySearch() {

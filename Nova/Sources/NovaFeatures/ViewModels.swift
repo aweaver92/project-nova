@@ -2179,6 +2179,22 @@ public final class AgentsViewModel {
         activeAgent?.id == Agent.SeedID.claude
     }
 
+    public var isMaxActive: Bool {
+        activeAgent?.id == Agent.SeedID.max
+    }
+
+    public var isSageActive: Bool {
+        activeAgent?.id == Agent.SeedID.sage
+    }
+
+    public var isRemyActive: Bool {
+        activeAgent?.id == Agent.SeedID.remy
+    }
+
+    public var isScholarActive: Bool {
+        activeAgent?.id == Agent.SeedID.scholar
+    }
+
     public func load() async {
         agents = await store.all()
         activeAgent = await store.active()

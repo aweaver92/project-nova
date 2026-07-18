@@ -283,7 +283,7 @@ public protocol WorkoutStoring: Sendable {
     /// The in-progress session, if any.
     func activeSession() async -> WorkoutSession?
     @discardableResult
-    func startSession(title: String) async -> WorkoutSession
+    func startSession(title: String, planId: UUID?) async -> WorkoutSession
     /// Append a set to the active session, starting one if none is in progress.
     @discardableResult
     func logSet(_ set: WorkoutSet) async -> WorkoutSession
@@ -324,6 +324,58 @@ public protocol PantryStoring: Sendable {
     func summary() async -> String
 }
 
+/// Remy's saved recipes and active cook session.
+public protocol RecipeStoring: Sendable {
+    func all() async -> [Recipe]
+    func recipe(id: UUID) async -> Recipe?
+    @discardableResult
+    func upsert(_ recipe: Recipe) async -> Recipe
+    func delete(id: UUID) async
+    func activeCookingSession() async -> CookingSession?
+    @discardableResult
+    func startCooking(recipe: Recipe) async -> CookingSession
+    @discardableResult
+    func updateCookingStep(_ index: Int) async -> CookingSession?
+    @discardableResult
+    func endCooking() async -> CookingSession?
+    func summary(limit: Int) async -> String
+    func cookingSummary() async -> String
+}
+
+/// Remy's shopping list.
+public protocol ShoppingListStoring: Sendable {
+    func all() async -> [ShoppingListItem]
+    @discardableResult
+    func upsert(_ item: ShoppingListItem) async -> ShoppingListItem
+    func delete(id: UUID) async
+    func clearChecked() async -> Int
+    func summary() async -> String
+}
+
+/// Remy's weekly meal plan.
+public protocol MealPlanStoring: Sendable {
+    func currentWeek() async -> MealPlan
+    @discardableResult
+    func setSlot(dayOffset: Int, kind: MealSlotKind, recipeId: UUID?, note: String?) async -> MealPlan
+    @discardableResult
+    func clearSlot(dayOffset: Int, kind: MealSlotKind) async -> MealPlan
+    func summary() async -> String
+}
+
+/// Remy's nutrition profile, light meal log, and last fridge scan.
+public protocol NutritionStoring: Sendable {
+    func profile() async -> NutritionProfile
+    @discardableResult
+    func updateProfile(_ profile: NutritionProfile) async -> NutritionProfile
+    @discardableResult
+    func logMeal(description: String, recipeId: UUID?) async -> MealLogEntry
+    func recentMeals(limit: Int) async -> [MealLogEntry]
+    func lastFridgeScan() async -> FridgeScanResult?
+    func saveFridgeScan(_ result: FridgeScanResult) async
+    func profileSummary() async -> String
+    func lastScanSummary() async -> String
+}
+
 /// Sage's mood / habit check-ins.
 public protocol WellnessStoring: Sendable {
     @discardableResult
@@ -336,13 +388,21 @@ public protocol WellnessStoring: Sendable {
 public protocol StudyDeckStoring: Sendable {
     func all() async -> [StudyCard]
     func decks() async -> [String]
-    func due(limit: Int) async -> [StudyCard]
+    /// Due cards, optionally filtered by deck **before** applying `limit`.
+    func due(deck: String?, limit: Int) async -> [StudyCard]
+    func card(id: UUID) async -> StudyCard?
     @discardableResult
     func upsert(_ card: StudyCard) async -> StudyCard
     @discardableResult
     func grade(id: UUID, grade: StudyGrade) async -> StudyCard?
     func delete(id: UUID) async
     func summary(dueLimit: Int) async -> String
+}
+
+public extension StudyDeckStoring {
+    func due(limit: Int) async -> [StudyCard] {
+        await due(deck: nil, limit: limit)
+    }
 }
 
 /// Result of a Nova Bridge call. `payloadJSON` is passed straight back to the

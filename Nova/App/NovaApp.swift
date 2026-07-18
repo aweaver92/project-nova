@@ -53,6 +53,10 @@ struct NovaApp: App {
                 visualMemory: container.visualMemoryVM,
                 agents: container.agentsVM,
                 coding: container.codingVM,
+                training: container.trainingVM,
+                wellness: container.wellnessVM,
+                kitchen: container.kitchenVM,
+                study: container.studyVM,
                 settings: container.settingsVM,
                 toolConfirmation: container.toolConfirmation
             )

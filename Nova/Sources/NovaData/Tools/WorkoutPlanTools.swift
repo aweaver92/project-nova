@@ -106,7 +106,7 @@ public struct StartWorkoutFromPlanTool: Tool {
         guard let plan else {
             return #"{"ok":false,"error":"plan_not_found"}"#
         }
-        let session = await workouts.startSession(title: plan.name)
+        let session = await workouts.startSession(title: plan.name, planId: plan.id)
         let exercises: [[String: Any]] = plan.exercises.map { ex in
             var d: [String: Any] = ["name": ex.name]
             if let sets = ex.sets { d["sets"] = sets }

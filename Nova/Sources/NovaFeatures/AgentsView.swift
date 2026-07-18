@@ -1,20 +1,32 @@
 import SwiftUI
 import NovaDomain
 
-/// Agents tab: Nova (master) plus specialists. Coding opens as a push destination
-/// when Claude is active. Bridge configuration lives in Settings.
+/// Agents tab: Nova (master) plus specialists. Each specialist opens a dedicated
+/// push destination when active (Coding / Training / Wellness / Kitchen / Study).
 public struct AgentsView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
+    @Bindable var training: TrainingViewModel
+    @Bindable var wellness: SageWellnessViewModel
+    @Bindable var kitchen: RemyKitchenViewModel
+    @Bindable var study: StudyViewModel
     var showSettings: () -> Void
 
     public init(
         agents: AgentsViewModel,
         coding: CodingViewModel,
+        training: TrainingViewModel,
+        wellness: SageWellnessViewModel,
+        kitchen: RemyKitchenViewModel,
+        study: StudyViewModel,
         showSettings: @escaping () -> Void = {}
     ) {
         self.agents = agents
         self.coding = coding
+        self.training = training
+        self.wellness = wellness
+        self.kitchen = kitchen
+        self.study = study
         self.showSettings = showSettings
     }
 
@@ -40,6 +52,108 @@ public struct AgentsView: View {
                         }
                     } header: {
                         Text("Claude")
+                    }
+                }
+
+                if agents.isMaxActive {
+                    Section {
+                        NavigationLink {
+                            TrainingView(training: training, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Training")
+                                    Text(training.hasActiveSession
+                                         ? "\(training.activeSession?.title ?? "Workout") · live"
+                                         : "Plans, history, and live HUD")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "figure.strengthtraining.traditional")
+                            }
+                        }
+                    } header: {
+                        Text("Max")
+                    } footer: {
+                        Text("Open Training while talking to Max for live sets and rest.")
+                            .font(.caption2)
+                    }
+                }
+
+                if agents.isSageActive {
+                    Section {
+                        NavigationLink {
+                            SageWellnessView(wellness: wellness, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Wellness")
+                                    Text(wellness.recent.isEmpty
+                                         ? "Check-ins and breath timers"
+                                         : "\(wellness.recent.count) recent check-ins")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "leaf")
+                            }
+                        }
+                    } header: {
+                        Text("Sage")
+                    } footer: {
+                        Text("Open Wellness while talking to Sage for mood check-ins and timers.")
+                            .font(.caption2)
+                    }
+                }
+
+                if agents.isRemyActive {
+                    Section {
+                        NavigationLink {
+                            RemyKitchenView(kitchen: kitchen, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Kitchen")
+                                    Text(kitchen.cookingSession == nil
+                                         ? "Pantry, recipes, meals"
+                                         : "Cooking \(kitchen.cookingSession!.recipeTitle)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "fork.knife")
+                            }
+                        }
+                    } header: {
+                        Text("Remy")
+                    } footer: {
+                        Text("Open Kitchen while talking to Remy for pantry, fridge scan, and cook mode.")
+                            .font(.caption2)
+                    }
+                }
+
+                if agents.isScholarActive {
+                    Section {
+                        NavigationLink {
+                            StudyView(study: study, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Study")
+                                    Text(study.dueTotal > 0 ? "\(study.dueTotal) due" : "Decks and review")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "text.book.closed")
+                            }
+                        }
+                    } header: {
+                        Text("Scholar")
+                    } footer: {
+                        Text("Open Study while talking to Scholar for decks and spaced-repetition review.")
+                            .font(.caption2)
                     }
                 }
 
@@ -85,9 +199,19 @@ public struct AgentsView: View {
                     .accessibilityLabel("New agent")
                 }
             }
+            .navigationDestination(isPresented: Binding(
+                get: { study.shouldPresentStudy },
+                set: { if !$0 { study.clearPresentFlag() } }
+            )) {
+                StudyView(study: study, embedded: true)
+            }
             .task {
                 await agents.load()
                 await coding.load()
+                await training.load()
+                await wellness.load()
+                await kitchen.load()
+                await study.load()
             }
         }
     }

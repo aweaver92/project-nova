@@ -741,3 +741,67 @@ final class CodingPromptComposerTests: XCTestCase {
         XCTAssertTrue(composed.hasSuffix("Add a button"))
     }
 }
+
+final class WorkoutPlanProgressTests: XCTestCase {
+    func testSessionPlanIdCodableRoundTrip() throws {
+        let planId = UUID()
+        let session = WorkoutSession(title: "Push", planId: planId)
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(WorkoutSession.self, from: data)
+        XCTAssertEqual(decoded.planId, planId)
+
+        // Older payloads omit planId; decode should default to nil.
+        let bare = WorkoutSession(title: "Old")
+        var obj = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(bare)) as! [String: Any]
+        obj.removeValue(forKey: "planId")
+        let legacyData = try JSONSerialization.data(withJSONObject: obj)
+        let legacyDecoded = try JSONDecoder().decode(WorkoutSession.self, from: legacyData)
+        XCTAssertNil(legacyDecoded.planId)
+    }
+
+    func testProgressAdvancesAfterTargetSets() {
+        let plan = WorkoutPlan(
+            name: "Push",
+            exercises: [
+                PlannedExercise(name: "Bench", sets: 2, reps: 8),
+                PlannedExercise(name: "Row", sets: 3, reps: 10),
+            ]
+        )
+        let none = WorkoutPlanProgress.derive(plan: plan, sets: [])
+        XCTAssertEqual(none.current?.name, "Bench")
+        XCTAssertEqual(none.next?.name, "Row")
+        XCTAssertEqual(none.completedSetsForCurrent, 0)
+        XCTAssertEqual(none.targetSetsForCurrent, 2)
+
+        let mid = WorkoutPlanProgress.derive(
+            plan: plan,
+            sets: [WorkoutSet(exercise: "bench", reps: 8)]
+        )
+        XCTAssertEqual(mid.current?.name, "Bench")
+        XCTAssertEqual(mid.completedSetsForCurrent, 1)
+
+        let next = WorkoutPlanProgress.derive(
+            plan: plan,
+            sets: [
+                WorkoutSet(exercise: "Bench", reps: 8),
+                WorkoutSet(exercise: "Bench", reps: 8),
+            ]
+        )
+        XCTAssertEqual(next.current?.name, "Row")
+        XCTAssertNil(next.next)
+    }
+
+    func testExercisePRFromHistory() {
+        let history = [
+            WorkoutSession(sets: [
+                WorkoutSet(exercise: "Squat", weight: 225),
+                WorkoutSet(exercise: "Squat", weight: 245),
+                WorkoutSet(exercise: "Bench", weight: 185),
+            ])
+        ]
+        let prs = ExercisePR.from(history: history)
+        XCTAssertEqual(prs.first?.exercise, "Squat")
+        XCTAssertEqual(prs.first?.weight, 245)
+        XCTAssertEqual(prs.first(where: { $0.exercise == "Bench" })?.weight, 185)
+    }
+}
