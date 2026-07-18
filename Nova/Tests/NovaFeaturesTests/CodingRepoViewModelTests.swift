@@ -33,6 +33,26 @@ final class CodingRepoViewModelTests: XCTestCase {
         let sessionAfter = await settings.codingSessionId()
         XCTAssertNil(sessionAfter)
     }
+
+    func testImageOnlyPromptSendsAttachmentAndClearsComposer() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.addImage(
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png",
+            width: 1,
+            height: 1
+        )
+
+        await vm.send()
+
+        let imageCount = await bridge.receivedImageCount
+        XCTAssertEqual(imageCount, 1)
+        XCTAssertTrue(vm.pendingImages.isEmpty)
+        XCTAssertTrue(vm.items.first?.text.contains("Analyze the attached image") == true)
+        XCTAssertTrue(vm.items.first?.text.contains("📎 1 image") == true)
+    }
 }
 
 private actor MemorySettings: SettingsStoring {
@@ -60,6 +80,7 @@ private actor MemorySettings: SettingsStoring {
 
 private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
+    private(set) var receivedImageCount = 0
 
     func isConfigured() async -> Bool { true }
 
@@ -105,5 +126,20 @@ private actor DirtyRepoBridge: AgentBridging {
 
     func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true,"messages":[]}"#)
+    }
+
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        receivedImageCount = images.count
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"finished","result":"ok"}"#
+        )
     }
 }

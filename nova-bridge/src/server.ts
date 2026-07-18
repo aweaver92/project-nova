@@ -76,7 +76,9 @@ const repos = new RepoService({ defaultWorkdir: DEFAULT_CWD });
 const previews = new PreviewService();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+// Coding prompts can include up to four compressed screenshots. Keep the
+// ceiling explicit so arbitrary large uploads cannot exhaust the bridge.
+app.use(express.json({ limit: "16mb" }));
 
 // --- Auth -------------------------------------------------------------------
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
@@ -380,6 +382,56 @@ const activeRuns = new Map<
   { cancel: () => Promise<void>; agentId: string }
 >();
 
+type PromptImage = {
+  data: string;
+  mimeType: "image/jpeg" | "image/png" | "image/webp";
+  dimension?: { width: number; height: number };
+};
+
+function parsePromptImages(raw: unknown): PromptImage[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new RepoError("invalid_images", "images_must_be_an_array", 400);
+  }
+  if (raw.length > 4) {
+    throw new RepoError("too_many_images", "maximum_4_images", 413);
+  }
+  let totalBytes = 0;
+  return raw.map((value, index) => {
+    if (!value || typeof value !== "object") {
+      throw new RepoError("invalid_image", `image_${index}_must_be_an_object`, 400);
+    }
+    const image = value as Record<string, unknown>;
+    const mimeType = String(image.mimeType ?? "").toLowerCase();
+    if (!["image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+      throw new RepoError("unsupported_image_type", `image_${index}:${mimeType}`, 415);
+    }
+    const data = typeof image.data === "string" ? image.data : "";
+    if (!data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+      throw new RepoError("invalid_image_data", `image_${index}_invalid_base64`, 400);
+    }
+    const bytes = Buffer.from(data, "base64").byteLength;
+    if (bytes === 0 || bytes > 3_000_000) {
+      throw new RepoError("image_too_large", `image_${index}_maximum_3mb`, 413);
+    }
+    totalBytes += bytes;
+    if (totalBytes > 8_000_000) {
+      throw new RepoError("images_too_large", "maximum_8mb_total", 413);
+    }
+    const width = Number(image.width);
+    const height = Number(image.height);
+    const dimension =
+      Number.isInteger(width) && width > 0 && Number.isInteger(height) && height > 0
+        ? { width, height }
+        : undefined;
+    return {
+      data,
+      mimeType: mimeType as PromptImage["mimeType"],
+      ...(dimension ? { dimension } : {}),
+    };
+  });
+}
+
 app.post("/cursor/command", requireAuth, async (req, res) => {
   const command = String(req.body?.command ?? "").trim();
   const sessionId = String(req.body?.sessionId ?? "").trim();
@@ -426,12 +478,22 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
 
 /** Streaming run for the Coding tab. Prefer this over /cursor/command. */
 app.post("/cursor/runs", requireAuth, async (req, res) => {
-  const command = String(req.body?.command ?? "").trim();
+  const requestedCommand = String(req.body?.command ?? "").trim();
   const sessionId = String(req.body?.sessionId ?? "").trim();
-  if (!command) {
+  let images: PromptImage[];
+  try {
+    images = parsePromptImages(req.body?.images);
+  } catch (err) {
+    sendRepoError(res, err);
+    return;
+  }
+  if (!requestedCommand && images.length === 0) {
     res.status(400).json({ ok: false, error: "missing_command" });
     return;
   }
+  const command =
+    requestedCommand ||
+    "Analyze the attached image. Identify any visible error and recommend the next debugging steps.";
   if (!CURSOR_API_KEY) {
     res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
     return;
@@ -502,7 +564,9 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       }
     };
 
-    const run = await agent.send(command, {
+    const message =
+      images.length > 0 ? { text: command, images } : command;
+    const run = await agent.send(message, {
       onDelta: ({ update }) => {
         emit(normalizeInteractionUpdate(update));
       },
@@ -528,6 +592,14 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       detail: runId,
       done: false,
     });
+    if (images.length > 0) {
+      write({
+        type: "activity",
+        phase: "attachment",
+        text: `${images.length} image${images.length === 1 ? "" : "s"} attached`,
+        done: true,
+      });
+    }
 
     // Drain the SDK message stream in parallel with wait() for envelopes that
     // onDelta does not cover (status/usage/system/task). Skip assistant /

@@ -2,6 +2,7 @@ import SwiftUI
 import NovaDomain
 #if canImport(UIKit)
 import UIKit
+import PhotosUI
 #endif
 
 public struct CodingView: View {
@@ -12,6 +13,9 @@ public struct CodingView: View {
     @State private var showClone = false
     @State private var showCreateProject = false
     @State private var showPublish = false
+    #if canImport(UIKit)
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    #endif
 
     public init(coding: CodingViewModel, embedded: Bool = false) {
         self.coding = coding
@@ -429,23 +433,131 @@ public struct CodingView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Prompt Cursor…", text: $coding.draft, axis: .vertical)
-                .lineLimit(1...4)
-                .textFieldStyle(.roundedBorder)
-                .disabled(coding.isRunning)
-            Button {
-                Task { await coding.send() }
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+        VStack(alignment: .leading, spacing: 6) {
+            #if canImport(UIKit)
+            if !coding.pendingImages.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(coding.pendingImages) { attachment in
+                            ZStack(alignment: .topTrailing) {
+                                if let image = UIImage(data: attachment.data) {
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 64, height: 64)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
+                                Button {
+                                    coding.removeImage(id: attachment.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .symbolRenderingMode(.palette)
+                                        .foregroundStyle(.white, .black.opacity(0.75))
+                                }
+                                .offset(x: 5, y: -5)
+                                .accessibilityLabel("Remove image")
+                            }
+                            .padding(.top, 5)
+                        }
+                    }
+                }
             }
-            .disabled(coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || coding.isRunning)
+            #endif
+
+            HStack(alignment: .bottom, spacing: 8) {
+                #if canImport(UIKit)
+                PhotosPicker(
+                    selection: $selectedPhotoItems,
+                    maxSelectionCount: max(1, 4 - coding.pendingImages.count),
+                    matching: .images
+                ) {
+                    Image(systemName: "photo.badge.plus")
+                        .font(.title3)
+                }
+                .disabled(coding.isRunning || coding.pendingImages.count >= 4)
+                .accessibilityLabel("Attach screenshot")
+                .onChange(of: selectedPhotoItems) { _, items in
+                    guard !items.isEmpty else { return }
+                    Task { await importPhotos(items) }
+                }
+                #endif
+
+                TextField("Prompt Claude about code or an image…", text: $coding.draft, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(coding.isRunning)
+                Button {
+                    Task { await coding.send() }
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
+                }
+                .disabled(
+                    coding.isRunning
+                        || (
+                            coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                && coding.pendingImages.isEmpty
+                        )
+                )
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
     }
+
+    #if canImport(UIKit)
+    @MainActor
+    private func importPhotos(_ items: [PhotosPickerItem]) async {
+        defer { selectedPhotoItems = [] }
+        for item in items.prefix(max(0, 4 - coding.pendingImages.count)) {
+            guard let original = try? await item.loadTransferable(type: Data.self),
+                  let image = UIImage(data: original),
+                  let compressed = Self.compressedPromptImage(image)
+            else {
+                continue
+            }
+            coding.addImage(
+                data: compressed.data,
+                mimeType: compressed.mimeType,
+                width: compressed.width,
+                height: compressed.height
+            )
+        }
+    }
+
+    /// Keep screenshot text readable while bounding JSON/base64 request size.
+    private static func compressedPromptImage(
+        _ image: UIImage
+    ) -> (data: Data, mimeType: String, width: Int, height: Int)? {
+        let maxDimension: CGFloat = 2_048
+        let sourceSize = image.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+        let scale = min(1, maxDimension / max(sourceSize.width, sourceSize.height))
+        let size = CGSize(
+            width: max(1, floor(sourceSize.width * scale)),
+            height: max(1, floor(sourceSize.height * scale))
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let resized = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            UIColor.white.setFill()
+            UIRectFill(CGRect(origin: .zero, size: size))
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+
+        // PNG preserves small error text. Fall back to high-quality JPEG when
+        // the PNG would exceed the bridge's 3 MB per-image limit.
+        if let png = resized.pngData(), png.count <= 3_000_000 {
+            return (png, "image/png", Int(size.width), Int(size.height))
+        }
+        guard let jpeg = resized.jpegData(compressionQuality: 0.88),
+              jpeg.count <= 3_000_000
+        else { return nil }
+        return (jpeg, "image/jpeg", Int(size.width), Int(size.height))
+    }
+    #endif
 
     private var repoPicker: some View {
         NavigationStack {

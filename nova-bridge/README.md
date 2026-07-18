@@ -18,7 +18,7 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/realtime/token` | `{ "model"?: string }` | Mint a short-lived OpenAI Realtime secret → `{ "value", "expires_at" }` |
 | `POST` | `/claude-code` | `{ "prompt": string, "cwd"?: string }` | Run Claude Code headlessly |
 | `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Blocking Cursor send (legacy; Coding tab prefers `/cursor/runs`) |
-| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string }` | **SSE** stream of a Cursor run (Coding tab) |
+| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string, "images"?: [{ "data", "mimeType", "width"?, "height"? }] }` | **SSE** stream of a Cursor run, with optional base64 screenshots |
 | `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
 | `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
@@ -48,6 +48,10 @@ Each event is one `data: {json}\n\n` line. Types:
 - `status` — `{ "type", "status" }`
 - `error` — `{ "type", "error" }`
 - `done` — `{ "type", "sessionId", "runId", "status", "result" }`
+
+Image prompts accept up to four JPEG, PNG, or WebP images (3 MB each, 8 MB
+total). Nova resizes screenshots on-device and sends them as native Cursor SDK
+image content, so the model can read visible errors and UI state directly.
 
 Smoke-test a streaming run:
 

@@ -575,6 +575,30 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
     public var isPending: Bool { state == "installing" || state == "starting" }
 }
 
+/// An image attached to a Coding prompt. Data is base64-encoded only at the
+/// bridge boundary; callers keep the compressed bytes locally.
+public struct CodingImageAttachment: Identifiable, Sendable, Equatable {
+    public let id: UUID
+    public let data: Data
+    public let mimeType: String
+    public let width: Int?
+    public let height: Int?
+
+    public init(
+        id: UUID = UUID(),
+        data: Data,
+        mimeType: String,
+        width: Int? = nil,
+        height: Int? = nil
+    ) {
+        self.id = id
+        self.data = data
+        self.mimeType = mimeType
+        self.width = width
+        self.height = height
+    }
+}
+
 /// One normalized SSE event from `POST /cursor/runs` (Coding tab preview).
 public struct CodingStreamEvent: Sendable, Equatable, Codable {
     public let type: String
@@ -653,6 +677,14 @@ public protocol AgentBridging: Sendable {
         repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult
     func cancelCursorRun(runId: String) async -> BridgeResult
 
     func listRepos() async -> BridgeResult
@@ -723,6 +755,22 @@ public extension AgentBridging {
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: repoId,
+            onEvent: onEvent
+        )
     }
     func cancelCursorRun(runId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)

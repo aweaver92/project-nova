@@ -110,12 +110,43 @@ public actor NovaBridgeClient: AgentBridging {
         repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            images: [],
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: repoId,
+            onEvent: onEvent
+        )
+    }
+
+    public func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
         let (base, token) = await configProvider()
         guard let base else { return Self.notConfigured }
 
         var body: [String: Any] = ["command": command]
         if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
         if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if !images.isEmpty {
+            body["images"] = images.map { image -> [String: Any] in
+                var payload: [String: Any] = [
+                    "data": image.data.base64EncodedString(),
+                    "mimeType": image.mimeType,
+                ]
+                if let width = image.width, let height = image.height {
+                    payload["width"] = width
+                    payload["height"] = height
+                }
+                return payload
+            }
+        }
         if repoId == nil || repoId?.isEmpty == true,
            let workingDirectory, !workingDirectory.isEmpty
         {

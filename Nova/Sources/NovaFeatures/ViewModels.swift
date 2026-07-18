@@ -826,6 +826,7 @@ public struct CodingActivityStep: Identifiable, Equatable, Sendable {
         case "summary": return "doc.text"
         case "usage": return "chart.bar"
         case "request": return "hand.raised"
+        case "attachment": return "photo"
         case "assistant": return "text.bubble"
         case "system": return "cpu"
         case "task": return "checkmark.circle"
@@ -878,6 +879,7 @@ public final class CodingViewModel {
     public private(set) var isLoading = false
     public private(set) var statusMessage: String = ""
     public var draft: String = ""
+    public private(set) var pendingImages: [CodingImageAttachment] = []
     public var cloneURL: String = ""
     public var newProjectName: String = ""
     public var newProjectDescription: String = ""
@@ -913,6 +915,35 @@ public final class CodingViewModel {
             return selected.name
         }
         return selectedRepoId?.isEmpty == false ? "Repository" : "No repo"
+    }
+
+    public func addImage(
+        data: Data,
+        mimeType: String,
+        width: Int? = nil,
+        height: Int? = nil
+    ) {
+        guard pendingImages.count < 4 else {
+            statusMessage = "You can attach up to 4 images."
+            return
+        }
+        guard !data.isEmpty, data.count <= 3_000_000 else {
+            statusMessage = "That image is too large. Choose a smaller screenshot."
+            return
+        }
+        pendingImages.append(
+            CodingImageAttachment(
+                data: data,
+                mimeType: mimeType,
+                width: width,
+                height: height
+            )
+        )
+        statusMessage = ""
+    }
+
+    public func removeImage(id: UUID) {
+        pendingImages.removeAll { $0.id == id }
     }
 
     public var shortWorkingDirectory: String {
@@ -1295,9 +1326,17 @@ public final class CodingViewModel {
 
     public func send() async {
         let command = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !command.isEmpty, !isRunning else { return }
+        guard !isRunning, !command.isEmpty || !pendingImages.isEmpty else { return }
+        let images = pendingImages
+        let effectiveCommand = command.isEmpty
+            ? "Analyze the attached image. Identify the visible error and recommend the next debugging steps."
+            : command
         draft = ""
-        items.append(CodingTranscriptItem(kind: .user, text: command))
+        pendingImages = []
+        let imageSuffix = images.isEmpty
+            ? ""
+            : "\n📎 \(images.count) image\(images.count == 1 ? "" : "s")"
+        items.append(CodingTranscriptItem(kind: .user, text: effectiveCommand + imageSuffix))
         isRunning = true
         runStatus = "running"
         statusMessage = ""
@@ -1314,7 +1353,8 @@ public final class CodingViewModel {
         let cwd = await settings.codingWorkingDirectory()
         workingDirectory = cwd ?? ""
         let result = await bridge.streamCursorRun(
-            command: command,
+            command: effectiveCommand,
+            images: images,
             sessionId: pinnedSessionId,
             workingDirectory: repoId == nil ? cwd : nil,
             repoId: repoId
