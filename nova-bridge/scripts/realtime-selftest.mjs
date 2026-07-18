@@ -285,7 +285,23 @@ async function main() {
   if (r.responseDones < 2) fail(`Expected 2 response.done, got ${r.responseDones}`);
   ok(`response.done × ${r.responseDones}`);
 
-  console.log("\n🎉 PASS: multi-turn client-commit Realtime path healthy.");
+  // Agent-switch path: close the first socket and open a NEW one with a FRESH
+  // ephemeral secret (OpenAI client secrets are single-use per WebSocket).
+  console.log("→ Simulating agent switch: remint + second Realtime connection…");
+  const ephemeral2 = await mintEphemeral(env);
+  const auth2 = ephemeral2 || apiKey;
+  if (ephemeral && ephemeral2 && ephemeral2 === ephemeral) {
+    fail("Bridge returned the same ephemeral secret twice — remint is broken");
+  }
+  ok(ephemeral2 ? "Reminted fresh ephemeral secret for second session" : "Using API key for second session");
+  const r2 = await runRealtime(auth2, pcm, { turns: 1 });
+  if (r2.sessionError) fail(`Second session error: ${r2.sessionError}`);
+  if (!r2.sessionUpdated) fail("Second session never got session.updated");
+  if (r2.committed < 1) fail("Second session commit failed");
+  if (!r2.transcripts.length) fail("Second session produced no transcript");
+  ok(`Second session transcript: "${r2.transcripts[0]}"`);
+
+  console.log("\n🎉 PASS: multi-turn client-commit + remint reconnect (agent-switch) healthy.");
   process.exit(0);
 }
 

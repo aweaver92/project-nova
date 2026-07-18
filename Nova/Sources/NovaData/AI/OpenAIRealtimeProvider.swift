@@ -36,6 +36,8 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     private let maxReconnectAttempts = 5
     private var reconnectStartedAt: ContinuousClock.Instant?
     private var waitingForSessionUpdated = false
+    /// Set when an `error` event arrives while waiting for `session.updated`.
+    private var sessionUpdateError: String?
     private static let sessionReadyTimeout: Duration = .seconds(8)
     /// Newest-event bound so a stalled UI/orchestrator cannot grow unboundedly.
     private static let eventBufferCapacity = 256
@@ -97,6 +99,10 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     private func openSocketUnrestricted(config: AISessionConfig) async throws {
+        // Always remint: OpenAI ephemeral client secrets authenticate a single
+        // WebSocket. Reusing the Nova-session token after an agent-switch
+        // disconnect left Listen hung on "Minting Realtime token…".
+        try? tokenStore.clear()
         let credential = try await resolveCredential()
         let configuration = URLSessionConfiguration.default
         configuration.waitsForConnectivity = false
@@ -168,10 +174,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             // connect, clears the flag, and we start streaming into a default
             // session with no input transcription → local mic energy, no You: lines.
             waitingForSessionUpdated = true
+            sessionUpdateError = nil
             try await sendJSON(["type": "session.update", "session": sessionDict])
             try await waitForSessionUpdated(timeout: Self.sessionReadyTimeout)
         } catch {
             waitingForSessionUpdated = false
+            sessionUpdateError = nil
             throw error
         }
 
@@ -194,10 +202,19 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             }
             try await Task.sleep(for: .milliseconds(20))
         }
+        if let sessionUpdateError {
+            let message = sessionUpdateError
+            self.sessionUpdateError = nil
+            throw NovaError.aiProvider(message)
+        }
     }
 
     public func disconnect() async {
         await tearDownSocket(clearConfig: true)
+        // Ephemeral Realtime client secrets are single-use per WebSocket.
+        // Drop the cache so the next connect (agent switch / re-engage) remints
+        // instead of hanging on a reused secret.
+        try? tokenStore.clear()
         // Deliberately do NOT finish `events`: the orchestrator keeps a single,
         // long-lived consumer across engage/disengage cycles (wake-word gating)
         // and reconnects. The stream ends when this provider is deallocated.
@@ -210,11 +227,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         cancelledResponseId = nil
         ttfaMark = nil
         speechEndMark = nil
+        // Unblock any in-flight commitInputAudio wait so agent-switch reconnect
+        // cannot stall behind a continuation that will never see `.committed`.
+        finishCommitWait(generation: commitWaitGeneration)
+        failAnalyzeWait(NovaError.cancelled)
         if clearConfig {
             lastConfig = nil
             reconnectStartedAt = nil
         }
         waitingForSessionUpdated = false
+        sessionUpdateError = nil
         receiveTask?.cancel()
         receiveTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
@@ -259,10 +281,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             return
         }
         // Wait briefly for committed so createResponse does not race an empty buffer.
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            commitWait = cont
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                commitWait = cont
+                Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(800))
+                    await self?.finishCommitWait(generation: gen)
+                }
+            }
+        } onCancel: {
             Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(800))
                 await self?.finishCommitWait(generation: gen)
             }
         }
@@ -436,6 +464,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     private func resolveCredential() async throws -> EphemeralCredential {
+        // Prefer a cached secret only if this process has not yet opened a socket
+        // with it. After disconnect we clear the store; a still-cached value is
+        // from a failed/partial connect attempt and may be reused once.
         if let existing = try tokenStore.load(), !existing.isExpired {
             return existing
         }
@@ -514,6 +545,8 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             try? await Task.sleep(for: .seconds(delay + jitter))
             if Task.isCancelled || lastConfig == nil { return }
             do {
+                // Drop any cached secret — OpenAI ephemeral tokens are one WS each.
+                try? tokenStore.clear()
                 try await openSocket(config: config)
                 reconnectAttempts = 0
                 eventsContinuation?.yield(.reconnected)
@@ -538,6 +571,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         switch type {
         case "session.updated":
+            sessionUpdateError = nil
             waitingForSessionUpdated = false
             if let session = json["session"] as? [String: Any],
                let audio = session["audio"] as? [String: Any],
@@ -638,6 +672,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             let message = (json["error"] as? [String: Any])?["message"] as? String ?? "unknown"
             // Unblock a pending commit wait so the orchestrator can unlock/retry.
             finishCommitWait(generation: commitWaitGeneration)
+            // session.update rejection must not leave connect() spinning until timeout.
+            if waitingForSessionUpdated {
+                sessionUpdateError = message
+                waitingForSessionUpdated = false
+            }
             // Benign under server VAD barge-in: a cancel can race with the response
             // completing, so the server reports no active response to cancel.
             let lowered = message.lowercased()

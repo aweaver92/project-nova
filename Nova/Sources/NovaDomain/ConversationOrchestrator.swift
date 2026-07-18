@@ -428,11 +428,15 @@ public actor ConversationOrchestrator {
             // Cut any in-flight specialist audio before tearing the graph down so
             // the user doesn't hear a clipped overlap across the handoff.
             await egress.flush()
-            await teardownStreaming()
+            // Do not cancel toolTask here — voice handoffs run inside switch_agent's
+            // tool Task; cancelling it aborts connect() with CancellationError and
+            // leaves Listen stuck on "Minting Realtime token…".
+            await teardownStreaming(cancelToolTask: false)
             do {
                 try await beginStreaming(sessionConfig)
             } catch is CancellationError {
-                NovaLog.session.info("Agent switch reconnect superseded")
+                NovaLog.session.info("Agent switch reconnect cancelled — restoring session")
+                await restoreSessionUnlocked()
                 return
             } catch {
                 NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
@@ -792,7 +796,7 @@ public actor ConversationOrchestrator {
         streaming && generation == streamGeneration && isRunning
     }
 
-    private func teardownStreaming() async {
+    private func teardownStreaming(cancelToolTask: Bool = true) async {
         // Invalidate in-flight beginStreaming / ingress pumps before awaiting I/O.
         streamGeneration &+= 1
         // Note: the long-lived `eventTask` intentionally survives teardown so the
@@ -815,8 +819,10 @@ public actor ConversationOrchestrator {
         }
         assistantSpeaking = false
         streaming = false
-        toolTask?.cancel()
-        toolTask = nil
+        if cancelToolTask {
+            toolTask?.cancel()
+            toolTask = nil
+        }
         publishListenHealth(phase: .idle, detail: "Listen stopped")
     }
 
@@ -1322,7 +1328,10 @@ public actor ConversationOrchestrator {
             role: .system,
             text: "tool:\(name) → \(result.payloadJSON)"
         ))
-        await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+        // switch_agent rebuilds the Realtime session; the old call_id is gone.
+        if name != "switch_agent" {
+            await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+        }
         onMetricsTick?()
     }
 
