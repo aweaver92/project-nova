@@ -462,7 +462,7 @@ private actor DirtyRepoBridge: AgentBridging {
                 payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"cancelled"}"#
             )
         }
-        await onEvent(CodingStreamEvent(type: "done", status: "finished", runId: "run-test", sessionId: "agent-test"))
+        await onEvent(CodingStreamEvent(type: "done", status: "finished", sessionId: "agent-test", runId: "run-test"))
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"finished","result":"ok"}"#
