@@ -372,16 +372,27 @@ final class WakeWordTests: XCTestCase {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
         try await orch.start()
+        await provider.emit(.responseStarted)
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
-        _ = await waitUntil {
-            let created = await provider.createResponseCount
-            let analyzed = await provider.analyzeCount
-            return created > 0 || analyzed > 0
-        }
+        let cancelled = await waitUntil { await provider.interruptCount == 1 }
+        XCTAssertTrue(cancelled, "non-addressed speech should cancel the VAD auto-reply")
         let created = await provider.createResponseCount
         let analyzed = await provider.analyzeCount
         XCTAssertEqual(created, 0)
         XCTAssertEqual(analyzed, 0)
+        await orch.stop()
+    }
+
+    func testEmptySTTDoesNotCancelVADAutoReply() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start()
+        // Server VAD already started a reply; failed/empty STT must not kill it.
+        await provider.emit(.responseStarted)
+        await provider.emit(.inputTranscriptionCompleted(transcript: ""))
+        try await Task.sleep(for: .milliseconds(80))
+        let interrupted = await provider.interruptCount
+        XCTAssertEqual(interrupted, 0)
         await orch.stop()
     }
 

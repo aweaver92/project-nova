@@ -98,10 +98,10 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Server-side noise reduction runs before VAD + the model.
-                    // `near_field` suits the close-talking glasses mic and
-                    // improves turn detection and perceived input quality.
-                    "noise_reduction": ["type": "near_field"],
+                    // Prefer far-field: capture is routed to the phone mic (glasses
+                    // HFP input is often silent for third-party apps). near_field
+                    // can suppress speech when the phone sits a few feet away.
+                    "noise_reduction": ["type": "far_field"],
                     // Always let VAD start a reply. Wake-word gating cancels
                     // non-addressed turns in the orchestrator (see handleUserUtterance).
                     // Waiting for STT before response.create caused Listen-green

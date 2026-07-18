@@ -2147,11 +2147,24 @@ private struct RepoStatusPayload: Decodable {
     let status: BridgeRepoStatus
 }
 
+/// Deep-link target under the Agents tab (Assistant resume CTAs + voice quiz).
+public enum AgentsPendingRoute: String, Sendable, Hashable, Identifiable {
+    case coding
+    case training
+    case wellness
+    case kitchen
+    case study
+
+    public var id: String { rawValue }
+}
+
 @MainActor
 @Observable
 public final class AgentsViewModel {
     public private(set) var agents: [Agent] = []
     public private(set) var activeAgent: Agent?
+    /// When set, AgentsView auto-pushes the matching specialist screen.
+    public var pendingRoute: AgentsPendingRoute?
 
     private let store: any AgentStoring
     private let orchestrator: ConversationOrchestrator
@@ -2193,6 +2206,14 @@ public final class AgentsViewModel {
 
     public var isScholarActive: Bool {
         activeAgent?.id == Agent.SeedID.scholar
+    }
+
+    public func requestRoute(_ route: AgentsPendingRoute) {
+        pendingRoute = route
+    }
+
+    public func clearPendingRoute() {
+        pendingRoute = nil
     }
 
     public func load() async {

@@ -862,6 +862,14 @@ public actor ConversationOrchestrator {
             listeningSuspended = false
         }
         if case .ignore = intent {
+            // Empty/failed STT must not cancel the VAD auto-reply — that was a
+            // Listen-green silence path (audio reached the model, transcript didn't).
+            let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                NovaLog.session.info("Wake gate: empty STT; leaving VAD auto-response alone")
+                lastEngagement = .now
+                return
+            }
             // Drop ignored / background speech and cancel the VAD auto-reply so
             // Nova stays quiet unless addressed (or inside the grace window).
             inputTranscript = ""
