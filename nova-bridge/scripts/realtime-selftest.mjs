@@ -63,14 +63,7 @@ function appSessionUpdate({ voice = "marin", instructions = "You are Nova." } = 
         input: {
           format: { type: "audio/pcm", rate: SAMPLE_RATE },
           noise_reduction: null,
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.125,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 400,
-            create_response: true,
-            interrupt_response: true,
-          },
+          turn_detection: null,
           transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
         },
         output: {
@@ -155,15 +148,12 @@ function runRealtime(authToken, pcm) {
 
     ws.addEventListener("open", () => {
       ws.send(JSON.stringify(appSessionUpdate()));
-      // Stream the speech in 20 ms chunks like HFPGlassesAudioIngress, then append
-      // ~1.2 s of trailing silence. server_vad needs real silent frames to detect
-      // end-of-speech; the live mic supplies these continuously (the harness must
-      // too, or speech_stopped/commit/transcription never arrive).
+      // Match the app: client-commit path (turn_detection null). Stream speech,
+      // then trailing silence, then commit + create_response.
       const bytesPerChunk = Math.floor(SAMPLE_RATE * 0.02) * 2;
       const silence = Buffer.alloc(bytesPerChunk);
-      const trailingSilenceChunks = 80; // 60 Ã— 20 ms = 1.2 s
       let off = 0;
-      let silenceLeft = trailingSilenceChunks;
+      let silenceLeft = 40;
       const iv = setInterval(() => {
         let slice;
         if (off < pcm.length) {
@@ -174,6 +164,8 @@ function runRealtime(authToken, pcm) {
           silenceLeft--;
         } else {
           clearInterval(iv);
+          ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          ws.send(JSON.stringify({ type: "response.create" }));
           return;
         }
         result.appendedChunks++;
@@ -267,14 +259,13 @@ async function main() {
   if (r.sessionError) fail(`session.update rejected: ${r.sessionError}`);
   if (!r.sessionUpdated) fail("Never received session.updated");
   ok("session.updated accepted");
-  if (!r.speechStarted)
-    fail("Cloud VAD never fired (input_audio_buffer.speech_started missing)");
-  ok("Cloud VAD fired (speech_started)");
+  if (!r.committed) fail("input_audio_buffer.commit never confirmed");
+  ok("Client commit confirmed");
   if (r.transcriptionFailed) fail(`STT failed: ${r.transcriptionFailed}`);
   if (!r.transcript) fail("No transcript produced");
   ok(`Transcript: "${r.transcript}"`);
 
-  console.log("\nðŸŽ‰ PASS: cloud path healthy (VAD + transcription working).");
+  console.log("\n🎉 PASS: client-commit Realtime path healthy.");
   process.exit(0);
 }
 

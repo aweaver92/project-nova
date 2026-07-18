@@ -53,6 +53,9 @@ public actor ConversationOrchestrator {
     // Supplies extra front-loaded context for a specific agent (e.g. the trainer's
     // recent workout history). Injected into that agent's session instructions.
     private let agentContextProvider: (@Sendable (Agent) async -> String)?
+    /// Optional upload of recent outbound mic PCM for offline Realtime diagnosis
+    /// on the bridge (so we can iterate without sideloading IPAs).
+    private let audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -129,6 +132,9 @@ public actor ConversationOrchestrator {
     private var clientSpeechActive = false
     private var clientSpeechQuietSince: ContinuousClock.Instant?
     private var didClientCommitFallback = false
+    /// Rolling outbound PCM for bridge diagnose dumps (~4 s @ 24 kHz mono).
+    private var outboundRing = Data()
+    private let outboundRingMaxBytes = 24_000 * 2 * 4
     private var lastMicEnergyAt: ContinuousClock.Instant?
     private var lastChunkAt: ContinuousClock.Instant?
     private var userTranscriptChars = 0
@@ -163,7 +169,8 @@ public actor ConversationOrchestrator {
         agentsProvider: (@Sendable () async -> [Agent])? = nil,
         activeAgentProvider: (@Sendable () async -> Agent?)? = nil,
         persistActiveAgent: (@Sendable (UUID) async -> Void)? = nil,
-        agentContextProvider: (@Sendable (Agent) async -> String)? = nil
+        agentContextProvider: (@Sendable (Agent) async -> String)? = nil,
+        audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -191,6 +198,7 @@ public actor ConversationOrchestrator {
         self.activeAgentProvider = activeAgentProvider
         self.persistActiveAgent = persistActiveAgent
         self.agentContextProvider = agentContextProvider
+        self.audioDiagnose = audioDiagnose
     }
 
     /// Speak a short system note when the stream is open (coding progress, etc.).
@@ -688,6 +696,7 @@ public actor ConversationOrchestrator {
         clientSpeechActive = false
         clientSpeechQuietSince = nil
         didClientCommitFallback = false
+        outboundRing = Data()
         lastMicEnergyAt = nil
         lastChunkAt = nil
         userTranscriptChars = 0
@@ -830,8 +839,13 @@ public actor ConversationOrchestrator {
         // EMA of zero-crossing rate — speech is typically ≫ 0.02; DC/noise ≈ 0.
         outboundZcrHeard = outboundZcrHeard * 0.85 + stats.zcr * 0.15
 
-        // Client-side energy VAD (cloud fallback). Require some zero-crossings so
-        // a stuck DC bias (high peak, no speech) cannot trigger commits.
+        outboundRing.append(pcm24)
+        if outboundRing.count > outboundRingMaxBytes {
+            outboundRing.removeFirst(outboundRing.count - outboundRingMaxBytes)
+        }
+
+        // Client-side energy VAD (primary — cloud server_vad is disabled).
+        // Require some zero-crossings so a stuck DC bias cannot trigger commits.
         if stats.peak >= 0.05, stats.zcr >= 0.015 {
             clientSpeechActive = true
             clientSpeechQuietSince = nil
@@ -945,10 +959,8 @@ public actor ConversationOrchestrator {
         }
 
         if heardRecently || micPeakHeard >= 0.02 {
-            // Cloud VAD fallback: local speech ended, cloud never started.
-            // Commit the input buffer so STT + create_response still run.
-            if cloudVadSpeechEvents == 0,
-               !didClientCommitFallback,
+            // Client energy VAD is the primary turn detector (server_vad is off).
+            if !didClientCommitFallback,
                !assistantSpeaking,
                clientSpeechActive,
                let quietSince = clientSpeechQuietSince,
@@ -959,20 +971,33 @@ public actor ConversationOrchestrator {
                 didClientCommitFallback = true
                 clientSpeechActive = false
                 clientSpeechQuietSince = nil
-                NovaLog.session.warning(
-                    "Cloud VAD silent after local speech; committing input buffer (client fallback) zcr=\(self.outboundZcrHeard)"
+                let clip = outboundRing
+                NovaLog.session.info(
+                    "Client VAD end-of-speech; committing input buffer zcr=\(self.outboundZcrHeard)"
                 )
                 onTranscript?(
-                    "[diag] Cloud VAD silent — forcing commit (\(NovaBuildStamp.id))",
+                    "[diag] End of speech — committing (client VAD, \(NovaBuildStamp.id))",
                     .system
                 )
                 await ai.commitInputAudio()
                 await ai.createResponse()
+                if let audioDiagnose, !clip.isEmpty {
+                    let meta = [
+                        "build": NovaBuildStamp.id,
+                        "peak": String(format: "%.3f", outboundPeakHeard),
+                        "rms": String(format: "%.3f", outboundRmsHeard),
+                        "zcr": String(format: "%.3f", outboundZcrHeard),
+                        "route": route,
+                        "ws_ok": "\(micChunksAppendOK)",
+                        "ws_fail": "\(micChunksAppendFailed)",
+                    ]
+                    Task { await audioDiagnose(clip, 24_000, meta) }
+                }
                 publishListenHealth(
                     phase: .hearingYou,
                     micLevel: liveLevel,
                     inputRoute: route,
-                    detail: "Client commit fallback — waiting for transcript…"
+                    detail: "Client VAD commit — waiting for transcript…"
                 )
                 return
             }
@@ -985,18 +1010,30 @@ public actor ConversationOrchestrator {
                 didAnnounceCloudQuiet = true
                 let vad = cloudVadSpeechEvents > 0
                     ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
-                    : "Cloud VAD never fired — check noise reduction / input sample rate (ws appends alone are not enough)"
+                    : "Client VAD waiting — no transcript yet after local speech"
                 let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
                 let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard)) rms=\(String(format: "%.3f", outboundRmsHeard)) zcr=\(String(format: "%.3f", outboundZcrHeard))"
                 let shapeHint = outboundZcrHeard < 0.01
                     ? " Audio looks like DC/noise (zcr≈0), not speech — mic converter suspect."
                     : ""
                 let message = """
-                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks).\(shapeHint) Build \(NovaBuildStamp.id). Stop and Listen again after updating — bridge mint is OK if Listen stayed green.
+                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks).\(shapeHint) Build \(NovaBuildStamp.id).
                 """
                 lastError = message
                 onError?(message)
                 onTranscript?("[diag] \(message)", .system)
+                if let audioDiagnose, !outboundRing.isEmpty {
+                    let clip = outboundRing
+                    let meta = [
+                        "build": NovaBuildStamp.id,
+                        "peak": String(format: "%.3f", outboundPeakHeard),
+                        "rms": String(format: "%.3f", outboundRmsHeard),
+                        "zcr": String(format: "%.3f", outboundZcrHeard),
+                        "route": route,
+                        "note": "cloud_quiet",
+                    ]
+                    Task { await audioDiagnose(clip, 24_000, meta) }
+                }
                 publishListenHealth(
                     phase: .cloudQuiet,
                     micLevel: liveLevel,
@@ -1149,6 +1186,7 @@ public actor ConversationOrchestrator {
             speechStoppedFallbackTask?.cancel()
             speechStoppedFallbackTask = nil
             userTranscriptChars += transcript.count
+            didClientCommitFallback = false
             if !transcript.isEmpty {
                 // Completed events sometimes arrive without deltas — surface the
                 // full turn so the UI is never blank when STT succeeded.
@@ -1174,6 +1212,7 @@ public actor ConversationOrchestrator {
             outputTranscript = ""
         case .responseEnded:
             assistantSpeaking = false
+            didClientCommitFallback = false
             // If a "Nova, stop" just landed, this is the cancelled response
             // completing. Don't reopen the listening window or emit follow-ups —
             // stay stood down until the wake word is heard again.

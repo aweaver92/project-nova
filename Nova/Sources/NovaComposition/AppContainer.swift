@@ -488,6 +488,16 @@ public final class AppContainer {
                     if !s.isEmpty { parts.append(s) }
                 }
                 return parts.joined(separator: "\n")
+            },
+            audioDiagnose: { pcm, rate, meta in
+                let result = await bridge.uploadRealtimeDiagnose(
+                    pcm16: pcm,
+                    sampleRate: rate,
+                    meta: meta
+                )
+                NovaLog.session.info(
+                    "Realtime diagnose upload ok=\(result.ok) \(result.payloadJSON.prefix(200), privacy: .public)"
+                )
             }
         )
         self.orchestrator = orchestrator

@@ -20,6 +20,7 @@
     "test:preview": "tsx src/preview-service.test.ts",
     "test:baseline": "tsx src/baseline-service.test.ts",
     "test:realtime": "node scripts/realtime-selftest.mjs",
+    "test:realtime:dump": "node scripts/realtime-dump-replay.mjs",
     "test": "npm run test:stream && npm run test:repos && npm run test:preview && npm run test:baseline"
   },
   "dependencies": {

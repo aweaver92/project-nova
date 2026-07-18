@@ -476,6 +476,22 @@ public actor NovaBridgeClient: AgentBridging {
         await send(path: "preview", method: "GET", body: nil, timeout: 30)
     }
 
+    /// Upload a short outbound mic PCM clip for offline Realtime diagnosis.
+    /// Bridge writes a WAV under `diagnostics/` and returns peak/zcr (+ optional
+    /// live VAD/transcript probe). Lets us iterate without another IPA.
+    public func uploadRealtimeDiagnose(
+        pcm16: Data,
+        sampleRate: Int,
+        meta: [String: String]
+    ) async -> BridgeResult {
+        var body: [String: Any] = [
+            "pcm_b64": pcm16.base64EncodedString(),
+            "sample_rate": sampleRate,
+            "meta": meta,
+        ]
+        return await post(path: "realtime/diagnose", body: body, timeout: 45)
+    }
+
     // MARK: - Transport
 
     private func post(path: String, body: [String: Any], timeout: TimeInterval = 60) async -> BridgeResult {

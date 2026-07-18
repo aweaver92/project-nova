@@ -1,7 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, existsSync, promises as fs } from "node:fs";
+import path, { resolve } from "node:path";
 import {
   describeUnknownMessage,
   formatSse,
@@ -476,6 +476,100 @@ app.post("/realtime/token", requireAuth, async (req, res) => {
     res.status(500).json({ ok: false, error: describe(err) });
   }
 });
+
+// --- Realtime mic diagnose (phone → bridge dump) ----------------------------
+// The iOS app uploads a recent outbound PCM clip when client VAD commits (or
+// cloud-quiet fires). We save a WAV and run peak/zcr stats so we can iterate on
+// the mic path WITHOUT another IPA sideload. Optional live Realtime probe.
+app.post("/realtime/diagnose", requireAuth, async (req, res) => {
+  try {
+    const sampleRate = Number(req.body?.sample_rate ?? 24000) || 24000;
+    const meta = (req.body?.meta && typeof req.body.meta === "object")
+      ? req.body.meta
+      : {};
+    const b64 = String(req.body?.pcm_b64 ?? "");
+    if (!b64) {
+      res.status(400).json({ ok: false, error: "missing_pcm_b64" });
+      return;
+    }
+    const pcm = Buffer.from(b64, "base64");
+    if (pcm.length < 100) {
+      res.status(400).json({ ok: false, error: "pcm_too_short", bytes: pcm.length });
+      return;
+    }
+
+    const dir = path.join(process.cwd(), "diagnostics");
+    await fs.mkdir(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const build = String(meta.build ?? "unknown").replace(/[^\w.-]+/g, "_");
+    const wavPath = path.join(dir, `realtime-${stamp}-${build}.wav`);
+    await fs.writeFile(wavPath, pcm16ToWav(pcm, sampleRate));
+
+    const stats = pcmStats(pcm);
+    const payload = {
+      ok: true,
+      path: wavPath,
+      bytes: pcm.length,
+      seconds: pcm.length / 2 / sampleRate,
+      sample_rate: sampleRate,
+      meta,
+      stats,
+      hint:
+        stats.zcr < 0.01
+          ? "zcr≈0 with high peak → likely DC/stuck converter, not speech"
+          : "speech-like zcr; replay with: npm run test:realtime:dump -- \"" + wavPath + "\"",
+    };
+    console.log("[realtime/diagnose]", JSON.stringify({
+      path: wavPath,
+      seconds: payload.seconds,
+      stats,
+      build: meta.build,
+    }));
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: describe(err) });
+  }
+});
+
+function pcmStats(pcm: Buffer) {
+  const samples = pcm.length / 2;
+  if (samples < 2) return { peak: 0, rms: 0, zcr: 0 };
+  let peak = 0;
+  let sumSq = 0;
+  let crossings = 0;
+  let prev = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = pcm.readInt16LE(i * 2);
+    const a = Math.abs(s);
+    if (a > peak) peak = a;
+    sumSq += s * s;
+    if (i > 0 && ((prev >= 0 && s < 0) || (prev < 0 && s >= 0))) crossings++;
+    prev = s;
+  }
+  return {
+    peak: peak / 32767,
+    rms: Math.sqrt(sumSq / samples) / 32767,
+    zcr: crossings / (samples - 1),
+  };
+}
+
+function pcm16ToWav(pcm: Buffer, sampleRate: number) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
 
 // --- Claude Code ------------------------------------------------------------
 app.post("/claude-code", requireAuth, async (req, res) => {

@@ -121,23 +121,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Phone/HFP close-talk already has Voice Processing NS on-device.
-                    // Extra cloud NR was a common cause of "local energy, no VAD".
+                    // Phone mic PCM reliably reaches OpenAI (ws ok, high peak) but
+                    // server_vad often never emits speech_started on-device. Drive
+                    // turns from local energy in ConversationOrchestrator instead
+                    // (commit + create_response). Keeps STT; drops cloud VAD dependency.
                     "noise_reduction": NSNull(),
-                    // server_vad keys off energy and reliably emits speech_started.
-                    // threshold MUST be a binary-exact Double (0.25 / 0.5 / …) —
-                    // values like 0.35 JSON-encode with excess decimals and OpenAI
-                    // rejects the whole session.update.
-                    "turn_detection": config.enableServerVAD ? [
-                        "type": "server_vad",
-                        // 0.125 is binary-exact (1/8) and more sensitive than 0.5,
-                        // without the "never ends" sticky behavior of threshold 0.0.
-                        "threshold": 0.125,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 400,
-                        "create_response": true,
-                        "interrupt_response": true
-                    ] as [String: Any] : NSNull(),
+                    "turn_detection": NSNull(),
                     "transcription": [
                         "model": "gpt-4o-mini-transcribe",
                         "language": "en"
