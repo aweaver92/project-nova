@@ -55,8 +55,8 @@ final class RemyKitchenTests: XCTestCase {
 
     func testFridgeScanDiffBuckets() {
         let pantry = [
-            PantryItem(name: "Milk", stockLevel: .ok, location: .fridge),
-            PantryItem(name: "Yogurt", stockLevel: .low, location: .fridge)
+            PantryItem(name: "Milk", location: .fridge, stockLevel: .ok),
+            PantryItem(name: "Yogurt", location: .fridge, stockLevel: .low)
         ]
         let raw = [
             FridgeScanDetectedItem(name: "Eggs", quantity: "6", stockLevel: .ok, confidence: 0.9),
