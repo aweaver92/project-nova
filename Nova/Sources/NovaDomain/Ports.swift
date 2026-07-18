@@ -537,6 +537,44 @@ public struct BridgePublishResult: Sendable, Equatable, Codable {
     }
 }
 
+/// A live preview server on the bridge PC (`/preview/*`). `url` is reachable
+/// from the phone because the bridge derives the host from this request.
+public struct BridgePreviewInfo: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let name: String
+    /// "static" | "vite" | "nextjs" | "dev"
+    public let kind: String
+    /// "installing" | "starting" | "ready" | "error" | "stopped"
+    public let state: String
+    public let port: Int
+    public let url: String
+    public let error: String?
+    public let lastOutput: String?
+
+    public init(
+        repoId: String,
+        name: String,
+        kind: String,
+        state: String,
+        port: Int,
+        url: String,
+        error: String? = nil,
+        lastOutput: String? = nil
+    ) {
+        self.repoId = repoId
+        self.name = name
+        self.kind = kind
+        self.state = state
+        self.port = port
+        self.url = url
+        self.error = error
+        self.lastOutput = lastOutput
+    }
+
+    public var isReady: Bool { state == "ready" }
+    public var isPending: Bool { state == "installing" || state == "starting" }
+}
+
 /// One normalized SSE event from `POST /cursor/runs` (Coding tab preview).
 public struct CodingStreamEvent: Sendable, Equatable, Codable {
     public let type: String
@@ -550,6 +588,10 @@ public struct CodingStreamEvent: Sendable, Equatable, Codable {
     public let sessionId: String?
     public let runId: String?
     public let result: String?
+    /// Agents-window style process row (`activity` events).
+    public let phase: String?
+    public let detail: String?
+    public let done: Bool?
 
     public init(
         type: String,
@@ -562,7 +604,10 @@ public struct CodingStreamEvent: Sendable, Equatable, Codable {
         error: String? = nil,
         sessionId: String? = nil,
         runId: String? = nil,
-        result: String? = nil
+        result: String? = nil,
+        phase: String? = nil,
+        detail: String? = nil,
+        done: Bool? = nil
     ) {
         self.type = type
         self.text = text
@@ -575,6 +620,9 @@ public struct CodingStreamEvent: Sendable, Equatable, Codable {
         self.sessionId = sessionId
         self.runId = runId
         self.result = result
+        self.phase = phase
+        self.detail = detail
+        self.done = done
     }
 
     /// Decode a single `data:` JSON payload from the bridge SSE stream.
@@ -614,6 +662,12 @@ public protocol AgentBridging: Sendable {
     func repositoryStatus(repoId: String) async -> BridgeResult
     func repositoryDiff(repoId: String) async -> BridgeResult
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
+
+    /// Live preview servers (`/preview/*`) so Safari on the phone can open
+    /// whatever the coding agents generated.
+    func startPreview(repoId: String) async -> BridgeResult
+    func stopPreview(repoId: String) async -> BridgeResult
+    func listPreviews() async -> BridgeResult
 }
 
 public extension AgentBridging {
@@ -692,6 +746,15 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func startPreview(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func stopPreview(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func listPreviews() async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
 }

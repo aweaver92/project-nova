@@ -1,6 +1,6 @@
 /**
- * Normalize @cursor/sdk stream messages into a stable SSE envelope for the
- * Nova iOS Coding tab. Keep this independent of raw SDK message layouts.
+ * Normalize @cursor/sdk stream messages / InteractionUpdates into a stable SSE
+ * envelope for the Nova iOS Coding tab.
  */
 
 export type CodingEvent =
@@ -8,6 +8,13 @@ export type CodingEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "tool_start"; name: string; summary?: string; path?: string }
   | { type: "tool_end"; name: string; summary?: string; path?: string; diff?: string }
+  | {
+      type: "activity";
+      phase: string;
+      text: string;
+      detail?: string;
+      done?: boolean;
+    }
   | { type: "status"; status: string; runId?: string; sessionId?: string }
   | { type: "error"; error: string }
   | {
@@ -47,7 +54,6 @@ function pathFromArgs(args: unknown): string | undefined {
 
 function diffFromResult(result: unknown): string | undefined {
   if (typeof result === "string") {
-    // Heuristic: unified diffs often start with ---/+++ or contain @@ hunks.
     if (result.includes("\n@@") || result.startsWith("--- ") || result.includes("diff --git")) {
       return result;
     }
@@ -68,7 +74,7 @@ function summaryFrom(value: unknown, fallback?: string): string | undefined {
   }
   const r = asRecord(value);
   if (r) {
-    for (const key of ["summary", "message", "output", "stdout"]) {
+    for (const key of ["summary", "message", "output", "stdout", "command"]) {
       const v = r[key];
       if (typeof v === "string" && v.trim()) {
         return v.length > 240 ? `${v.slice(0, 237)}…` : v;
@@ -76,6 +82,55 @@ function summaryFrom(value: unknown, fallback?: string): string | undefined {
     }
   }
   return fallback;
+}
+
+function toolCallFields(toolCall: unknown): {
+  name: string;
+  path?: string;
+  summary?: string;
+  diff?: string;
+} {
+  const t = asRecord(toolCall);
+  if (!t) return { name: "tool" };
+  const name =
+    typeof t.type === "string" && t.type.trim()
+      ? t.type
+      : typeof t.name === "string" && t.name.trim()
+        ? t.name
+        : "tool";
+  const args = t.args ?? t.arguments;
+  const path = pathFromArgs(args);
+  const summary =
+    summaryFrom(args) ??
+    (typeof (asRecord(args) as Loose | null)?.command === "string"
+      ? String((args as Loose).command)
+      : undefined);
+  const result = t.result;
+  const resultRec = asRecord(result);
+  const resultValue = resultRec?.value ?? result;
+  return {
+    name,
+    ...(path ? { path } : {}),
+    ...(summary ? { summary } : {}),
+    ...(diffFromResult(resultValue) || diffFromResult(result)
+      ? { diff: diffFromResult(resultValue) ?? diffFromResult(result) }
+      : {}),
+  };
+}
+
+function activity(
+  phase: string,
+  text: string,
+  detail?: string,
+  done?: boolean,
+): CodingEvent {
+  return {
+    type: "activity",
+    phase,
+    text,
+    ...(detail ? { detail } : {}),
+    ...(done !== undefined ? { done } : {}),
+  };
 }
 
 /** Map one SDKMessage (or similar) into zero-or-more CodingEvents. */
@@ -99,9 +154,21 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           : typeof m.delta === "string"
             ? m.delta
             : "";
-      return text ? [{ type: "thinking_delta", text }] : [];
+      if (text) return [{ type: "thinking_delta", text }];
+      // Empty thinking placeholders still mean the agent is reasoning.
+      const duration =
+        typeof m.thinking_duration_ms === "number"
+          ? `${Math.round(m.thinking_duration_ms)}ms`
+          : undefined;
+      return [
+        activity(
+          "thinking",
+          duration ? `Thinking (${duration})` : "Thinking…",
+          undefined,
+          typeof m.thinking_duration_ms === "number",
+        ),
+      ];
     }
-    // Newer local-run stream updates (InteractionUpdateSchema family).
     case "text-delta":
     case "text_delta":
     case "assistant_delta": {
@@ -137,6 +204,12 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
             summary: summaryFrom(m.args ?? m.arguments),
             ...(path ? { path } : {}),
           },
+          activity(
+            "tool",
+            path ? `${name} · ${path}` : `Running ${name}`,
+            summaryFrom(m.args ?? m.arguments),
+            false,
+          ),
         ];
       }
       return [
@@ -147,6 +220,12 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           ...(path ? { path } : {}),
           ...(diffFromResult(m.result) ? { diff: diffFromResult(m.result) } : {}),
         },
+        activity(
+          "tool",
+          path ? `${name} · ${path}` : `Finished ${name}`,
+          summaryFrom(m.result, status === "error" ? "error" : undefined),
+          true,
+        ),
       ];
     }
     case "tool-call-completed":
@@ -161,15 +240,200 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           ...(path ? { path } : {}),
           ...(diffFromResult(m.result) ? { diff: diffFromResult(m.result) } : {}),
         },
+        activity(
+          "tool",
+          path ? `${name} · ${path}` : `Finished ${name}`,
+          summaryFrom(m.result),
+          true,
+        ),
       ];
     }
     case "status": {
       const status = typeof m.status === "string" ? m.status : "UNKNOWN";
-      return [{ type: "status", status }];
+      const message = typeof m.message === "string" ? m.message : undefined;
+      return [
+        { type: "status", status },
+        activity("status", status, message, ["FINISHED", "ERROR", "CANCELLED", "EXPIRED"].includes(status)),
+      ];
     }
+    case "system": {
+      const model = asRecord(m.model);
+      const modelId = typeof model?.id === "string" ? model.id : undefined;
+      return [activity("system", "Agent ready", modelId ?? (typeof m.subtype === "string" ? m.subtype : undefined))];
+    }
+    case "task": {
+      const text =
+        typeof m.text === "string" && m.text.trim()
+          ? m.text
+          : typeof m.status === "string"
+            ? m.status
+            : "Task update";
+      return [activity("task", text, typeof m.status === "string" ? m.status : undefined)];
+    }
+    case "request": {
+      return [activity("request", "Waiting for approval", typeof m.request_id === "string" ? m.request_id : undefined)];
+    }
+    case "usage": {
+      const usage = asRecord(m.usage);
+      const total =
+        typeof usage?.totalTokens === "number"
+          ? usage.totalTokens
+          : typeof usage?.total_tokens === "number"
+            ? usage.total_tokens
+            : undefined;
+      const detail =
+        total !== undefined
+          ? `${total} tokens`
+          : usage
+            ? JSON.stringify(usage).slice(0, 120)
+            : undefined;
+      return [activity("usage", "Token usage", detail, true)];
+    }
+    case "user":
+      return [];
     default:
       return [];
   }
+}
+
+/** Map one InteractionUpdate from `send({ onDelta })` into CodingEvents. */
+export function normalizeInteractionUpdate(update: unknown): CodingEvent[] {
+  const u = asRecord(update);
+  if (!u || typeof u.type !== "string") return [];
+
+  switch (u.type) {
+    case "text-delta": {
+      const text = typeof u.text === "string" ? u.text : "";
+      return text ? [{ type: "assistant_delta", text }] : [];
+    }
+    case "thinking-delta": {
+      const text = typeof u.text === "string" ? u.text : "";
+      if (text) return [{ type: "thinking_delta", text }];
+      return [activity("thinking", "Thinking…")];
+    }
+    case "thinking-completed": {
+      const ms =
+        typeof u.thinkingDurationMs === "number"
+          ? `${Math.round(u.thinkingDurationMs)}ms`
+          : undefined;
+      return [activity("thinking", ms ? `Thought for ${ms}` : "Thinking done", undefined, true)];
+    }
+    case "tool-call-started":
+    case "partial-tool-call": {
+      const fields = toolCallFields(u.toolCall);
+      const started = u.type === "tool-call-started";
+      const events: CodingEvent[] = [
+        activity(
+          "tool",
+          fields.path ? `${fields.name} · ${fields.path}` : `Running ${fields.name}`,
+          fields.summary,
+          false,
+        ),
+      ];
+      if (started) {
+        events.unshift({
+          type: "tool_start",
+          name: fields.name,
+          ...(fields.summary ? { summary: fields.summary } : {}),
+          ...(fields.path ? { path: fields.path } : {}),
+        });
+      }
+      return events;
+    }
+    case "tool-call-completed": {
+      const fields = toolCallFields(u.toolCall);
+      return [
+        {
+          type: "tool_end",
+          name: fields.name,
+          ...(fields.summary ? { summary: fields.summary } : {}),
+          ...(fields.path ? { path: fields.path } : {}),
+          ...(fields.diff ? { diff: fields.diff } : {}),
+        },
+        activity(
+          "tool",
+          fields.path ? `${fields.name} · ${fields.path}` : `Finished ${fields.name}`,
+          fields.summary,
+          true,
+        ),
+      ];
+    }
+    case "step-started": {
+      const id = typeof u.stepId === "number" ? u.stepId : undefined;
+      return [activity("step", id !== undefined ? `Step ${id}` : "Step started")];
+    }
+    case "step-completed": {
+      const id = typeof u.stepId === "number" ? u.stepId : undefined;
+      const ms =
+        typeof u.stepDurationMs === "number"
+          ? `${Math.round(u.stepDurationMs)}ms`
+          : undefined;
+      return [
+        activity(
+          "step",
+          id !== undefined ? `Step ${id} done` : "Step done",
+          ms,
+          true,
+        ),
+      ];
+    }
+    case "turn-ended": {
+      const usage = asRecord(u.usage);
+      const detail = usage
+        ? `in ${usage.inputTokens ?? "?"} / out ${usage.outputTokens ?? "?"}`
+        : undefined;
+      return [activity("turn", "Turn ended", detail, true)];
+    }
+    case "summary": {
+      const text = typeof u.summary === "string" ? u.summary : "Summary";
+      return [activity("summary", text)];
+    }
+    case "summary-started":
+      return [activity("summary", "Summarizing…")];
+    case "summary-completed":
+      return [activity("summary", "Summary ready", undefined, true)];
+    case "shell-output-delta":
+      return [activity("shell", "Shell output…")];
+    case "token-delta":
+    case "user-message-appended":
+      return [];
+    default:
+      return [];
+  }
+}
+
+/** Light activity markers from `send({ onStep })` completed conversation steps. */
+export function normalizeConversationStep(step: unknown): CodingEvent[] {
+  const s = asRecord(step);
+  if (!s || typeof s.type !== "string") return [];
+  switch (s.type) {
+    case "thinkingMessage":
+      return [activity("thinking", "Thinking step complete", undefined, true)];
+    case "toolCall": {
+      const fields = toolCallFields(s.message ?? s.toolCall ?? s);
+      return [
+        activity(
+          "tool",
+          fields.path ? `${fields.name} · ${fields.path}` : fields.name,
+          fields.summary,
+          true,
+        ),
+      ];
+    }
+    case "assistantMessage":
+      return [activity("assistant", "Assistant reply", undefined, true)];
+    default:
+      return [];
+  }
+}
+
+/** Compact debug sample for unmapped payloads (no huge dumps). */
+export function describeUnknownMessage(msg: unknown): string {
+  const m = asRecord(msg);
+  if (!m) return typeof msg;
+  const keys = Object.keys(m).slice(0, 12).join(",");
+  const type = typeof m.type === "string" ? m.type : "?";
+  return `type=${type} keys=${keys}`;
 }
 
 /** Normalize Agent.messages.list entries into simple transcript turns. */

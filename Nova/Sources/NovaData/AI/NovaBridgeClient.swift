@@ -267,6 +267,21 @@ public actor NovaBridgeClient: AgentBridging {
         return await post(path: "repos/\(escaped)/publish", body: body, timeout: 320)
     }
 
+    // MARK: - Live preview
+
+    public func startPreview(repoId: String) async -> BridgeResult {
+        // Dev servers may run `npm install` first; keep a generous timeout.
+        await post(path: "preview/start", body: ["repoId": repoId], timeout: 120)
+    }
+
+    public func stopPreview(repoId: String) async -> BridgeResult {
+        await post(path: "preview/stop", body: ["repoId": repoId], timeout: 30)
+    }
+
+    public func listPreviews() async -> BridgeResult {
+        await send(path: "preview", method: "GET", body: nil, timeout: 30)
+    }
+
     // MARK: - Transport
 
     private func post(path: String, body: [String: Any], timeout: TimeInterval = 60) async -> BridgeResult {

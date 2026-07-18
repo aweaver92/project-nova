@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "test:stream": "tsx src/cursor-stream.test.ts",
     "test:repos": "tsx src/repo-service.test.ts",
-    "test": "npm run test:stream && npm run test:repos"
+    "test:preview": "tsx src/preview-service.test.ts",
+    "test": "npm run test:stream && npm run test:repos && npm run test:preview"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.23",

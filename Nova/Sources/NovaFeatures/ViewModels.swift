@@ -795,6 +795,45 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Live process row for the Agents-window style activity strip.
+public struct CodingActivityStep: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public var phase: String
+    public var text: String
+    public var detail: String?
+    public var isDone: Bool
+
+    public init(
+        id: UUID = UUID(),
+        phase: String,
+        text: String,
+        detail: String? = nil,
+        isDone: Bool = false
+    ) {
+        self.id = id
+        self.phase = phase
+        self.text = text
+        self.detail = detail
+        self.isDone = isDone
+    }
+
+    public var symbolName: String {
+        switch phase {
+        case "thinking": return "brain.head.profile"
+        case "tool": return "wrench.and.screwdriver"
+        case "step": return "list.number"
+        case "shell": return "terminal"
+        case "summary": return "doc.text"
+        case "usage": return "chart.bar"
+        case "request": return "hand.raised"
+        case "assistant": return "text.bubble"
+        case "system": return "cpu"
+        case "task": return "checkmark.circle"
+        default: return "circle.dotted"
+        }
+    }
+}
+
 public struct CodingSessionInfo: Identifiable, Equatable, Sendable {
     public let id: String
     public let title: String
@@ -827,7 +866,12 @@ public final class CodingViewModel {
     public private(set) var isRefreshingRepo = false
     public private(set) var isCreatingProject = false
     public private(set) var isPublishing = false
+    /// Live preview server for the selected repo ("Preview in browser").
+    public private(set) var activePreview: BridgePreviewInfo?
+    public private(set) var isStartingPreview = false
     public private(set) var items: [CodingTranscriptItem] = []
+    /// Live Agents-window style process feed for the current (or last) run.
+    public private(set) var activitySteps: [CodingActivityStep] = []
     public private(set) var runStatus: String = "idle"
     public private(set) var activeRunId: String?
     public private(set) var isRunning = false
@@ -929,10 +973,12 @@ public final class CodingViewModel {
         }
         selectedRepoId = trimmed
         await settings.setCodingSelectedRepoId(trimmed)
+        activePreview = nil
         // Resumed Cursor sessions keep their original cwd — start fresh.
         await startNewSession()
         await refreshRepositories()
         await refreshRepoStatusAndDiff()
+        await refreshPreviews()
         statusMessage = "Selected \(selectedRepoName). New Cursor session for this repo."
     }
 
@@ -1048,6 +1094,86 @@ public final class CodingViewModel {
 
     public func toggleShowDiff() {
         showDiff.toggle()
+    }
+
+    // MARK: - Live preview ("open in browser")
+
+    /// Start (or reuse) a preview server for the selected repo, then poll the
+    /// bridge until the dev server is ready. Static sites are ready instantly.
+    public func startPreview() async {
+        guard let repoId = selectedRepoId, !repoId.isEmpty, !isStartingPreview else { return }
+        isStartingPreview = true
+        defer { isStartingPreview = false }
+
+        let result = await bridge.startPreview(repoId: repoId)
+        guard result.ok, let preview = Self.decodePreview(result.payloadJSON) else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        activePreview = preview
+
+        // Vite/Next dev servers may npm-install + boot; poll until ready.
+        var attempts = 0
+        while let current = activePreview,
+              current.repoId == repoId,
+              current.isPending,
+              attempts < 60
+        {
+            try? await Task.sleep(for: .seconds(2))
+            attempts += 1
+            let listResult = await bridge.listPreviews()
+            guard let refreshed = Self.decodePreviewList(listResult.payloadJSON)
+                .first(where: { $0.repoId == repoId })
+            else { break }
+            activePreview = refreshed
+        }
+        if let final = activePreview, final.repoId == repoId {
+            if final.isReady {
+                statusMessage = "Preview ready: \(final.url)"
+            } else if final.state == "error" {
+                statusMessage = "Preview failed: \(final.error ?? "unknown")"
+            }
+        }
+    }
+
+    public func stopPreview() async {
+        guard let preview = activePreview else { return }
+        _ = await bridge.stopPreview(repoId: preview.repoId)
+        activePreview = nil
+    }
+
+    /// Re-sync preview state (e.g. when the tab reappears).
+    public func refreshPreviews() async {
+        let result = await bridge.listPreviews()
+        guard result.ok else { return }
+        let list = Self.decodePreviewList(result.payloadJSON)
+        if let repoId = selectedRepoId,
+           let match = list.first(where: { $0.repoId == repoId })
+        {
+            activePreview = match
+        } else if let current = activePreview,
+                  !list.contains(where: { $0.repoId == current.repoId })
+        {
+            activePreview = nil
+        }
+    }
+
+    private static func decodePreview(_ payloadJSON: String) -> BridgePreviewInfo? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let previewObj = obj["preview"],
+              let previewData = try? JSONSerialization.data(withJSONObject: previewObj)
+        else { return nil }
+        return try? JSONDecoder().decode(BridgePreviewInfo.self, from: previewData)
+    }
+
+    private static func decodePreviewList(_ payloadJSON: String) -> [BridgePreviewInfo] {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let listObj = obj["previews"],
+              let listData = try? JSONSerialization.data(withJSONObject: listObj)
+        else { return [] }
+        return (try? JSONDecoder().decode([BridgePreviewInfo].self, from: listData)) ?? []
     }
 
     public func preparePublishDraft() {
@@ -1176,6 +1302,9 @@ public final class CodingViewModel {
         runStatus = "running"
         statusMessage = ""
         activeRunId = nil
+        activitySteps = [
+            CodingActivityStep(phase: "status", text: "Starting…", isDone: false)
+        ]
         streamingAssistantId = nil
         streamingThinkingId = nil
 
@@ -1220,6 +1349,10 @@ public final class CodingViewModel {
         _ = await bridge.cancelCursorRun(runId: runId)
         runStatus = "cancelled"
         isRunning = false
+        for idx in activitySteps.indices where !activitySteps[idx].isDone {
+            activitySteps[idx].isDone = true
+        }
+        upsertActivity(phase: "status", text: "Cancelled", done: true)
     }
 
     public func toggleExpand(_ item: CodingTranscriptItem) {
@@ -1232,6 +1365,7 @@ public final class CodingViewModel {
         case "assistant_delta":
             let text = event.text ?? ""
             guard !text.isEmpty else { return }
+            upsertActivity(phase: "assistant", text: "Writing reply…", done: false)
             if let id = streamingAssistantId,
                let idx = items.firstIndex(where: { $0.id == id })
             {
@@ -1245,10 +1379,15 @@ public final class CodingViewModel {
         case "thinking_delta":
             let text = event.text ?? ""
             guard !text.isEmpty else { return }
+            upsertActivity(phase: "thinking", text: "Thinking…", done: false)
             if let id = streamingThinkingId,
                let idx = items.firstIndex(where: { $0.id == id })
             {
-                items[idx].text += text
+                if items[idx].text == "Thinking…" {
+                    items[idx].text = text
+                } else {
+                    items[idx].text += text
+                }
             } else {
                 let item = CodingTranscriptItem(kind: .thinking, text: text)
                 streamingThinkingId = item.id
@@ -1265,6 +1404,7 @@ public final class CodingViewModel {
                 detail: event.summary,
                 diff: nil
             ))
+            upsertActivity(phase: "tool", text: label, detail: event.summary, done: false)
             speakProgress(Self.spokenToolLine(name: name, path: event.path, ended: false))
         case "tool_end":
             streamingAssistantId = nil
@@ -1285,10 +1425,17 @@ public final class CodingViewModel {
                     diff: event.diff
                 ))
             }
+            upsertActivity(phase: "tool", text: label, detail: event.summary, done: true)
             speakProgress(Self.spokenToolLine(name: name, path: event.path, ended: true))
         case "status":
             if let status = event.status {
                 runStatus = status.lowercased()
+                upsertActivity(
+                    phase: "status",
+                    text: status.capitalized,
+                    detail: event.runId,
+                    done: ["finished", "error", "cancelled", "expired"].contains(status.lowercased())
+                )
             }
             if let runId = event.runId, !runId.isEmpty {
                 activeRunId = runId
@@ -1297,9 +1444,25 @@ public final class CodingViewModel {
                 pinnedSessionId = sid
                 Task { await settings.setCodingSessionId(sid) }
             }
+        case "activity":
+            let phase = event.phase ?? "status"
+            let text = event.text ?? phase
+            upsertActivity(
+                phase: phase,
+                text: text,
+                detail: event.detail ?? event.summary,
+                done: event.done ?? false
+            )
+            if phase == "thinking", !(event.done ?? false), streamingThinkingId == nil {
+                // Ensure the transcript shows a thinking row even before text arrives.
+                let item = CodingTranscriptItem(kind: .thinking, text: "Thinking…")
+                streamingThinkingId = item.id
+                items.append(item)
+            }
         case "error":
             items.append(CodingTranscriptItem(kind: .error, text: event.error ?? "Unknown error"))
             runStatus = "error"
+            upsertActivity(phase: "status", text: "Error", detail: event.error, done: true)
         case "done":
             if let sid = event.sessionId, !sid.isEmpty {
                 pinnedSessionId = sid
@@ -1311,9 +1474,45 @@ public final class CodingViewModel {
             runStatus = (event.status ?? "finished").lowercased()
             streamingAssistantId = nil
             streamingThinkingId = nil
+            upsertActivity(
+                phase: "status",
+                text: runStatus == "finished" ? "Finished" : runStatus.capitalized,
+                done: true
+            )
             speakProgress(runStatus == "error" ? "Coding run failed." : "Coding run finished.")
         default:
             break
+        }
+    }
+
+    private func upsertActivity(phase: String, text: String, detail: String? = nil, done: Bool) {
+        // Merge into the latest open row when phase+text match; otherwise append.
+        if let last = activitySteps.indices.last,
+           activitySteps[last].phase == phase,
+           !activitySteps[last].isDone,
+           activitySteps[last].text == text || phase == "thinking" || phase == "status"
+        {
+            activitySteps[last].text = text
+            if let detail { activitySteps[last].detail = detail }
+            activitySteps[last].isDone = done
+            return
+        }
+        if phase == "thinking",
+           let last = activitySteps.indices.last,
+           activitySteps[last].phase == "thinking",
+           !activitySteps[last].isDone
+        {
+            activitySteps[last].text = text
+            if let detail { activitySteps[last].detail = detail }
+            activitySteps[last].isDone = done
+            return
+        }
+        activitySteps.append(
+            CodingActivityStep(phase: phase, text: text, detail: detail, isDone: done)
+        )
+        // Keep the Agents strip focused on the current turn.
+        if activitySteps.count > 40 {
+            activitySteps.removeFirst(activitySteps.count - 40)
         }
     }
 

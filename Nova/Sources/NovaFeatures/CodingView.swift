@@ -34,6 +34,10 @@ public struct CodingView: View {
         VStack(spacing: 0) {
             repoStatusCard
             Divider()
+            if coding.isRunning || !coding.activitySteps.isEmpty {
+                agentProcessPanel
+                Divider()
+            }
             transcript
             Divider()
             composer
@@ -102,7 +106,10 @@ public struct CodingView: View {
         .sheet(isPresented: $showClone) { cloneSheet }
         .sheet(isPresented: $showCreateProject) { createProjectSheet }
         .sheet(isPresented: $showPublish) { publishSheet }
-        .task { await coding.load() }
+        .task {
+            await coding.load()
+            await coding.refreshPreviews()
+        }
     }
 
     @ViewBuilder
@@ -170,6 +177,8 @@ public struct CodingView: View {
                     .foregroundStyle(.secondary)
             }
 
+            previewRow
+
             if coding.showDiff, let diff = coding.repoDiff {
                 ScrollView {
                     Text(diff.diff.isEmpty ? "(no textual diff — untracked files only)" : diff.diff)
@@ -205,6 +214,118 @@ public struct CodingView: View {
         }
         .padding(12)
         .background(Color(.tertiarySystemBackground))
+    }
+
+    /// Live preview: serve the repo from the bridge PC and open it in Safari.
+    @ViewBuilder
+    private var previewRow: some View {
+        if let preview = coding.activePreview {
+            HStack(spacing: 8) {
+                Image(systemName: preview.isReady ? "globe" : "hourglass")
+                    .font(.caption)
+                    .foregroundStyle(preview.isReady ? Color.accentColor : .secondary)
+                if preview.isReady, let url = URL(string: preview.url) {
+                    Link(destination: url) {
+                        Text(preview.url)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(preview.state == "installing" ? "Installing dependencies…" : preview.state == "error" ? "Preview failed" : "Starting \(preview.kind) server…")
+                            .font(.caption)
+                            .foregroundStyle(preview.state == "error" ? Color.red : .secondary)
+                        if preview.state == "error", let detail = preview.error ?? preview.lastOutput {
+                            Text(detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    if preview.isPending {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+                Spacer()
+                Button("Stop") {
+                    Task { await coding.stopPreview() }
+                }
+                .font(.caption)
+            }
+        } else if coding.selectedRepoId != nil {
+            Button {
+                Task { await coding.startPreview() }
+            } label: {
+                Label(
+                    coding.isStartingPreview ? "Starting preview…" : "Preview in browser",
+                    systemImage: "safari"
+                )
+                .font(.caption.weight(.semibold))
+            }
+            .disabled(coding.isStartingPreview)
+        }
+    }
+
+    /// Cursor Agents-window style live process feed.
+    private var agentProcessPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Agent process")
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(coding.runStatus.uppercased())
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                if coding.isRunning {
+                    ProgressView().controlSize(.mini)
+                    Button("Stop") {
+                        Task { await coding.cancel() }
+                    }
+                    .font(.caption.weight(.semibold))
+                    .disabled(coding.activeRunId == nil)
+                }
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(coding.activitySteps.suffix(24)) { step in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: step.symbolName)
+                                .font(.caption)
+                                .foregroundStyle(step.isDone ? Color.secondary : Color.accentColor)
+                                .frame(width: 14)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(step.text)
+                                    .font(.caption)
+                                    .foregroundStyle(step.isDone ? .secondary : .primary)
+                                    .lineLimit(2)
+                                if let detail = step.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(2)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                            if !step.isDone && coding.isRunning {
+                                ProgressView().controlSize(.mini)
+                            } else if step.isDone {
+                                Image(systemName: "checkmark")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: coding.isRunning ? 140 : 88)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(.secondarySystemBackground))
     }
 
     private var transcript: some View {

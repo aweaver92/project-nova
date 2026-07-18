@@ -22,7 +22,20 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
 | `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
+| `GET`  | `/preview` | — | Active live previews (with phone-reachable URLs) |
+| `POST` | `/preview/start` | `{ "repoId": string }` | Serve the repo on a LAN port (static or `npm run dev`) |
+| `POST` | `/preview/stop` | `{ "repoId": string }` | Stop the repo's preview server |
 | `GET`  | `/health` | — | Liveness (no auth) |
+
+### Live preview (`/preview/*`)
+
+Lets the phone's browser open whatever Claude/Cursor generated. The bridge
+detects the project type: no `package.json` dev script → in-process static
+server; `vite`/`next` → spawns `npm run dev` bound to `0.0.0.0` (running
+`npm install` first when `node_modules` is missing). Dev servers start
+asynchronously — poll `GET /preview` until `state` is `ready`, then open
+`url` in Safari. Preview ports (default 8790–8799) are unauthenticated by
+design; they serve only project content on your LAN.
 
 ### SSE events (`POST /cursor/runs`)
 
@@ -31,6 +44,7 @@ Each event is one `data: {json}\n\n` line. Types:
 - `assistant_delta` — `{ "type", "text" }`
 - `thinking_delta` — `{ "type", "text" }`
 - `tool_start` / `tool_end` — `{ "type", "name", "summary"?, "path"?, "diff"? }`
+- `activity` — `{ "type", "phase", "text", "detail"?, "done"? }` (live process feed)
 - `status` — `{ "type", "status" }`
 - `error` — `{ "type", "error" }`
 - `done` — `{ "type", "sessionId", "runId", "status", "result" }`

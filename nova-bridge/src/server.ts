@@ -3,12 +3,16 @@ import { spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  describeUnknownMessage,
   formatSse,
+  normalizeConversationStep,
   normalizeHistoryMessage,
+  normalizeInteractionUpdate,
   normalizeSdkMessage,
   type CodingEvent,
 } from "./cursor-stream.js";
 import { bootstrapCursorRipgrep } from "./bootstrap-ripgrep.js";
+import { PreviewService, previewUrl } from "./preview-service.js";
 import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js";
 
 /**
@@ -25,6 +29,9 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   POST /repos/clone | /repos/create | /repos/select
  *   GET  /repos/:repoId/status | /diff
  *   POST /repos/:repoId/publish
+ *   GET  /preview                  active previews
+ *   POST /preview/start            { repoId }  → LAN preview URL
+ *   POST /preview/stop             { repoId }
  *   GET  /health                   (unauthenticated liveness check)
  */
 
@@ -66,6 +73,7 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_ARGS = (process.env.CLAUDE_ARGS ?? "").trim();
 const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 600_000);
 const repos = new RepoService({ defaultWorkdir: DEFAULT_CWD });
+const previews = new PreviewService();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -206,6 +214,50 @@ app.post("/repos/:repoId/publish", requireAuth, async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     sendRepoError(res, err);
+  }
+});
+
+// --- Live preview -----------------------------------------------------------
+// Serves generated projects on LAN ports the phone's browser can open. Dev
+// servers (vite/next) start asynchronously; the app polls until state=ready.
+app.get("/preview", requireAuth, (req, res) => {
+  const host = req.get("host");
+  const list = previews.list().map((p) => ({
+    ...p,
+    url: previewUrl(host, p.port),
+  }));
+  res.json({ ok: true, previews: list });
+});
+
+app.post("/preview/start", requireAuth, async (req, res) => {
+  const repoId = String(req.body?.repoId ?? "").trim();
+  if (!repoId) {
+    res.status(400).json({ ok: false, error: "missing_repo_id" });
+    return;
+  }
+  try {
+    const { id, path, name } = repos.resolveRepo(repoId);
+    const info = await previews.start(id, path, name);
+    res.json({
+      ok: true,
+      preview: { ...info, url: previewUrl(req.get("host"), info.port) },
+    });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/preview/stop", requireAuth, async (req, res) => {
+  const repoId = String(req.body?.repoId ?? "").trim();
+  if (!repoId) {
+    res.status(400).json({ ok: false, error: "missing_repo_id" });
+    return;
+  }
+  try {
+    const stopped = await previews.stop(repoId);
+    res.json({ ok: true, stopped });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: describe(err) });
   }
 });
 
@@ -427,7 +479,25 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     resolvedSessionId = agent.agentId;
     write({ type: "status", status: "CREATING", sessionId: resolvedSessionId });
 
-    const run = await agent.send(command);
+    let sawAssistant = false;
+    // Live Agents-window style updates come from onDelta/onStep. Coarse
+    // run.stream() messages often include empty thinking placeholders and are
+    // easy to miss — keep them as a secondary feed only.
+    const emit = (events: CodingEvent[]): void => {
+      for (const event of events) {
+        if (event.type === "assistant_delta") sawAssistant = true;
+        write(event);
+      }
+    };
+
+    const run = await agent.send(command, {
+      onDelta: ({ update }) => {
+        emit(normalizeInteractionUpdate(update));
+      },
+      onStep: ({ step }) => {
+        emit(normalizeConversationStep(step));
+      },
+    });
     runId = run.id;
     activeRuns.set(runId, {
       agentId: resolvedSessionId,
@@ -439,26 +509,57 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       runId,
       sessionId: resolvedSessionId,
     });
+    write({
+      type: "activity",
+      phase: "status",
+      text: "Running",
+      detail: runId,
+      done: false,
+    });
 
-    let sawAssistant = false;
-    for await (const msg of run.stream()) {
-      const events = normalizeSdkMessage(msg);
-      if (events.length === 0) {
-        const t = (msg as { type?: string } | null)?.type ?? typeof msg;
-        console.log(`[cursor/runs] unmapped stream message type=${t}`);
+    // Drain the SDK message stream in parallel with wait() for envelopes that
+    // onDelta does not cover (status/usage/system/task). Skip assistant /
+    // thinking / tool_call — those already stream via onDelta.
+    const streamDrain = (async () => {
+      try {
+        for await (const msg of run.stream()) {
+          const type = (msg as { type?: string } | null)?.type;
+          if (
+            type === "assistant" ||
+            type === "thinking" ||
+            type === "tool_call" ||
+            type === "user" ||
+            type === "text-delta" ||
+            type === "thinking-delta"
+          ) {
+            continue;
+          }
+          const events = normalizeSdkMessage(msg);
+          if (events.length === 0) {
+            console.log(
+              `[cursor/runs] unmapped stream message ${describeUnknownMessage(msg)}`,
+            );
+          }
+          emit(events);
+        }
+      } catch (err) {
+        console.log(`[cursor/runs] stream drain error: ${describe(err)}`);
       }
-      for (const event of events) {
-        if (event.type === "assistant_delta") sawAssistant = true;
-        write(event);
-      }
-    }
+    })();
 
     const result = await run.wait();
-    // If the stream produced no assistant deltas but wait() has a final result,
-    // surface it so the Coding tab isn't blank.
+    await streamDrain.catch(() => undefined);
+
+    // If neither deltas nor stream produced assistant text, fall back to wait().
     if (!sawAssistant && result.result?.trim()) {
       write({ type: "assistant_delta", text: result.result.trim() });
     }
+    write({
+      type: "activity",
+      phase: "status",
+      text: result.status === "finished" ? "Finished" : result.status,
+      done: true,
+    });
     write({
       type: "done",
       sessionId: resolvedSessionId,
