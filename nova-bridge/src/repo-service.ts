@@ -349,16 +349,27 @@ export async function runProcess(
   }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxStdout = opts.maxStdout ?? MAX_STDOUT;
+  // Keep a minimal env, but include the Windows profile vars `gh` needs to
+  // read its keyring login (APPDATA / LOCALAPPDATA). Without those, spawned
+  // `gh repo create` fails with "please run: gh auth login" even when the
+  // interactive shell is already authenticated.
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     SystemRoot: process.env.SystemRoot,
     USERPROFILE: process.env.USERPROFILE,
     HOME: process.env.HOME,
+    USERNAME: process.env.USERNAME,
+    USERDOMAIN: process.env.USERDOMAIN,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
     LANG: process.env.LANG ?? "C",
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",
     GH_PROMPT_DISABLED: "1",
     GH_NO_UPDATE_NOTIFIER: "1",
+    // Optional explicit tokens (preferred when set; otherwise gh uses keyring).
+    ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
+    ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
     ...opts.env,
   };
   // Strip credential helpers that might prompt; keep GH token auth via gh itself.
