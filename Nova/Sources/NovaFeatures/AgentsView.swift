@@ -2,8 +2,7 @@ import SwiftUI
 import NovaDomain
 
 /// Agents tab: Nova (master) plus specialists. Each specialist opens a dedicated
-/// push destination when active — or when live work (workout / cook / review) is
-/// in progress even if another agent is talking.
+/// push destination when active (Coding / Training / Wellness / Kitchen / Study).
 public struct AgentsView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
@@ -31,88 +30,10 @@ public struct AgentsView: View {
         self.showSettings = showSettings
     }
 
-    private var showCoding: Bool {
-        agents.isClaudeActive || coding.pinnedSessionId != nil
-    }
-
-    private var showTraining: Bool {
-        agents.isMaxActive || training.hasActiveSession
-    }
-
-    private var showWellness: Bool {
-        agents.isSageActive || wellness.hasResumeSignal
-    }
-
-    private var showKitchen: Bool {
-        agents.isRemyActive || kitchen.cookingSession != nil
-    }
-
-    private var showStudy: Bool {
-        agents.isScholarActive || study.isReviewing || study.dueTotal > 0
-    }
-
-    private var hasLiveWorkAwayFromAgent: Bool {
-        (!agents.isMaxActive && training.hasActiveSession)
-            || (!agents.isRemyActive && kitchen.cookingSession != nil)
-            || (!agents.isScholarActive && study.isReviewing)
-            || (!agents.isClaudeActive && coding.pinnedSessionId != nil)
-            || (!agents.isSageActive && wellness.hasResumeSignal)
-    }
-
     public var body: some View {
         NavigationStack {
             List {
-                if hasLiveWorkAwayFromAgent {
-                    Section {
-                        if training.hasActiveSession, !agents.isMaxActive {
-                            resumeRow(
-                                title: "Resume workout",
-                                subtitle: training.activeSession?.title ?? "Live",
-                                systemImage: "figure.strengthtraining.traditional",
-                                route: .training
-                            )
-                        }
-                        if kitchen.cookingSession != nil, !agents.isRemyActive {
-                            resumeRow(
-                                title: "Resume cooking",
-                                subtitle: kitchen.cookingSession?.recipeTitle ?? "Cook mode",
-                                systemImage: "fork.knife",
-                                route: .kitchen
-                            )
-                        }
-                        if study.isReviewing, !agents.isScholarActive {
-                            resumeRow(
-                                title: "Resume review",
-                                subtitle: study.reviewProgressLabel,
-                                systemImage: "text.book.closed",
-                                route: .study
-                            )
-                        }
-                        if coding.pinnedSessionId != nil, !agents.isClaudeActive {
-                            resumeRow(
-                                title: "Resume Coding",
-                                subtitle: coding.shortSessionId,
-                                systemImage: "chevron.left.forwardslash.chevron.right",
-                                route: .coding
-                            )
-                        }
-                        if wellness.hasResumeSignal, !agents.isSageActive {
-                            resumeRow(
-                                title: "Resume Wellness",
-                                subtitle: wellness.resumeSubtitle,
-                                systemImage: "leaf",
-                                route: .wellness
-                            )
-                        }
-                    } header: {
-                        Text("Resume live work")
-                    } footer: {
-                        Text("Live sessions stay reachable even after you switch agents.")
-                            .font(.caption2)
-                    }
-                }
-
-                if showCoding {
+                if agents.isClaudeActive {
                     Section {
                         NavigationLink {
                             CodingView(coding: coding, embedded: true)
@@ -134,7 +55,7 @@ public struct AgentsView: View {
                     }
                 }
 
-                if showTraining {
+                if agents.isMaxActive {
                     Section {
                         NavigationLink {
                             TrainingView(training: training, embedded: true)
@@ -155,14 +76,12 @@ public struct AgentsView: View {
                     } header: {
                         Text("Max")
                     } footer: {
-                        Text(training.hasActiveSession
-                             ? "Workout in progress — open Training for live sets and rest."
-                             : "Open Training while talking to Max for live sets and rest.")
+                        Text("Open Training while talking to Max for live sets and rest.")
                             .font(.caption2)
                     }
                 }
 
-                if showWellness {
+                if agents.isSageActive {
                     Section {
                         NavigationLink {
                             SageWellnessView(wellness: wellness, embedded: true)
@@ -170,7 +89,9 @@ public struct AgentsView: View {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Wellness")
-                                    Text(wellness.resumeSubtitle)
+                                    Text(wellness.recent.isEmpty
+                                         ? "Check-ins and breath timers"
+                                         : "\(wellness.recent.count) recent check-ins")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -181,12 +102,12 @@ public struct AgentsView: View {
                     } header: {
                         Text("Sage")
                     } footer: {
-                        Text("Check-ins and breath timers.")
+                        Text("Open Wellness while talking to Sage for mood check-ins and timers.")
                             .font(.caption2)
                     }
                 }
 
-                if showKitchen {
+                if agents.isRemyActive {
                     Section {
                         NavigationLink {
                             RemyKitchenView(kitchen: kitchen, embedded: true)
@@ -207,14 +128,12 @@ public struct AgentsView: View {
                     } header: {
                         Text("Remy")
                     } footer: {
-                        Text(kitchen.cookingSession == nil
-                             ? "Open Kitchen while talking to Remy for pantry, fridge scan, and cook mode."
-                             : "Cook mode is live — open Kitchen for the step HUD.")
+                        Text("Open Kitchen while talking to Remy for pantry, fridge scan, and cook mode.")
                             .font(.caption2)
                     }
                 }
 
-                if showStudy {
+                if agents.isScholarActive {
                     Section {
                         NavigationLink {
                             StudyView(study: study, embedded: true)
@@ -222,9 +141,7 @@ public struct AgentsView: View {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Study")
-                                    Text(study.isReviewing
-                                         ? study.reviewProgressLabel
-                                         : (study.dueTotal > 0 ? "\(study.dueTotal) due" : "Decks and review"))
+                                    Text(study.dueTotal > 0 ? "\(study.dueTotal) due" : "Decks and review")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -235,7 +152,7 @@ public struct AgentsView: View {
                     } header: {
                         Text("Scholar")
                     } footer: {
-                        Text("Open Study for decks and spaced-repetition review.")
+                        Text("Open Study while talking to Scholar for decks and spaced-repetition review.")
                             .font(.caption2)
                     }
                 }
@@ -283,11 +200,8 @@ public struct AgentsView: View {
                     .accessibilityLabel("New agent")
                 }
             }
-            .navigationDestination(item: $agents.pendingRoute) { route in
-                specialistDestination(route)
-            }
             .navigationDestination(isPresented: Binding(
-                get: { study.shouldPresentStudy && agents.pendingRoute == nil },
+                get: { study.shouldPresentStudy },
                 set: { if !$0 { study.clearPresentFlag() } }
             )) {
                 StudyView(study: study, embedded: true)
@@ -300,44 +214,6 @@ public struct AgentsView: View {
                 await kitchen.load()
                 await study.load()
             }
-        }
-    }
-
-    private func resumeRow(
-        title: String,
-        subtitle: String,
-        systemImage: String,
-        route: AgentsPendingRoute
-    ) -> some View {
-        Button {
-            agents.requestRoute(route)
-        } label: {
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } icon: {
-                Image(systemName: systemImage)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func specialistDestination(_ route: AgentsPendingRoute) -> some View {
-        switch route {
-        case .coding:
-            CodingView(coding: coding, embedded: true)
-        case .training:
-            TrainingView(training: training, embedded: true)
-        case .wellness:
-            SageWellnessView(wellness: wellness, embedded: true)
-        case .kitchen:
-            RemyKitchenView(kitchen: kitchen, embedded: true)
-        case .study:
-            StudyView(study: study, embedded: true)
         }
     }
 }
