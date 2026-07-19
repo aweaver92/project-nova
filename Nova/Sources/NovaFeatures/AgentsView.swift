@@ -12,6 +12,10 @@ public struct AgentsView: View {
     @Bindable var study: StudyViewModel
     var showSettings: () -> Void
 
+    /// Drives programmatic pushes from `agents.pendingRoute` (Assistant-tab CTAs
+    /// and voice `open_app_screen`). Without this the buttons only switched tab.
+    @State private var path = NavigationPath()
+
     public init(
         agents: AgentsViewModel,
         coding: CodingViewModel,
@@ -31,7 +35,7 @@ public struct AgentsView: View {
     }
 
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 if agents.isClaudeActive {
                     Section {
@@ -206,6 +210,12 @@ public struct AgentsView: View {
             )) {
                 StudyView(study: study, embedded: true)
             }
+            .navigationDestination(for: AgentsPendingRoute.self) { route in
+                specialistDestination(route)
+            }
+            .onChange(of: agents.pendingRoute) { _, newValue in
+                if newValue != nil { consumePendingRoute() }
+            }
             .task {
                 await agents.load()
                 await coding.load()
@@ -213,7 +223,36 @@ public struct AgentsView: View {
                 await wellness.load()
                 await kitchen.load()
                 await study.load()
+                // A route requested before this tab appeared (e.g. an Assistant-tab
+                // CTA or voice command that also switched tabs) won't fire onChange,
+                // so consume any pending route once we're on screen.
+                consumePendingRoute()
             }
+        }
+    }
+
+    /// Push the specialist screen for a programmatic route, then clear the flag so
+    /// it can't re-fire. Unlike the gated "Open …" sections, this works regardless
+    /// of which agent is active (the caller decides when it's appropriate).
+    private func consumePendingRoute() {
+        guard let route = agents.pendingRoute else { return }
+        agents.clearPendingRoute()
+        path.append(route)
+    }
+
+    @ViewBuilder
+    private func specialistDestination(_ route: AgentsPendingRoute) -> some View {
+        switch route {
+        case .coding:
+            CodingView(coding: coding, embedded: true)
+        case .training:
+            TrainingView(training: training, embedded: true)
+        case .wellness:
+            SageWellnessView(wellness: wellness, embedded: true)
+        case .kitchen:
+            RemyKitchenView(kitchen: kitchen, embedded: true)
+        case .study:
+            StudyView(study: study, embedded: true)
         }
     }
 }
