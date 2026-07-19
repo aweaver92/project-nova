@@ -11,6 +11,13 @@ public struct MealPhotoEstimate: Sendable, Equatable {
     }
 }
 
+/// Parse failure for meal-photo JSON (Result.Failure must conform to Error).
+public struct MealPhotoAnalysisFailure: Error, Sendable, Equatable, CustomStringConvertible {
+    public let message: String
+    public var description: String { message }
+    public init(_ message: String) { self.message = message }
+}
+
 /// Prompt + JSON parsing for meal-photo → macros (mirrors `FridgeScanDiff`).
 public enum MealPhotoAnalysis {
     /// Ask the multimodal model for a short meal description and macro estimate.
@@ -23,7 +30,7 @@ public enum MealPhotoAnalysis {
         """
 
     /// Parse model output into a meal estimate. Fails if JSON is missing or description is empty.
-    public static func parseModelJSON(_ text: String) -> Result<MealPhotoEstimate, String> {
+    public static func parseModelJSON(_ text: String) -> Result<MealPhotoEstimate, MealPhotoAnalysisFailure> {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let jsonText: String
         if let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}") {
@@ -33,12 +40,12 @@ public enum MealPhotoAnalysis {
         }
         guard let data = jsonText.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .failure("Could not parse meal photo JSON.")
+            return .failure(MealPhotoAnalysisFailure("Could not parse meal photo JSON."))
         }
         let rawDescription = (root["description"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !rawDescription.isEmpty else {
-            return .failure("Meal photo analysis returned no description.")
+            return .failure(MealPhotoAnalysisFailure("Meal photo analysis returned no description."))
         }
         let nutrition = MealNutrition(
             calories: number(in: root, keys: ["calories", "calorie", "kcal"]),
@@ -47,7 +54,7 @@ public enum MealPhotoAnalysis {
             fatGrams: number(in: root, keys: ["fat_grams", "fat", "fatGrams"])
         )
         if nutrition.isEmpty {
-            return .failure("Meal photo analysis returned no macros.")
+            return .failure(MealPhotoAnalysisFailure("Meal photo analysis returned no macros."))
         }
         return .success(MealPhotoEstimate(description: rawDescription, nutrition: nutrition))
     }

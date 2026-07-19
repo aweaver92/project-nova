@@ -13,8 +13,8 @@ final class MealPhotoAnalysisTests: XCTestCase {
             XCTAssertEqual(estimate.nutrition.proteinGrams, 42)
             XCTAssertEqual(estimate.nutrition.carbsGrams, 48)
             XCTAssertEqual(estimate.nutrition.fatGrams, 16)
-        case .failure(let message):
-            XCTFail(message)
+        case .failure(let failure):
+            XCTFail(failure.message)
         }
     }
 
@@ -28,8 +28,8 @@ final class MealPhotoAnalysisTests: XCTestCase {
         case .success(let estimate):
             XCTAssertEqual(estimate.description, "Avocado toast")
             XCTAssertEqual(estimate.nutrition.calories, 320)
-        case .failure(let message):
-            XCTFail(message)
+        case .failure(let failure):
+            XCTFail(failure.message)
         }
     }
 
@@ -39,8 +39,8 @@ final class MealPhotoAnalysisTests: XCTestCase {
         case .success(let estimate):
             XCTAssertEqual(estimate.nutrition.calories, 180)
             XCTAssertEqual(estimate.nutrition.proteinGrams, 15)
-        case .failure(let message):
-            XCTFail(message)
+        case .failure(let failure):
+            XCTFail(failure.message)
         }
     }
 
@@ -49,8 +49,8 @@ final class MealPhotoAnalysisTests: XCTestCase {
         switch MealPhotoAnalysis.parseModelJSON(text) {
         case .success:
             XCTFail("expected failure")
-        case .failure(let message):
-            XCTAssertTrue(message.localizedCaseInsensitiveContains("description"))
+        case .failure(let failure):
+            XCTAssertTrue(failure.message.localizedCaseInsensitiveContains("description"))
         }
     }
 
@@ -59,8 +59,8 @@ final class MealPhotoAnalysisTests: XCTestCase {
         switch MealPhotoAnalysis.parseModelJSON(text) {
         case .success:
             XCTFail("expected failure")
-        case .failure(let message):
-            XCTAssertTrue(message.localizedCaseInsensitiveContains("macros"))
+        case .failure(let failure):
+            XCTAssertTrue(failure.message.localizedCaseInsensitiveContains("macros"))
         }
     }
 

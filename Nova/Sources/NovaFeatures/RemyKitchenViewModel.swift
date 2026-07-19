@@ -740,8 +740,8 @@ public final class RemyKitchenViewModel {
             let cal = estimate.nutrition.calories.map { " · \(Int($0)) kcal" } ?? ""
             statusMessage = "Logged \(estimate.description)\(cal)"
             selectedSection = .profile
-        case .failure(let message):
-            statusMessage = message
+        case .failure(let failure):
+            statusMessage = failure.message
         }
     }
 
