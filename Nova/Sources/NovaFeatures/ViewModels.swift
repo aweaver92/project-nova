@@ -2084,9 +2084,7 @@ public final class CodingViewModel {
                 delayBeforePoll = true
             }
 
-            let bg = await BackgroundTask.begin(name: "nova.cursor-recover")
             let statusResult = await bridge.cursorRunStatus(runId: runId)
-            await BackgroundTask.end(bg)
             guard generation == runGeneration, isRunning else { return nil }
             if !statusResult.ok,
                statusResult.payloadJSON.contains("run_not_found")
