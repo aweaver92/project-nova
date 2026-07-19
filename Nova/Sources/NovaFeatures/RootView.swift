@@ -31,6 +31,7 @@ public struct RootView: View {
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
+    @Bindable var simpleVoice: SimpleVoiceViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
     var appNavigation: AppNavigationBridge
     @State private var selectedTab: RootTab = .assistant
@@ -60,6 +61,7 @@ public struct RootView: View {
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         settings: SettingsViewModel,
+        simpleVoice: SimpleVoiceViewModel,
         toolConfirmation: ToolConfirmationCoordinator,
         appNavigation: AppNavigationBridge
     ) {
@@ -80,6 +82,7 @@ public struct RootView: View {
         self.kitchen = kitchen
         self.study = study
         self.settings = settings
+        self.simpleVoice = simpleVoice
         self.toolConfirmation = toolConfirmation
         self.appNavigation = appNavigation
     }
@@ -117,7 +120,7 @@ public struct RootView: View {
         // Tap-to-dismiss keyboard (window UIKit gesture; does not delay List/NavigationLink taps).
         .dismissKeyboardOnTap()
         .sheet(isPresented: $showSettings) {
-            SettingsView(settings: settings, conversation: conversation)
+            SettingsView(settings: settings, conversation: conversation, simpleVoice: simpleVoice)
         }
         .alert(
             toolConfirmation.prompt?.title ?? "Confirm",

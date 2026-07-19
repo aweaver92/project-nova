@@ -63,6 +63,9 @@ public final class AppContainer {
     public let kitchenVM: RemyKitchenViewModel
     public let studyVM: StudyViewModel
     public let settingsVM: SettingsViewModel
+    /// "Voice V2" beta: minimal OpenAI Realtime voice chat, parallel to the
+    /// main Assistant tab and its orchestrator.
+    public let simpleVoiceVM: SimpleVoiceViewModel
     public let appNavigation: AppNavigationBridge
 
     /// - Parameter useMockGlasses: when `true`, the wearable session runs an
@@ -531,6 +534,12 @@ public final class AppContainer {
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
+        // Voice V2 (beta): self-contained Realtime engine + view model, sharing
+        // only the agent roster with the rest of the app.
+        self.simpleVoiceVM = SimpleVoiceViewModel(
+            engine: SimpleVoiceClient(),
+            agentStore: agentStore
+        )
         let codingVM = CodingViewModel(
             bridge: bridge,
             settings: settingsStore,

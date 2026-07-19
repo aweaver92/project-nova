@@ -58,6 +58,7 @@ struct NovaApp: App {
                 kitchen: container.kitchenVM,
                 study: container.studyVM,
                 settings: container.settingsVM,
+                simpleVoice: container.simpleVoiceVM,
                 toolConfirmation: container.toolConfirmation,
                 appNavigation: container.appNavigation
             )

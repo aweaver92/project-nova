@@ -70,5 +70,5 @@ else
   cp -R "$APP_PATH" "$BUILD_DIR/Payload/"
   ( cd "$BUILD_DIR" && zip -qr "Nova-unsigned.ipa" "Payload" && rm -rf "Payload" )
 
-  echo "==> Done: $BUILD_DIR/Nova-unsigned.ipa (re-sign with AltStore/Sideloadly to install)"
+  echo "==> Done: $BUILD_DIR/Nova-unsigned.ipa (re-sign with SideStore to install)"
 fi

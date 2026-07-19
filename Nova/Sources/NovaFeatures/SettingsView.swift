@@ -9,18 +9,37 @@ import UIKit
 public struct SettingsView: View {
     @Bindable var settings: SettingsViewModel
     @Bindable var conversation: ConversationViewModel
+    @Bindable var simpleVoice: SimpleVoiceViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var bridgeProfileEditor: BridgeProfileEditor?
     @State private var bridgeProfileName = ""
+    @State private var showSimpleVoice = false
 
-    public init(settings: SettingsViewModel, conversation: ConversationViewModel) {
+    public init(
+        settings: SettingsViewModel,
+        conversation: ConversationViewModel,
+        simpleVoice: SimpleVoiceViewModel
+    ) {
         self.settings = settings
         self.conversation = conversation
+        self.simpleVoice = simpleVoice
     }
 
     public var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Button {
+                        showSimpleVoice = true
+                    } label: {
+                        Label("Voice chat (beta)", systemImage: "waveform.circle")
+                    }
+                } header: {
+                    Text("Experimental")
+                } footer: {
+                    Text("A rebuilt, minimal voice chat: pick an agent and talk directly to OpenAI Realtime in that agent's voice. Independent of the main Assistant tab.")
+                }
+
                 Section {
                     Toggle("Follow-up suggestion chips", isOn: Binding(
                         get: { settings.followUpSuggestionsEnabled },
@@ -255,6 +274,9 @@ public struct SettingsView: View {
                 Text(editor.message)
             }
             .task { await settings.load() }
+            .fullScreenCover(isPresented: $showSimpleVoice) {
+                SimpleVoiceView(model: simpleVoice)
+            }
         }
     }
 
