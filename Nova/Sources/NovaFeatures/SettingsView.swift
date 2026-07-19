@@ -227,7 +227,14 @@ public struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .alert("Bridge profile", item: $bridgeProfileEditor) { editor in
+            .alert(
+                "Bridge profile",
+                isPresented: Binding(
+                    get: { bridgeProfileEditor != nil },
+                    set: { if !$0 { bridgeProfileEditor = nil } }
+                ),
+                presenting: bridgeProfileEditor
+            ) { editor in
                 TextField("Name (e.g. Home, VPN)", text: $bridgeProfileName)
                     .textInputAutocapitalization(.words)
                 Button(editor.actionTitle) {
