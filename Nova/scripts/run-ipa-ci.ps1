@@ -8,7 +8,7 @@
   writes the artifact to App/NovaApp.ipa for AltStore.
 
   On a public repo this uses free Actions minutes. On a private repo macOS is
-  billed at 10x — only run when you need a new sideload build.
+  billed at 10x - only run when you need a new sideload build.
 
 .PARAMETER Ref
   Git ref to build (branch, tag, or SHA). Default: current branch, else main.
@@ -27,11 +27,13 @@ $ErrorActionPreference = "Stop"
 function Find-Gh {
     $cmd = Get-Command gh -ErrorAction SilentlyContinue
     $candidates = @(
-        $(if ($cmd) { $cmd.Source })
-        "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
-        "$env:ProgramFiles\GitHub CLI\gh.exe"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    if (-not $candidates) {
+        @(
+            $(if ($cmd) { $cmd.Source })
+            "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
+            "$env:ProgramFiles\GitHub CLI\gh.exe"
+        ) | Where-Object { $_ -and (Test-Path $_) }
+    )
+    if ($candidates.Count -eq 0) {
         throw "gh CLI not found. Install GitHub CLI and run 'gh auth login'."
     }
     return $candidates[0]
@@ -64,7 +66,7 @@ try {
     }
     $unpushed = & $git log "origin/$Ref..HEAD" --oneline 2>$null
     if ($unpushed) {
-        Write-Warning "Local commits not on origin/$Ref yet — push before dispatching, or CI will build an older tip:"
+        Write-Warning "Local commits not on origin/$Ref yet - push before dispatching, or CI will build an older tip:"
         $unpushed | ForEach-Object { Write-Host "  $_" }
     }
 
@@ -95,7 +97,7 @@ try {
         }
     }
     if (-not $runId) {
-        throw "Timed out waiting for the new workflow run to appear. Check GitHub → Actions."
+        throw "Timed out waiting for the new workflow run to appear. Check GitHub Actions."
     }
 
     Write-Host "Run $runId started. Waiting for completion (this is the macOS build; often 10-25 min)..."

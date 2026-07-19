@@ -28,11 +28,13 @@ $ErrorActionPreference = "Stop"
 function Find-Gh {
     $cmd = Get-Command gh -ErrorAction SilentlyContinue
     $candidates = @(
-        $(if ($cmd) { $cmd.Source })
-        "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
-        "$env:ProgramFiles\GitHub CLI\gh.exe"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    if (-not $candidates) {
+        @(
+            $(if ($cmd) { $cmd.Source })
+            "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
+            "$env:ProgramFiles\GitHub CLI\gh.exe"
+        ) | Where-Object { $_ -and (Test-Path $_) }
+    )
+    if ($candidates.Count -eq 0) {
         throw "gh CLI not found. Install GitHub CLI and run 'gh auth login'."
     }
     return $candidates[0]
@@ -137,7 +139,7 @@ try {
         Write-Host ("Wrote {0} ({1:N1} MB)" -f $DestIpa, ($item.Length / 1MB))
         Write-Host "Sideload this file with AltStore. Check Settings/Listen for NovaBuildStamp matching the short SHA above."
         if ($runMeta.headSha -and $runMeta.headSha -ne $headSha) {
-            Write-Warning "Still not your current HEAD — commit, push, then .\scripts\run-ipa-ci.ps1 for a fresh build."
+            Write-Warning "Still not your current HEAD - commit, push, then .\scripts\run-ipa-ci.ps1 for a fresh build."
         }
     }
     finally {
