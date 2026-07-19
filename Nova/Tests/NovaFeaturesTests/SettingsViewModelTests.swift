@@ -51,6 +51,29 @@ final class SettingsViewModelTests: XCTestCase {
         let remainingProfiles = await store.bridgeProfiles()
         XCTAssertTrue(remainingProfiles.isEmpty)
     }
+
+    func testLoadAutoDiscoversWhenSavedBridgeIsUnreachable() async throws {
+        let store = SettingsStoreMock(
+            baseURL: "http://192.168.1.20:8787",
+            token: "keep-me"
+        )
+        let viewModel = SettingsViewModel(
+            store: store,
+            bridge: UnhealthyBridgeMock(),
+            bridgeDiscovery: BridgeDiscoveryMock(url: "http://192.168.1.44:8787")
+        )
+
+        await viewModel.load()
+        for _ in 0..<50 where viewModel.bridgeBaseURL != "http://192.168.1.44:8787" {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        XCTAssertEqual(viewModel.bridgeBaseURL, "http://192.168.1.44:8787")
+        let savedURL = await store.bridgeBaseURL()
+        let savedToken = await store.bridgeToken()
+        XCTAssertEqual(savedURL, "http://192.168.1.44:8787")
+        XCTAssertEqual(savedToken, "keep-me")
+    }
 }
 
 private actor BridgeDiscoveryMock: BridgeDiscovering {
@@ -66,6 +89,13 @@ private struct HealthyBridgeMock: AgentBridging {
             ok: true,
             payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true}"#
         )
+    }
+}
+
+private struct UnhealthyBridgeMock: AgentBridging {
+    func isConfigured() async -> Bool { true }
+    func health() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"offline"}"#)
     }
 }
 

@@ -31,7 +31,6 @@ public struct RootView: View {
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
-    @Bindable var simpleVoice: SimpleVoiceViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
     var appNavigation: AppNavigationBridge
     @State private var selectedTab: RootTab = .assistant
@@ -61,7 +60,6 @@ public struct RootView: View {
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         settings: SettingsViewModel,
-        simpleVoice: SimpleVoiceViewModel,
         toolConfirmation: ToolConfirmationCoordinator,
         appNavigation: AppNavigationBridge
     ) {
@@ -82,7 +80,6 @@ public struct RootView: View {
         self.kitchen = kitchen
         self.study = study
         self.settings = settings
-        self.simpleVoice = simpleVoice
         self.toolConfirmation = toolConfirmation
         self.appNavigation = appNavigation
     }
@@ -120,7 +117,7 @@ public struct RootView: View {
         // Tap-to-dismiss keyboard (window UIKit gesture; does not delay List/NavigationLink taps).
         .dismissKeyboardOnTap()
         .sheet(isPresented: $showSettings) {
-            SettingsView(settings: settings, conversation: conversation, simpleVoice: simpleVoice)
+            SettingsView(settings: settings, conversation: conversation)
         }
         .alert(
             toolConfirmation.prompt?.title ?? "Confirm",
@@ -422,7 +419,10 @@ public struct RootView: View {
             }
             .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
 
-            if conversation.isRunning || conversation.listenHealth.phase == .connecting {
+            if conversation.isRunning
+                || conversation.listenHealth.phase == .connecting
+                || conversation.listenHealth.phase == .awaitingWakeWord
+            {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Circle()
@@ -465,8 +465,12 @@ public struct RootView: View {
                     .textSelection(.enabled)
             }
         } footer: {
-            if conversation.isRunning {
-                Text("Watch the mic meter and transcript below. If the meter stays flat, Nova cannot hear. If the meter moves but no You: line appears, cloud STT is stuck.")
+            if conversation.listenHealth.phase == .awaitingWakeWord {
+                Text("Connection closed. Say “Nova” or tap Listen to reconnect.")
+            } else if conversation.isRunning {
+                Text("Listening. Say “Close Connection” to disconnect. Watch the mic meter — if it stays flat, Nova cannot hear.")
+            } else {
+                Text("Tap Listen to start voice. Transcripts stay on screen.")
             }
         }
     }
@@ -475,6 +479,7 @@ public struct RootView: View {
         switch conversation.listenHealth.phase {
         case .hearingYou, .speaking: return .green
         case .waitingForSpeech, .connecting: return .orange
+        case .awaitingWakeWord: return .purple
         case .micSilent, .streamStalled, .cloudQuiet, .error: return .red
         case .idle: return .secondary
         }

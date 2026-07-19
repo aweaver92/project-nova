@@ -220,6 +220,10 @@ public actor ConversationOrchestrator {
     /// wake-word listening). Exposed for diagnostics/tests.
     public var isStreaming: Bool { streaming }
 
+    /// True while `start()` has not been paired with `stop()` — includes the
+    /// post-"Close Connection" local wake-word standby (Realtime may be down).
+    public var isSessionActive: Bool { isRunning }
+
     public func setTranscriptHandler(_ handler: (@Sendable (String, ConversationTurn.Role) -> Void)?) {
         onTranscript = handler
     }
@@ -608,8 +612,31 @@ public actor ConversationOrchestrator {
                 NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
                 if let listener = wakeWordListener, isRunning {
                     try? await beginLocalListening(listener)
+                    publishListenHealth(
+                        phase: .awaitingWakeWord,
+                        detail: "Say \"Nova\" or tap Listen to reconnect."
+                    )
                 }
             }
+        }
+    }
+
+    /// Reopen Realtime after "Close Connection" standby (Listen button path).
+    public func reopenRealtime() async throws {
+        try await withLifecycle {
+            guard isRunning else {
+                throw NovaError.notConfigured("Voice session is not active — tap Listen to start")
+            }
+            guard !streaming else { return }
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            var engaged = sessionConfig
+            engaged.requireWakeWord = false
+            sessionConfig.requireWakeWord = false
+            try await beginStreaming(engaged)
+            lastEngagement = .now
+            listeningSuspended = false
         }
     }
 
@@ -1336,6 +1363,13 @@ public actor ConversationOrchestrator {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // "Close Connection" always tears down Realtime — even when Listen has
+        // disabled the wake-word reply gate — then arms on-device "Nova".
+        if Self.isCloseConnectionCommand(trimmed) {
+            await handleCloseConnection()
+            return
+        }
+
         // 0) Master control channel — always, even when Listen disables the
         //    wake-word reply gate. Otherwise "Nova, let me talk to Claude" is
         //    ignored and the model invents a "configuration" excuse.
@@ -1434,6 +1468,55 @@ public actor ConversationOrchestrator {
         inputTranscript = ""
         outputTranscript = ""
         NovaLog.session.info("Stop command: speech halted; wake word required to resume")
+    }
+
+    /// "Close Connection": drop the cloud Realtime session and arm on-device
+    /// wake-word listening. Tap Listen or say "Nova" to reopen.
+    private func handleCloseConnection() async {
+        await ai.interrupt()
+        await egress.flush()
+        inputTranscript = ""
+        outputTranscript = ""
+        onTranscript?("Connection closed.", .system)
+        await withLifecycle {
+            await teardownStreaming()
+            if let listener = wakeWordListener, isRunning {
+                sessionConfig.useLocalWakeWord = true
+                do {
+                    try await beginLocalListening(listener)
+                    publishListenHealth(
+                        phase: .awaitingWakeWord,
+                        detail: "Connection closed — say \"Nova\" or tap Listen to reconnect."
+                    )
+                    NovaLog.session.info("Close Connection: Realtime closed; local wake word armed")
+                } catch {
+                    NovaLog.session.error("Close Connection: wake listener failed: \(String(describing: error), privacy: .public)")
+                    isRunning = false
+                    eventTask?.cancel()
+                    eventTask = nil
+                    publishListenHealth(
+                        phase: .idle,
+                        detail: "Connection closed. Tap Listen to start again."
+                    )
+                }
+            } else {
+                isRunning = false
+                eventTask?.cancel()
+                eventTask = nil
+                publishListenHealth(
+                    phase: .idle,
+                    detail: "Connection closed. Tap Listen to start again."
+                )
+                NovaLog.session.info("Close Connection: Realtime closed (no local wake listener)")
+            }
+        }
+    }
+
+    /// Exact voice command (punctuation ignored) that closes Realtime.
+    static func isCloseConnectionCommand(_ text: String) -> Bool {
+        let normalized = WakeWordDetector.normalizeText(text)
+        return normalized == "close connection"
+            || normalized == "nova close connection"
     }
 
     /// Deterministic routing for bookmark requests and skill trigger phrases.

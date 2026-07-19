@@ -12,6 +12,7 @@ public struct RemyKitchenView: View {
     var embedded: Bool
 
     @State private var photoItems: [PhotosPickerItem] = []
+    @State private var mealPhotoItems: [PhotosPickerItem] = []
     @State private var editingPantry: PantryItem?
     @State private var showNewPantry = false
     @State private var editingRecipe: Recipe?
@@ -732,6 +733,35 @@ public struct RemyKitchenView: View {
                 mealLogDraft = ""
                 Task { await kitchen.logMeal(text) }
             }
+            .disabled(kitchen.isScanning)
+
+            PhotosPicker(selection: $mealPhotoItems, maxSelectionCount: 1, matching: .images) {
+                Label(
+                    kitchen.isScanning ? "Analyzing…" : "Log meal from photo",
+                    systemImage: "camera.fill"
+                )
+            }
+            .disabled(kitchen.isScanning)
+            .onChange(of: mealPhotoItems) { _, items in
+                guard let item = items.first else { return }
+                Task {
+                    #if canImport(UIKit)
+                    if let data = try? await item.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data),
+                       let jpeg = image.jpegData(compressionQuality: 0.85) {
+                        await kitchen.logMealPhotoData(jpeg, mimeType: "image/jpeg")
+                    }
+                    #endif
+                    mealPhotoItems = []
+                }
+            }
+
+            Button {
+                Task { await kitchen.logMealWithGlasses() }
+            } label: {
+                Label("Log meal with glasses", systemImage: "eyeglasses")
+            }
+            .disabled(kitchen.isScanning)
         }
 
         if !kitchen.recentMeals.isEmpty {
@@ -766,7 +796,7 @@ public struct RemyKitchenView: View {
             }
             .padding(.vertical, 4)
             if !kitchen.hasMacroData {
-                Text("Ask Remy to log meals — she'll estimate calories and macros and they'll show up here.")
+                Text("Log a meal photo or ask Remy — she'll estimate calories and macros and they'll show up here.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

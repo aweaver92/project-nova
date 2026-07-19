@@ -137,7 +137,8 @@ try {
         Copy-Item -LiteralPath $found.FullName -Destination $DestIpa -Force
         $item = Get-Item -LiteralPath $DestIpa
         Write-Host ("Wrote {0} ({1:N1} MB)" -f $DestIpa, ($item.Length / 1MB))
-        Write-Host "Sideload this file with AltStore. Check Settings/Listen for NovaBuildStamp matching the short SHA above."
+        Write-Host "Sideload with SideStore (My Apps -> +). Check Settings/Listen for NovaBuildStamp matching the short SHA above."
+        Write-Host "If SideStore says it cannot detect UDID (esp. after a router reboot): .\scripts\repair-sidestore.ps1"
         if ($runMeta.headSha -and $runMeta.headSha -ne $headSha) {
             Write-Warning "Still not your current HEAD - commit, push, then .\scripts\run-ipa-ci.ps1 for a fresh build."
         }

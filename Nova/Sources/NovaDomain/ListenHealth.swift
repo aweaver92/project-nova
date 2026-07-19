@@ -7,6 +7,8 @@ public struct ListenHealth: Sendable, Equatable {
         case idle
         case connecting
         case waitingForSpeech
+        /// Realtime closed after "Close Connection"; on-device "Nova" (or Listen) reopens it.
+        case awaitingWakeWord
         case hearingYou
         case micSilent
         case streamStalled
@@ -49,6 +51,7 @@ public struct ListenHealth: Sendable, Equatable {
         case .idle: return "Idle"
         case .connecting: return "Connecting…"
         case .waitingForSpeech: return "Waiting for speech"
+        case .awaitingWakeWord: return "Say Nova or tap Listen"
         case .hearingYou: return "Hearing you"
         case .micSilent: return "Mic silent"
         case .streamStalled: return "Mic stalled"

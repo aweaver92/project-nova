@@ -2,26 +2,32 @@ import Darwin
 import Foundation
 import NovaDomain
 
-/// Probes the current Wi-Fi /24 for Nova Bridge's unauthenticated health endpoint.
+/// Finds Nova Bridge via Bonjour, then falls back to probing the Wi-Fi `/24`.
 ///
-/// Nova Bridge normally listens on port 8787. A validated service response is
-/// required, so another HTTP server on that port cannot be selected accidentally.
+/// Bonjour is the normal path and survives DHCP/router address changes. The
+/// bounded legacy scan remains useful on access points that suppress multicast.
 public actor LANBridgeDiscovery: BridgeDiscovering {
     private let session: URLSession
     private let port: Int
     private let batchSize: Int
+    private let bonjour: any BridgeDiscovering
 
     public init(
         session: URLSession = .shared,
         port: Int = 8787,
-        batchSize: Int = 32
+        batchSize: Int = 32,
+        bonjour: (any BridgeDiscovering)? = nil
     ) {
         self.session = session
         self.port = port
         self.batchSize = max(1, batchSize)
+        self.bonjour = bonjour ?? BonjourBridgeDiscovery(session: session)
     }
 
     public func discoverBridgeURL() async -> String? {
+        if let discovered = await bonjour.discoverBridgeURL() {
+            return discovered
+        }
         guard let prefix = Self.wifiIPv4Prefix() else { return nil }
         let hosts = Array(1...254)
 
@@ -35,7 +41,7 @@ public actor LANBridgeDiscovery: BridgeDiscovering {
                 for host in batch {
                     let baseURL = "http://\(prefix).\(host):\(port)"
                     group.addTask { [session] in
-                        await Self.validate(baseURL: baseURL, session: session)
+                        await BridgeDiscoveryValidator.validate(baseURL: baseURL, session: session)
                     }
                 }
                 for await result in group {
@@ -50,25 +56,6 @@ public actor LANBridgeDiscovery: BridgeDiscovering {
             }
         }
         return nil
-    }
-
-    private static func validate(baseURL: String, session: URLSession) async -> String? {
-        guard let url = URL(string: "\(baseURL)/health") else { return nil }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 0.8)
-        request.httpMethod = "GET"
-
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard !Task.isCancelled,
-                  (response as? HTTPURLResponse)?.statusCode == 200,
-                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  json["ok"] as? Bool == true,
-                  json["service"] as? String == "nova-bridge"
-            else { return nil }
-            return baseURL
-        } catch {
-            return nil
-        }
     }
 
     /// `en0` is Wi-Fi on iOS. A /24 is overwhelmingly the common home-network

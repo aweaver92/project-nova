@@ -1,5 +1,6 @@
 import Foundation
 import NovaDomain
+import NovaLiveActivity
 import Observation
 
 /// One week's training volume, for Max's analytics bar chart.
@@ -103,6 +104,22 @@ public final class TrainingViewModel {
         restTimers = await timers.list()
         personalRecords = ExercisePR.from(history: analyticsSessions, limit: 8)
         syncLogDefaults()
+        syncRestLiveActivity()
+    }
+
+    /// Mirror the rest countdown to a Live Activity (lock screen / Dynamic Island).
+    private func syncRestLiveActivity() {
+        guard hasActiveSession, restRemainingSeconds > 0, let timer = primaryRestTimer else {
+            LiveActivityCoordinator.shared.endRest()
+            return
+        }
+        let exercise = progress.current?.name ?? activeSession?.sets.last?.exercise ?? "Rest"
+        LiveActivityCoordinator.shared.syncRest(
+            workoutTitle: activeSession?.title ?? "Workout",
+            exercise: exercise,
+            endsAt: timer.firesAt,
+            totalSeconds: timer.seconds
+        )
     }
 
     // MARK: - Analytics

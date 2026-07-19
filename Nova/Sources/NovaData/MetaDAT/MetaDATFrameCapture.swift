@@ -107,26 +107,26 @@ public actor MetaDATFrameCapture: FrameCapture {
     private func ensureStreaming(fps: Int) async throws {
         if isStreaming, stream != nil { return }
 
-        do {
-            try await openStream(fps: fps)
-        } catch {
-            // After Meta AI "Always Allow", the BLE/link handshake often lags the
-            // permission callback — one short retry clears most noEligibleDevice races.
-            if Self.isRetryableDeviceError(error) {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                try await openStream(fps: fps)
+                return
+            } catch {
+                lastError = error
+                // After Meta AI "Always Allow", BLE/link and session settle often lag
+                // the permission callback — retry noEligibleDevice / stopped-before-start.
+                guard MetaCameraOpenRetryPolicy.isRetryable(error), attempt < 2 else {
+                    throw Self.mapCameraError(error)
+                }
                 NovaLog.vision.info(
-                    "camera open retry after: \(String(describing: error), privacy: .public)"
+                    "camera open retry \(attempt + 1) after: \(String(describing: error), privacy: .public)"
                 )
                 await tearDownSessionOnly()
                 try await Task.sleep(for: .milliseconds(900))
-                do {
-                    try await openStream(fps: fps)
-                } catch {
-                    throw Self.mapCameraError(error)
-                }
-                return
             }
-            throw Self.mapCameraError(error)
         }
+        throw Self.mapCameraError(lastError ?? NovaError.vision("Glasses camera failed to open"))
     }
 
     private func openStream(fps: Int) async throws {
@@ -141,8 +141,8 @@ public actor MetaDATFrameCapture: FrameCapture {
         try await waitForActiveDevice(selector)
 
         let session = try Wearables.shared.createSession(deviceSelector: selector)
-        try session.start()
-        try await waitForSessionStarted(session)
+        // Meta DAT: create stateStream() before start() or the .started transition is missed.
+        try await startDeviceSession(session)
 
         let config = StreamConfiguration(videoCodec: .raw, resolution: .low, frameRate: UInt(fps))
         guard let newStream = try session.addStream(config: config) else {
@@ -173,20 +173,45 @@ public actor MetaDATFrameCapture: FrameCapture {
 
     private func ensureCameraPermission() async throws {
         // Prefer status check so we do not re-open Meta AI when already granted.
-        let existing: PermissionStatus
-        do {
-            existing = try await Wearables.shared.checkPermissionStatus(.camera)
-        } catch {
-            // Older/edge SDK paths may throw instead of returning a status —
-            // fall through to an explicit request.
-            NovaLog.vision.info(
-                "checkPermissionStatus failed; requesting: \(String(describing: error), privacy: .public)"
-            )
-            existing = .denied
+        // Never map check failures to .denied — disconnected glasses make the SDK
+        // throw / report unavailable even after Always Allow.
+        var explicitStatus: PermissionStatus?
+        for attempt in 0..<3 {
+            do {
+                let status = try await Wearables.shared.checkPermissionStatus(.camera)
+                if status == .granted {
+                    NovaLog.vision.info("glasses camera permission already granted")
+                    return
+                }
+                NovaLog.vision.info(
+                    "glasses camera permission status=\(String(describing: status), privacy: .public); will request via Meta AI"
+                )
+                explicitStatus = status
+                break
+            } catch {
+                let detail = String(describing: error)
+                NovaLog.vision.info(
+                    "checkPermissionStatus failed (attempt \(attempt + 1)); not treating as denied: \(detail, privacy: .public)"
+                )
+                if attempt < 2 {
+                    await waitBeforePermissionRecheck(attempt: attempt)
+                    continue
+                }
+                if MetaCameraOpenRetryPolicy.isPermissionUnavailableMessage(detail) {
+                    throw NovaError.vision(
+                        "Glasses camera permission unavailable — wear the glasses, reconnect in Meta AI, then retry.\n\n\(Self.cameraChecklist)"
+                    )
+                }
+                throw NovaError.vision(
+                    "Could not read glasses camera permission status. Wear the glasses, open Meta AI, return to Nova, then retry.\n\n\(Self.cameraChecklist)"
+                )
+            }
         }
-        if existing == .granted {
-            NovaLog.vision.info("glasses camera permission already granted")
-            return
+
+        guard explicitStatus != nil else {
+            throw NovaError.vision(
+                "Could not read glasses camera permission status. Wear the glasses, open Meta AI, return to Nova, then retry.\n\n\(Self.cameraChecklist)"
+            )
         }
 
         NovaLog.vision.info("requesting glasses camera permission via Meta AI")
@@ -196,8 +221,24 @@ public actor MetaDATFrameCapture: FrameCapture {
                 "Camera permission was not granted in Meta AI. Open Meta AI → Apps → Nova and allow camera, then retry."
             )
         }
-        // Give devicesStream a beat to populate after the Always-Allow callback.
-        try await Task.sleep(for: .milliseconds(500))
+        // Wait for nova:// handleUrl to apply Always Allow, then BLE settle.
+        await MetaWearablesURLGate.shared.waitUntilSettled(extraMilliseconds: 500)
+    }
+
+    private func waitBeforePermissionRecheck(attempt: Int) async {
+        if let selector = deviceSelector {
+            do {
+                try await withTimeout(seconds: 3) {
+                    for await device in selector.activeDeviceStream() {
+                        if device != nil { return }
+                    }
+                }
+            } catch {
+                try? await Task.sleep(for: .milliseconds(400 * (attempt + 1)))
+            }
+        } else {
+            try? await Task.sleep(for: .milliseconds(400 * (attempt + 1)))
+        }
     }
 
     /// Meta requires a non-nil active device (connected + compatible) before
@@ -244,11 +285,32 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveCont?.yield(CapturedFrame(imageData: jpeg, mimeType: "image/jpeg", width: width, height: height))
     }
 
-    private func waitForSessionStarted(_ session: DeviceSession) async throws {
+    /// Subscribe to `stateStream` (and errors) **before** `start()` — Meta DAT docs:
+    /// creating the stream after start misses the `.started` transition and a later
+    /// `.stopped` looks like "closed before it could open."
+    private func startDeviceSession(_ session: DeviceSession) async throws {
         try await withTimeout(seconds: 15) {
-            for await state in session.stateStream() {
-                if state == .started { return }
-                if state == .stopped { throw NovaError.vision("Glasses session stopped before it started") }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await state in session.stateStream() {
+                        if state == .started { return }
+                        if state == .stopped {
+                            throw NovaError.vision("Glasses session stopped before it started")
+                        }
+                    }
+                    throw NovaError.vision("Glasses session state stream ended before start")
+                }
+                group.addTask {
+                    for await error in session.errorStream() {
+                        throw error
+                    }
+                }
+                // Let the for-await subscriptions attach before start().
+                await Task.yield()
+                try await Task.sleep(for: .milliseconds(25))
+                try session.start()
+                try await group.next()
+                group.cancelAll()
             }
         }
     }
@@ -272,21 +334,6 @@ public actor MetaDATFrameCapture: FrameCapture {
             try await group.next()
             group.cancelAll()
         }
-    }
-
-    private static func isRetryableDeviceError(_ error: Error) -> Bool {
-        if let sessionError = error as? DeviceSessionError {
-            switch sessionError {
-            case .noEligibleDevice:
-                return true
-            default:
-                break
-            }
-        }
-        let text = String(describing: error).lowercased()
-        return text.contains("noeligibledevice")
-            || text.contains("nodevicewithconnection")
-            || text.contains("no device")
     }
 
     /// Maps opaque SDK permission/session failures into actionable UI copy.

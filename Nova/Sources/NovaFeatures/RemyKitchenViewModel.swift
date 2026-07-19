@@ -1,5 +1,6 @@
 import Foundation
 import NovaDomain
+import NovaLiveActivity
 import Observation
 #if canImport(UIKit)
 import UIKit
@@ -191,6 +192,24 @@ public final class RemyKitchenViewModel {
         recentMeals = await nutrition.recentMeals(limit: 60)
         lastScan = await nutrition.lastFridgeScan()
         syncProfileDrafts()
+        syncCookLiveActivity()
+    }
+
+    /// Mirror cook mode (current step + running timer) to a Live Activity.
+    private func syncCookLiveActivity() {
+        guard let session = cookingSession, let recipe = cookingRecipe else {
+            LiveActivityCoordinator.shared.endCook()
+            return
+        }
+        let idx = session.currentStepIndex
+        let stepText = recipe.steps.indices.contains(idx) ? recipe.steps[idx] : ""
+        LiveActivityCoordinator.shared.syncCook(
+            recipeTitle: session.recipeTitle,
+            stepIndex: idx,
+            stepCount: max(1, recipe.steps.count),
+            stepText: stepText,
+            timerEndsAt: primaryCookTimer?.firesAt
+        )
     }
 
     private func updatePolling() {
@@ -668,6 +687,62 @@ public final class RemyKitchenViewModel {
         guard !trimmed.isEmpty else { return }
         _ = await nutrition.logMeal(description: trimmed, recipeId: nil)
         await load()
+    }
+
+    /// Analyze a meal photo for description + macros, then log it to today's totals.
+    public func logMealPhotoData(_ data: Data, mimeType: String = "image/jpeg") async {
+        isScanning = true
+        statusMessage = "Analyzing meal photo…"
+        defer { isScanning = false }
+        do {
+            #if canImport(UIKit)
+            let image = UIImage(data: data)
+            let width = Int(image?.size.width ?? 0)
+            let height = Int(image?.size.height ?? 0)
+            #else
+            let width = 0
+            let height = 0
+            #endif
+            let frame = CapturedFrame(imageData: data, mimeType: mimeType, width: width, height: height)
+            try await runMealPhotoLog(on: frame)
+        } catch {
+            statusMessage = "Meal photo failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Capture a meal still from the glasses camera, analyze macros, and log it.
+    public func logMealWithGlasses() async {
+        guard await isVisionReady(), let captureStill else {
+            statusMessage = "Glasses vision isn’t ready — pick a phone photo instead."
+            return
+        }
+        isScanning = true
+        statusMessage = "Capturing meal from glasses…"
+        defer { isScanning = false }
+        do {
+            let frame = try await captureStill()
+            try await runMealPhotoLog(on: frame)
+        } catch {
+            statusMessage = "Glasses meal log failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func runMealPhotoLog(on frame: CapturedFrame) async throws {
+        let answer = try await analyzeImage(frame, MealPhotoAnalysis.analysisPrompt)
+        switch MealPhotoAnalysis.parseModelJSON(answer) {
+        case .success(let estimate):
+            _ = await nutrition.logMeal(
+                description: estimate.description,
+                recipeId: nil,
+                nutrition: estimate.nutrition
+            )
+            await load()
+            let cal = estimate.nutrition.calories.map { " · \(Int($0)) kcal" } ?? ""
+            statusMessage = "Logged \(estimate.description)\(cal)"
+            selectedSection = .profile
+        case .failure(let message):
+            statusMessage = message
+        }
     }
 
     // MARK: - Nutrition dashboard

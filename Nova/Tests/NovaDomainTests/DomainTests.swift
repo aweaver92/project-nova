@@ -98,6 +98,14 @@ final class WakeWordTests: XCTestCase {
         }
     }
 
+    func testCloseConnectionCommandDetection() {
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("Close Connection"))
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("close connection."))
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("Nova, close connection!"))
+        XCTAssertFalse(ConversationOrchestrator.isCloseConnectionCommand("Please close the connection"))
+        XCTAssertFalse(ConversationOrchestrator.isCloseConnectionCommand("Nova, stop"))
+    }
+
     func testDetectAssumingAddressedSkipsWakeWord() {
         let d = WakeWordDetector()
         // No wake word, but treated as addressed (listening mode).

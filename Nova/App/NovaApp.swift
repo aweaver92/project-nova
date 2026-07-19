@@ -1,6 +1,8 @@
 import SwiftUI
 import NovaComposition
 import NovaFeatures
+import NovaData
+import NovaCore
 #if canImport(MWDATCore)
 import MWDATCore
 #endif
@@ -58,20 +60,21 @@ struct NovaApp: App {
                 kitchen: container.kitchenVM,
                 study: container.studyVM,
                 settings: container.settingsVM,
-                simpleVoice: container.simpleVoiceVM,
                 toolConfirmation: container.toolConfirmation,
                 appNavigation: container.appNavigation
             )
             #if canImport(MWDATCore)
             // Meta AI deep-links back here after registration / permission grants.
-            // handleUrl must complete so Wearables can apply the Always-Allow result
-            // before the next createSession / activeDevice wait.
+            // Await handleUrl via the shared gate so Always-Allow is applied before
+            // the next createSession / activeDevice wait.
             .onOpenURL { url in
                 Task {
                     do {
-                        _ = try await Wearables.shared.handleUrl(url)
+                        try await MetaWearablesURLGate.shared.handle(url)
                     } catch {
-                        print("Wearables.handleUrl failed: \(error)")
+                        NovaLog.session.error(
+                            "Wearables.handleUrl failed: \(String(describing: error), privacy: .public)"
+                        )
                     }
                 }
             }

@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   Dispatches the CI workflow (macOS ios-ipa job), waits for it to finish, then
-  writes the artifact to App/NovaApp.ipa for AltStore.
+  writes the artifact to App/NovaApp.ipa for SideStore.
 
   On a public repo this uses free Actions minutes. On a private repo macOS is
   billed at 10x - only run when you need a new sideload build.

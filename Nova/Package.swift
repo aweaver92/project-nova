@@ -11,7 +11,10 @@ let package = Package(
         .library(name: "NovaDomain", targets: ["NovaDomain"]),
         .library(name: "NovaData", targets: ["NovaData"]),
         .library(name: "NovaFeatures", targets: ["NovaFeatures"]),
-        .library(name: "NovaComposition", targets: ["NovaComposition"])
+        .library(name: "NovaComposition", targets: ["NovaComposition"]),
+        // Shared ActivityKit attributes + coordinator, linked by both the app
+        // (via NovaFeatures) and the widget extension (via project.yml).
+        .library(name: "NovaLiveActivity", targets: ["NovaLiveActivity"])
     ],
     dependencies: [
         // Meta Wearables Device Access Toolkit (binary XCFrameworks) — real
@@ -40,8 +43,12 @@ let package = Package(
             path: "Sources/NovaData"
         ),
         .target(
+            name: "NovaLiveActivity",
+            path: "Sources/NovaLiveActivity"
+        ),
+        .target(
             name: "NovaFeatures",
-            dependencies: ["NovaCore", "NovaDomain"],
+            dependencies: ["NovaCore", "NovaDomain", "NovaLiveActivity"],
             path: "Sources/NovaFeatures"
         ),
         .target(

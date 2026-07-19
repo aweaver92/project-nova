@@ -160,10 +160,33 @@ public final class ConversationViewModel {
         }
         await orchestrator.setListenHealthHandler { health in
             Task { @MainActor [weak self] in
-                self?.listenHealth = health
+                guard let self else { return }
+                self.listenHealth = health
+                switch health.phase {
+                case .awaitingWakeWord, .idle:
+                    // After "Close Connection" (or full stop), show Listen again.
+                    self.isRunning = false
+                    self.isAssistantSpeaking = false
+                case .connecting, .waitingForSpeech, .hearingYou, .speaking,
+                     .micSilent, .streamStalled, .cloudQuiet:
+                    // Wake-word or Listen reopened Realtime.
+                    self.isRunning = true
+                case .error:
+                    break
+                }
             }
         }
         do {
+            // Reopen Realtime if we're in post-"Close Connection" standby.
+            if await orchestrator.isSessionActive, await !orchestrator.isStreaming {
+                isRunning = true
+                listenHealth = ListenHealth(phase: .connecting, detail: "Reopening Realtime…")
+                try await orchestrator.reopenRealtime()
+                usage?.markSessionStarted()
+                refreshLatency()
+                refreshUsage()
+                return
+            }
             var config = AISessionConfig()
             // Explicit Listen / typed chat must open Realtime immediately.
             // "Local wake word first" is for idle always-on mode only — if we
@@ -718,7 +741,15 @@ public final class SettingsViewModel {
         bridgeToken = await store.bridgeToken() ?? ""
         bridgeProfiles = await store.bridgeProfiles()
         codingWorkingDirectory = await store.codingWorkingDirectory() ?? ""
-        await refreshBridgeHealth()
+        let reachable = await refreshBridgeHealth()
+        if !reachable {
+            // Do not hold up app launch while Bonjour resolves (or the bounded
+            // subnet fallback runs). A successful discovery persists the new
+            // DHCP address while preserving the existing bearer token.
+            Task { [weak self] in
+                await self?.scanForLocalBridge(automatic: true)
+            }
+        }
     }
 
     /// The saved profile whose URL+token match the active bridge fields, if any.
@@ -786,17 +817,23 @@ public final class SettingsViewModel {
 
     /// Find a validated Nova Bridge on the current Wi-Fi network and use it.
     /// If a saved profile is currently selected, keep it useful by updating its URL.
-    public func scanForLocalBridge() async {
+    public func scanForLocalBridge(automatic: Bool = false) async {
         guard !bridgeScanning, !bridgeChecking else { return }
+        let startingURL = bridgeBaseURL
         let selectedProfileID = activeBridgeProfileID
         bridgeScanning = true
-        bridgeStatus = "Scanning the local Wi-Fi network for Nova Bridge…"
+        bridgeStatus = automatic
+            ? "Auto-detecting Nova Bridge on this network…"
+            : "Finding Nova Bridge via Bonjour and local Wi-Fi…"
         defer { bridgeScanning = false }
 
         guard let discoveredURL = await bridgeDiscovery.discoverBridgeURL() else {
-            bridgeStatus = "No Nova Bridge found. Make sure the phone and computer are on the same Wi-Fi and the bridge is running."
+            bridgeStatus = "No Nova Bridge found. Check same Wi-Fi, Windows Private network/firewall, and that the bridge is running."
             return
         }
+        // Do not overwrite a URL the user edited while background discovery was
+        // in flight. Manual scans are explicit and always apply their result.
+        guard !automatic || bridgeBaseURL == startingURL else { return }
 
         bridgeBaseURL = discoveredURL
         if let selectedProfileID,
@@ -875,7 +912,8 @@ public final class SettingsViewModel {
         bridgeChecking = false
     }
 
-    public func refreshBridgeHealth() async {
+    @discardableResult
+    public func refreshBridgeHealth() async -> Bool {
         let result = await bridge.health()
         if result.ok {
             applyHealthPayload(result.payloadJSON)
@@ -893,6 +931,7 @@ public final class SettingsViewModel {
                 parts.append(ghReady ? "gh ready" : "gh missing")
             }
             bridgeStatus = parts.joined(separator: " · ")
+            return true
         } else if !(await store.bridgeBaseURL() ?? "").isEmpty {
             bridgeStatus = "Couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
             openaiConfigured = nil
@@ -900,6 +939,7 @@ public final class SettingsViewModel {
             gitReady = nil
             ghReady = nil
         }
+        return false
     }
 
     private func applyHealthPayload(_ payloadJSON: String) {
