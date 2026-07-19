@@ -113,7 +113,7 @@ public struct RootView: View {
                 .tabItem { Label("Media", systemImage: "photo.on.rectangle") }
                 .tag(RootTab.media)
         }
-        // Tap outside the software keyboard (and scroll) dismisses it.
+        // Tap-to-dismiss keyboard (window UIKit gesture; does not delay List/NavigationLink taps).
         .dismissKeyboardOnTap()
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings, conversation: conversation)

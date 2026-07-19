@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Nova — AI Assistant for Meta Ray-Ban Glasses</title>
+<meta name="description" content="Nova turns Meta Ray-Ban smart glasses into a hands-free, low-latency AI assistant on iOS — voice, skills, memory, knowledge, coding agents, and smart home control." />
+<meta property="og:title" content="Nova — AI Assistant for Meta Ray-Ban Glasses" />
+<meta property="og:description" content="A hands-free, low-latency AI assistant built to rival ChatGPT Voice Mode — entirely within Meta's supported developer ecosystem." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%237c6cff'/><stop offset='1' stop-color='%234fd1c5'/></linearGradient></defs><circle cx='50' cy='50' r='42' fill='url(%23g)'/></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<a class="skip-link" href="#features">Skip to content</a>
+
+<nav id="nav">
+  <div class="wrap nav-inner">
+    <a class="logo" href="#top" aria-label="Nova home"><span class="logo-dot"></span>Nova</a>
+    <div class="nav-links" id="nav-links">
+      <a href="#features">Features</a>
+      <a href="#how">How it works</a>
+      <a href="#app">The app</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#faq">FAQ</a>
+    </div>
+    <div class="nav-actions">
+      <a class="btn btn-small btn-primary" href="#get-started">Get started</a>
+      <button class="nav-toggle" id="nav-toggle" aria-label="Toggle menu" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </div>
+  <div class="mobile-menu" id="mobile-menu">
+    <a href="#features">Features</a>
+    <a href="#how">How it works</a>
+    <a href="#app">The app</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#roadmap">Roadmap</a>
+    <a href="#faq">FAQ</a>
+    <a class="btn btn-primary" href="#get-started">Get started</a>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header id="top">
+  <div class="hero-glow" aria-hidden="true"></div>
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <span class="badge reveal">iOS · Meta Ray-Ban Glasses · OpenAI Realtime</span>
+      <h1 class="reveal">Your glasses, with a <span class="grad">real assistant</span> inside.</h1>
+      <p class="sub reveal">
+        Nova turns Meta Ray-Ban smart glasses into a hands-free, low-latency AI assistant —
+        a voice experience built to rival ChatGPT Voice Mode, entirely within Meta's
+        supported developer ecosystem.
+      </p>
+      <div class="cta-row reveal">
+        <a class="btn btn-primary" href="#get-started">Get started</a>
+        <a class="btn btn-ghost" href="#how">See how it works</a>
+      </div>
+      <div class="hero-stats reveal">
+        <div class="stat"><strong>&lt;1s</strong><span>voice round-trip target</span></div>
+        <div class="stat"><strong>On-device</strong><span>memory &amp; knowledge</span></div>
+        <div class="stat"><strong>Zero</strong><span>API keys shipped in-app</span></div>
+      </div>
+    </div>
+
+    <div class="hero-demo reveal" aria-label="Simulated Nova conversation">
+      <div class="demo-frame">
+        <div class="demo-titlebar">
+          <span class="demo-dot"></span><span class="demo-dot"></span><span class="demo-dot"></span>
+          <span class="demo-title">Nova · live session</span>
+          <span class="demo-live"><span class="pulse"></span>listening</span>
+        </div>
+        <div class="demo-body" id="demo-body">
+          <!-- messages injected by script.js -->
+        </div>
+        <div class="demo-waveform" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ TRUST STRIP ============ -->
+<div class="trust-strip">
+  <div class="wrap trust-inner">
+    <span>Built on</span>
+    <span class="trust-item">Meta Wearables Device Access Toolkit</span>
+    <span class="trust-sep" aria-hidden="true">·</span>
+    <span class="trust-item">OpenAI Realtime API</span>
+    <span class="trust-sep" aria-hidden="true">·</span>
+    <span class="trust-item">SwiftUI + Swift Concurrency</span>
+    <span class="trust-sep" aria-hidden="true">·</span>
+    <span class="trust-item">Claude Code &amp; Cursor Agents</span>
+  </div>
+</div>
+
+<!-- ============ FEATURES ============ -->
+<section id="features">
+  <div class="wrap">
+    <div class="kicker reveal">Features</div>
+    <h2 class="reveal">Everything an assistant should do — on your face, not in your hand.</h2>
+    <p class="lede reveal">
+      Nova is built around a fast voice loop, then layered with the capabilities that make
+      an assistant genuinely useful day to day. Almost all of it runs on-device.
+    </p>
+    <div class="grid grid-3">
+      <div class="card reveal">
+        <div class="icon">🎙️</div>
+        <h3>Low-latency voice</h3>
+        <p>Streams glasses microphone audio to the OpenAI Realtime API and plays replies back through the glasses — with barge-in, persistent sessions, and latency metrics built in.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">⚡</div>
+        <h3>Skills &amp; automations</h3>
+        <p>Reusable voice macros with trigger phrases, variables, conditions, retries, webhooks, and delays. Schedule skills to run daily, and share them via JSON import/export.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🗂️</div>
+        <h3>Workspaces &amp; memory</h3>
+        <p>Per-project workspaces with scoped conversation memory, background summarization into long-term digests, and continuity across sessions.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🔎</div>
+        <h3>Knowledge search</h3>
+        <p>Ask about anything you've saved — notes, bookmarks, facts, and past conversations — with blended keyword and semantic (embedding) search.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">💻</div>
+        <h3>Coding companion</h3>
+        <p>Say "Nova, let me talk to Claude" and hand off coding tasks. Nova drives Claude Code and Cursor agents through the Nova Bridge, streams live progress, and can preview the result in your browser.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🏠</div>
+        <h3>Smart home &amp; actions</h3>
+        <p>Query and control Home Assistant ("is the front door locked?"), draft emails and texts, create reminders, notes, and calendar events — all by voice.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">💡</div>
+        <h3>Proactive follow-ups</h3>
+        <p>Suggestion chips after every reply — and optional spoken follow-ups — so conversations keep moving without you re-prompting.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🔐</div>
+        <h3>Private by design</h3>
+        <p>On-device stores for memory, skills, and knowledge. API keys never ship in the app — short-lived tokens are minted through your own bridge. Per-feature cost controls included.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">👁️</div>
+        <h3>Vision <span class="soon">coming</span></h3>
+        <p>"What am I looking at?" — camera-frame analysis and OCR read-back are wired into the architecture, waiting on Meta's device registration to unlock.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section id="how" class="alt">
+  <div class="wrap">
+    <div class="kicker reveal">How it works</div>
+    <h2 class="reveal">From your voice to an answer in a blink.</h2>
+    <div class="how-grid">
+      <div class="steps">
+        <div class="step reveal">
+          <div class="step-num">1</div>
+          <div>
+            <h3>Speak through the glasses</h3>
+            <p>Meta Ray-Ban microphones stream your voice to the Nova iOS app over Meta's Wearables Device Access Toolkit.</p>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="step-num">2</div>
+          <div>
+            <h3>Nova thinks in real time</h3>
+            <p>Audio streams to the OpenAI Realtime API. Nova injects your workspace context, long-term memory digest, and skill catalog so answers are personal and actionable.</p>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="step-num">3</div>
+          <div>
+            <h3>Tools do the work</h3>
+            <p>The tool router runs skills, searches your knowledge, drafts messages, controls your home, or pushes a coding task to Claude Code / Cursor through the bridge.</p>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="step-num">4</div>
+          <div>
+            <h3>You hear the answer</h3>
+            <p>The response streams back through the glasses' speakers. Interrupt any time — barge-in is native to the pipeline.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="pipeline reveal" aria-hidden="true">
+        <div class="pipe-node">
+          <span class="pipe-icon">🕶️</span>
+          <strong>Ray-Ban glasses</strong>
+          <span class="pipe-sub">mic + speakers</span>
+        </div>
+        <div class="pipe-arrow">⇅ <span>DAT / Bluetooth</span></div>
+        <div class="pipe-node accent">
+          <span class="pipe-icon">📱</span>
+          <strong>Nova iOS app</strong>
+          <span class="pipe-sub">orchestrator · memory · tool router</span>
+        </div>
+        <div class="pipe-split">
+          <div>
+            <div class="pipe-arrow">⇅ <span>WebSocket</span></div>
+            <div class="pipe-node">
+              <span class="pipe-icon">🧠</span>
+              <strong>OpenAI Realtime</strong>
+              <span class="pipe-sub">speech ↔ speech</span>
+            </div>
+          </div>
+          <div>
+            <div class="pipe-arrow">⇅ <span>LAN / SSE</span></div>
+            <div class="pipe-node">
+              <span class="pipe-icon">🖥️</span>
+              <strong>Nova Bridge</strong>
+              <span class="pipe-sub">Claude Code · Cursor · previews</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ APP SHELL ============ -->
+<section id="app">
+  <div class="wrap">
+    <div class="kicker reveal">The app</div>
+    <h2 class="reveal">A focused, power-user shell. Your phone stays in your pocket.</h2>
+    <p class="lede reveal">
+      Five tabs cover everything — but the point of Nova is that you rarely need to open any of them.
+      Set things up once, then live in the conversation.
+    </p>
+    <div class="grid grid-3 tabs-grid">
+      <div class="card tab-card reveal">
+        <div class="tab-head"><span class="tab-glyph">🎧</span><h3>Assistant</h3></div>
+        <p>The live conversation. Transcript, latency readout, barge-in status, and suggestion chips after every reply.</p>
+      </div>
+      <div class="card tab-card reveal">
+        <div class="tab-head"><span class="tab-glyph">🤖</span><h3>Agents</h3></div>
+        <p>Hand off coding tasks to Claude Code or Cursor agents, watch live progress streams, and open browser previews of the result.</p>
+      </div>
+      <div class="card tab-card reveal">
+        <div class="tab-head"><span class="tab-glyph">🛠️</span><h3>Studio</h3></div>
+        <p>Build and schedule skills, manage workspaces, tune memory digests, and set per-feature cost controls.</p>
+      </div>
+      <div class="card tab-card reveal">
+        <div class="tab-head"><span class="tab-glyph">📚</span><h3>Library</h3></div>
+        <p>Notes, bookmarks, and saved facts — everything Nova's knowledge search draws from, editable by hand.</p>
+      </div>
+      <div class="card tab-card reveal">
+        <div class="tab-head"><span class="tab-glyph">🎬</span><h3>Media</h3></div>
+        <p>Voice settings and — once Meta unlocks camera access — captures, frame analysis, and visual memory.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ARCHITECTURE ============ -->
+<section id="architecture" class="alt">
+  <div class="wrap">
+    <div class="kicker reveal">Architecture</div>
+    <h2 class="reveal">Three parts, one contract.</h2>
+    <p class="lede reveal">
+      Nova is built as clean Swift Package modules behind stable domain ports, validated
+      first in a Windows simulator, and extended to your desktop through a small bridge service.
+    </p>
+    <div class="arch">
+      <div class="card reveal">
+        <h3><span class="mono">Nova/</span> iOS app</h3>
+        <p>SwiftUI + MVVM over layered packages — <strong>NovaCore</strong> (errors, logging, latency), <strong>NovaDomain</strong> (ports, orchestrator, tools, memory), <strong>NovaData</strong> (DAT adapters, HFP audio, Realtime, Keychain), and <strong>NovaFeatures</strong> composed by a DI container.</p>
+      </div>
+      <div class="card reveal">
+        <h3><span class="mono">nova-bridge/</span> desktop bridge</h3>
+        <p>A small Node service on your dev machine: runs Claude Code headlessly, streams Cursor agent runs over SSE (with screenshots), serves live previews of generated projects on your LAN, and mints short-lived Realtime tokens.</p>
+      </div>
+      <div class="card reveal">
+        <h3><span class="mono">nova-sim/</span> Windows sim</h3>
+        <p>The same voice-loop domain contracts running against a PC microphone — resampling, barge-in, and tools — so conversation quality is validated before it ever touches the glasses.</p>
+      </div>
+    </div>
+    <div class="arch-principles reveal">
+      <div class="principle"><strong>Protocol-first.</strong> The AI provider sits behind a domain port — OpenAI today, swappable tomorrow. No vendor lock-in.</div>
+      <div class="principle"><strong>Sim-before-device.</strong> Every conversation-quality change lands in the Windows sim first, then swaps adapters on iOS.</div>
+      <div class="principle"><strong>Ephemeral credentials.</strong> The app holds no long-lived secrets; the bridge mints short-lived tokens on demand.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ROADMAP ============ -->
+<section id="roadmap">
+  <div class="wrap">
+    <div class="kicker reveal">Roadmap</div>
+    <h2 class="reveal">Where Nova is today.</h2>
+    <p class="lede reveal">Phases 1 and 2 shipped on-device with no new infrastructure. The rest is sequenced deliberately.</p>
+    <div class="road">
+      <div class="card reveal">
+        <span class="pill shipped">Shipped</span>
+        <h3>Skills, workspaces, knowledge &amp; memory</h3>
+        <p>Voice macros, per-project memory, bookmarks, knowledge search, follow-up suggestions, and voice drafting — plus memory compaction, semantic search, scheduled skills, and skill sharing.</p>
+      </div>
+      <div class="card reveal">
+        <span class="pill progress">Mostly shipped</span>
+        <h3>Actions &amp; integrations</h3>
+        <p>Home Assistant state queries and scenes, richer drafting (reminders with due dates, calendar events), and webhook/delay skill steps. Silent auto-send remains blocked by iOS sideload limits.</p>
+      </div>
+      <div class="card reveal">
+        <span class="pill planned">Blocked on Meta</span>
+        <h3>Vision &amp; camera</h3>
+        <p>"What am I looking at?", OCR read-back, and visual memory are wired in the architecture — pending Meta AI companion-app registration for camera access.</p>
+      </div>
+      <div class="card reveal">
+        <span class="pill planned">Planned</span>
+        <h3>Cross-device &amp; multi-model</h3>
+        <p>A sync backend for workspaces and memory, conversation handoff between glasses, phone, and desktop, and a Claude pipeline for long-form reasoning alongside the Realtime voice front-end.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FAQ ============ -->
+<section id="faq" class="alt">
+  <div class="wrap wrap-narrow">
+    <div class="kicker reveal">FAQ</div>
+    <h2 class="reveal">Questions, answered.</h2>
+    <div class="faq-list">
+      <details class="faq-item reveal">
+        <summary>Do I need Meta Ray-Ban glasses to try Nova?</summary>
+        <p>For the full experience, yes — Nova is designed around the glasses' microphones and speakers. But the voice pipeline also runs against your iPhone's mic, and the Windows simulator (<span class="mono">nova-sim</span>) lets you test conversation quality with just a PC and an OpenAI API key.</p>
+      </details>
+      <details class="faq-item reveal">
+        <summary>Is my data sent anywhere?</summary>
+        <p>Voice audio streams to the OpenAI Realtime API during a conversation — that's the assistant. Everything else — memory, skills, notes, knowledge — is stored on-device. API keys never ship in the app; short-lived tokens are minted through a bridge you run yourself.</p>
+      </details>
+      <details class="faq-item reveal">
+        <summary>What does the Nova Bridge require?</summary>
+        <p>A machine on your LAN running Node. It mints ephemeral Realtime tokens, runs Claude Code headlessly, streams Cursor agent progress, and serves previews of generated projects. It's optional — voice, skills, memory, and knowledge work without it.</p>
+      </details>
+      <details class="faq-item reveal">
+        <summary>Why isn't vision available yet?</summary>
+        <p>Camera access on Meta Ray-Ban glasses requires Meta AI companion-app device registration, which is still gated. The vision ports, frame selector, and OCR read-back are already implemented behind the domain contracts, so they light up as soon as Meta unlocks access.</p>
+      </details>
+      <details class="faq-item reveal">
+        <summary>Can Nova use a different AI provider?</summary>
+        <p>The AI layer is protocol-abstracted by design — OpenAI Realtime is the current adapter, but the domain logic doesn't know or care. A Claude pipeline for long-form reasoning is on the roadmap alongside the realtime voice front-end.</p>
+      </details>
+      <details class="faq-item reveal">
+        <summary>Is this an official Meta or OpenAI product?</summary>
+        <p>No. Nova is an independent project built entirely on officially supported APIs: Meta's Wearables Device Access Toolkit and the OpenAI Realtime API.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CTA ============ -->
+<section id="get-started" class="cta-section">
+  <div class="cta-glow" aria-hidden="true"></div>
+  <div class="wrap cta-inner reveal">
+    <h2>Put a real assistant on your face.</h2>
+    <p class="lede center">Clone the repo, run the simulator, and hear the voice loop in under five minutes — no glasses required to start.</p>
+    <div class="code-block" role="img" aria-label="Quick start commands">
+      <div class="code-titlebar"><span>Quick start · Windows</span><button class="copy-btn" id="copy-btn" type="button">Copy</button></div>
+<pre><code id="quickstart-code">cd nova-sim
+npm install
+npm test
+
+<span class="code-comment"># Live (needs OPENAI_API_KEY + ffmpeg on PATH):</span>
+$env:OPENAI_API_KEY = "sk-..."
+npm run sim -- --mode live --seconds 45 --play</code></pre>
+    </div>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#top">Back to top</a>
+      <a class="btn btn-ghost" href="#architecture">Read the architecture</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <div class="logo"><span class="logo-dot"></span>Nova</div>
+      <p>Project Nova — AI assistant for Meta Ray-Ban glasses.<br />Built on Meta's Wearables Device Access Toolkit and the OpenAI Realtime API.</p>
+    </div>
+    <div class="footer-links">
+      <div>
+        <h4>Product</h4>
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#app">The app</a>
+      </div>
+      <div>
+        <h4>Project</h4>
+        <a href="#architecture">Architecture</a>
+        <a href="#roadmap">Roadmap</a>
+        <a href="#faq">FAQ</a>
+      </div>
+    </div>
+  </div>
+  <div class="wrap footer-bottom">
+    <span>Not affiliated with Meta Platforms, Inc. or OpenAI.</span>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

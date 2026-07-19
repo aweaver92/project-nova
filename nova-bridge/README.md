@@ -127,21 +127,39 @@ curl -X POST localhost:8787/claude-code \
   -d '{"prompt":"list the files in this repo"}'
 ```
 
-## 3. Expose it over HTTPS (Tailscale)
+## 3. Expose it over HTTPS (Tailscale) — works from ANY network
 
-The iOS app blocks plain `http://` by default (App Transport Security), so give it an **HTTPS** URL. Tailscale keeps it private to your devices — no public exposure.
+The iOS app blocks plain `http://` by default (App Transport Security), so give it an **HTTPS** URL. Tailscale is a private VPN overlay: once the bridge PC and your iPhone are on the same tailnet, the app reaches the bridge from **any network** (cellular, coffee-shop Wi-Fi, another house) — not just your LAN. It stays private to your devices — no public exposure.
 
-1. Install Tailscale on the **Mac** and the **iPhone**; log both into the same tailnet.
-2. On the Mac, publish the bridge over your tailnet with HTTPS:
+**One-time setup:**
+
+1. Install Tailscale on the **bridge PC** and the **iPhone**; log both into the **same account**.
+   - Windows: `winget install --id Tailscale.Tailscale`, then `tailscale up`.
+   - iPhone: install "Tailscale" from the App Store and sign in.
+2. Enable these once in the Tailscale admin console (all free):
+   - **Serve:** <https://login.tailscale.com/f/serve>
+   - **MagicDNS + HTTPS certificates:** <https://login.tailscale.com/admin/dns>
+3. Publish the bridge over your tailnet with HTTPS:
+
+```powershell
+# From the nova-bridge folder — reads PORT from .env and prints the app URL:
+powershell -ExecutionPolicy Bypass -File scripts\setup-tailscale.ps1
+```
+
+Or manually:
 
 ```bash
 tailscale serve --bg 8787
 tailscale serve status   # shows the https URL
 ```
 
-This gives a URL like `https://your-mac.tailnet-name.ts.net/`.
+Either way you get a URL like `https://your-pc.tailnet-name.ts.net/`. The `--bg`
+serve config persists across reboots (the Tailscale service starts at boot), so
+this survives restarts alongside the `NovaBridge` scheduled task.
 
-> Prefer a quick throwaway tunnel instead? `ngrok http 8787` also works and returns an `https://…ngrok…` URL. (Public — rely on the bearer token.)
+> Prefer a quick throwaway public tunnel instead? `ngrok http 8787` also works and returns an `https://…ngrok…` URL. (Public — rely on the bearer token; Tailscale is preferred because it stays private.)
+
+> **Live preview caveat:** "Preview in browser" serves on LAN ports 8790–8799 and is only tunnelled on the same network. Coding/Cursor commands work from anywhere; browser previews still need same-LAN (or a separate tunnel per preview port).
 
 ## 4. Point the app at it
 

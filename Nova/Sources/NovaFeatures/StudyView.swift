@@ -57,6 +57,13 @@ public struct StudyView: View {
             await study.load()
             await study.consumeDeepLink()
         }
+        .onAppear { study.setScreenVisible(true) }
+        .onDisappear { study.setScreenVisible(false) }
+        .onChange(of: study.shouldPresentStudy) { _, present in
+            if present {
+                Task { await study.consumeDeepLink() }
+            }
+        }
         .sheet(item: $editingCard) { card in
             StudyCardEditorSheet(card: card) { updated in
                 Task { await study.upsertCard(updated) }

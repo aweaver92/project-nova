@@ -105,6 +105,7 @@ See [`ios-without-a-mac.md`](ios-without-a-mac.md) and the risk notes in
 - **Vision unlock:** ✅ `analyze()` awaits correlated transcript; Vision UI when glasses registered; voice vision gated on registration.
 - **Tab consolidation:** ✅ power-user shell — five primary tabs (**Assistant**, **Agents**, **Studio**, **Library**, **Media**). Settings is a toolbar sheet (Bridge + Diagnostics + About). Coding is a push destination under Agents when Claude is active. Studio = Workspaces \| Skills; Media = Voice \| Video. Notes + Knowledge remain in Library.
 - **Specialist UIs:** ✅ each built-in specialist has a gated Agents destination — Claude **Open Coding**, Max **Open Training**, Sage **Open Wellness**, Remy **Open Kitchen**, Scholar **Open Study** — plus Assistant resume CTAs when that agent is active.
+- **Specialist Continuity:** ✅ Assistant resume CTAs deep-link via `AgentsPendingRoute`; live workout/cook/review stay reachable after agent switches; Remy/Scholar/Sage poll like Max for voice↔UI sync; Remy cook-mode HUD + timers; voice quiz shares Study review queue.
 - **Max Training v1:** ✅ Max-exclusive Training hub + live HUD (plans, history, PR strip, set logging, rest countdown); sessions store optional `planId` for next-up progress.
 - **Remy Kitchen:** ✅ Enriched pantry, fridge scan, recipes + cook mode, shopping, meal plan, nutrition; voice tools share on-device stores.
 - **Testing:** extend the unit suite as stores/tools evolve; add UI smoke tests once the tab set stabilizes.

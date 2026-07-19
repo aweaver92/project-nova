@@ -47,6 +47,7 @@ public final class RemyKitchenViewModel {
     public private(set) var recipes: [Recipe] = []
     public private(set) var cookingSession: CookingSession?
     public private(set) var cookingRecipe: Recipe?
+    public private(set) var cookTimers: [ActiveTimer] = []
     public private(set) var shoppingItems: [ShoppingListItem] = []
     public private(set) var mealPlan: MealPlan = MealPlan(weekStart: Date())
     public private(set) var nutritionProfile: NutritionProfile = NutritionProfile()
@@ -61,14 +62,19 @@ public final class RemyKitchenViewModel {
     public var draftDietStyle: String = ""
     public var draftNotes: String = ""
 
+    /// True while Kitchen is on-screen (drives polling for voice cook advances).
+    public private(set) var isScreenVisible = false
+
     private let pantry: any PantryStoring
     private let recipesStore: any RecipeStoring
     private let shopping: any ShoppingListStoring
     private let meals: any MealPlanStoring
     private let nutrition: any NutritionStoring
+    private let timers: (any TimerScheduling)?
     private let analyzeImage: (CapturedFrame, String) async throws -> String
     private let captureStill: (() async throws -> CapturedFrame)?
     private let isVisionReady: () async -> Bool
+    private var pollTask: Task<Void, Never>?
 
     public init(
         pantry: any PantryStoring,
@@ -76,6 +82,7 @@ public final class RemyKitchenViewModel {
         shopping: any ShoppingListStoring,
         meals: any MealPlanStoring,
         nutrition: any NutritionStoring,
+        timers: (any TimerScheduling)? = nil,
         analyzeImage: @escaping (CapturedFrame, String) async throws -> String,
         captureStill: (() async throws -> CapturedFrame)? = nil,
         isVisionReady: @escaping () async -> Bool = { false }
@@ -85,9 +92,23 @@ public final class RemyKitchenViewModel {
         self.shopping = shopping
         self.meals = meals
         self.nutrition = nutrition
+        self.timers = timers
         self.analyzeImage = analyzeImage
         self.captureStill = captureStill
         self.isVisionReady = isVisionReady
+    }
+
+    public var cookTimerRemainingSeconds: Int {
+        cookTimers.map(\.remainingSeconds).max() ?? 0
+    }
+
+    public var primaryCookTimer: ActiveTimer? {
+        cookTimers.min(by: { $0.firesAt < $1.firesAt })
+    }
+
+    public func setScreenVisible(_ visible: Bool) {
+        isScreenVisible = visible
+        updatePolling()
     }
 
     public var filteredPantry: [PantryItem] {
@@ -108,13 +129,29 @@ public final class RemyKitchenViewModel {
     }
 
     public func load() async {
+        await refresh()
+        updatePolling()
+    }
+
+    private func refresh() async {
         pantryItems = await pantry.all()
         recipes = await recipesStore.all()
+        let previousCooking = cookingSession != nil
         cookingSession = await recipesStore.activeCookingSession()
         if let session = cookingSession {
             cookingRecipe = await recipesStore.recipe(id: session.recipeId)
+            // Auto-jump to Recipes when cook mode starts (voice or UI).
+            if !previousCooking {
+                selectedSection = .recipes
+            }
         } else {
             cookingRecipe = nil
+        }
+        if let timers, cookingSession != nil {
+            // While cooking, surface any live timer (voice set_timer or Cook HUD).
+            cookTimers = await timers.list()
+        } else {
+            cookTimers = []
         }
         shoppingItems = await shopping.all()
         mealPlan = await meals.currentWeek()
@@ -122,6 +159,27 @@ public final class RemyKitchenViewModel {
         recentMeals = await nutrition.recentMeals(limit: 12)
         lastScan = await nutrition.lastFridgeScan()
         syncProfileDrafts()
+    }
+
+    private func updatePolling() {
+        let shouldPoll = isScreenVisible || cookingSession != nil
+        if !shouldPoll {
+            pollTask?.cancel()
+            pollTask = nil
+            return
+        }
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                await self.refresh()
+                if !self.isScreenVisible && self.cookingSession == nil {
+                    self.pollTask = nil
+                    return
+                }
+            }
+        }
     }
 
     private func syncProfileDrafts() {
@@ -227,8 +285,8 @@ public final class RemyKitchenViewModel {
 
     public func startCooking(_ recipe: Recipe) async {
         _ = await recipesStore.startCooking(recipe: recipe)
-        await load()
         selectedSection = .recipes
+        await load()
     }
 
     public func cookingNext() async {
@@ -244,7 +302,36 @@ public final class RemyKitchenViewModel {
     }
 
     public func endCooking() async {
+        if let timers {
+            _ = await timers.cancel(id: nil, label: "Cook")
+        }
         _ = await recipesStore.endCooking()
+        await load()
+    }
+
+    public func startCookTimer(seconds: Int = 60) async {
+        guard let timers else {
+            statusMessage = "Timers unavailable."
+            return
+        }
+        _ = await timers.cancel(id: nil, label: "Cook")
+        _ = await timers.schedule(seconds: max(1, seconds), label: "Cook")
+        statusMessage = "Cook timer · \(seconds)s"
+        await load()
+    }
+
+    public func skipCookTimer() async {
+        guard let timers else { return }
+        _ = await timers.cancel(id: primaryCookTimer?.id, label: "Cook")
+        await load()
+    }
+
+    public func addCookTimer(seconds: Int = 30) async {
+        guard let timers else { return }
+        let remaining = cookTimerRemainingSeconds
+        let next = max(1, remaining + seconds)
+        _ = await timers.cancel(id: nil, label: "Cook")
+        _ = await timers.schedule(seconds: next, label: "Cook")
         await load()
     }
 

@@ -54,6 +54,8 @@ public struct SageWellnessView: View {
         .navigationBarTitleDisplayMode(.inline)
         .tint(Self.sage)
         .task { await wellness.load() }
+        .onAppear { wellness.setScreenVisible(true) }
+        .onDisappear { wellness.setScreenVisible(false) }
     }
 
     private var greetingHeader: some View {
@@ -149,6 +151,12 @@ public struct SageWellnessView: View {
             }
             .frame(height: 150)
             .onAppear { breathePhase = true }
+            if wellness.breathRemainingSeconds > 0 {
+                Text("\(wellness.breathRemainingSeconds)s")
+                    .font(.system(size: 36, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(Self.sage)
+            }
             HStack(spacing: 12) {
                 breatheButton("1 min breath", icon: "wind", seconds: 60)
                 breatheButton("3 min scan", icon: "figure.mind.and.body", seconds: 180)

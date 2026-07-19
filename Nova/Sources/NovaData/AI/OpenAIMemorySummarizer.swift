@@ -44,7 +44,7 @@ public struct OpenAIMemorySummarizer: MemorySummarizing {
         let body: [String: Any] = [
             "model": model,
             "instructions": """
-            Maintain a durable, compact memory summary of the user's conversation for continuity across sessions. Merge the new turns into the existing summary. Keep durable facts, decisions, preferences, ongoing tasks, and names; drop small talk and anything transient. Use terse bullet points, at most ~200 words. Output only the updated summary.
+            Maintain a durable memory summary of the user's conversation for continuity across sessions. Merge the new turns into the existing summary. Keep durable facts, decisions, preferences, ongoing tasks, open questions, and names; drop small talk and anything transient. Use terse bullet points, at most ~400 words. Output only the updated summary.
             """,
             "input": input
         ]

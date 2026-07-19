@@ -152,6 +152,16 @@ public struct DeleteStudyCardTool: Tool {
     }
 }
 
+/// Optional hooks so AppContainer can keep Study UI + voice quiz on one queue
+/// without NovaData importing NovaFeatures.
+public final class StudyUIBridge: @unchecked Sendable {
+    public var onQuizStart: (@Sendable (String?) async -> Void)?
+    public var onReveal: (@Sendable (UUID) async -> Void)?
+    public var onGrade: (@Sendable (UUID) async -> Void)?
+
+    public init() {}
+}
+
 public struct StartQuizTool: Tool {
     public let name = "start_quiz"
     public let description = "Start a quiz session: returns due cards (front only). After the user answers, call reveal_card, then grade_card."
@@ -160,12 +170,20 @@ public struct StartQuizTool: Tool {
     {"type":"object","properties":{"deck":{"type":"string","description":"Optional deck filter."},"limit":{"type":"integer"}},"additionalProperties":false}
     """
     private let store: any StudyDeckStoring
-    public init(store: any StudyDeckStoring) { self.store = store }
+    private let ui: StudyUIBridge?
+
+    public init(store: any StudyDeckStoring, ui: StudyUIBridge? = nil) {
+        self.store = store
+        self.ui = ui
+    }
 
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let deck: String?; let limit: Int? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(deck: nil, limit: nil)
         let due = await store.due(deck: args.deck, limit: args.limit ?? 10)
+        if !due.isEmpty {
+            await ui?.onQuizStart?(args.deck)
+        }
         let cards: [[String: Any]] = due.map {
             [
                 "id": $0.id.uuidString,
@@ -185,7 +203,12 @@ public struct RevealCardTool: Tool {
     {"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}
     """
     private let store: any StudyDeckStoring
-    public init(store: any StudyDeckStoring) { self.store = store }
+    private let ui: StudyUIBridge?
+
+    public init(store: any StudyDeckStoring, ui: StudyUIBridge? = nil) {
+        self.store = store
+        self.ui = ui
+    }
 
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let id: String }
@@ -194,6 +217,7 @@ public struct RevealCardTool: Tool {
               let card = await store.card(id: id) else {
             return #"{"ok":false,"error":"card_not_found"}"#
         }
+        await ui?.onReveal?(id)
         return try StudyToolJSON.encode([
             "ok": true,
             "id": card.id.uuidString,
@@ -212,7 +236,12 @@ public struct GradeCardTool: Tool {
     {"type":"object","properties":{"id":{"type":"string"},"grade":{"type":"string","enum":["again","hard","good","easy"]},"user_answer":{"type":"string"}},"required":["id","grade"],"additionalProperties":false}
     """
     private let store: any StudyDeckStoring
-    public init(store: any StudyDeckStoring) { self.store = store }
+    private let ui: StudyUIBridge?
+
+    public init(store: any StudyDeckStoring, ui: StudyUIBridge? = nil) {
+        self.store = store
+        self.ui = ui
+    }
 
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let id: String; let grade: String; let user_answer: String? }
@@ -224,6 +253,7 @@ public struct GradeCardTool: Tool {
         guard let card = await store.grade(id: id, grade: grade) else {
             return #"{"ok":false,"error":"card_not_found"}"#
         }
+        await ui?.onGrade?(id)
         var result: [String: Any] = [
             "ok": true,
             "id": card.id.uuidString,

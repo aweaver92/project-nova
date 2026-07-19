@@ -34,66 +34,19 @@ public struct RemyKitchenView: View {
             }
         }
         .task { await kitchen.load() }
+        .onAppear { kitchen.setScreenVisible(true) }
+        .onDisappear { kitchen.setScreenVisible(false) }
     }
 
     /// Warm terracotta identity for Remy's kitchen.
     static let terracotta = Color(red: 0.80, green: 0.40, blue: 0.20)
 
     private var content: some View {
-        List {
-            Section {
-                VStack(spacing: 10) {
-                    if let session = kitchen.cookingSession {
-                        cookingBanner(session)
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(RemyKitchenViewModel.Section.allCases) { section in
-                                Button {
-                                    withAnimation(.snappy) { kitchen.selectedSection = section }
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        Image(systemName: section.systemImage)
-                                            .font(.caption)
-                                        Text(section.title)
-                                            .font(.caption.weight(.semibold))
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(
-                                        kitchen.selectedSection == section
-                                            ? Self.terracotta
-                                            : Self.terracotta.opacity(0.10),
-                                        in: Capsule()
-                                    )
-                                    .foregroundStyle(
-                                        kitchen.selectedSection == section ? .white : Self.terracotta
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                }
-                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
-                .listRowBackground(Color.clear)
-            }
-
-            if !kitchen.statusMessage.isEmpty {
-                Section {
-                    Label(kitchen.statusMessage, systemImage: "sparkles")
-                        .font(.footnote)
-                        .foregroundStyle(Self.terracotta)
-                }
-            }
-
-            switch kitchen.selectedSection {
-            case .pantry: pantrySections
-            case .scan: scanSections
-            case .recipes: recipeSections
-            case .shopping: shoppingSections
-            case .meals: mealSections
-            case .profile: profileSections
+        Group {
+            if kitchen.cookingSession != nil, kitchen.selectedSection == .recipes {
+                cookModeHUD
+            } else {
+                kitchenList
             }
         }
         .navigationTitle(embedded ? "Kitchen" : "Remy Kitchen")
@@ -130,6 +83,209 @@ public struct RemyKitchenView: View {
                     Task { await kitchen.clearMealSlot(dayOffset: day, kind: kind) }
                 }
             )
+        }
+    }
+
+    private var kitchenList: some View {
+        List {
+            Section {
+                VStack(spacing: 10) {
+                    if let session = kitchen.cookingSession {
+                        cookingBanner(session)
+                    }
+                    sectionChips
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                .listRowBackground(Color.clear)
+            }
+
+            if !kitchen.statusMessage.isEmpty {
+                Section {
+                    Label(kitchen.statusMessage, systemImage: "sparkles")
+                        .font(.footnote)
+                        .foregroundStyle(Self.terracotta)
+                }
+            }
+
+            switch kitchen.selectedSection {
+            case .pantry: pantrySections
+            case .scan: scanSections
+            case .recipes: recipeSections
+            case .shopping: shoppingSections
+            case .meals: mealSections
+            case .profile: profileSections
+            }
+        }
+    }
+
+    /// Full-bleed hands-friendly cook HUD (large step + timer ring).
+    private var cookModeHUD: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                sectionChips
+                if let session = kitchen.cookingSession, let recipe = kitchen.cookingRecipe {
+                    let idx = session.currentStepIndex
+                    let total = max(1, recipe.steps.count)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label(session.recipeTitle, systemImage: "frying.pan.fill")
+                            .font(.caption.weight(.heavy))
+                            .foregroundStyle(.white.opacity(0.85))
+                        HStack(spacing: 4) {
+                            ForEach(0..<total, id: \.self) { step in
+                                Capsule()
+                                    .fill(step <= idx ? Color.white : Color.white.opacity(0.25))
+                                    .frame(height: 5)
+                            }
+                        }
+                        Text("Step \(idx + 1) of \(total)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.8))
+                        Text(recipe.steps.indices.contains(idx) ? recipe.steps[idx] : "No steps")
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 8)
+                    }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        LinearGradient(
+                            colors: [Self.terracotta, Color(red: 0.65, green: 0.28, blue: 0.15)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        in: RoundedRectangle(cornerRadius: 20)
+                    )
+
+                    cookTimerCard
+
+                    HStack(spacing: 12) {
+                        Button("Back") { Task { await kitchen.cookingPrevious() } }
+                            .buttonStyle(.bordered)
+                            .frame(maxWidth: .infinity)
+                        Button("Next") { Task { await kitchen.cookingNext() } }
+                            .buttonStyle(.borderedProminent)
+                            .frame(maxWidth: .infinity)
+                    }
+                    Button(role: .destructive) {
+                        Task { await kitchen.endCooking() }
+                    } label: {
+                        Label("End cook mode", systemImage: "xmark.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    if !recipe.ingredients.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("INGREDIENTS")
+                                .font(.caption.weight(.heavy))
+                                .foregroundStyle(.secondary)
+                            ForEach(recipe.ingredients) { ing in
+                                Text(ing.quantity.map { "\($0) · \(ing.name)" } ?? ing.name)
+                                    .font(.subheadline)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+                    }
+                }
+                if !kitchen.statusMessage.isEmpty {
+                    Text(kitchen.statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(Self.terracotta)
+                }
+            }
+            .padding(16)
+        }
+        .background(Color(.systemGroupedBackground))
+    }
+
+    private var cookTimerCard: some View {
+        VStack(spacing: 10) {
+            if kitchen.cookTimerRemainingSeconds > 0 {
+                ZStack {
+                    Circle()
+                        .stroke(Self.terracotta.opacity(0.2), lineWidth: 10)
+                    Circle()
+                        .trim(from: 0, to: cookTimerFraction)
+                        .stroke(Self.terracotta, style: StrokeStyle(lineWidth: 10, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .animation(.linear(duration: 1), value: kitchen.cookTimerRemainingSeconds)
+                    VStack(spacing: 0) {
+                        Text("\(kitchen.cookTimerRemainingSeconds)")
+                            .font(.system(size: 40, weight: .heavy, design: .rounded))
+                            .monospacedDigit()
+                        Text(kitchen.primaryCookTimer?.label.uppercased() ?? "TIMER")
+                            .font(.caption2.weight(.heavy))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 130, height: 130)
+                HStack(spacing: 12) {
+                    Button("Skip") { Task { await kitchen.skipCookTimer() } }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                    Button("+30s") { Task { await kitchen.addCookTimer() } }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await kitchen.startCookTimer(seconds: 60) }
+                    } label: {
+                        Label("1 min", systemImage: "timer")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        Task { await kitchen.startCookTimer(seconds: 300) }
+                    } label: {
+                        Label("5 min", systemImage: "timer")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding(16)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private var cookTimerFraction: CGFloat {
+        let total = max(1, kitchen.primaryCookTimer?.seconds ?? 60)
+        return CGFloat(kitchen.cookTimerRemainingSeconds) / CGFloat(total)
+    }
+
+    private var sectionChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(RemyKitchenViewModel.Section.allCases) { section in
+                    Button {
+                        withAnimation(.snappy) { kitchen.selectedSection = section }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: section.systemImage)
+                                .font(.caption)
+                            Text(section.title)
+                                .font(.caption.weight(.semibold))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            kitchen.selectedSection == section
+                                ? Self.terracotta
+                                : Self.terracotta.opacity(0.10),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(
+                            kitchen.selectedSection == section ? .white : Self.terracotta
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 

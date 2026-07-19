@@ -44,6 +44,20 @@ final class StudyViewModelTests: XCTestCase {
         XCTAssertTrue(vm.isReviewing)
         XCTAssertEqual(vm.currentReviewCard?.front, "Cell?")
     }
+
+    func testVoiceGradeAdvancesSharedReviewQueue() async {
+        let store = InMemoryStudyDeckStore()
+        let a = await store.upsert(StudyCard(deck: "Hist", front: "Year?", back: "1776"))
+        _ = await store.upsert(StudyCard(deck: "Hist", front: "Who?", back: "Washington"))
+        let vm = StudyViewModel(store: store)
+        await vm.startReview(deck: "Hist")
+        XCTAssertEqual(vm.currentReviewCard?.id, a.id)
+
+        _ = await store.grade(id: a.id, grade: .good)
+        await vm.syncGradeFromVoice(cardId: a.id)
+        XCTAssertEqual(vm.reviewIndex, 1)
+        XCTAssertEqual(vm.currentReviewCard?.front, "Who?")
+    }
 }
 
 /// Minimal in-memory store for StudyViewModel tests (mirrors SM-2-lite scheduling).
