@@ -673,6 +673,8 @@ public final class SettingsViewModel {
     public var codingWorkingDirectory: String = ""
     public private(set) var bridgeStatus: String = ""
     public private(set) var bridgeChecking = false
+    /// Saved bridge endpoints (Home LAN, VPN, …) for one-tap switching.
+    public private(set) var bridgeProfiles: [BridgeProfile] = []
     public private(set) var openaiConfigured: Bool?
     public private(set) var cursorConfigured: Bool?
     public private(set) var gitReady: Bool?
@@ -707,8 +709,50 @@ public final class SettingsViewModel {
         visualMemoryRetentionDays = await store.visualMemoryRetentionDays()
         bridgeBaseURL = await store.bridgeBaseURL() ?? ""
         bridgeToken = await store.bridgeToken() ?? ""
+        bridgeProfiles = await store.bridgeProfiles()
         codingWorkingDirectory = await store.codingWorkingDirectory() ?? ""
         await refreshBridgeHealth()
+    }
+
+    /// The saved profile whose URL+token match the active bridge fields, if any.
+    public var activeBridgeProfileID: UUID? {
+        let url = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return bridgeProfiles.first { $0.baseURL == url && $0.token == token }?.id
+    }
+
+    /// Save the current URL+token as a named profile. Reuses an existing profile
+    /// with the same name (case-insensitive) so re-saving "Home" updates it.
+    public func saveBridgeProfile(name: String) async {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        let url = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var profiles = bridgeProfiles
+        if let idx = profiles.firstIndex(where: { $0.name.caseInsensitiveCompare(trimmedName) == .orderedSame }) {
+            profiles[idx].baseURL = url
+            profiles[idx].token = token
+        } else {
+            profiles.append(BridgeProfile(name: trimmedName, baseURL: url, token: token))
+        }
+        profiles.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        bridgeProfiles = profiles
+        await store.setBridgeProfiles(profiles)
+        bridgeStatus = "Saved profile \"\(trimmedName)\"."
+    }
+
+    /// Load a saved profile into the active fields, persist, and test it.
+    public func applyBridgeProfile(_ profile: BridgeProfile) async {
+        bridgeBaseURL = profile.baseURL
+        bridgeToken = profile.token
+        bridgeStatus = "Switched to \"\(profile.name)\". Checking connection…"
+        await saveBridge()
+    }
+
+    public func deleteBridgeProfile(_ profile: BridgeProfile) async {
+        bridgeProfiles.removeAll { $0.id == profile.id }
+        await store.setBridgeProfiles(bridgeProfiles)
     }
 
     public func setCodingAutoOpenPreview(_ enabled: Bool) async {

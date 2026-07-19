@@ -1,5 +1,6 @@
 import SwiftUI
 import NovaCore
+import NovaDomain
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -9,6 +10,8 @@ public struct SettingsView: View {
     @Bindable var settings: SettingsViewModel
     @Bindable var conversation: ConversationViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var showSaveBridgeProfile = false
+    @State private var newBridgeProfileName = ""
 
     public init(settings: SettingsViewModel, conversation: ConversationViewModel) {
         self.settings = settings
@@ -98,6 +101,45 @@ public struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+
+                    ForEach(settings.bridgeProfiles) { profile in
+                        Button {
+                            Task { await settings.applyBridgeProfile(profile) }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: settings.activeBridgeProfileID == profile.id
+                                    ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(settings.activeBridgeProfileID == profile.id ? .green : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(profile.name)
+                                    Text(profile.baseURL)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(settings.bridgeChecking)
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                Task { await settings.deleteBridgeProfile(profile) }
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                    }
+
+                    Button {
+                        newBridgeProfileName = ""
+                        showSaveBridgeProfile = true
+                    } label: {
+                        Label("Save current as profile…", systemImage: "plus.circle")
+                    }
+                    .buttonStyle(.borderless)
+
                     if let openai = settings.openaiConfigured {
                         LabeledContent("Realtime mint") {
                             Text(openai ? "Ready" : "Missing key")
@@ -198,6 +240,19 @@ public struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .alert("Save bridge profile", isPresented: $showSaveBridgeProfile) {
+                TextField("Name (e.g. Home, VPN)", text: $newBridgeProfileName)
+                    .textInputAutocapitalization(.words)
+                Button("Save") {
+                    let name = newBridgeProfileName
+                    newBridgeProfileName = ""
+                    Task { await settings.saveBridgeProfile(name: name) }
+                }
+                .disabled(newBridgeProfileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Cancel", role: .cancel) { newBridgeProfileName = "" }
+            } message: {
+                Text("Saves the current bridge URL and token so you can switch between them with one tap.")
             }
             .task { await settings.load() }
         }

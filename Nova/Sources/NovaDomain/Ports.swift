@@ -192,6 +192,9 @@ public protocol SettingsStoring: Sendable {
     /// Shared secret sent as a bearer token to the Nova Bridge.
     func bridgeToken() async -> String?
     func setBridgeToken(_ value: String?) async
+    /// Saved bridge endpoints (Home LAN, VPN, …) for one-tap switching.
+    func bridgeProfiles() async -> [BridgeProfile]
+    func setBridgeProfiles(_ profiles: [BridgeProfile]) async
     /// Pinned Cursor agent session id shared by the Coding tab and `push_to_cursor`.
     func codingSessionId() async -> String?
     func setCodingSessionId(_ value: String?) async
@@ -237,6 +240,8 @@ public extension SettingsStoring {
     func setBridgeBaseURL(_ value: String?) async {}
     func bridgeToken() async -> String? { nil }
     func setBridgeToken(_ value: String?) async {}
+    func bridgeProfiles() async -> [BridgeProfile] { [] }
+    func setBridgeProfiles(_ profiles: [BridgeProfile]) async {}
     func codingSessionId() async -> String? { nil }
     func setCodingSessionId(_ value: String?) async {}
     func codingWorkingDirectory() async -> String? { nil }

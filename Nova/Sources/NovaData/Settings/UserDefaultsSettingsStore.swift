@@ -8,6 +8,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         static let spokenFollowUps = "nova.settings.spokenFollowUps"
         static let bridgeBaseURL = "nova.settings.bridgeBaseURL"
         static let bridgeToken = "nova.settings.bridgeToken"
+        static let bridgeProfiles = "nova.settings.bridgeProfiles"
         static let codingSessionId = "nova.settings.codingSessionId"
         static let codingWorkingDirectory = "nova.settings.codingWorkingDirectory"
         static let codingSelectedRepoId = "nova.settings.codingSelectedRepoId"
@@ -48,6 +49,23 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
 
     public func setBridgeToken(_ value: String?) async {
         setOptionalString(normalized(value), forKey: Keys.bridgeToken)
+    }
+
+    public func bridgeProfiles() async -> [BridgeProfile] {
+        guard let data = defaults.data(forKey: Keys.bridgeProfiles),
+              let profiles = try? JSONDecoder().decode([BridgeProfile].self, from: data)
+        else { return [] }
+        return profiles
+    }
+
+    public func setBridgeProfiles(_ profiles: [BridgeProfile]) async {
+        if profiles.isEmpty {
+            defaults.removeObject(forKey: Keys.bridgeProfiles)
+            return
+        }
+        if let data = try? JSONEncoder().encode(profiles) {
+            defaults.set(data, forKey: Keys.bridgeProfiles)
+        }
     }
 
     public func codingSessionId() async -> String? {

@@ -143,6 +143,31 @@ final class SettingsStoreTests: XCTestCase {
         let fromReload = await reloaded.codingSessionId()
         XCTAssertEqual(fromReload, "sess-1")
     }
+
+    func testBridgeProfilesRoundTripAndClear() async {
+        let suite = "nova.test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        let empty = await store.bridgeProfiles()
+        XCTAssertTrue(empty.isEmpty)
+
+        let profiles = [
+            BridgeProfile(name: "Home", baseURL: "http://nova.local:8787", token: "home-tok"),
+            BridgeProfile(name: "VPN", baseURL: "https://nova.ts.net", token: "vpn-tok"),
+        ]
+        await store.setBridgeProfiles(profiles)
+
+        // A fresh store over the same suite reads the persisted profiles.
+        let reloaded = UserDefaultsSettingsStore(defaults: defaults)
+        let persisted = await reloaded.bridgeProfiles()
+        XCTAssertEqual(persisted, profiles)
+
+        await store.setBridgeProfiles([])
+        let cleared = await reloaded.bridgeProfiles()
+        XCTAssertTrue(cleared.isEmpty)
+    }
 }
 
 // MARK: - Skill import/export contract (Codable round-trip incl. schedule)

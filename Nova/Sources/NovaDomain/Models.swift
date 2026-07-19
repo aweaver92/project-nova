@@ -620,6 +620,24 @@ public struct StreamBandwidthPolicy: Sendable, Equatable {
     }
 }
 
+// MARK: - Bridge profiles (saved bridge endpoints for quick switching)
+
+/// A saved Nova Bridge endpoint (URL + token) the user can switch between —
+/// e.g. a "Home" LAN bridge and a "VPN" Tailscale bridge for when they're away.
+public struct BridgeProfile: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var baseURL: String
+    public var token: String
+
+    public init(id: UUID = UUID(), name: String, baseURL: String, token: String) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.token = token
+    }
+}
+
 // MARK: - Agents (multi-agent: Nova master + specialist sub-agents)
 
 /// The OpenAI Realtime voices Nova can assign to an agent. Stored on `Agent` as a
