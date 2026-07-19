@@ -115,61 +115,7 @@ public struct SettingsView: View {
                     }
 
                     ForEach(settings.bridgeProfiles) { profile in
-                        HStack(spacing: 10) {
-                            Button {
-                                Task { await settings.applyBridgeProfile(profile) }
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: settings.activeBridgeProfileID == profile.id
-                                        ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(settings.activeBridgeProfileID == profile.id ? .green : .secondary)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(profile.name)
-                                        Text(profile.baseURL)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(settings.bridgeChecking || settings.bridgeScanning)
-
-                            Menu {
-                                Button {
-                                    bridgeProfileName = profile.name
-                                    bridgeProfileEditor = .rename(profile)
-                                } label: {
-                                    Label("Rename", systemImage: "pencil")
-                                }
-                                Button(role: .destructive) {
-                                    Task { await settings.deleteBridgeProfile(profile) }
-                                } label: {
-                                    Label("Remove", systemImage: "trash")
-                                }
-                            } label: {
-                                Image(systemName: "ellipsis.circle")
-                                    .foregroundStyle(.secondary)
-                                    .padding(.vertical, 8)
-                            }
-                            .accessibilityLabel("Manage \(profile.name) profile")
-                        }
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                Task { await settings.deleteBridgeProfile(profile) }
-                            } label: {
-                                Label("Remove", systemImage: "trash")
-                            }
-                            Button {
-                                bridgeProfileName = profile.name
-                                bridgeProfileEditor = .rename(profile)
-                            } label: {
-                                Label("Rename", systemImage: "pencil")
-                            }
-                            .tint(.blue)
-                        }
+                        bridgeProfileRow(profile)
                     }
 
                     Button {
@@ -302,6 +248,63 @@ public struct SettingsView: View {
                 Text(editor.message)
             }
             .task { await settings.load() }
+        }
+    }
+
+    private func bridgeProfileRow(_ profile: BridgeProfile) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                Task { await settings.applyBridgeProfile(profile) }
+            } label: {
+                HStack(spacing: 10) {
+                    let isActive = settings.activeBridgeProfileID == profile.id
+                    Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(isActive ? .green : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(profile.name)
+                        Text(profile.baseURL)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(settings.bridgeChecking || settings.bridgeScanning)
+
+            Menu {
+                profileRenameButton(profile)
+                profileRemoveButton(profile)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
+            }
+            .accessibilityLabel("Manage \(profile.name) profile")
+        }
+        .swipeActions(edge: .trailing) {
+            profileRemoveButton(profile)
+            profileRenameButton(profile)
+                .tint(.blue)
+        }
+    }
+
+    private func profileRenameButton(_ profile: BridgeProfile) -> some View {
+        Button {
+            bridgeProfileName = profile.name
+            bridgeProfileEditor = .rename(profile)
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
+    }
+
+    private func profileRemoveButton(_ profile: BridgeProfile) -> some View {
+        Button(role: .destructive) {
+            Task { await settings.deleteBridgeProfile(profile) }
+        } label: {
+            Label("Remove", systemImage: "trash")
         }
     }
 
