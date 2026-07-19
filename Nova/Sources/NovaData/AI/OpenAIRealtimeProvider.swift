@@ -130,12 +130,18 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Phone mic PCM reliably reaches OpenAI (ws ok, high peak) but
-                    // server_vad often never emits speech_started on-device. Drive
-                    // turns from local energy in ConversationOrchestrator instead
-                    // (commit + create_response). Keeps STT; drops cloud VAD dependency.
                     "noise_reduction": ["type": "near_field"],
-                    "turn_detection": NSNull(),
+                    // Server-side VAD owns turn-taking: OpenAI detects end of
+                    // speech, commits the buffer, and auto-creates the response.
+                    // This replaces the client energy VAD + manual commit loop.
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 600,
+                        "create_response": true,
+                        "interrupt_response": true
+                    ],
                     "transcription": [
                         "model": "gpt-4o-mini-transcribe",
                         "language": "en"
@@ -269,32 +275,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         }
     }
 
-    public func commitInputAudio() async {
-        guard connected else { return }
-        commitWaitGeneration &+= 1
-        let gen = commitWaitGeneration
-        do {
-            try await sendJSON(["type": "input_audio_buffer.commit"])
-        } catch {
-            metrics?.increment(.sendFailures)
-            NovaLog.ai.error("commitInputAudio failed: \(String(describing: error), privacy: .public)")
-            return
-        }
-        // Wait briefly for committed so createResponse does not race an empty buffer.
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                commitWait = cont
-                Task { [weak self] in
-                    try? await Task.sleep(for: .milliseconds(800))
-                    await self?.finishCommitWait(generation: gen)
-                }
-            }
-        } onCancel: {
-            Task { [weak self] in
-                await self?.finishCommitWait(generation: gen)
-            }
-        }
-    }
+    /// No-op under server-side VAD: OpenAI commits the input buffer itself when
+    /// it detects end of speech. Kept to satisfy the provider protocol.
+    public func commitInputAudio() async {}
 
     private func finishCommitWait(generation: Int) {
         guard generation == commitWaitGeneration, let wait = commitWait else { return }
@@ -302,19 +285,10 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         wait.resume()
     }
 
-    public func createResponse() async {
-        guard connected else { return }
-        // Wake-word path: the orchestrator decides to answer after speech ended.
-        // Prefer the speech-end mark so TTFA includes model think time.
-        if ttfaMark == nil {
-            ttfaMark = speechEndMark ?? .now
-        }
-        do {
-            try await sendJSON(["type": "response.create"])
-        } catch {
-            metrics?.increment(.sendFailures)
-        }
-    }
+    /// No-op under server-side VAD: `create_response: true` makes OpenAI create
+    /// the response automatically at end of turn. Kept for protocol conformance
+    /// and for the tool-output path, which still creates a response explicitly.
+    public func createResponse() async {}
 
     public func sendToolOutput(callId: String, outputJSON: String) async {
         guard connected else { return }

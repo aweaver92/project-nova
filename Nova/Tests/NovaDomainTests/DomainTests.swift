@@ -602,15 +602,9 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
-    func testClientVADAppendsTriggeringAudioBeforeSingleCommit() async throws {
-        // Drives the full orchestrator on real-time `Task.sleep` cadence plus the
-        // 500ms health/reconnect monitor, which is flaky on shared CI runners.
-        // The VAD decision logic itself is covered deterministically (injected
-        // timestamps) in ClientEnergyVADTests.
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Real-time VAD cadence is flaky on CI; see ClientEnergyVADTests for deterministic coverage."
-        )
+    func testContinuousAppendUnderServerVAD() async throws {
+        // Server-side VAD owns turn-taking: the orchestrator streams mic audio
+        // continuously and must never issue a client commit or response.create.
         let provider = MockProvider()
         let ingress = ControllableIngress()
         let orch = ConversationOrchestrator(
@@ -623,60 +617,18 @@ final class WakeWordTests: XCTestCase {
         try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
 
         let speech = speechLikePCM()
-        for _ in 0..<38 {
+        for _ in 0..<20 {
             ingress.emit(AudioChunk(pcm: speech, sampleRate: 24_000))
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        for _ in 0..<36 {
-            ingress.emit(AudioChunk(pcm: Data(count: 960), sampleRate: 24_000))
-            try await Task.sleep(for: .milliseconds(20))
         }
 
-        let committed = await waitUntil { await provider.commitCount == 1 }
-        XCTAssertTrue(committed)
-        let operations = await provider.audioOperations
-        XCTAssertEqual(operations.filter { $0 == "commit" }.count, 1)
-        XCTAssertEqual(operations.filter { $0 == "response" }.count, 1)
-        // The mic keeps streaming, so trailing silence appends after the turn are
-        // expected. Assert the commit is wrapped as append→commit→response rather
-        // than requiring "response" to be the very last recorded operation.
-        if let commitIndex = operations.firstIndex(of: "commit") {
-            XCTAssertGreaterThan(commitIndex, 0)
-            XCTAssertEqual(operations[commitIndex - 1], "append")
-            XCTAssertLessThan(commitIndex + 1, operations.count)
-            XCTAssertEqual(operations[commitIndex + 1], "response")
-        } else {
-            XCTFail("expected client VAD commit")
+        let appended = await waitUntil {
+            await provider.audioOperations.filter { $0 == "append" }.count >= 20
         }
-        await orch.stop()
-    }
-
-    func testClientVADDoesNotCommitSubtleTransient() async throws {
-        // Real-time orchestrator/health-monitor integration path — flaky on CI.
-        // Deterministic transient-rejection coverage is in ClientEnergyVADTests.
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Real-time VAD cadence is flaky on CI; see ClientEnergyVADTests for deterministic coverage."
-        )
-        let provider = MockProvider()
-        let ingress = ControllableIngress()
-        let orch = ConversationOrchestrator(
-            ai: provider,
-            ingress: ingress,
-            egress: MockEgress(),
-            resampler: PassThroughResampler(),
-            metrics: InMemoryLatencyMetricsRecorder()
-        )
-        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
-
-        let subtle = speechLikePCM(amplitude: 1_500)
-        for _ in 0..<12 {
-            ingress.emit(AudioChunk(pcm: subtle, sampleRate: 24_000))
-        }
-        try await Task.sleep(for: .milliseconds(250))
-
+        XCTAssertTrue(appended)
         let commits = await provider.commitCount
-        XCTAssertEqual(commits, 0)
+        let created = await provider.createResponseCount
+        XCTAssertEqual(commits, 0, "server VAD commits the buffer; the client must not")
+        XCTAssertEqual(created, 0, "server VAD auto-creates the response; the client must not")
         await orch.stop()
     }
 

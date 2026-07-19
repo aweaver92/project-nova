@@ -1,7 +1,8 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync, promises as fs } from "node:fs";
+import { readFileSync, existsSync, realpathSync, promises as fs } from "node:fs";
 import path, { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   describeUnknownMessage,
   formatSse,
@@ -109,10 +110,40 @@ function sendRepoError(res: Response, err: unknown): void {
   res.status(500).json({ ok: false, error: describe(err) });
 }
 
+// The bridge runs from the same monorepo the coding agent edits, so a stray
+// `cd nova-bridge` + restart could kill the service mid-task. Compute our own
+// package dir once (parent of this src/ file) and refuse to run coding commands
+// that resolve into it.
+const BRIDGE_SELF_DIR = (() => {
+  try {
+    return realpathSync(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
+  } catch {
+    return path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  }
+})();
+
+function assertNotBridgeSelf(cwd: string): void {
+  let resolved: string;
+  try {
+    resolved = realpathSync(resolve(cwd));
+  } catch {
+    resolved = resolve(cwd);
+  }
+  if (resolved === BRIDGE_SELF_DIR || resolved.startsWith(BRIDGE_SELF_DIR + path.sep)) {
+    throw new RepoError(
+      "bridge_protected",
+      "coding_in_nova_bridge_dir_blocked",
+      403,
+    );
+  }
+}
+
 function resolveRequestCwd(body: { repoId?: unknown; cwd?: unknown }): string {
   const repoId = typeof body.repoId === "string" ? body.repoId.trim() : "";
   const legacyCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
-  return repos.resolveCwd(repoId || null, legacyCwd || null);
+  const cwd = repos.resolveCwd(repoId || null, legacyCwd || null);
+  assertNotBridgeSelf(cwd);
+  return cwd;
 }
 
 function resolveQueryCwd(req: Request): string {
@@ -820,6 +851,7 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
     const agent = sessionId
       ? await Agent.resume(sessionId, {
           apiKey: CURSOR_API_KEY,
+          model: { id: CURSOR_MODEL },
           local: { cwd },
         })
       : await Agent.create({
@@ -828,7 +860,7 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
           local: { cwd },
         });
     try {
-      const run = await agent.send(command);
+      const run = await agent.send(command, { model: { id: CURSOR_MODEL } });
       const result = await run.wait();
       res.json({
         ok: result.status === "finished",
@@ -982,6 +1014,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
             "agent_resume",
             Agent.resume(sessionId, {
               apiKey: CURSOR_API_KEY,
+              model: { id: CURSOR_MODEL },
               local: { cwd },
             }),
             90_000,
@@ -1041,6 +1074,7 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     const run = await withTimeout(
       "agent_send",
       agent.send(message, {
+        model: { id: CURSOR_MODEL },
         onDelta: ({ update }) => {
           emit(normalizeInteractionUpdate(update));
         },

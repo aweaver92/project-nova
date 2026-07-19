@@ -75,6 +75,7 @@ public final class RemyKitchenViewModel {
     private let captureStill: (() async throws -> CapturedFrame)?
     private let isVisionReady: () async -> Bool
     private var pollTask: Task<Void, Never>?
+    private var lastSyncedNutritionProfile: NutritionProfile?
 
     public init(
         pantry: any PantryStoring,
@@ -99,7 +100,7 @@ public final class RemyKitchenViewModel {
     }
 
     public var cookTimerRemainingSeconds: Int {
-        cookTimers.map(\.remainingSeconds).max() ?? 0
+        primaryCookTimer?.remainingSeconds ?? 0
     }
 
     public var primaryCookTimer: ActiveTimer? {
@@ -182,13 +183,38 @@ public final class RemyKitchenViewModel {
         }
     }
 
-    private func syncProfileDrafts() {
-        draftDietStyle = nutritionProfile.dietStyle ?? ""
-        draftNotes = nutritionProfile.notes ?? ""
-        draftStaplesText = nutritionProfile.staples.joined(separator: ", ")
-        draftAllergensText = nutritionProfile.allergens.joined(separator: ", ")
-        draftGoalsText = nutritionProfile.goals.joined(separator: ", ")
-        draftCuisinesText = nutritionProfile.preferredCuisines.joined(separator: ", ")
+    private func syncProfileDrafts(force: Bool = false) {
+        if force || lastSyncedNutritionProfile == nil {
+            draftDietStyle = nutritionProfile.dietStyle ?? ""
+            draftNotes = nutritionProfile.notes ?? ""
+            draftStaplesText = nutritionProfile.staples.joined(separator: ", ")
+            draftAllergensText = nutritionProfile.allergens.joined(separator: ", ")
+            draftGoalsText = nutritionProfile.goals.joined(separator: ", ")
+            draftCuisinesText = nutritionProfile.preferredCuisines.joined(separator: ", ")
+            lastSyncedNutritionProfile = nutritionProfile
+            return
+        }
+
+        guard let previous = lastSyncedNutritionProfile else { return }
+        if draftDietStyle == (previous.dietStyle ?? "") {
+            draftDietStyle = nutritionProfile.dietStyle ?? ""
+        }
+        if draftNotes == (previous.notes ?? "") {
+            draftNotes = nutritionProfile.notes ?? ""
+        }
+        if Self.splitList(draftStaplesText) == previous.staples {
+            draftStaplesText = nutritionProfile.staples.joined(separator: ", ")
+        }
+        if Self.splitList(draftAllergensText) == previous.allergens {
+            draftAllergensText = nutritionProfile.allergens.joined(separator: ", ")
+        }
+        if Self.splitList(draftGoalsText) == previous.goals {
+            draftGoalsText = nutritionProfile.goals.joined(separator: ", ")
+        }
+        if Self.splitList(draftCuisinesText) == previous.preferredCuisines {
+            draftCuisinesText = nutritionProfile.preferredCuisines.joined(separator: ", ")
+        }
+        lastSyncedNutritionProfile = nutritionProfile
     }
 
     // MARK: - Pantry
@@ -321,17 +347,19 @@ public final class RemyKitchenViewModel {
     }
 
     public func skipCookTimer() async {
-        guard let timers else { return }
-        _ = await timers.cancel(id: primaryCookTimer?.id, label: "Cook")
+        guard let timers, let timer = primaryCookTimer else { return }
+        _ = await timers.cancel(id: timer.id, label: nil)
         await load()
     }
 
     public func addCookTimer(seconds: Int = 30) async {
         guard let timers else { return }
-        let remaining = cookTimerRemainingSeconds
-        let next = max(1, remaining + seconds)
-        _ = await timers.cancel(id: nil, label: "Cook")
-        _ = await timers.schedule(seconds: next, label: "Cook")
+        let timer = primaryCookTimer
+        let next = max(1, (timer?.remainingSeconds ?? 0) + seconds)
+        if let timer {
+            _ = await timers.cancel(id: timer.id, label: nil)
+        }
+        _ = await timers.schedule(seconds: next, label: timer?.label ?? "Cook")
         await load()
     }
 
@@ -426,7 +454,9 @@ public final class RemyKitchenViewModel {
         profile.goals = Self.splitList(draftGoalsText)
         profile.preferredCuisines = Self.splitList(draftCuisinesText)
         if profile.staples.isEmpty { profile.staples = NutritionProfile.defaultStaples }
-        _ = await nutrition.updateProfile(profile)
+        let updated = await nutrition.updateProfile(profile)
+        nutritionProfile = updated
+        syncProfileDrafts(force: true)
         await load()
         statusMessage = "Nutrition profile saved."
     }

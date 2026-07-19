@@ -549,6 +549,7 @@ public final class AppContainer {
             shopping: shoppingStore,
             meals: mealPlanStore,
             nutrition: nutritionStore,
+            timers: timerService,
             analyzeImage: { [orchestrator] frame, prompt in
                 try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },

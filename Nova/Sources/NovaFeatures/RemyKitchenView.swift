@@ -43,7 +43,7 @@ public struct RemyKitchenView: View {
 
     private var content: some View {
         Group {
-            if kitchen.cookingSession != nil, kitchen.selectedSection == .recipes {
+            if kitchen.cookingSession != nil {
                 cookModeHUD
             } else {
                 kitchenList
@@ -122,7 +122,6 @@ public struct RemyKitchenView: View {
     private var cookModeHUD: some View {
         ScrollView {
             VStack(spacing: 16) {
-                sectionChips
                 if let session = kitchen.cookingSession, let recipe = kitchen.cookingRecipe {
                     let idx = session.currentStepIndex
                     let total = max(1, recipe.steps.count)

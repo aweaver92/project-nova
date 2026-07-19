@@ -249,7 +249,8 @@ public struct RootView: View {
                 await kitchen.load()
                 await study.load()
                 await settings.load()
-                await startListeningIfReady()
+                // Voice starts OFF on launch. The user taps Listen (or the
+                // header toggle) to open Realtime on demand.
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else { return }
