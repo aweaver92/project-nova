@@ -1,0 +1,91 @@
+import XCTest
+import NovaDomain
+@testable import NovaFeatures
+
+@MainActor
+final class SettingsViewModelTests: XCTestCase {
+    func testLANScanSelectsBridgeAndUpdatesActiveProfile() async {
+        let home = BridgeProfile(
+            name: "Home",
+            baseURL: "http://192.168.66.10:8787",
+            token: "token"
+        )
+        let store = SettingsStoreMock(
+            baseURL: home.baseURL,
+            token: home.token,
+            profiles: [home]
+        )
+        let viewModel = SettingsViewModel(
+            store: store,
+            bridge: HealthyBridgeMock(),
+            bridgeDiscovery: BridgeDiscoveryMock(url: "http://192.168.0.107:8787")
+        )
+
+        await viewModel.load()
+        await viewModel.scanForLocalBridge()
+
+        XCTAssertEqual(viewModel.bridgeBaseURL, "http://192.168.0.107:8787")
+        XCTAssertEqual(viewModel.bridgeProfiles.first?.baseURL, "http://192.168.0.107:8787")
+        let persistedURL = await store.bridgeBaseURL()
+        let persistedProfiles = await store.bridgeProfiles()
+        XCTAssertEqual(persistedURL, "http://192.168.0.107:8787")
+        XCTAssertEqual(persistedProfiles.first?.baseURL, "http://192.168.0.107:8787")
+    }
+
+    func testProfilesCanBeRenamedAndRemoved() async {
+        let home = BridgeProfile(name: "Home", baseURL: "http://home:8787", token: "token")
+        let store = SettingsStoreMock(profiles: [home])
+        let viewModel = SettingsViewModel(store: store, bridge: HealthyBridgeMock())
+        await viewModel.load()
+
+        await viewModel.renameBridgeProfile(home, to: "House")
+        XCTAssertEqual(viewModel.bridgeProfiles.map(\.name), ["House"])
+        let renamedProfiles = await store.bridgeProfiles()
+        XCTAssertEqual(renamedProfiles.map(\.name), ["House"])
+
+        guard let renamed = viewModel.bridgeProfiles.first else {
+            return XCTFail("Renamed profile missing")
+        }
+        await viewModel.deleteBridgeProfile(renamed)
+        XCTAssertTrue(viewModel.bridgeProfiles.isEmpty)
+        let remainingProfiles = await store.bridgeProfiles()
+        XCTAssertTrue(remainingProfiles.isEmpty)
+    }
+}
+
+private actor BridgeDiscoveryMock: BridgeDiscovering {
+    let url: String?
+    init(url: String?) { self.url = url }
+    func discoverBridgeURL() async -> String? { url }
+}
+
+private struct HealthyBridgeMock: AgentBridging {
+    func isConfigured() async -> Bool { true }
+    func health() async -> BridgeResult {
+        BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true}"#
+        )
+    }
+}
+
+private actor SettingsStoreMock: SettingsStoring {
+    private var storedBaseURL: String?
+    private var storedToken: String?
+    private var storedProfiles: [BridgeProfile]
+
+    init(baseURL: String? = nil, token: String? = nil, profiles: [BridgeProfile] = []) {
+        storedBaseURL = baseURL
+        storedToken = token
+        storedProfiles = profiles
+    }
+
+    func spokenFollowUps() async -> Bool { false }
+    func setSpokenFollowUps(_ enabled: Bool) async {}
+    func bridgeBaseURL() async -> String? { storedBaseURL }
+    func setBridgeBaseURL(_ value: String?) async { storedBaseURL = value }
+    func bridgeToken() async -> String? { storedToken }
+    func setBridgeToken(_ value: String?) async { storedToken = value }
+    func bridgeProfiles() async -> [BridgeProfile] { storedProfiles }
+    func setBridgeProfiles(_ profiles: [BridgeProfile]) async { storedProfiles = profiles }
+}

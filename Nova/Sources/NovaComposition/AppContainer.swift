@@ -558,7 +558,11 @@ public final class AppContainer {
                 await session.isRegistered()
             }
         )
-        let settingsVM = SettingsViewModel(store: settingsStore, bridge: bridge)
+        let settingsVM = SettingsViewModel(
+            store: settingsStore,
+            bridge: bridge,
+            bridgeDiscovery: LANBridgeDiscovery()
+        )
         settingsVM.realtimeUsesBridge = usesBridgeRealtime
         self.settingsVM = settingsVM
         // Starting a recording ensures the mic loop is live (no-op if already

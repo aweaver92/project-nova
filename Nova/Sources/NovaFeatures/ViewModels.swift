@@ -673,6 +673,7 @@ public final class SettingsViewModel {
     public var codingWorkingDirectory: String = ""
     public private(set) var bridgeStatus: String = ""
     public private(set) var bridgeChecking = false
+    public private(set) var bridgeScanning = false
     /// Saved bridge endpoints (Home LAN, VPN, …) for one-tap switching.
     public private(set) var bridgeProfiles: [BridgeProfile] = []
     public private(set) var openaiConfigured: Bool?
@@ -685,10 +686,16 @@ public final class SettingsViewModel {
 
     private let store: any SettingsStoring
     private let bridge: any AgentBridging
+    private let bridgeDiscovery: any BridgeDiscovering
 
-    public init(store: any SettingsStoring, bridge: any AgentBridging) {
+    public init(
+        store: any SettingsStoring,
+        bridge: any AgentBridging,
+        bridgeDiscovery: any BridgeDiscovering = UnavailableBridgeDiscovery()
+    ) {
         self.store = store
         self.bridge = bridge
+        self.bridgeDiscovery = bridgeDiscovery
     }
 
     /// True when Listen will fail because bridge Realtime minting lacks OPENAI_API_KEY.
@@ -753,6 +760,52 @@ public final class SettingsViewModel {
     public func deleteBridgeProfile(_ profile: BridgeProfile) async {
         bridgeProfiles.removeAll { $0.id == profile.id }
         await store.setBridgeProfiles(bridgeProfiles)
+        bridgeStatus = "Removed profile \"\(profile.name)\"."
+    }
+
+    public func renameBridgeProfile(_ profile: BridgeProfile, to name: String) async {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty,
+              !bridgeProfiles.contains(where: {
+                  $0.id != profile.id &&
+                  $0.name.caseInsensitiveCompare(trimmedName) == .orderedSame
+              }),
+              let index = bridgeProfiles.firstIndex(where: { $0.id == profile.id })
+        else {
+            bridgeStatus = "Profile names must be unique and cannot be empty."
+            return
+        }
+
+        bridgeProfiles[index].name = trimmedName
+        bridgeProfiles.sort {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        await store.setBridgeProfiles(bridgeProfiles)
+        bridgeStatus = "Renamed profile to \"\(trimmedName)\"."
+    }
+
+    /// Find a validated Nova Bridge on the current Wi-Fi network and use it.
+    /// If a saved profile is currently selected, keep it useful by updating its URL.
+    public func scanForLocalBridge() async {
+        guard !bridgeScanning, !bridgeChecking else { return }
+        let selectedProfileID = activeBridgeProfileID
+        bridgeScanning = true
+        bridgeStatus = "Scanning the local Wi-Fi network for Nova Bridge…"
+        defer { bridgeScanning = false }
+
+        guard let discoveredURL = await bridgeDiscovery.discoverBridgeURL() else {
+            bridgeStatus = "No Nova Bridge found. Make sure the phone and computer are on the same Wi-Fi and the bridge is running."
+            return
+        }
+
+        bridgeBaseURL = discoveredURL
+        if let selectedProfileID,
+           let index = bridgeProfiles.firstIndex(where: { $0.id == selectedProfileID })
+        {
+            bridgeProfiles[index].baseURL = discoveredURL
+            await store.setBridgeProfiles(bridgeProfiles)
+        }
+        await saveBridge()
     }
 
     public func setCodingAutoOpenPreview(_ enabled: Bool) async {

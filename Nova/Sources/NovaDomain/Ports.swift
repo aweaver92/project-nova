@@ -915,6 +915,18 @@ public struct CodingStreamEvent: Sendable, Equatable, Codable {
     }
 }
 
+/// Finds a Nova Bridge on the phone's current local network.
+public protocol BridgeDiscovering: Sendable {
+    /// Returns a validated base URL such as `http://192.168.0.107:8787`.
+    func discoverBridgeURL() async -> String?
+}
+
+/// Default used by previews/tests or platforms without LAN discovery.
+public struct UnavailableBridgeDiscovery: BridgeDiscovering {
+    public init() {}
+    public func discoverBridgeURL() async -> String? { nil }
+}
+
 /// Bridge to the user's dev machine: runs Claude Code and pushes commands to
 /// active Cursor sessions. Backed by a small "Nova Bridge" HTTP service the user
 /// runs locally; unconfigured instances return a clear, actionable message.

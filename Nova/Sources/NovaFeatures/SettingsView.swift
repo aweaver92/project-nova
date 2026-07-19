@@ -10,8 +10,8 @@ public struct SettingsView: View {
     @Bindable var settings: SettingsViewModel
     @Bindable var conversation: ConversationViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var showSaveBridgeProfile = false
-    @State private var newBridgeProfileName = ""
+    @State private var bridgeProfileEditor: BridgeProfileEditor?
+    @State private var bridgeProfileName = ""
 
     public init(settings: SettingsViewModel, conversation: ConversationViewModel) {
         self.settings = settings
@@ -85,6 +85,18 @@ public struct SettingsView: View {
                         .keyboardType(.URL)
                     SecureField("Bridge token", text: $settings.bridgeToken)
                     Button {
+                        Task { await settings.scanForLocalBridge() }
+                    } label: {
+                        HStack {
+                            Label("Find bridge on local network", systemImage: "wifi")
+                            if settings.bridgeScanning {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(settings.bridgeScanning || settings.bridgeChecking)
+                    Button {
                         Task { await settings.saveBridge() }
                     } label: {
                         HStack {
@@ -103,38 +115,66 @@ public struct SettingsView: View {
                     }
 
                     ForEach(settings.bridgeProfiles) { profile in
-                        Button {
-                            Task { await settings.applyBridgeProfile(profile) }
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: settings.activeBridgeProfileID == profile.id
-                                    ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(settings.activeBridgeProfileID == profile.id ? .green : .secondary)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(profile.name)
-                                    Text(profile.baseURL)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
+                        HStack(spacing: 10) {
+                            Button {
+                                Task { await settings.applyBridgeProfile(profile) }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: settings.activeBridgeProfileID == profile.id
+                                        ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(settings.activeBridgeProfileID == profile.id ? .green : .secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(profile.name)
+                                        Text(profile.baseURL)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
                                 }
-                                Spacer()
+                                .contentShape(Rectangle())
                             }
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .disabled(settings.bridgeChecking || settings.bridgeScanning)
+
+                            Menu {
+                                Button {
+                                    bridgeProfileName = profile.name
+                                    bridgeProfileEditor = .rename(profile)
+                                } label: {
+                                    Label("Rename", systemImage: "pencil")
+                                }
+                                Button(role: .destructive) {
+                                    Task { await settings.deleteBridgeProfile(profile) }
+                                } label: {
+                                    Label("Remove", systemImage: "trash")
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 8)
+                            }
+                            .accessibilityLabel("Manage \(profile.name) profile")
                         }
-                        .buttonStyle(.plain)
-                        .disabled(settings.bridgeChecking)
                         .swipeActions(edge: .trailing) {
                             Button(role: .destructive) {
                                 Task { await settings.deleteBridgeProfile(profile) }
                             } label: {
-                                Label("Delete", systemImage: "trash")
+                                Label("Remove", systemImage: "trash")
                             }
+                            Button {
+                                bridgeProfileName = profile.name
+                                bridgeProfileEditor = .rename(profile)
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                            .tint(.blue)
                         }
                     }
 
                     Button {
-                        newBridgeProfileName = ""
-                        showSaveBridgeProfile = true
+                        bridgeProfileName = ""
+                        bridgeProfileEditor = .save
                     } label: {
                         Label("Save current as profile…", systemImage: "plus.circle")
                     }
@@ -241,18 +281,25 @@ public struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .alert("Save bridge profile", isPresented: $showSaveBridgeProfile) {
-                TextField("Name (e.g. Home, VPN)", text: $newBridgeProfileName)
+            .alert("Bridge profile", item: $bridgeProfileEditor) { editor in
+                TextField("Name (e.g. Home, VPN)", text: $bridgeProfileName)
                     .textInputAutocapitalization(.words)
-                Button("Save") {
-                    let name = newBridgeProfileName
-                    newBridgeProfileName = ""
-                    Task { await settings.saveBridgeProfile(name: name) }
+                Button(editor.actionTitle) {
+                    let name = bridgeProfileName
+                    bridgeProfileName = ""
+                    Task {
+                        switch editor {
+                        case .save:
+                            await settings.saveBridgeProfile(name: name)
+                        case .rename(let profile):
+                            await settings.renameBridgeProfile(profile, to: name)
+                        }
+                    }
                 }
-                .disabled(newBridgeProfileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("Cancel", role: .cancel) { newBridgeProfileName = "" }
-            } message: {
-                Text("Saves the current bridge URL and token so you can switch between them with one tap.")
+                .disabled(bridgeProfileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Cancel", role: .cancel) { bridgeProfileName = "" }
+            } message: { editor in
+                Text(editor.message)
             }
             .task { await settings.load() }
         }
@@ -263,6 +310,34 @@ public struct SettingsView: View {
         case "Pass": return .green
         case "Fail": return .red
         default: return .secondary
+        }
+    }
+}
+
+private enum BridgeProfileEditor: Identifiable {
+    case save
+    case rename(BridgeProfile)
+
+    var id: String {
+        switch self {
+        case .save: return "save"
+        case .rename(let profile): return "rename-\(profile.id)"
+        }
+    }
+
+    var actionTitle: String {
+        switch self {
+        case .save: return "Save"
+        case .rename: return "Rename"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .save:
+            return "Saves the current bridge URL and token for one-tap switching."
+        case .rename:
+            return "Enter a new name for this saved connection."
         }
     }
 }
