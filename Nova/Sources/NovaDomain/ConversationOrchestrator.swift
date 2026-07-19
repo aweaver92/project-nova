@@ -425,25 +425,26 @@ public actor ConversationOrchestrator {
         // Reconnect so the voice/instructions actually change (voice is fixed for
         // the life of a Realtime connection).
         if streaming {
-            // Cut any in-flight specialist audio before tearing the graph down so
-            // the user doesn't hear a clipped overlap across the handoff.
-            await egress.flush()
-            // Do not cancel toolTask here — voice handoffs run inside switch_agent's
-            // tool Task; cancelling it aborts connect() with CancellationError and
-            // leaves Listen stuck on "Minting Realtime token…".
-            await teardownStreaming(cancelToolTask: false)
-            do {
-                try await beginStreaming(sessionConfig)
-            } catch is CancellationError {
-                NovaLog.session.info("Agent switch reconnect cancelled — restoring session")
-                await restoreSessionUnlocked()
-                return
-            } catch {
-                NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
-                // Don't leave a dead session (mic stopped, no transcripts): fall
-                // back to a healthy state so the user can keep talking / recover.
-                await restoreSessionUnlocked()
-                return
+            // Reconnect ONLY the Realtime session for the new voice/persona and
+            // keep the mic + playback engines running. Restarting Core Audio here
+            // raced the greeting's playback route change and stalled the mic after
+            // ~20 chunks. Fall back to a full re-engage only if the light path fails.
+            let reconnected = await reconnectAIForActiveAgent()
+            if !reconnected {
+                await teardownStreaming(cancelToolTask: false)
+                do {
+                    try await beginStreaming(sessionConfig)
+                } catch is CancellationError {
+                    NovaLog.session.info("Agent switch reconnect cancelled — restoring session")
+                    await restoreSessionUnlocked()
+                    return
+                } catch {
+                    NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
+                    // Don't leave a dead session (mic stopped, no transcripts): fall
+                    // back to a healthy state so the user can keep talking / recover.
+                    await restoreSessionUnlocked()
+                    return
+                }
             }
         } else {
             // Not currently streaming (e.g. UI toggle while idle): selection is
@@ -616,12 +617,10 @@ public actor ConversationOrchestrator {
 
     // MARK: - Streaming (engaged state)
 
-    private func beginStreaming(_ config: AISessionConfig) async throws {
-        guard !streaming else { return }
-        streamGeneration &+= 1
-        let gen = streamGeneration
-        publishListenHealth(phase: .connecting, detail: "Preparing agent context…")
-        // Prime the session with durable facts + recent memory for continuity.
+    /// Compose the effective session config for the active agent: persona voice +
+    /// front-loaded instructions + durable/recent memory + workspace context +
+    /// tool allowlist. `gen` is used to bail out if the stream is superseded.
+    private func buildEffectiveConfig(base config: AISessionConfig, gen: Int) async throws -> AISessionConfig {
         var effective = config
         // Active-agent persona + voice: the persona is front-loaded ahead of the
         // base rules, and the voice determines who the user hears.
@@ -681,6 +680,53 @@ public actor ConversationOrchestrator {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
             guard gen == streamGeneration, isRunning else { throw CancellationError() }
         }
+        return effective
+    }
+
+    /// Reconnect only the Realtime session (new voice + persona) while leaving the
+    /// mic ingress and playback engines running. Used for agent switching: tearing
+    /// down and restarting Core Audio raced the greeting's playback route change
+    /// and stalled the mic after ~20 chunks. Returns false if not currently
+    /// streaming (caller should fall back to a full engage).
+    private func reconnectAIForActiveAgent() async -> Bool {
+        guard streaming else { return false }
+        // Keep the SAME generation so the running ingress pump keeps forwarding to
+        // the reconnected socket (bumping it would stop the pump = mic "stall").
+        let gen = streamGeneration
+        do {
+            let effective = try await buildEffectiveConfig(base: sessionConfig, gen: gen)
+            await egress.flush()
+            await ai.disconnect()
+            publishListenHealth(phase: .connecting, detail: "Switching voice — reconnecting Realtime…")
+            try await ai.connect(config: effective)
+            guard gen == streamGeneration, isRunning else {
+                await ai.disconnect()
+                return true
+            }
+            // Fresh turn state for the new session; leave mic/egress untouched.
+            assistantSpeaking = false
+            clientVAD.reset()
+            pendingClientCommit = false
+            outboundRing = Data()
+            lastActivity = .now
+            publishListenHealth(phase: .waitingForSpeech, detail: "Switched agent — speak or type.")
+            return true
+        } catch is CancellationError {
+            return true
+        } catch {
+            NovaLog.session.error("Agent-switch AI reconnect failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    private func beginStreaming(_ config: AISessionConfig) async throws {
+        guard !streaming else { return }
+        streamGeneration &+= 1
+        let gen = streamGeneration
+        publishListenHealth(phase: .connecting, detail: "Preparing agent context…")
+        let effective = try await buildEffectiveConfig(base: config, gen: gen)
+        let scopeId = await memoryScopeId()
+        guard gen == streamGeneration, isRunning else { throw CancellationError() }
         // Cloud first so text chat can work even when mic permission/HFP stalls.
         publishListenHealth(phase: .connecting, detail: "Minting Realtime token / opening WebSocket…")
         try await ai.connect(config: effective)

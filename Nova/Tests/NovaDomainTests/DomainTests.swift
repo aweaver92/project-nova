@@ -276,6 +276,50 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testAgentSwitchReconnectsAIWithoutRestartingMic() async throws {
+        // Regression: switching agents must reconnect the Realtime session for the
+        // new voice WITHOUT stopping/restarting the mic ingress. Restarting Core
+        // Audio raced the greeting playback route change and stalled the mic.
+        let provider = MockProvider()
+        let ingress = CountingIngress()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        _ = await waitUntil { await provider.connectCount == 1 }
+        _ = await waitUntil { await ingress.startCount == 1 }
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let switched = await waitUntil { await provider.lastVoice == "cedar" }
+        XCTAssertTrue(switched)
+
+        // AI reconnected (disconnect + fresh connect) for the new voice…
+        let reconnected = await waitUntil { await provider.connectCount >= 2 }
+        XCTAssertTrue(reconnected)
+        let disconnects = await provider.disconnectCount
+        XCTAssertGreaterThanOrEqual(disconnects, 1)
+
+        // …but the mic engine was NEVER torn down / restarted.
+        let starts = await ingress.startCount
+        let stops = await ingress.stopCount
+        XCTAssertEqual(starts, 1, "mic ingress must not restart on agent switch")
+        XCTAssertEqual(stops, 0, "mic ingress must not stop on agent switch")
+
+        await orch.stop()
+    }
+
     func testGraceWindowDisabledRequiresWakeWordEveryTurn() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
@@ -704,6 +748,16 @@ private struct MockIngress: AudioIngress {
     var chunks: AsyncStream<AudioChunk> { AsyncStream { $0.finish() } }
     func start() async throws {}
     func stop() async {}
+}
+
+/// Ingress that counts start/stop so tests can assert the mic engine is not
+/// torn down and restarted on an agent switch (which stalled Core Audio).
+private actor CountingIngress: AudioIngress {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    nonisolated var chunks: AsyncStream<AudioChunk> { AsyncStream { $0.finish() } }
+    func start() async throws { startCount += 1 }
+    func stop() async { stopCount += 1 }
 }
 
 private final class MockWakeWordListener: WakeWordListening, @unchecked Sendable {
