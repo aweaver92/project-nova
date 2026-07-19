@@ -66,34 +66,112 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
-        // The action id makes every retry idempotent on the bridge: if the phone
-        // loses HTTP mid-edit, the same Claude process is awaited instead of
-        // spawning a second process with the same prompt.
+        // Detach on the bridge so Claude keeps running after the phone locks.
+        // The action id makes every retry/poll idempotent (one process per id).
+        let actionId = UUID().uuidString
         var body: [String: Any] = [
             "prompt": prompt,
-            "actionId": UUID().uuidString,
+            "actionId": actionId,
+            "detach": true,
         ]
         if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
-        // Legacy cwd is only sent when no repoId is available (bridge validates containment).
         if repoId == nil || repoId?.isEmpty == true,
            let workingDirectory, !workingDirectory.isEmpty
         {
             body["cwd"] = workingDirectory
         }
+
+        PendingClaudeJobStore.save(
+            PendingClaudeJob(actionId: actionId, prompt: prompt, repoId: repoId, workingDirectory: workingDirectory)
+        )
+        let bg = await BackgroundTask.begin(name: "nova.claude-code")
+        defer { Task { await BackgroundTask.end(bg) } }
+
+        var start = BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"not_started"}"#)
         while !Task.isCancelled {
-            let result = await post(path: "claude-code", body: body, timeout: 600)
-            guard Self.isRetryableConnectionFailure(result) else { return result }
+            start = await post(path: "claude-code", body: body, timeout: 60)
+            if !Self.isRetryableConnectionFailure(start) { break }
             let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+            do { try await Task.sleep(nanoseconds: nanos) } catch { break }
+        }
+
+        if Self.isTerminalClaudePayload(start.payloadJSON) {
+            PendingClaudeJobStore.clear(actionId: actionId)
+            return start
+        }
+        if Self.isRetryableConnectionFailure(start) || (!start.ok && !Self.isRunningClaudePayload(start.payloadJSON)) {
+            // Keep pending so unlock can resume; return the transport error now.
+            return start
+        }
+
+        return await pollClaudeJob(actionId: actionId)
+    }
+
+    /// Resume a Claude job after the app returns to the foreground (phone unlock).
+    public func resumePendingClaudeCode() async -> BridgeResult? {
+        guard let pending = PendingClaudeJobStore.load() else { return nil }
+        let status = await send(
+            path: "claude-code/\(pending.actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? pending.actionId)",
+            method: "GET",
+            body: nil,
+            timeout: 30
+        )
+        if Self.isRunningClaudePayload(status.payloadJSON) || Self.isRetryableConnectionFailure(status) {
+            return await pollClaudeJob(actionId: pending.actionId)
+        }
+        if Self.isTerminalClaudePayload(status.payloadJSON) || status.ok {
+            PendingClaudeJobStore.clear(actionId: pending.actionId)
+            return status
+        }
+        // Unknown/404 — clear stale pending so we do not loop forever.
+        if status.payloadJSON.contains("action_not_found") {
+            PendingClaudeJobStore.clear(actionId: pending.actionId)
+        }
+        return status
+    }
+
+    private func pollClaudeJob(actionId: String) async -> BridgeResult {
+        let escaped = actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? actionId
+        while !Task.isCancelled {
+            let status = await send(
+                path: "claude-code/\(escaped)",
+                method: "GET",
+                body: nil,
+                timeout: 30
+            )
+            if Self.isTerminalClaudePayload(status.payloadJSON) {
+                PendingClaudeJobStore.clear(actionId: actionId)
+                return status
+            }
+            if status.payloadJSON.contains("action_not_found") {
+                PendingClaudeJobStore.clear(actionId: actionId)
+                return status
+            }
+            // Still running or transient network — wait and retry.
             do {
-                try await Task.sleep(nanoseconds: nanos)
+                try await Task.sleep(nanoseconds: 2_000_000_000)
             } catch {
                 break
             }
         }
         return BridgeResult(
             ok: false,
-            payloadJSON: #"{"ok":false,"error":"cancelled","hint":"Claude Code reconnect was cancelled."}"#
+            payloadJSON: #"{"ok":false,"status":"running","error":"claude_poll_interrupted","hint":"Claude keeps running on the bridge; unlock the phone to fetch the result."}"#
         )
+    }
+
+    private static func isRunningClaudePayload(_ json: String) -> Bool {
+        json.contains("\"status\":\"running\"")
+    }
+
+    private static func isTerminalClaudePayload(_ json: String) -> Bool {
+        if json.contains("\"status\":\"running\"") { return false }
+        // Done payloads include result/error/exitCode; legacy responses omit status.
+        return json.contains("\"status\":\"done\"")
+            || json.contains("\"result\"")
+            || json.contains("\"exitCode\"")
+            || (json.contains("\"ok\":true") && !json.contains("\"status\":\"running\""))
+            || (json.contains("\"ok\":false") && (json.contains("\"error\"") || json.contains("\"stderr\"")))
     }
 
     public func pushToCursor(

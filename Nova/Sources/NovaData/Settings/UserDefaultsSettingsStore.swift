@@ -101,7 +101,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func followUpSuggestionsEnabled() async -> Bool {
-        bool(forKey: Keys.followUpSuggestionsEnabled, default: true)
+        bool(forKey: Keys.followUpSuggestionsEnabled, default: false)
     }
 
     public func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {
@@ -109,7 +109,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func webSearchEnabled() async -> Bool {
-        bool(forKey: Keys.webSearchEnabled, default: true)
+        bool(forKey: Keys.webSearchEnabled, default: false)
     }
 
     public func setWebSearchEnabled(_ enabled: Bool) async {
@@ -117,7 +117,10 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func useLocalWakeWord() async -> Bool {
-        defaults.bool(forKey: Keys.useLocalWakeWord)
+        // Default ON for new installs: delays Realtime connect until "Nova" is
+        // heard locally (big API spend saver). Explicit Listen still forces cloud on.
+        if defaults.object(forKey: Keys.useLocalWakeWord) == nil { return true }
+        return defaults.bool(forKey: Keys.useLocalWakeWord)
     }
 
     public func setUseLocalWakeWord(_ enabled: Bool) async {
@@ -133,7 +136,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
     }
 
     public func meetingCloudProcessingEnabled() async -> Bool {
-        bool(forKey: Keys.meetingCloudProcessingEnabled, default: true)
+        bool(forKey: Keys.meetingCloudProcessingEnabled, default: false)
     }
 
     public func setMeetingCloudProcessingEnabled(_ enabled: Bool) async {

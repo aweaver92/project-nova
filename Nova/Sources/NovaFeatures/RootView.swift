@@ -40,6 +40,7 @@ public struct RootView: View {
     @State private var showRealtimeWarning = false
     @State private var draftMessage = ""
     @State private var isSendingText = false
+    @Environment(\.scenePhase) private var scenePhase
 
     public init(
         session: SessionViewModel,
@@ -249,6 +250,10 @@ public struct RootView: View {
                 await study.load()
                 await settings.load()
                 await startListeningIfReady()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                Task { await coding.resumePendingClaudeIfNeeded() }
             }
         }
     }

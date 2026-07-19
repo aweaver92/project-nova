@@ -31,7 +31,7 @@ public struct WebSearchTool: Tool {
 
     public init(
         apiKey: String? = OpenAICredentials.apiKey(),
-        model: String = "gpt-4.1",
+        model: String = "gpt-4.1-mini",
         endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
         session: URLSession = .shared,
         isEnabled: @escaping @Sendable () async -> Bool = { true },

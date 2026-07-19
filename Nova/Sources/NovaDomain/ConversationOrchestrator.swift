@@ -131,6 +131,11 @@ public actor ConversationOrchestrator {
     /// Local energy VAD — primary turn detector (`turn_detection` is null).
     private var clientVAD = ClientEnergyVAD()
     private var pendingClientCommit = false
+    /// True after local VAD commit+createResponse until responseStarted or timeout retry.
+    private var awaitingReplyAfterCommit = false
+    private var lastClientCommitAt: ContinuousClock.Instant?
+    private var didRetryCreateResponseAfterCommit = false
+    private var lastOutputAudioAt: ContinuousClock.Instant?
     /// How many client-driven commits we've sent this stream (for cloud-quiet diag).
     private var clientCommitAttempts = 0
     /// One forced commit after VAD never fired, before raising cloud-quiet.
@@ -723,6 +728,10 @@ public actor ConversationOrchestrator {
             assistantSpeaking = false
             clientVAD.reset()
             pendingClientCommit = false
+            awaitingReplyAfterCommit = false
+            didRetryCreateResponseAfterCommit = false
+            lastClientCommitAt = nil
+            lastOutputAudioAt = nil
             clientCommitAttempts = 0
             didForceCommitOnCloudQuiet = false
             didAnnounceCloudQuiet = false
@@ -766,6 +775,10 @@ public actor ConversationOrchestrator {
         outboundZcrHeard = 0
         clientVAD.reset()
         pendingClientCommit = false
+        awaitingReplyAfterCommit = false
+        didRetryCreateResponseAfterCommit = false
+        lastClientCommitAt = nil
+        lastOutputAudioAt = nil
         clientCommitAttempts = 0
         didForceCommitOnCloudQuiet = false
         lastOutboundPeak = 0
@@ -1019,16 +1032,52 @@ public actor ConversationOrchestrator {
 
         let now = ContinuousClock.Instant.now
         if assistantSpeaking {
-            // Barge-in is driven from the per-chunk ingress path (accurate mic
-            // energy). The health poll only reports state so it cannot false-fire
-            // on a stale level and cut Nova off.
-            publishListenHealth(
-                phase: .speaking,
-                micLevel: liveLevel,
-                inputRoute: route,
-                detail: "Playing assistant audio — speak to interrupt"
+            // Stuck-speaking watchdog: if we never got audio (or audio stalled)
+            // after response.created, unlock so the next utterance can commit.
+            if let started = lastClientCommitAt ?? lastOutputAudioAt {
+                let silentFor = lastOutputAudioAt.map { now - $0 } ?? (now - started)
+                if silentFor > .seconds(12) {
+                    NovaLog.session.info("Clearing stuck assistantSpeaking after \(silentFor)")
+                    onTranscript?(
+                        "[diag] Cleared stuck Nova-speaking state — try talking again",
+                        .system
+                    )
+                    assistantSpeaking = false
+                    awaitingReplyAfterCommit = false
+                    clientVAD.unlockForRetry()
+                } else {
+                    publishListenHealth(
+                        phase: .speaking,
+                        micLevel: liveLevel,
+                        inputRoute: route,
+                        detail: "Playing assistant audio — speak to interrupt"
+                    )
+                    return
+                }
+            } else {
+                publishListenHealth(
+                    phase: .speaking,
+                    micLevel: liveLevel,
+                    inputRoute: route,
+                    detail: "Playing assistant audio — speak to interrupt"
+                )
+                return
+            }
+        }
+
+        // Listen: if we committed and got no responseStarted, retry createResponse once.
+        if awaitingReplyAfterCommit,
+           !didRetryCreateResponseAfterCommit,
+           let lastClientCommitAt,
+           now - lastClientCommitAt > .seconds(2.5)
+        {
+            didRetryCreateResponseAfterCommit = true
+            NovaLog.session.info("Retrying response.create after commit with no responseStarted")
+            onTranscript?(
+                "[diag] No reply yet after commit — retrying response.create",
+                .system
             )
-            return
+            await ai.createResponse()
         }
 
         if micChunksSent == 0 || lastChunkAt == nil {
@@ -1295,6 +1344,9 @@ public actor ConversationOrchestrator {
         )
         await ai.commitInputAudio()
         await ai.createResponse()
+        awaitingReplyAfterCommit = true
+        lastClientCommitAt = .now
+        didRetryCreateResponseAfterCommit = false
         if let audioDiagnose, !clip.isEmpty {
             let meta = [
                 "build": NovaBuildStamp.id,
@@ -1454,6 +1506,7 @@ public actor ConversationOrchestrator {
             outputTranscript += delta
             onTranscript?(delta, .assistant)
         case .outputAudio(let pcm24):
+            lastOutputAudioAt = .now
             let t0 = ContinuousClock.Instant.now
             // Play the assistant voice at its native 24 kHz. Downsampling to 8 kHz
             // here needlessly crushed it to narrowband before the (already
@@ -1463,6 +1516,9 @@ public actor ConversationOrchestrator {
             metrics.mark(.audioToSpeaker, startedAt: t0)
         case .responseStarted:
             assistantSpeaking = true
+            awaitingReplyAfterCommit = false
+            didRetryCreateResponseAfterCommit = false
+            lastOutputAudioAt = .now
             outputTranscript = ""
             // Don't carry a mid-reply energy commit into the next listen window.
             pendingClientCommit = false
@@ -1470,6 +1526,7 @@ public actor ConversationOrchestrator {
             resetClientTurnAudio()
         case .responseEnded:
             assistantSpeaking = false
+            awaitingReplyAfterCommit = false
             clientVAD.acknowledgeTurnFinished()
             // Keep pendingClientCommit: speech segmented during playback should
             // flush on the next health tick / ingress commit once we are listening.
@@ -1672,7 +1729,20 @@ public actor ConversationOrchestrator {
 
         // Wake-word reply gating only — Listen sets requireWakeWord=false so the
         // model answers every turn; handoffs above still run.
-        guard sessionConfig.requireWakeWord else { return }
+        guard sessionConfig.requireWakeWord else {
+            // Safety net: commit-time createResponse can fail silently (WS drop /
+            // race). Only retry while we are still awaiting a reply after a commit.
+            if !assistantSpeaking, awaitingReplyAfterCommit, !didRetryCreateResponseAfterCommit {
+                didRetryCreateResponseAfterCommit = true
+                NovaLog.session.info("Listen transcript safety-net response.create")
+                onTranscript?(
+                    "[diag] Transcript received — ensuring response.create",
+                    .system
+                )
+                await ai.createResponse()
+            }
+            return
+        }
 
         // 2) Strict pass: did the utterance actually contain the active wake word?
         let strict = detector.detect(trimmed)

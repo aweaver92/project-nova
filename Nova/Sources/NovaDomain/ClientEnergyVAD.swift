@@ -11,25 +11,25 @@ public struct ClientEnergyVAD: Sendable, Equatable {
     }
 
     /// Minimum time speech must stay "active" before a commit is allowed.
-    public var minSpeech: Duration = .milliseconds(700)
+    public var minSpeech: Duration = .milliseconds(550)
     /// How long peak must stay low to count as end-of-speech.
-    public var endSilence: Duration = .milliseconds(650)
+    public var endSilence: Duration = .milliseconds(600)
     /// Force a commit after this much continuous speech even without silence
     /// (noise floor in the peak hysteresis band can otherwise block forever).
-    public var maxSpeech: Duration = .seconds(4)
+    public var maxSpeech: Duration = .seconds(3.5)
     /// Cooldown after a commit before another is allowed (prevents lockups /
     /// double-commits when the server never ACKs the previous turn).
-    public var commitCooldown: Duration = .milliseconds(2000)
+    public var commitCooldown: Duration = .milliseconds(1800)
     /// Minimum outbound ring size (~0.35 s @ 24 kHz mono PCM16).
     public var minRingBytes: Int = 24_000 * 2 / 3
-    /// Peak gate — raised so rustles / AC / distant taps do not start a turn.
-    public var speechPeak: Float = 0.10
+    /// Peak gate — high enough to ignore rustles, low enough for near-field HFP.
+    public var speechPeak: Float = 0.08
     /// Sustained energy gate — spikes can hit speechPeak with near-zero RMS.
-    public var speechRms: Float = 0.035
-    public var speechZcr: Float = 0.02
+    public var speechRms: Float = 0.028
+    public var speechZcr: Float = 0.015
     /// Reject hiss / static (near-Nyquist zero crossings) that is not speech.
     public var maxSpeechZcr: Float = 0.35
-    public var quietPeak: Float = 0.04
+    public var quietPeak: Float = 0.035
 
     public private(set) var speechActive = false
     public private(set) var speechStartedAt: ContinuousClock.Instant?

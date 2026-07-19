@@ -50,7 +50,7 @@ public struct SettingsView: View {
                 } header: {
                     Text("Cost & privacy")
                 } footer: {
-                    Text("Disabling follow-ups or web search avoids paid API calls. Local wake word is for idle always-on mode; tapping Listen or sending a text chat still opens Realtime immediately.")
+                    Text("Defaults favor lower spend: follow-ups, web search, and meeting cloud off; local wake word on for idle mode. Tapping Listen or sending a text chat still opens Realtime immediately. ChatGPT Plus does not cover these API calls — they bill your OpenAI API key.")
                 }
 
                 Section {

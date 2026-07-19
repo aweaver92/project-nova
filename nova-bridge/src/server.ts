@@ -19,7 +19,8 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  * Nova Bridge — implements the wire contract the Nova iOS app's `NovaBridgeClient`
  * expects (all JSON, bearer-authenticated):
  *   POST /realtime/token           { model? }               → { value, expires_at }
- *   POST /claude-code              { prompt, repoId?, cwd? }
+ *   POST /claude-code              { prompt, repoId?, cwd?, actionId?, detach? }
+ *   GET  /claude-code/:actionId    → { status: running|done, ... }
  *   POST /cursor/command           { command, sessionId?, repoId? }
  *   POST /cursor/runs              { command, sessionId?, repoId? }  → SSE stream
  *   POST /cursor/runs/:runId/cancel
@@ -579,7 +580,12 @@ type ClaudeJobResult = {
   stderr?: string;
   error?: string;
 };
-const claudeJobs = new Map<string, Promise<ClaudeJobResult>>();
+type ClaudeJobEntry = {
+  startedAt: number;
+  promise: Promise<ClaudeJobResult>;
+  result?: ClaudeJobResult;
+};
+const claudeJobs = new Map<string, ClaudeJobEntry>();
 const CLAUDE_JOB_TTL_MS = 30 * 60_000;
 
 app.post("/claude-code", requireAuth, async (req, res) => {
@@ -587,6 +593,7 @@ app.post("/claude-code", requireAuth, async (req, res) => {
   const suppliedActionId = String(req.body?.actionId ?? "").trim();
   const actionId =
     suppliedActionId || `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const detach = req.body?.detach === true || req.query?.detach === "1";
   if (!prompt) {
     res.status(400).json({ ok: false, error: "missing_prompt" });
     return;
@@ -598,9 +605,9 @@ app.post("/claude-code", requireAuth, async (req, res) => {
     sendRepoError(res, err);
     return;
   }
-  let job = claudeJobs.get(actionId);
-  if (!job) {
-    job = runClaude(prompt, cwd)
+  let entry = claudeJobs.get(actionId);
+  if (!entry) {
+    const promise = runClaude(prompt, cwd)
       .then((result): ClaudeJobResult => ({
         ok: result.code === 0,
         exitCode: result.code,
@@ -608,16 +615,62 @@ app.post("/claude-code", requireAuth, async (req, res) => {
         ...(result.stderr.trim() ? { stderr: result.stderr.trim() } : {}),
       }))
       .catch((err): ClaudeJobResult => ({ ok: false, error: describe(err) }));
-    claudeJobs.set(actionId, job);
+    entry = { startedAt: Date.now(), promise };
+    claudeJobs.set(actionId, entry);
+    promise.then((result) => {
+      const current = claudeJobs.get(actionId);
+      if (current) current.result = result;
+    });
     const timer = setTimeout(() => claudeJobs.delete(actionId), CLAUDE_JOB_TTL_MS);
     timer.unref?.();
+  }
+
+  // Detached mode: return immediately so the phone can lock; poll GET for status.
+  // The Claude process keeps running on the bridge either way.
+  if (detach && !entry.result) {
+    res.status(202).json({
+      ok: true,
+      status: "running",
+      actionId,
+      startedAt: entry.startedAt,
+    });
+    return;
   }
 
   // Repeated requests with the same actionId await the original process. This
   // makes phone-side reconnect retries idempotent instead of spawning duplicate
   // Claude Code edits after an HTTP connection loss.
-  const result = await job;
-  res.json({ ...result, actionId });
+  const result = await entry.promise;
+  res.json({ ...result, actionId, status: "done" });
+});
+
+app.get("/claude-code/:actionId", requireAuth, (req, res) => {
+  const actionId = String(req.params.actionId ?? "").trim();
+  if (!actionId) {
+    res.status(400).json({ ok: false, error: "missing_action_id" });
+    return;
+  }
+  const entry = claudeJobs.get(actionId);
+  if (!entry) {
+    res.status(404).json({
+      ok: false,
+      status: "unknown",
+      actionId,
+      error: "action_not_found",
+      hint: "Job expired, bridge restarted, or actionId never started.",
+    });
+    return;
+  }
+  if (!entry.result) {
+    res.json({
+      ok: true,
+      status: "running",
+      actionId,
+      startedAt: entry.startedAt,
+    });
+    return;
+  }
+  res.json({ ...entry.result, actionId, status: "done", startedAt: entry.startedAt });
 });
 
 function runClaude(

@@ -250,15 +250,15 @@ public extension SettingsStoring {
     func setCodingSelectedRepoId(_ value: String?) async {}
     func codingAutoOpenPreview() async -> Bool { false }
     func setCodingAutoOpenPreview(_ enabled: Bool) async {}
-    func followUpSuggestionsEnabled() async -> Bool { true }
+    func followUpSuggestionsEnabled() async -> Bool { false }
     func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {}
-    func webSearchEnabled() async -> Bool { true }
+    func webSearchEnabled() async -> Bool { false }
     func setWebSearchEnabled(_ enabled: Bool) async {}
-    func useLocalWakeWord() async -> Bool { false }
+    func useLocalWakeWord() async -> Bool { true }
     func setUseLocalWakeWord(_ enabled: Bool) async {}
     func visualMemoryEnabled() async -> Bool { true }
     func setVisualMemoryEnabled(_ enabled: Bool) async {}
-    func meetingCloudProcessingEnabled() async -> Bool { true }
+    func meetingCloudProcessingEnabled() async -> Bool { false }
     func setMeetingCloudProcessingEnabled(_ enabled: Bool) async {}
     func voiceRetentionDays() async -> Int { 0 }
     func setVoiceRetentionDays(_ days: Int) async {}
@@ -937,6 +937,8 @@ public protocol AgentBridging: Sendable {
     /// user real feedback instead of failing silently on the first coding task.
     func health() async -> BridgeResult
     func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult
+    /// Reattach to a Claude Code job after unlock/foreground (bridge owns the process).
+    func resumePendingClaudeCode() async -> BridgeResult?
     func pushToCursor(command: String, sessionId: String?, workingDirectory: String?, repoId: String?) async -> BridgeResult
     func listCursorSessions() async -> BridgeResult
     /// Transcript history for a Cursor agent session (`GET /cursor/sessions/:id/messages`).
@@ -1005,6 +1007,7 @@ public extension AgentBridging {
     func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
+    func resumePendingClaudeCode() async -> BridgeResult? { nil }
     func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
         await runClaudeCode(prompt: prompt, workingDirectory: workingDirectory, repoId: nil)
     }

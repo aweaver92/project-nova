@@ -677,11 +677,13 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 sessionUpdateError = message
                 waitingForSessionUpdated = false
             }
-            // Benign under server VAD barge-in: a cancel can race with the response
-            // completing, so the server reports no active response to cancel.
+            // Benign under barge-in: cancel can race with response.done so the
+            // server reports nothing to cancel. Do NOT swallow "already has an
+            // active response" — the orchestrator needs that to unlock/retry.
             let lowered = message.lowercased()
-            if lowered.contains("no active response") || lowered.contains("cancellation failed")
-                || lowered.contains("active response")
+            if lowered.contains("cancellation failed")
+                || lowered.contains("no active response to cancel")
+                || (lowered.contains("no active response") && !lowered.contains("already has"))
             {
                 break
             }

@@ -658,11 +658,11 @@ public final class SkillsViewModel {
 @Observable
 public final class SettingsViewModel {
     public private(set) var spokenFollowUps: Bool = false
-    public private(set) var followUpSuggestionsEnabled: Bool = true
-    public private(set) var webSearchEnabled: Bool = true
-    public private(set) var useLocalWakeWord: Bool = false
+    public private(set) var followUpSuggestionsEnabled: Bool = false
+    public private(set) var webSearchEnabled: Bool = false
+    public private(set) var useLocalWakeWord: Bool = true
     public private(set) var visualMemoryEnabled: Bool = true
-    public private(set) var meetingCloudProcessingEnabled: Bool = true
+    public private(set) var meetingCloudProcessingEnabled: Bool = false
     public private(set) var codingAutoOpenPreview: Bool = false
     public var voiceRetentionDays: Int = 0
     public var videoRetentionDays: Int = 0
@@ -1247,6 +1247,28 @@ public final class CodingViewModel {
         if selectedRepoId != nil {
             await refreshRepoStatusAndDiff()
         }
+        await resumePendingClaudeIfNeeded()
+    }
+
+    /// After unlock/foreground: reattach to a Claude Code job the bridge kept running.
+    public func resumePendingClaudeIfNeeded() async {
+        guard let result = await bridge.resumePendingClaudeCode() else { return }
+        let snippet = String(result.payloadJSON.prefix(240))
+        activitySteps.append(
+            CodingActivityStep(
+                phase: "status",
+                text: result.ok
+                    ? "Claude Code finished after unlock"
+                    : "Claude Code status after unlock",
+                detail: snippet,
+                isDone: true
+            )
+        )
+        if activitySteps.count > 40 {
+            activitySteps.removeFirst(activitySteps.count - 40)
+        }
+        statusMessage = result.ok ? "Claude Code finished (recovered after unlock)" : "Claude Code still running / recovered"
+        await refreshRepoStatusAndDiff()
     }
 
     private func reloadPromptState() async {
