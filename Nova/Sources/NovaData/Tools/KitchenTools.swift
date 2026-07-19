@@ -95,10 +95,10 @@ public struct ScanFridgeTool: Tool {
 
 public struct SaveRecipeTool: Tool {
     public let name = "save_recipe"
-    public let description = "Save or update a recipe with ingredients and step-by-step instructions."
+    public let description = "Save or update a recipe with ingredients and step-by-step instructions. Optionally pass step_timers: an array of seconds aligned with steps (0 = no timer) so cook mode can auto-start each step's countdown."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"recipe_id":{"type":"string"},"title":{"type":"string"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"quantity":{"type":"string"}},"required":["name"]}},"steps":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}},"source_note":{"type":"string"}},"required":["title"],"additionalProperties":false}
+    {"type":"object","properties":{"recipe_id":{"type":"string"},"title":{"type":"string"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"quantity":{"type":"string"}},"required":["name"]}},"steps":{"type":"array","items":{"type":"string"}},"step_timers":{"type":"array","items":{"type":"integer"},"description":"Seconds per step, aligned with steps; 0 for no timer."},"tags":{"type":"array","items":{"type":"string"}},"source_note":{"type":"string"}},"required":["title"],"additionalProperties":false}
     """
     private let store: any RecipeStoring
     public init(store: any RecipeStoring) { self.store = store }
@@ -111,17 +111,20 @@ public struct SaveRecipeTool: Tool {
             let servings: Int?
             let ingredients: [Ing]?
             let steps: [String]?
+            let step_timers: [Int]?
             let tags: [String]?
             let source_note: String?
         }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         let id = args.recipe_id.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let stepTimers = args.step_timers.flatMap { $0.contains(where: { $0 > 0 }) ? $0 : nil }
         let recipe = await store.upsert(Recipe(
             id: id,
             title: args.title,
             servings: args.servings,
             ingredients: (args.ingredients ?? []).map { RecipeIngredient(name: $0.name, quantity: $0.quantity) },
             steps: args.steps ?? [],
+            stepTimerSeconds: stepTimers,
             tags: args.tags ?? [],
             sourceNote: args.source_note
         ))
@@ -190,6 +193,7 @@ public struct GetRecipeTool: Tool {
             "tags": recipe.tags
         ]
         if let servings = recipe.servings { payload["servings"] = servings }
+        if let timers = recipe.stepTimerSeconds { payload["step_timers"] = timers }
         let data = try JSONSerialization.data(withJSONObject: payload)
         return String(decoding: data, as: UTF8.self)
     }
@@ -491,6 +495,10 @@ public struct GetNutritionProfileTool: Tool {
         ]
         if let diet = p.dietStyle { payload["diet_style"] = diet }
         if let notes = p.notes { payload["notes"] = notes }
+        if let c = p.calorieTarget { payload["calorie_target"] = c }
+        if let pr = p.proteinTarget { payload["protein_target"] = pr }
+        if let cb = p.carbTarget { payload["carb_target"] = cb }
+        if let f = p.fatTarget { payload["fat_target"] = f }
         let data = try JSONSerialization.data(withJSONObject: payload)
         return String(decoding: data, as: UTF8.self)
     }
@@ -498,10 +506,10 @@ public struct GetNutritionProfileTool: Tool {
 
 public struct UpdateNutritionProfileTool: Tool {
     public let name = "update_nutrition_profile"
-    public let description = "Update nutrition profile fields. Omitted fields keep prior values; pass arrays to replace allergens/goals/cuisines/staples."
+    public let description = "Update nutrition profile fields. Omitted fields keep prior values; pass arrays to replace allergens/goals/cuisines/staples. Daily macro targets feed the dashboard rings."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"diet_style":{"type":"string"},"allergens":{"type":"array","items":{"type":"string"}},"goals":{"type":"array","items":{"type":"string"}},"preferred_cuisines":{"type":"array","items":{"type":"string"}},"staples":{"type":"array","items":{"type":"string"}},"notes":{"type":"string"}},"additionalProperties":false}
+    {"type":"object","properties":{"diet_style":{"type":"string"},"allergens":{"type":"array","items":{"type":"string"}},"goals":{"type":"array","items":{"type":"string"}},"preferred_cuisines":{"type":"array","items":{"type":"string"}},"staples":{"type":"array","items":{"type":"string"}},"notes":{"type":"string"},"calorie_target":{"type":"number"},"protein_target":{"type":"number"},"carb_target":{"type":"number"},"fat_target":{"type":"number"}},"additionalProperties":false}
     """
     private let store: any NutritionStoring
     public init(store: any NutritionStoring) { self.store = store }
@@ -514,6 +522,10 @@ public struct UpdateNutritionProfileTool: Tool {
             let preferred_cuisines: [String]?
             let staples: [String]?
             let notes: String?
+            let calorie_target: Double?
+            let protein_target: Double?
+            let carb_target: Double?
+            let fat_target: Double?
         }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         var p = await store.profile()
@@ -523,6 +535,10 @@ public struct UpdateNutritionProfileTool: Tool {
         if let c = args.preferred_cuisines { p.preferredCuisines = c }
         if let s = args.staples { p.staples = s }
         if let n = args.notes { p.notes = n }
+        if let ct = args.calorie_target { p.calorieTarget = ct }
+        if let pt = args.protein_target { p.proteinTarget = pt }
+        if let cbt = args.carb_target { p.carbTarget = cbt }
+        if let ft = args.fat_target { p.fatTarget = ft }
         _ = await store.updateProfile(p)
         return #"{"ok":true}"#
     }
@@ -530,20 +546,34 @@ public struct UpdateNutritionProfileTool: Tool {
 
 public struct LogMealTool: Tool {
     public let name = "log_meal"
-    public let description = "Log a light meal description (no calorie tracking)."
+    public let description = "Log a meal with an estimated calorie count and protein/carbs/fat in grams. Estimate the macros yourself from the description or recipe; omit any you truly can't estimate."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"description":{"type":"string"},"recipe_id":{"type":"string"}},"required":["description"],"additionalProperties":false}
+    {"type":"object","properties":{"description":{"type":"string"},"recipe_id":{"type":"string"},"calories":{"type":"number","description":"Estimated total kilocalories."},"protein_grams":{"type":"number"},"carbs_grams":{"type":"number"},"fat_grams":{"type":"number"}},"required":["description"],"additionalProperties":false}
     """
     private let store: any NutritionStoring
     public init(store: any NutritionStoring) { self.store = store }
 
     public func invoke(argumentsJSON: String) async throws -> String {
-        struct Args: Decodable { let description: String; let recipe_id: String? }
+        struct Args: Decodable {
+            let description: String
+            let recipe_id: String?
+            let calories: Double?
+            let protein_grams: Double?
+            let carbs_grams: Double?
+            let fat_grams: Double?
+        }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let nutrition = MealNutrition(
+            calories: args.calories,
+            proteinGrams: args.protein_grams,
+            carbsGrams: args.carbs_grams,
+            fatGrams: args.fat_grams
+        )
         let entry = await store.logMeal(
             description: args.description,
-            recipeId: args.recipe_id.flatMap(UUID.init(uuidString:))
+            recipeId: args.recipe_id.flatMap(UUID.init(uuidString:)),
+            nutrition: nutrition.isEmpty ? nil : nutrition
         )
         return #"{"ok":true,"id":"\#(entry.id.uuidString)"}"#
     }
@@ -563,12 +593,17 @@ public struct RecentMealsTool: Tool {
         struct Args: Decodable { let limit: Int? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(limit: nil)
         let meals = await store.recentMeals(limit: args.limit ?? 8)
-        let payload: [[String: Any]] = meals.map {
-            [
-                "id": $0.id.uuidString,
-                "description": $0.description,
-                "at": ISO8601DateFormatter().string(from: $0.at)
+        let payload: [[String: Any]] = meals.map { meal in
+            var row: [String: Any] = [
+                "id": meal.id.uuidString,
+                "description": meal.description,
+                "at": ISO8601DateFormatter().string(from: meal.at)
             ]
+            if let c = meal.calories { row["calories"] = c }
+            if let p = meal.proteinGrams { row["protein_grams"] = p }
+            if let cb = meal.carbsGrams { row["carbs_grams"] = cb }
+            if let f = meal.fatGrams { row["fat_grams"] = f }
+            return row
         }
         let data = try JSONSerialization.data(withJSONObject: ["ok": true, "meals": payload])
         return String(decoding: data, as: UTF8.self)

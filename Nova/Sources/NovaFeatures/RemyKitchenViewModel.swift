@@ -5,6 +5,33 @@ import Observation
 import UIKit
 #endif
 
+/// Aggregated macros for a day, driving Remy's nutrition rings.
+public struct MacroTotals: Sendable, Equatable {
+    public var calories: Double
+    public var protein: Double
+    public var carbs: Double
+    public var fat: Double
+
+    public init(calories: Double = 0, protein: Double = 0, carbs: Double = 0, fat: Double = 0) {
+        self.calories = calories
+        self.protein = protein
+        self.carbs = carbs
+        self.fat = fat
+    }
+}
+
+/// One day's calorie total for the weekly nutrition trend.
+public struct DailyCaloriePoint: Sendable, Identifiable, Equatable {
+    public var id: Date { day }
+    public let day: Date
+    public let calories: Double
+
+    public init(day: Date, calories: Double) {
+        self.day = day
+        self.calories = calories
+    }
+}
+
 @MainActor
 @Observable
 public final class RemyKitchenViewModel {
@@ -61,6 +88,10 @@ public final class RemyKitchenViewModel {
     public var draftCuisinesText: String = ""
     public var draftDietStyle: String = ""
     public var draftNotes: String = ""
+    public var draftCalorieTarget: String = ""
+    public var draftProteinTarget: String = ""
+    public var draftCarbTarget: String = ""
+    public var draftFatTarget: String = ""
 
     /// True while Kitchen is on-screen (drives polling for voice cook advances).
     public private(set) var isScreenVisible = false
@@ -157,7 +188,7 @@ public final class RemyKitchenViewModel {
         shoppingItems = await shopping.all()
         mealPlan = await meals.currentWeek()
         nutritionProfile = await nutrition.profile()
-        recentMeals = await nutrition.recentMeals(limit: 12)
+        recentMeals = await nutrition.recentMeals(limit: 60)
         lastScan = await nutrition.lastFridgeScan()
         syncProfileDrafts()
     }
@@ -191,6 +222,10 @@ public final class RemyKitchenViewModel {
             draftAllergensText = nutritionProfile.allergens.joined(separator: ", ")
             draftGoalsText = nutritionProfile.goals.joined(separator: ", ")
             draftCuisinesText = nutritionProfile.preferredCuisines.joined(separator: ", ")
+            draftCalorieTarget = Self.targetString(nutritionProfile.calorieTarget)
+            draftProteinTarget = Self.targetString(nutritionProfile.proteinTarget)
+            draftCarbTarget = Self.targetString(nutritionProfile.carbTarget)
+            draftFatTarget = Self.targetString(nutritionProfile.fatTarget)
             lastSyncedNutritionProfile = nutritionProfile
             return
         }
@@ -213,6 +248,18 @@ public final class RemyKitchenViewModel {
         }
         if Self.splitList(draftCuisinesText) == previous.preferredCuisines {
             draftCuisinesText = nutritionProfile.preferredCuisines.joined(separator: ", ")
+        }
+        if draftCalorieTarget == Self.targetString(previous.calorieTarget) {
+            draftCalorieTarget = Self.targetString(nutritionProfile.calorieTarget)
+        }
+        if draftProteinTarget == Self.targetString(previous.proteinTarget) {
+            draftProteinTarget = Self.targetString(nutritionProfile.proteinTarget)
+        }
+        if draftCarbTarget == Self.targetString(previous.carbTarget) {
+            draftCarbTarget = Self.targetString(nutritionProfile.carbTarget)
+        }
+        if draftFatTarget == Self.targetString(previous.fatTarget) {
+            draftFatTarget = Self.targetString(nutritionProfile.fatTarget)
         }
         lastSyncedNutritionProfile = nutritionProfile
     }
@@ -319,12 +366,61 @@ public final class RemyKitchenViewModel {
         guard let session = cookingSession else { return }
         _ = await recipesStore.updateCookingStep(session.currentStepIndex + 1)
         await load()
+        await autoStartStepTimerIfNeeded()
     }
 
     public func cookingPrevious() async {
         guard let session = cookingSession else { return }
         _ = await recipesStore.updateCookingStep(session.currentStepIndex - 1)
         await load()
+    }
+
+    /// Seconds for the current cook step's timer (explicit metadata or parsed
+    /// from the step text), if any.
+    public var currentStepTimerSeconds: Int? {
+        guard let session = cookingSession, let recipe = cookingRecipe else { return nil }
+        return recipe.effectiveTimerSeconds(forStep: session.currentStepIndex)
+    }
+
+    /// When advancing to a step that declares a duration, start its timer so the
+    /// user doesn't have to tap. Labeled "Cook …" so end/cancel still catches it.
+    private func autoStartStepTimerIfNeeded() async {
+        guard let timers,
+              let session = cookingSession,
+              let recipe = cookingRecipe,
+              let seconds = recipe.effectiveTimerSeconds(forStep: session.currentStepIndex) else { return }
+        _ = await timers.cancel(id: nil, label: "Cook")
+        _ = await timers.schedule(seconds: seconds, label: "Cook · Step \(session.currentStepIndex + 1)")
+        statusMessage = "Auto-started a \(Self.durationLabel(seconds)) timer for step \(session.currentStepIndex + 1)."
+        await load()
+    }
+
+    // MARK: - Cook ingredient check-off
+
+    public func isCookIngredientChecked(_ ingredient: RecipeIngredient) -> Bool {
+        cookingSession?.checkedIngredientIds.contains(ingredient.id) ?? false
+    }
+
+    public func toggleCookIngredient(_ ingredient: RecipeIngredient) async {
+        guard let session = cookingSession else { return }
+        var checked = Set(session.checkedIngredientIds)
+        if checked.contains(ingredient.id) {
+            checked.remove(ingredient.id)
+        } else {
+            checked.insert(ingredient.id)
+        }
+        _ = await recipesStore.setCheckedIngredients(Array(checked))
+        await load()
+    }
+
+    private static func durationLabel(_ seconds: Int) -> String {
+        if seconds >= 60 {
+            let minutes = Double(seconds) / 60
+            return minutes.truncatingRemainder(dividingBy: 1) == 0
+                ? "\(Int(minutes)) min"
+                : String(format: "%.1f min", minutes)
+        }
+        return "\(seconds)s"
     }
 
     public func endCooking() async {
@@ -373,6 +469,47 @@ public final class RemyKitchenViewModel {
         }
     }
 
+    // MARK: - "Cook what I have"
+
+    /// How well a recipe matches the current pantry.
+    public struct RecipeMatch: Sendable, Identifiable, Equatable {
+        public let recipe: Recipe
+        public let have: Int
+        public let total: Int
+        public var id: UUID { recipe.id }
+        public var fraction: Double { total == 0 ? 0 : Double(have) / Double(total) }
+        public var missing: Int { max(0, total - have) }
+    }
+
+    /// True when an allergen from the profile appears in the recipe's ingredients.
+    public func containsAllergen(_ recipe: Recipe) -> Bool {
+        let allergens = nutritionProfile.allergens
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !allergens.isEmpty else { return false }
+        return recipe.ingredients.contains { ing in
+            let name = ing.name.lowercased()
+            return allergens.contains { name.contains($0) }
+        }
+    }
+
+    /// Allergen-safe recipes ranked by fraction of ingredients already in stock.
+    public func recipeSuggestions(limit: Int = 3) -> [RecipeMatch] {
+        recipes
+            .filter { !$0.ingredients.isEmpty && !containsAllergen($0) }
+            .map { recipe -> RecipeMatch in
+                let availability = pantryAvailability(for: recipe)
+                let have = availability.filter { $0.1 }.count
+                return RecipeMatch(recipe: recipe, have: have, total: availability.count)
+            }
+            .sorted { lhs, rhs in
+                if lhs.fraction != rhs.fraction { return lhs.fraction > rhs.fraction }
+                return lhs.recipe.updatedAt > rhs.recipe.updatedAt
+            }
+            .prefix(max(0, limit))
+            .map { $0 }
+    }
+
     // MARK: - Shopping
 
     public func saveShoppingItem(_ item: ShoppingListItem) async {
@@ -411,10 +548,71 @@ public final class RemyKitchenViewModel {
 
     public func addPantryLowsToShopping() async {
         for item in pantryItems where item.stockLevel == .low || item.stockLevel == .out {
-            _ = await shopping.upsert(ShoppingListItem(name: item.name, quantity: item.quantity))
+            _ = await shopping.upsert(ShoppingListItem(
+                name: item.name,
+                quantity: item.quantity,
+                category: item.category.rawValue
+            ))
         }
         await load()
         selectedSection = .shopping
+    }
+
+    /// Build the shopping list from every recipe in this week's meal plan,
+    /// adding only ingredients not already in the pantry or on the list.
+    public func addMissingFromMealPlan() async {
+        var seen = Set(shoppingItems.map { $0.name.lowercased() })
+        var added = 0
+        for slot in mealPlan.slots {
+            guard let recipeId = slot.recipeId,
+                  let recipe = recipes.first(where: { $0.id == recipeId }) else { continue }
+            for (ing, have) in pantryAvailability(for: recipe) where !have {
+                let key = ing.name.lowercased()
+                guard !seen.contains(key) else { continue }
+                seen.insert(key)
+                _ = await shopping.upsert(ShoppingListItem(
+                    name: ing.name,
+                    quantity: ing.quantity,
+                    fromRecipeId: recipe.id,
+                    category: inferredCategory(for: ing.name)
+                ))
+                added += 1
+            }
+        }
+        await load()
+        selectedSection = .shopping
+        statusMessage = added > 0
+            ? "Added \(added) item\(added == 1 ? "" : "s") from this week's meals."
+            : "This week's meals are already covered."
+    }
+
+    /// Best-guess category for an ingredient, matched against pantry items.
+    private func inferredCategory(for name: String) -> String? {
+        pantryItems.first {
+            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }?.category.rawValue
+    }
+
+    /// Shopping items grouped by category (aisle), with "Other" last and
+    /// unchecked items first within each group.
+    public var shoppingGroupedByCategory: [(category: String, items: [ShoppingListItem])] {
+        guard !shoppingItems.isEmpty else { return [] }
+        let groups = Dictionary(grouping: shoppingItems) { item -> String in
+            let category = item.category?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return category.isEmpty ? "Other" : category.capitalized
+        }
+        return groups
+            .map { key, value in
+                (category: key, items: value.sorted { lhs, rhs in
+                    if lhs.checked != rhs.checked { return !lhs.checked }
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                })
+            }
+            .sorted { lhs, rhs in
+                if lhs.category == "Other" { return false }
+                if rhs.category == "Other" { return true }
+                return lhs.category < rhs.category
+            }
     }
 
     public var shoppingShareText: String {
@@ -453,6 +651,10 @@ public final class RemyKitchenViewModel {
         profile.allergens = Self.splitList(draftAllergensText)
         profile.goals = Self.splitList(draftGoalsText)
         profile.preferredCuisines = Self.splitList(draftCuisinesText)
+        profile.calorieTarget = Self.parseTarget(draftCalorieTarget)
+        profile.proteinTarget = Self.parseTarget(draftProteinTarget)
+        profile.carbTarget = Self.parseTarget(draftCarbTarget)
+        profile.fatTarget = Self.parseTarget(draftFatTarget)
         if profile.staples.isEmpty { profile.staples = NutritionProfile.defaultStaples }
         let updated = await nutrition.updateProfile(profile)
         nutritionProfile = updated
@@ -468,9 +670,58 @@ public final class RemyKitchenViewModel {
         await load()
     }
 
+    // MARK: - Nutrition dashboard
+
+    /// Macro totals for `dayOffset` days from today (0 = today, -1 = yesterday).
+    public func macroTotals(dayOffset: Int = 0) -> MacroTotals {
+        let cal = Calendar.current
+        guard let start = cal.date(byAdding: .day, value: dayOffset, to: cal.startOfDay(for: Date())),
+              let end = cal.date(byAdding: .day, value: 1, to: start) else {
+            return MacroTotals()
+        }
+        var totals = MacroTotals()
+        for meal in recentMeals where meal.at >= start && meal.at < end {
+            totals.calories += meal.calories ?? 0
+            totals.protein += meal.proteinGrams ?? 0
+            totals.carbs += meal.carbsGrams ?? 0
+            totals.fat += meal.fatGrams ?? 0
+        }
+        return totals
+    }
+
+    public var todaysMacros: MacroTotals { macroTotals(dayOffset: 0) }
+
+    /// True once any logged meal carries macro data (so the dashboard is worth showing).
+    public var hasMacroData: Bool {
+        recentMeals.contains {
+            ($0.calories ?? 0) > 0 || ($0.proteinGrams ?? 0) > 0
+                || ($0.carbsGrams ?? 0) > 0 || ($0.fatGrams ?? 0) > 0
+        }
+    }
+
+    /// Per-day calorie totals for the last 7 days, oldest first.
+    public var weeklyCalories: [DailyCaloriePoint] {
+        let cal = Calendar.current
+        return (0..<7).reversed().compactMap { offset in
+            guard let day = cal.date(byAdding: .day, value: -offset, to: cal.startOfDay(for: Date())) else { return nil }
+            return DailyCaloriePoint(day: day, calories: macroTotals(dayOffset: -offset).calories)
+        }
+    }
+
     private static func splitList(_ text: String) -> [String] {
         text.split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    private static func targetString(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(Int(value.rounded()))
+    }
+
+    private static func parseTarget(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let value = Double(trimmed), value > 0 else { return nil }
+        return value
     }
 }

@@ -33,7 +33,19 @@ public actor FileNutritionStore: NutritionStoring {
 
     @discardableResult
     public func logMeal(description: String, recipeId: UUID?) -> MealLogEntry {
-        let entry = MealLogEntry(description: description, recipeId: recipeId)
+        logMeal(description: description, recipeId: recipeId, nutrition: nil)
+    }
+
+    @discardableResult
+    public func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) -> MealLogEntry {
+        let entry = MealLogEntry(
+            description: description,
+            recipeId: recipeId,
+            calories: nutrition?.calories,
+            proteinGrams: nutrition?.proteinGrams,
+            carbsGrams: nutrition?.carbsGrams,
+            fatGrams: nutrition?.fatGrams
+        )
         state.meals.append(entry)
         persist()
         return entry
@@ -60,6 +72,12 @@ public actor FileNutritionStore: NutritionStoring {
         if !p.goals.isEmpty { parts.append("Goals: \(p.goals.joined(separator: ", "))") }
         if !p.preferredCuisines.isEmpty { parts.append("Cuisines: \(p.preferredCuisines.joined(separator: ", "))") }
         if !p.staples.isEmpty { parts.append("Staples: \(p.staples.joined(separator: ", "))") }
+        var targets: [String] = []
+        if let c = p.calorieTarget { targets.append("\(Int(c)) kcal") }
+        if let pr = p.proteinTarget { targets.append("\(Int(pr))g protein") }
+        if let cb = p.carbTarget { targets.append("\(Int(cb))g carbs") }
+        if let f = p.fatTarget { targets.append("\(Int(f))g fat") }
+        if !targets.isEmpty { parts.append("Daily targets: \(targets.joined(separator: ", "))") }
         if let notes = p.notes, !notes.isEmpty { parts.append("Notes: \(notes)") }
         guard !parts.isEmpty else { return "" }
         return "Nutrition profile — \(parts.joined(separator: ". "))."

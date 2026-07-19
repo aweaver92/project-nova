@@ -10,6 +10,17 @@ import UIKit
 /// Composition root — construct once in the app entry point.
 @MainActor
 public final class AppContainer {
+    /// Number shown when "Nova, find my phone" rings this device. Override via the
+    /// `NOVA_FIND_MY_PHONE_NUMBER` env var / Info.plist key; falls back to the
+    /// owner's number so the alert reads naturally.
+    static var findMyPhoneNumber: String? {
+        let fromEnv = ProcessInfo.processInfo.environment["NOVA_FIND_MY_PHONE_NUMBER"]
+        let fromPlist = Bundle.main.object(forInfoDictionaryKey: "NovaFindMyPhoneNumber") as? String
+        let configured = (fromEnv ?? fromPlist)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let configured, !configured.isEmpty { return configured }
+        return "+1 856 230 5648"
+    }
+
     public let metrics: InMemoryLatencyMetricsRecorder
     public let usage: UsageMeter
     public let wearableSession: MetaDATWearableSession
@@ -192,6 +203,7 @@ public final class AppContainer {
         let wellnessStore = FileWellnessStore()
         let studyStore = FileStudyDeckStore()
         let timerService = LocalTimerService()
+        let phoneRinger = LocalPhoneRinger(phoneNumber: Self.findMyPhoneNumber)
         self.trainingVM = TrainingViewModel(
             workouts: workoutStore,
             plans: workoutPlanStore,
@@ -321,6 +333,7 @@ public final class AppContainer {
             ListTimersTool(timers: timerService),
             PlayMusicTool(openURL: openURL, haBaseURL: ha?.baseURL, haToken: ha?.token),
             OpenURLTool(openURL: openURL),
+            FindMyPhoneTool(ringer: phoneRinger, phoneNumber: Self.findMyPhoneNumber),
             // Claude's programming tools (Claude Code + Cursor via the Nova Bridge).
             ListReposTool(bridge: bridge),
             SelectRepoTool(bridge: bridge, settings: settingsStore),

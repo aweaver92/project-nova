@@ -344,10 +344,22 @@ public protocol RecipeStoring: Sendable {
     func startCooking(recipe: Recipe) async -> CookingSession
     @discardableResult
     func updateCookingStep(_ index: Int) async -> CookingSession?
+    /// Persist the set of checked-off ingredient ids on the active cook session.
+    @discardableResult
+    func setCheckedIngredients(_ ids: [UUID]) async -> CookingSession?
     @discardableResult
     func endCooking() async -> CookingSession?
     func summary(limit: Int) async -> String
     func cookingSummary() async -> String
+}
+
+public extension RecipeStoring {
+    // Keeps existing conformers (mocks/fakes) source-compatible; the file-backed
+    // store overrides this to persist checked ingredients.
+    @discardableResult
+    func setCheckedIngredients(_ ids: [UUID]) async -> CookingSession? {
+        await activeCookingSession()
+    }
 }
 
 /// Remy's shopping list.
@@ -377,11 +389,24 @@ public protocol NutritionStoring: Sendable {
     func updateProfile(_ profile: NutritionProfile) async -> NutritionProfile
     @discardableResult
     func logMeal(description: String, recipeId: UUID?) async -> MealLogEntry
+    /// Log a meal along with Remy's estimated macros. Conformers that only
+    /// implement the plain `logMeal` get a default that discards the macros.
+    @discardableResult
+    func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) async -> MealLogEntry
     func recentMeals(limit: Int) async -> [MealLogEntry]
     func lastFridgeScan() async -> FridgeScanResult?
     func saveFridgeScan(_ result: FridgeScanResult) async
     func profileSummary() async -> String
     func lastScanSummary() async -> String
+}
+
+public extension NutritionStoring {
+    // Keeps existing conformers (mocks/fakes) source-compatible; the file-backed
+    // store overrides this to persist the macros.
+    @discardableResult
+    func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) async -> MealLogEntry {
+        await logMeal(description: description, recipeId: recipeId)
+    }
 }
 
 /// Sage's mood / habit check-ins.
@@ -1153,6 +1178,15 @@ public extension AgentBridging {
 /// Registers/cancels proactive local notifications for scheduled skills.
 public protocol SkillScheduling: Sendable {
     func sync(_ skills: [Skill]) async
+}
+
+/// Rings THIS device so the user can locate a misplaced phone (sound + haptics
+/// + screen wake), independent of the live conversation audio route.
+public protocol PhoneRinging: Sendable {
+    /// Starts an attention-grabbing alert burst. Returns true if it was scheduled.
+    func ring() async -> Bool
+    /// Silences any in-progress find-my-phone alerts.
+    func stop() async
 }
 
 public protocol Tool: Sendable {

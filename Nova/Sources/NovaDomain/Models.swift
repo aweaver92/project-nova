@@ -749,7 +749,8 @@ public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
     /// v12: open_app_screen on specialists (scoped UI navigation).
-    static let seedCapabilitiesVersion = 14
+    /// v15: Remy estimates macros in log_meal for the nutrition dashboard.
+    static let seedCapabilitiesVersion = 15
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -843,7 +844,7 @@ public extension Agent {
                 name: "Remy",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a chef and nutrition assistant",
-                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; for hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; for hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan. When you log a meal with log_meal, estimate its calories and protein/carbs/fat in grams from the description or recipe and pass them so the nutrition dashboard stays accurate; keep estimates reasonable and don't ask for exact numbers unless the user offers them. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
                 toolNames: Agent.commonToolNames + [
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
                     "remember_visual",
@@ -1050,35 +1051,54 @@ public struct WorkoutPlanProgress: Sendable, Equatable {
     }
 }
 
-/// Max weight (lb) seen for each exercise across sessions — lightweight PR strip.
+/// Personal record for an exercise: the heaviest set seen plus its estimated
+/// one-rep max and when it happened. Backs Max's PR strip and analytics.
 public struct ExercisePR: Sendable, Identifiable, Equatable {
     public var id: String { exercise }
     public let exercise: String
+    /// Heaviest weight (lb) seen for this exercise.
     public let weight: Double
+    /// Reps performed on that heaviest set (if known).
+    public let reps: Int?
+    /// Epley estimated one-rep max derived from the heaviest set.
+    public let estimatedOneRepMax: Double
+    /// When the heaviest set was logged (if known).
+    public let achievedAt: Date?
 
-    public init(exercise: String, weight: Double) {
+    public init(
+        exercise: String,
+        weight: Double,
+        reps: Int? = nil,
+        estimatedOneRepMax: Double? = nil,
+        achievedAt: Date? = nil
+    ) {
         self.exercise = exercise
         self.weight = weight
+        self.reps = reps
+        self.estimatedOneRepMax = estimatedOneRepMax ?? ExercisePR.epley(weight: weight, reps: reps)
+        self.achievedAt = achievedAt
+    }
+
+    /// Epley one-rep-max estimate. Falls back to the raw weight when reps are
+    /// unknown or a single rep.
+    public static func epley(weight: Double, reps: Int?) -> Double {
+        guard let reps, reps > 1 else { return weight }
+        return weight * (1.0 + Double(reps) / 30.0)
     }
 
     public static func from(history: [WorkoutSession], limit: Int = 8) -> [ExercisePR] {
-        var best: [String: Double] = [:]
-        var displayName: [String: String] = [:]
+        struct Best { var weight: Double; var reps: Int?; var at: Date; var display: String }
+        var best: [String: Best] = [:]
         for session in history {
             for set in session.sets {
                 guard let w = set.weight, w > 0 else { continue }
                 let key = set.exercise.lowercased()
-                if best[key] == nil || w > best[key]! {
-                    best[key] = w
-                    displayName[key] = set.exercise
-                }
+                if let existing = best[key], existing.weight >= w { continue }
+                best[key] = Best(weight: w, reps: set.reps, at: set.at, display: set.exercise)
             }
         }
-        return best.keys
-            .compactMap { key -> ExercisePR? in
-                guard let name = displayName[key], let w = best[key] else { return nil }
-                return ExercisePR(exercise: name, weight: w)
-            }
+        return best.values
+            .map { ExercisePR(exercise: $0.display, weight: $0.weight, reps: $0.reps, achievedAt: $0.at) }
             .sorted { $0.weight > $1.weight }
             .prefix(max(0, limit))
             .map { $0 }
@@ -1263,6 +1283,10 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
     public var servings: Int?
     public var ingredients: [RecipeIngredient]
     public var steps: [String]
+    /// Optional per-step countdown durations (seconds), aligned by index with
+    /// `steps`. `0`/missing means the step has no timer. Cook mode auto-starts
+    /// these; when absent, a duration is parsed from the step text instead.
+    public var stepTimerSeconds: [Int]?
     public var tags: [String]
     public var sourceNote: String?
     public var updatedAt: Date
@@ -1273,6 +1297,7 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
         servings: Int? = nil,
         ingredients: [RecipeIngredient] = [],
         steps: [String] = [],
+        stepTimerSeconds: [Int]? = nil,
         tags: [String] = [],
         sourceNote: String? = nil,
         updatedAt: Date = Date()
@@ -1282,9 +1307,48 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
         self.servings = servings
         self.ingredients = ingredients
         self.steps = steps
+        self.stepTimerSeconds = stepTimerSeconds
         self.tags = tags
         self.sourceNote = sourceNote
         self.updatedAt = updatedAt
+    }
+
+    /// Explicit timer for a step from `stepTimerSeconds`, if any.
+    public func timerSeconds(forStep index: Int) -> Int? {
+        guard let stepTimerSeconds, stepTimerSeconds.indices.contains(index) else { return nil }
+        let secs = stepTimerSeconds[index]
+        return secs > 0 ? secs : nil
+    }
+
+    /// Timer for a step: the explicit metadata if present, otherwise a duration
+    /// parsed from the step text ("simmer for 9 minutes").
+    public func effectiveTimerSeconds(forStep index: Int) -> Int? {
+        if let explicit = timerSeconds(forStep: index) { return explicit }
+        guard steps.indices.contains(index) else { return nil }
+        return Recipe.parseDurationSeconds(from: steps[index])
+    }
+
+    /// Parse the first duration ("9 minutes", "90 sec", "1 hour") from free text.
+    public static func parseDurationSeconds(from text: String) -> Int? {
+        let lower = text.lowercased()
+        let pattern = #"(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(lower.startIndex..., in: lower)
+        guard let match = regex.firstMatch(in: lower, range: range),
+              let numberRange = Range(match.range(at: 1), in: lower),
+              let unitRange = Range(match.range(at: 2), in: lower),
+              let value = Double(lower[numberRange]) else { return nil }
+        let unit = String(lower[unitRange])
+        let seconds: Double
+        if unit.hasPrefix("h") {
+            seconds = value * 3600
+        } else if unit.hasPrefix("m") {
+            seconds = value * 60
+        } else {
+            seconds = value
+        }
+        let rounded = Int(seconds.rounded())
+        return rounded > 0 ? rounded : nil
     }
 }
 
@@ -1294,6 +1358,8 @@ public struct CookingSession: Sendable, Identifiable, Codable, Equatable {
     public var recipeId: UUID
     public var recipeTitle: String
     public var currentStepIndex: Int
+    /// Ingredient ids the user has checked off during this cook.
+    public var checkedIngredientIds: [UUID]
     public var startedAt: Date
     public var endedAt: Date?
 
@@ -1302,6 +1368,7 @@ public struct CookingSession: Sendable, Identifiable, Codable, Equatable {
         recipeId: UUID,
         recipeTitle: String,
         currentStepIndex: Int = 0,
+        checkedIngredientIds: [UUID] = [],
         startedAt: Date = Date(),
         endedAt: Date? = nil
     ) {
@@ -1309,8 +1376,20 @@ public struct CookingSession: Sendable, Identifiable, Codable, Equatable {
         self.recipeId = recipeId
         self.recipeTitle = recipeTitle
         self.currentStepIndex = max(0, currentStepIndex)
+        self.checkedIngredientIds = checkedIngredientIds
         self.startedAt = startedAt
         self.endedAt = endedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        recipeId = try c.decode(UUID.self, forKey: .recipeId)
+        recipeTitle = try c.decode(String.self, forKey: .recipeTitle)
+        currentStepIndex = max(0, try c.decodeIfPresent(Int.self, forKey: .currentStepIndex) ?? 0)
+        checkedIngredientIds = try c.decodeIfPresent([UUID].self, forKey: .checkedIngredientIds) ?? []
+        startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
     }
 
     public var isActive: Bool { endedAt == nil }
@@ -1404,6 +1483,11 @@ public struct NutritionProfile: Sendable, Codable, Equatable {
     public var preferredCuisines: [String]
     public var staples: [String]
     public var notes: String?
+    /// Optional daily targets for Remy's nutrition dashboard rings.
+    public var calorieTarget: Double?
+    public var proteinTarget: Double?
+    public var carbTarget: Double?
+    public var fatTarget: Double?
     public var updatedAt: Date
 
     public init(
@@ -1413,6 +1497,10 @@ public struct NutritionProfile: Sendable, Codable, Equatable {
         preferredCuisines: [String] = [],
         staples: [String] = NutritionProfile.defaultStaples,
         notes: String? = nil,
+        calorieTarget: Double? = nil,
+        proteinTarget: Double? = nil,
+        carbTarget: Double? = nil,
+        fatTarget: Double? = nil,
         updatedAt: Date = Date()
     ) {
         self.dietStyle = dietStyle
@@ -1421,6 +1509,10 @@ public struct NutritionProfile: Sendable, Codable, Equatable {
         self.preferredCuisines = preferredCuisines
         self.staples = staples
         self.notes = notes
+        self.calorieTarget = calorieTarget
+        self.proteinTarget = proteinTarget
+        self.carbTarget = carbTarget
+        self.fatTarget = fatTarget
         self.updatedAt = updatedAt
     }
 
@@ -1437,7 +1529,37 @@ public struct NutritionProfile: Sendable, Codable, Equatable {
         preferredCuisines = try c.decodeIfPresent([String].self, forKey: .preferredCuisines) ?? []
         staples = try c.decodeIfPresent([String].self, forKey: .staples) ?? NutritionProfile.defaultStaples
         notes = try c.decodeIfPresent(String.self, forKey: .notes)
+        calorieTarget = try c.decodeIfPresent(Double.self, forKey: .calorieTarget)
+        proteinTarget = try c.decodeIfPresent(Double.self, forKey: .proteinTarget)
+        carbTarget = try c.decodeIfPresent(Double.self, forKey: .carbTarget)
+        fatTarget = try c.decodeIfPresent(Double.self, forKey: .fatTarget)
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+/// Estimated macros for a logged meal. Remy fills these in from the meal
+/// description or recipe; all fields are optional so a plain description still
+/// logs cleanly.
+public struct MealNutrition: Sendable, Codable, Equatable {
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+
+    public init(
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil
+    ) {
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+    }
+
+    public var isEmpty: Bool {
+        calories == nil && proteinGrams == nil && carbsGrams == nil && fatGrams == nil
     }
 }
 
@@ -1446,17 +1568,34 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
     public var description: String
     public var at: Date
     public var recipeId: UUID?
+    /// Remy's estimated calories for the meal, if known.
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
 
     public init(
         id: UUID = UUID(),
         description: String,
         at: Date = Date(),
-        recipeId: UUID? = nil
+        recipeId: UUID? = nil,
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil
     ) {
         self.id = id
         self.description = description
         self.at = at
         self.recipeId = recipeId
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+    }
+
+    public var nutrition: MealNutrition {
+        MealNutrition(calories: calories, proteinGrams: proteinGrams, carbsGrams: carbsGrams, fatGrams: fatGrams)
     }
 }
 

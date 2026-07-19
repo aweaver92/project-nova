@@ -43,6 +43,7 @@ public actor FileRecipeStore: RecipeStoring {
                 servings: recipe.servings ?? recipes[idx].servings,
                 ingredients: recipe.ingredients.isEmpty ? recipes[idx].ingredients : recipe.ingredients,
                 steps: recipe.steps.isEmpty ? recipes[idx].steps : recipe.steps,
+                stepTimerSeconds: recipe.stepTimerSeconds ?? recipes[idx].stepTimerSeconds,
                 tags: recipe.tags.isEmpty ? recipes[idx].tags : recipe.tags,
                 sourceNote: recipe.sourceNote ?? recipes[idx].sourceNote,
                 updatedAt: Date()
@@ -82,6 +83,15 @@ public actor FileRecipeStore: RecipeStoring {
         guard let recipe = recipes.first(where: { $0.id == session.recipeId }) else { return nil }
         let maxIndex = max(0, recipe.steps.count - 1)
         session.currentStepIndex = min(max(0, index), maxIndex)
+        cooking = session
+        persist()
+        return session
+    }
+
+    @discardableResult
+    public func setCheckedIngredients(_ ids: [UUID]) -> CookingSession? {
+        guard var session = cooking, session.isActive else { return nil }
+        session.checkedIngredientIds = ids
         cooking = session
         persist()
         return session

@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import NovaDomain
 import PhotosUI
 #if canImport(UIKit)
@@ -180,8 +181,20 @@ public struct RemyKitchenView: View {
                                 .font(.caption.weight(.heavy))
                                 .foregroundStyle(.secondary)
                             ForEach(recipe.ingredients) { ing in
-                                Text(ing.quantity.map { "\($0) · \(ing.name)" } ?? ing.name)
-                                    .font(.subheadline)
+                                Button {
+                                    Task { await kitchen.toggleCookIngredient(ing) }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: kitchen.isCookIngredientChecked(ing) ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(kitchen.isCookIngredientChecked(ing) ? .green : .secondary)
+                                        Text(ing.quantity.map { "\($0) · \(ing.name)" } ?? ing.name)
+                                            .font(.subheadline)
+                                            .strikethrough(kitchen.isCookIngredientChecked(ing))
+                                            .foregroundStyle(kitchen.isCookIngredientChecked(ing) ? .secondary : .primary)
+                                        Spacer()
+                                    }
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -230,6 +243,17 @@ public struct RemyKitchenView: View {
                         .frame(maxWidth: .infinity)
                 }
             } else {
+                if let stepSeconds = kitchen.currentStepTimerSeconds {
+                    Button {
+                        Task { await kitchen.startCookTimer(seconds: stepSeconds) }
+                    } label: {
+                        Label("Start step timer · \(Self.durationLabel(stepSeconds))", systemImage: "timer")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
                 HStack(spacing: 10) {
                     Button {
                         Task { await kitchen.startCookTimer(seconds: 60) }
@@ -244,7 +268,7 @@ public struct RemyKitchenView: View {
                         Label("5 min", systemImage: "timer")
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
                 }
             }
         }
@@ -478,6 +502,8 @@ public struct RemyKitchenView: View {
             }
         }
 
+        cookTonightSection
+
         Section("Saved recipes") {
             if kitchen.recipes.isEmpty {
                 Text("No recipes yet.").foregroundStyle(.secondary)
@@ -524,6 +550,40 @@ public struct RemyKitchenView: View {
         }
     }
 
+    @ViewBuilder
+    private var cookTonightSection: some View {
+        let suggestions = kitchen.recipeSuggestions(limit: 3)
+        if suggestions.contains(where: { $0.have > 0 }) {
+            Section("Cook tonight") {
+                ForEach(suggestions) { match in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(match.recipe.title)
+                                .font(.headline)
+                            Spacer()
+                            Text("\(match.have)/\(match.total) on hand")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(match.missing == 0 ? .green : Self.terracotta)
+                        }
+                        ProgressView(value: match.fraction)
+                            .tint(match.missing == 0 ? .green : Self.terracotta)
+                        HStack {
+                            Button("Cook") { Task { await kitchen.startCooking(match.recipe) } }
+                                .buttonStyle(.borderedProminent)
+                            if match.missing > 0 {
+                                Button("Shop missing") {
+                                    Task { await kitchen.addMissingFromRecipe(match.recipe) }
+                                }
+                            }
+                        }
+                        .font(.caption)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+
     // MARK: - Shopping
 
     @ViewBuilder
@@ -536,6 +596,11 @@ public struct RemyKitchenView: View {
                 Task { await kitchen.addPantryLowsToShopping() }
             } label: {
                 Label("Add pantry lows", systemImage: "exclamationmark.circle")
+            }
+            Button {
+                Task { await kitchen.addMissingFromMealPlan() }
+            } label: {
+                Label("Build from this week's meals", systemImage: "calendar.badge.plus")
             }
             ShareLink(item: kitchen.shoppingShareText) {
                 Label("Share list", systemImage: "square.and.arrow.up")
@@ -555,34 +620,43 @@ public struct RemyKitchenView: View {
             Button("Cancel", role: .cancel) { newShoppingName = "" }
         }
 
-        Section("List") {
-            if kitchen.shoppingItems.isEmpty {
+        if kitchen.shoppingItems.isEmpty {
+            Section("List") {
                 Text("List is empty.").foregroundStyle(.secondary)
-            } else {
-                ForEach(kitchen.shoppingItems) { item in
-                    Button {
-                        Task { await kitchen.toggleShopping(item) }
-                    } label: {
-                        HStack {
-                            Image(systemName: item.checked ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(item.checked ? .green : .secondary)
-                            VStack(alignment: .leading) {
-                                Text(item.name)
-                                    .strikethrough(item.checked)
-                                if let q = item.quantity, !q.isEmpty {
-                                    Text(q).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                    .swipeActions {
-                        Button(role: .destructive) {
-                            Task { await kitchen.deleteShopping(item) }
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
+            }
+        } else {
+            let groups = kitchen.shoppingGroupedByCategory
+            ForEach(groups, id: \.category) { group in
+                Section(groups.count == 1 && group.category == "Other" ? "List" : group.category) {
+                    ForEach(group.items) { item in
+                        shoppingRow(item)
                     }
                 }
+            }
+        }
+    }
+
+    private func shoppingRow(_ item: ShoppingListItem) -> some View {
+        Button {
+            Task { await kitchen.toggleShopping(item) }
+        } label: {
+            HStack {
+                Image(systemName: item.checked ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(item.checked ? .green : .secondary)
+                VStack(alignment: .leading) {
+                    Text(item.name)
+                        .strikethrough(item.checked)
+                    if let q = item.quantity, !q.isEmpty {
+                        Text(q).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .swipeActions {
+            Button(role: .destructive) {
+                Task { await kitchen.deleteShopping(item) }
+            } label: {
+                Label("Delete", systemImage: "trash")
             }
         }
     }
@@ -628,6 +702,8 @@ public struct RemyKitchenView: View {
 
     @ViewBuilder
     private var profileSections: some View {
+        nutritionDashboardSection
+
         Section("Nutrition profile") {
             TextField("Diet style", text: $kitchen.draftDietStyle)
             TextField("Allergens / avoid (comma-separated)", text: $kitchen.draftAllergensText)
@@ -642,6 +718,13 @@ public struct RemyKitchenView: View {
             }
         }
 
+        Section("Daily targets (optional)") {
+            targetField("Calories", text: $kitchen.draftCalorieTarget, unit: "kcal")
+            targetField("Protein", text: $kitchen.draftProteinTarget, unit: "g")
+            targetField("Carbs", text: $kitchen.draftCarbTarget, unit: "g")
+            targetField("Fat", text: $kitchen.draftFatTarget, unit: "g")
+        }
+
         Section("Log a meal") {
             TextField("What did you eat?", text: $mealLogDraft)
             Button("Log") {
@@ -653,20 +736,142 @@ public struct RemyKitchenView: View {
 
         if !kitchen.recentMeals.isEmpty {
             Section("Recent meals") {
-                ForEach(kitchen.recentMeals) { meal in
-                    VStack(alignment: .leading) {
+                ForEach(kitchen.recentMeals.prefix(12)) { meal in
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(meal.description)
-                        Text(meal.at.formatted(date: .abbreviated, time: .shortened))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            Text(meal.at.formatted(date: .abbreviated, time: .shortened))
+                            if let macros = Self.macroLabel(meal) {
+                                Text(macros).foregroundStyle(Self.terracotta)
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }
         }
     }
+
+    @ViewBuilder
+    private var nutritionDashboardSection: some View {
+        let macros = kitchen.todaysMacros
+        let profile = kitchen.nutritionProfile
+        Section("Today") {
+            HStack(spacing: 8) {
+                MacroRingView(title: "Cal", value: macros.calories, target: profile.calorieTarget, unit: "", color: Self.terracotta)
+                MacroRingView(title: "Protein", value: macros.protein, target: profile.proteinTarget, unit: "g", color: .blue)
+                MacroRingView(title: "Carbs", value: macros.carbs, target: profile.carbTarget, unit: "g", color: .green)
+                MacroRingView(title: "Fat", value: macros.fat, target: profile.fatTarget, unit: "g", color: .orange)
+            }
+            .padding(.vertical, 4)
+            if !kitchen.hasMacroData {
+                Text("Ask Remy to log meals — she'll estimate calories and macros and they'll show up here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        let week = kitchen.weeklyCalories
+        if week.contains(where: { $0.calories > 0 }) {
+            Section("Calories · last 7 days") {
+                Chart {
+                    ForEach(week) { point in
+                        BarMark(
+                            x: .value("Day", point.day, unit: .day),
+                            y: .value("Calories", point.calories)
+                        )
+                        .foregroundStyle(Self.terracotta.gradient)
+                        .cornerRadius(3)
+                    }
+                    if let target = profileCalorieTarget {
+                        RuleMark(y: .value("Target", target))
+                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4]))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .chartXAxis {
+                    AxisMarks(values: .stride(by: .day)) { _ in
+                        AxisValueLabel(format: .dateTime.weekday(.narrow))
+                    }
+                }
+                .frame(height: 130)
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private var profileCalorieTarget: Double? { kitchen.nutritionProfile.calorieTarget }
+
+    private func targetField(_ label: String, text: Binding<String>, unit: String) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField("—", text: text)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 90)
+            Text(unit).foregroundStyle(.secondary)
+        }
+    }
+
+    static func durationLabel(_ seconds: Int) -> String {
+        if seconds % 60 == 0 { return "\(seconds / 60) min" }
+        if seconds < 60 { return "\(seconds)s" }
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private static func macroLabel(_ meal: MealLogEntry) -> String? {
+        var parts: [String] = []
+        if let c = meal.calories, c > 0 { parts.append("\(Int(c)) kcal") }
+        if let p = meal.proteinGrams, p > 0 { parts.append("\(Int(p))P") }
+        if let cb = meal.carbsGrams, cb > 0 { parts.append("\(Int(cb))C") }
+        if let f = meal.fatGrams, f > 0 { parts.append("\(Int(f))F") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 // MARK: - Rows / sheets
+
+private struct MacroRingView: View {
+    let title: String
+    let value: Double
+    let target: Double?
+    let unit: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .stroke(color.opacity(0.2), lineWidth: 7)
+                Circle()
+                    .trim(from: 0, to: fraction)
+                    .stroke(color, style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(Int(value))")
+                    .font(.subheadline.weight(.bold))
+                    .monospacedDigit()
+                    .minimumScaleFactor(0.6)
+                    .lineLimit(1)
+            }
+            .frame(width: 56, height: 56)
+            Text(title)
+                .font(.caption2.weight(.semibold))
+            Text(target.map { "of \(Int($0))\(unit)" } ?? "\(unit.isEmpty ? "kcal" : unit)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var fraction: CGFloat {
+        guard let target, target > 0 else { return value > 0 ? 1 : 0 }
+        return min(1, CGFloat(value / target))
+    }
+}
 
 private struct PantryRow: View {
     let item: PantryItem

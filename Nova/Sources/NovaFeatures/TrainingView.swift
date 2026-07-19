@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import NovaDomain
 
 /// Max-exclusive training hub + live workout HUD. High-energy "gym HUD" look:
@@ -10,6 +11,7 @@ public struct TrainingView: View {
     @State private var editingPlan: WorkoutPlan?
     @State private var showNewPlan = false
     @State private var planPendingDelete: WorkoutPlan?
+    @State private var selectedTrendExercise: String?
 
     private static let heat = LinearGradient(
         colors: [Color(red: 0.85, green: 0.15, blue: 0.10), Color(red: 0.95, green: 0.45, blue: 0.10)],
@@ -47,6 +49,7 @@ public struct TrainingView: View {
                     hubHero
                     plansCarousel
                     prStrip
+                    analyticsCard
                     historyCard
                 }
                 if !training.statusMessage.isEmpty {
@@ -462,6 +465,144 @@ public struct TrainingView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    // MARK: - Analytics
+
+    @ViewBuilder
+    private var analyticsCard: some View {
+        if training.hasAnalytics {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("PROGRESS")
+                    .font(.caption.weight(.heavy))
+                    .foregroundStyle(.secondary)
+                summaryStrip
+                volumeChart
+                trendChart
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+        }
+    }
+
+    private var summaryStrip: some View {
+        HStack(spacing: 10) {
+            statPill(
+                title: "THIS WEEK",
+                value: Self.volumeLabel(training.volumeThisWeek),
+                sub: training.volumeDeltaLabel
+            )
+            statPill(
+                title: "STREAK",
+                value: "\(training.weekStreak) wk",
+                sub: "\(training.sessionsThisWeek) this week"
+            )
+            statPill(
+                title: "WORKOUTS",
+                value: "\(training.totalWorkouts)",
+                sub: "logged"
+            )
+        }
+    }
+
+    private func statPill(title: String, value: String, sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2.weight(.heavy))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 20, weight: .heavy, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(sub)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(Color(.tertiarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var volumeChart: some View {
+        let points = training.weeklyVolumes(weeks: 8)
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("WEEKLY VOLUME")
+                .font(.caption2.weight(.heavy))
+                .foregroundStyle(.secondary)
+            Chart(points) { point in
+                BarMark(
+                    x: .value("Week", point.weekStart, unit: .weekOfYear),
+                    y: .value("Volume", point.volume)
+                )
+                .foregroundStyle(.orange.gradient)
+                .cornerRadius(4)
+            }
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .weekOfYear, count: 2)) { value in
+                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                }
+            }
+            .frame(height: 140)
+        }
+    }
+
+    @ViewBuilder
+    private var trendChart: some View {
+        let exercises = training.trackedExercises
+        if let selected = selectedTrendExercise ?? exercises.first {
+            let points = training.trend(for: selected)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("EST. 1RM TREND")
+                        .font(.caption2.weight(.heavy))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("Exercise", selection: Binding(
+                        get: { selectedTrendExercise ?? selected },
+                        set: { selectedTrendExercise = $0 }
+                    )) {
+                        ForEach(exercises, id: \.self) { Text($0).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(.orange)
+                }
+                if points.count >= 2 {
+                    Chart(points) { point in
+                        LineMark(
+                            x: .value("Date", point.date),
+                            y: .value("Est 1RM", point.estimatedOneRepMax)
+                        )
+                        .foregroundStyle(.orange)
+                        .interpolationMethod(.catmullRom)
+                        PointMark(
+                            x: .value("Date", point.date),
+                            y: .value("Est 1RM", point.estimatedOneRepMax)
+                        )
+                        .foregroundStyle(.orange)
+                    }
+                    .frame(height: 140)
+                } else {
+                    Text("Log a few more \(selected) sets to chart a trend.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                }
+            }
+        }
+    }
+
+    private static func volumeLabel(_ volume: Double) -> String {
+        if volume >= 1000 {
+            let k = volume / 1000
+            return String(format: k >= 10 ? "%.0fk" : "%.1fk", k)
+        }
+        return "\(Int(volume))"
     }
 
     private var historyCard: some View {
