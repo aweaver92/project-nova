@@ -1,4 +1,5 @@
 import XCTest
+@testable import NovaCore
 @testable import NovaData
 @testable import NovaDomain
 
