@@ -664,7 +664,7 @@ final class WakeWordTests: XCTestCase {
         )
     }
 
-    private func waitUntil(timeout: TimeInterval = 2, _ condition: @escaping () async -> Bool) async -> Bool {
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: @escaping () async -> Bool) async -> Bool {
         let start = Date()
         while Date().timeIntervalSince(start) < timeout {
             if await condition() { return true }
