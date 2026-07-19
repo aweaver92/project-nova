@@ -602,7 +602,76 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testClientVADAppendsTriggeringAudioBeforeSingleCommit() async throws {
+        let provider = MockProvider()
+        let ingress = ControllableIngress()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder()
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+
+        let speech = speechLikePCM()
+        for _ in 0..<38 {
+            ingress.emit(AudioChunk(pcm: speech, sampleRate: 24_000))
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        for _ in 0..<36 {
+            ingress.emit(AudioChunk(pcm: Data(count: 960), sampleRate: 24_000))
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let committed = await waitUntil { await provider.commitCount == 1 }
+        XCTAssertTrue(committed)
+        let operations = await provider.audioOperations
+        XCTAssertEqual(operations.filter { $0 == "commit" }.count, 1)
+        XCTAssertEqual(operations.filter { $0 == "response" }.count, 1)
+        XCTAssertEqual(operations.last, "response")
+        if let commitIndex = operations.firstIndex(of: "commit") {
+            XCTAssertGreaterThan(commitIndex, 0)
+            XCTAssertEqual(operations[commitIndex - 1], "append")
+        } else {
+            XCTFail("expected client VAD commit")
+        }
+        await orch.stop()
+    }
+
+    func testClientVADDoesNotCommitSubtleTransient() async throws {
+        let provider = MockProvider()
+        let ingress = ControllableIngress()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder()
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+
+        let subtle = speechLikePCM(amplitude: 1_500)
+        for _ in 0..<12 {
+            ingress.emit(AudioChunk(pcm: subtle, sampleRate: 24_000))
+        }
+        try await Task.sleep(for: .milliseconds(250))
+
+        let commits = await provider.commitCount
+        XCTAssertEqual(commits, 0)
+        await orch.stop()
+    }
+
     // MARK: - Helpers
+
+    private func speechLikePCM(amplitude: Int16 = 8_000) -> Data {
+        var samples = [Int16]()
+        samples.reserveCapacity(480)
+        for index in 0..<480 {
+            samples.append((index / 10).isMultiple(of: 2) ? amplitude : -amplitude)
+        }
+        return samples.withUnsafeBytes { Data($0) }
+    }
 
     private func makeOrchestrator(
         provider: MockProvider,
@@ -636,6 +705,8 @@ private actor MockProvider: ConversationalAIProvider {
     let events: AsyncStream<AIConversationEvent>
     private let continuation: AsyncStream<AIConversationEvent>.Continuation
     private(set) var createResponseCount = 0
+    private(set) var commitCount = 0
+    private(set) var audioOperations: [String] = []
     private(set) var interruptCount = 0
     private(set) var analyzeCount = 0
     private(set) var connectCount = 0
@@ -671,8 +742,18 @@ private actor MockProvider: ConversationalAIProvider {
     // stream down and reopen it while the orchestrator keeps its single consumer.
     func disconnect() async { disconnectCount += 1 }
     @discardableResult
-    func appendAudio(_ pcm16_24k: Data) async -> Bool { appendShouldSucceed }
-    func createResponse() async { createResponseCount += 1 }
+    func appendAudio(_ pcm16_24k: Data) async -> Bool {
+        audioOperations.append("append")
+        return appendShouldSucceed
+    }
+    func commitInputAudio() async {
+        commitCount += 1
+        audioOperations.append("commit")
+    }
+    func createResponse() async {
+        createResponseCount += 1
+        audioOperations.append("response")
+    }
     func interrupt() async { interruptCount += 1 }
     func analyze(image: CapturedFrame, prompt: String) async throws -> String {
         analyzeCount += 1

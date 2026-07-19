@@ -17,23 +17,52 @@ final class ClientEnergyVADTests: XCTestCase {
         let t0 = ContinuousClock.Instant.now
 
         XCTAssertEqual(
-            vad.observe(peak: 0.2, zcr: 0.05, ringBytes: 2000, now: t0),
+            vad.observe(peak: 0.2, zcr: 0.05, rms: 0.08, ringBytes: 2000, now: t0),
             .none
         )
         XCTAssertEqual(
-            vad.observe(peak: 0.2, zcr: 0.05, ringBytes: 4000, now: t0.advanced(by: .milliseconds(450))),
+            vad.observe(peak: 0.2, zcr: 0.05, rms: 0.08, ringBytes: 4000, now: t0.advanced(by: .milliseconds(450))),
             .none
         )
         // Quiet timer starts here.
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0.0, ringBytes: 5000, now: t0.advanced(by: .milliseconds(500))),
+            vad.observe(peak: 0.01, zcr: 0.0, rms: 0.005, ringBytes: 5000, now: t0.advanced(by: .milliseconds(500))),
             .none
         )
         // End silence elapsed + min speech → commit.
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0.0, ringBytes: 6000, now: t0.advanced(by: .milliseconds(1100))),
+            vad.observe(peak: 0.01, zcr: 0.0, rms: 0.005, ringBytes: 6000, now: t0.advanced(by: .milliseconds(1100))),
             .commit
         )
+    }
+
+    func testIgnoresSubtlePeakWithoutRms() {
+        var vad = makeVAD()
+        let t0 = ContinuousClock.Instant.now
+        // Old speechPeak (0.05) would accept this rustle; RMS gate must reject it.
+        XCTAssertEqual(
+            vad.observe(peak: 0.08, zcr: 0.05, rms: 0.01, ringBytes: 8000, now: t0),
+            .none
+        )
+        XCTAssertFalse(vad.speechActive)
+        XCTAssertEqual(
+            vad.observe(peak: 0.08, zcr: 0.05, rms: 0.01, ringBytes: 9000, now: t0.advanced(by: .milliseconds(800))),
+            .none
+        )
+        XCTAssertEqual(
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 10_000, now: t0.advanced(by: .milliseconds(1500))),
+            .none
+        )
+    }
+
+    func testIgnoresHighZcrHiss() {
+        var vad = makeVAD()
+        let t0 = ContinuousClock.Instant.now
+        XCTAssertEqual(
+            vad.observe(peak: 0.3, zcr: 0.45, rms: 0.1, ringBytes: 8000, now: t0),
+            .none
+        )
+        XCTAssertFalse(vad.speechActive)
     }
 
     func testStickyFlagBug_secondUtteranceStillCommitsWithoutAck() {
@@ -43,19 +72,19 @@ final class ClientEnergyVADTests: XCTestCase {
         let t0 = ContinuousClock.Instant.now
 
         // Turn 1
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 2000, now: t0)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 2000, now: t0)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
             .commit
         )
 
         // No acknowledgeTurnFinished — server silent. After cooldown, turn 2 must commit.
         let t2 = t0.advanced(by: .milliseconds(2800))
-        _ = vad.observe(peak: 0.25, zcr: 0.05, ringBytes: 12_000, now: t2)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 14_000, now: t2.advanced(by: .milliseconds(400)))
+        _ = vad.observe(peak: 0.25, zcr: 0.05, rms: 0.09, ringBytes: 12_000, now: t2)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 14_000, now: t2.advanced(by: .milliseconds(400)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 16_000, now: t2.advanced(by: .milliseconds(1000))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 16_000, now: t2.advanced(by: .milliseconds(1000))),
             .commit
         )
     }
@@ -63,19 +92,19 @@ final class ClientEnergyVADTests: XCTestCase {
     func testCooldownBlocksImmediateDoubleCommit() {
         var vad = makeVAD()
         let t0 = ContinuousClock.Instant.now
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 2000, now: t0)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 2000, now: t0)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
             .commit
         )
 
         // Same silence window inside cooldown — must not re-commit.
         let mid = t0.advanced(by: .milliseconds(1500))
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 9000, now: mid)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 9500, now: mid.advanced(by: .milliseconds(400)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 9000, now: mid)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 9500, now: mid.advanced(by: .milliseconds(400)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 10_000, now: mid.advanced(by: .milliseconds(1000))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 10_000, now: mid.advanced(by: .milliseconds(1000))),
             .none
         )
     }
@@ -83,19 +112,19 @@ final class ClientEnergyVADTests: XCTestCase {
     func testUnlockForRetryAllowsImmediateNextCommit() {
         var vad = makeVAD()
         let t0 = ContinuousClock.Instant.now
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 2000, now: t0)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 2000, now: t0)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
             .commit
         )
         vad.unlockForRetry()
 
         let t1 = t0.advanced(by: .milliseconds(1300))
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 9000, now: t1)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 10_000, now: t1.advanced(by: .milliseconds(400)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 9000, now: t1)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 10_000, now: t1.advanced(by: .milliseconds(400)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 12_000, now: t1.advanced(by: .milliseconds(1000))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 12_000, now: t1.advanced(by: .milliseconds(1000))),
             .commit
         )
     }
@@ -103,19 +132,19 @@ final class ClientEnergyVADTests: XCTestCase {
     func testRecoverIfStuckClearsCooldownAfterTimeout() {
         var vad = makeVAD()
         let t0 = ContinuousClock.Instant.now
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 2000, now: t0)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 2000, now: t0)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 4000, now: t0.advanced(by: .milliseconds(500)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 8000, now: t0.advanced(by: .milliseconds(1200))),
             .commit
         )
 
         // 4s stuck recovery fires inside observe.
         let tStuck = t0.advanced(by: .seconds(6))
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 9000, now: tStuck)
-        _ = vad.observe(peak: 0.01, zcr: 0, ringBytes: 10_000, now: tStuck.advanced(by: .milliseconds(400)))
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 9000, now: tStuck)
+        _ = vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 10_000, now: tStuck.advanced(by: .milliseconds(400)))
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 12_000, now: tStuck.advanced(by: .milliseconds(1000))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 12_000, now: tStuck.advanced(by: .milliseconds(1000))),
             .commit
         )
     }
@@ -123,10 +152,52 @@ final class ClientEnergyVADTests: XCTestCase {
     func testRejectsShortSpeechAndTinyRing() {
         var vad = makeVAD()
         let t0 = ContinuousClock.Instant.now
-        _ = vad.observe(peak: 0.3, zcr: 0.04, ringBytes: 100, now: t0)
+        _ = vad.observe(peak: 0.3, zcr: 0.04, rms: 0.1, ringBytes: 100, now: t0)
         // Quiet after only 100ms of speech + tiny ring → no commit.
         XCTAssertEqual(
-            vad.observe(peak: 0.01, zcr: 0, ringBytes: 100, now: t0.advanced(by: .milliseconds(700))),
+            vad.observe(peak: 0.01, zcr: 0, rms: 0, ringBytes: 100, now: t0.advanced(by: .milliseconds(700))),
+            .none
+        )
+    }
+
+    func testCommitsAfterMaxSpeechWithoutSilence() {
+        var vad = makeVAD()
+        vad.maxSpeech = .milliseconds(800)
+        let t0 = ContinuousClock.Instant.now
+
+        XCTAssertEqual(
+            vad.observe(peak: 0.3, zcr: 0.05, rms: 0.1, ringBytes: 2000, now: t0),
+            .none
+        )
+        // Still loud — no quiet — but maxSpeech elapsed.
+        XCTAssertEqual(
+            vad.observe(peak: 0.3, zcr: 0.05, rms: 0.1, ringBytes: 8000, now: t0.advanced(by: .milliseconds(850))),
+            .commit
+        )
+    }
+
+    func testCommitsFromHysteresisBandAfterMaxSpeech() {
+        var vad = makeVAD()
+        vad.maxSpeech = .milliseconds(800)
+        let t0 = ContinuousClock.Instant.now
+
+        _ = vad.observe(peak: 0.3, zcr: 0.05, rms: 0.1, ringBytes: 2000, now: t0)
+        // Peak between quietPeak and speechPeak — still needs speech-like RMS.
+        XCTAssertEqual(
+            vad.observe(peak: 0.07, zcr: 0.01, rms: 0.05, ringBytes: 8000, now: t0.advanced(by: .milliseconds(900))),
+            .commit
+        )
+    }
+
+    func testHysteresisBandRejectsLowRmsAmbient() {
+        var vad = makeVAD()
+        vad.maxSpeech = .milliseconds(800)
+        let t0 = ContinuousClock.Instant.now
+
+        _ = vad.observe(peak: 0.3, zcr: 0.05, rms: 0.1, ringBytes: 2000, now: t0)
+        // Ambient floor in the hysteresis band without real RMS must not force-commit.
+        XCTAssertEqual(
+            vad.observe(peak: 0.07, zcr: 0.01, rms: 0.01, ringBytes: 8000, now: t0.advanced(by: .milliseconds(900))),
             .none
         )
     }
@@ -134,24 +205,26 @@ final class ClientEnergyVADTests: XCTestCase {
     func testBargeInRequiresSustainedLoudSpeech() {
         var vad = makeVAD()
         vad.bargeInPeak = 0.12
+        vad.bargeInRms = 0.05
         vad.bargeInHold = .milliseconds(280)
         let t0 = ContinuousClock.Instant.now
 
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0))
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(200))))
-        XCTAssertTrue(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(300))))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, rms: 0.08, zcr: 0.05, now: t0))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, rms: 0.08, zcr: 0.05, now: t0.advanced(by: .milliseconds(200))))
+        XCTAssertTrue(vad.observeBargeIn(peak: 0.2, rms: 0.08, zcr: 0.05, now: t0.advanced(by: .milliseconds(300))))
 
         // Quiet resets; must hold again.
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.01, zcr: 0, now: t0.advanced(by: .milliseconds(400))))
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, zcr: 0.05, now: t0.advanced(by: .milliseconds(410))))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.01, rms: 0, zcr: 0, now: t0.advanced(by: .milliseconds(400))))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.2, rms: 0.08, zcr: 0.05, now: t0.advanced(by: .milliseconds(410))))
     }
 
     func testBargeInIgnoresSoftEchoLikeEnergy() {
         var vad = makeVAD()
         vad.bargeInPeak = 0.12
+        vad.bargeInRms = 0.05
         let t0 = ContinuousClock.Instant.now
         // Below barge-in peak (normal speechPeak would accept this).
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, zcr: 0.05, now: t0))
-        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, zcr: 0.05, now: t0.advanced(by: .milliseconds(400))))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, rms: 0.06, zcr: 0.05, now: t0))
+        XCTAssertFalse(vad.observeBargeIn(peak: 0.08, rms: 0.06, zcr: 0.05, now: t0.advanced(by: .milliseconds(400))))
     }
 }

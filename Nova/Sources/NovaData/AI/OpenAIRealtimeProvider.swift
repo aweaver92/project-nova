@@ -134,7 +134,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     // server_vad often never emits speech_started on-device. Drive
                     // turns from local energy in ConversationOrchestrator instead
                     // (commit + create_response). Keeps STT; drops cloud VAD dependency.
-                    "noise_reduction": NSNull(),
+                    "noise_reduction": ["type": "near_field"],
                     "turn_detection": NSNull(),
                     "transcription": [
                         "model": "gpt-4o-mini-transcribe",

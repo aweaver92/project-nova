@@ -131,11 +131,27 @@ public actor ConversationOrchestrator {
     /// Local energy VAD — primary turn detector (`turn_detection` is null).
     private var clientVAD = ClientEnergyVAD()
     private var pendingClientCommit = false
+    /// How many client-driven commits we've sent this stream (for cloud-quiet diag).
+    private var clientCommitAttempts = 0
+    /// One forced commit after VAD never fired, before raising cloud-quiet.
+    private var didForceCommitOnCloudQuiet = false
     private var lastOutboundPeak: Float = 0
+    private var lastOutboundRms: Float = 0
     private var lastOutboundZcr: Float = 0
+    /// Instantaneous zcr of the last outbound chunk (VAD / health poll).
+    private var lastOutboundInstantZcr: Float = 0
+    /// STT completed at least once this stream (even with empty text).
+    private var sttCompletionCount = 0
     /// Rolling outbound PCM for bridge diagnose dumps (~4 s @ 24 kHz mono).
     private var outboundRing = Data()
     private let outboundRingMaxBytes = 24_000 * 2 * 4
+    /// Audio and strongest frame statistics for only the current local turn.
+    /// Unlike `outboundRing`, this is cleared after every commit decision so an
+    /// earlier utterance cannot make a later rustle pass validation.
+    private var clientTurnAudio = Data()
+    private var clientTurnPeak: Float = 0
+    private var clientTurnRms: Float = 0
+    private var clientTurnZcr: Float = 0
     private var lastMicEnergyAt: ContinuousClock.Instant?
     private var lastChunkAt: ContinuousClock.Instant?
     private var userTranscriptChars = 0
@@ -707,7 +723,11 @@ public actor ConversationOrchestrator {
             assistantSpeaking = false
             clientVAD.reset()
             pendingClientCommit = false
+            clientCommitAttempts = 0
+            didForceCommitOnCloudQuiet = false
+            didAnnounceCloudQuiet = false
             outboundRing = Data()
+            resetClientTurnAudio()
             lastActivity = .now
             publishListenHealth(phase: .waitingForSpeech, detail: "Switched agent — speak or type.")
             return true
@@ -746,13 +766,19 @@ public actor ConversationOrchestrator {
         outboundZcrHeard = 0
         clientVAD.reset()
         pendingClientCommit = false
+        clientCommitAttempts = 0
+        didForceCommitOnCloudQuiet = false
         lastOutboundPeak = 0
+        lastOutboundRms = 0
         lastOutboundZcr = 0
+        lastOutboundInstantZcr = 0
         outboundRing = Data()
+        resetClientTurnAudio()
         lastMicEnergyAt = nil
         lastChunkAt = nil
         userTranscriptChars = 0
         cloudVadSpeechEvents = 0
+        sttCompletionCount = 0
         didFailoverMicRoute = false
         didAnnounceMicSilent = false
         didAnnounceCloudQuiet = false
@@ -810,8 +836,8 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
-                let shouldBargeIn = await self.noteOutboundAudio(pcm24)
-                if shouldBargeIn {
+                let outbound = await self.noteOutboundAudio(pcm24)
+                if outbound.bargeIn {
                     await self.handleBargeIn()
                 }
                 guard await self.isCurrentStream(gen) else { return }
@@ -822,6 +848,16 @@ public actor ConversationOrchestrator {
                     await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
                 } else {
                     await self.metrics.increment(.droppedMicChunks)
+                }
+                // Commit only after append so the triggering chunk is in the
+                // server buffer. Do this on the ingress path (not the 500ms
+                // health poll) so end-of-speech cannot sit uncommitted.
+                if outbound.commit, await self.isCurrentStream(gen) {
+                    await self.performClientCommit(
+                        route: nil,
+                        liveLevel: nil,
+                        reason: "client VAD"
+                    )
                 }
             }
         }
@@ -881,22 +917,18 @@ public actor ConversationOrchestrator {
         micBytesSent += chunk.pcm.count
         let peak = Self.pcmPeak(chunk.pcm)
         if peak > micPeakHeard { micPeakHeard = peak }
-        if peak >= 0.02 {
-            lastMicEnergyAt = .now
-            if listenHealth.phase == .waitingForSpeech || listenHealth.phase == .micSilent {
-                publishListenHealth(phase: .hearingYou, detail: "Local mic energy detected")
-            }
-        }
     }
 
-    /// Returns `true` when local mic energy should interrupt the assistant
-    /// (voice barge-in). Cloud `speech_started` never arrives with
-    /// `turn_detection: null`, so this is the only voice path.
-    private func noteOutboundAudio(_ pcm24: Data) -> Bool {
+    /// Returns barge-in / commit flags for the ingress pump.
+    /// Cloud `speech_started` never arrives with `turn_detection: null`, so
+    /// local energy is the only voice turn + interrupt path.
+    private func noteOutboundAudio(_ pcm24: Data) -> (bargeIn: Bool, commit: Bool) {
         let stats = Self.pcmStats(pcm24)
         if stats.peak > outboundPeakHeard { outboundPeakHeard = stats.peak }
         if stats.rms > outboundRmsHeard { outboundRmsHeard = stats.rms }
         // EMA of zero-crossing rate — speech is typically ≫ 0.02; DC/noise ≈ 0.
+        // Kept for diagnostics only; VAD uses the instantaneous chunk zcr so
+        // onset is not delayed by the EMA ramp.
         outboundZcrHeard = outboundZcrHeard * 0.85 + stats.zcr * 0.15
 
         outboundRing.append(pcm24)
@@ -905,31 +937,51 @@ public actor ConversationOrchestrator {
         }
 
         lastOutboundPeak = stats.peak
+        lastOutboundRms = stats.rms
         lastOutboundZcr = outboundZcrHeard
+        lastOutboundInstantZcr = stats.zcr
         let now = ContinuousClock.Instant.now
 
-        // Core turn VAD — ALWAYS runs (identical to the working build). Commit is
-        // gated on `!assistantSpeaking` at the health monitor and cleared on
-        // responseEnded, so this can never be starved by the barge-in path.
+        let speechLike = clientVAD.isSpeechLike(
+            peak: stats.peak,
+            rms: stats.rms,
+            zcr: stats.zcr
+        )
+        if speechLike || clientVAD.speechActive || !clientTurnAudio.isEmpty {
+            clientTurnAudio.append(pcm24)
+            clientTurnPeak = max(clientTurnPeak, stats.peak)
+            clientTurnRms = max(clientTurnRms, stats.rms)
+            if speechLike {
+                clientTurnZcr = stats.zcr
+                lastMicEnergyAt = now
+                if listenHealth.phase == .waitingForSpeech || listenHealth.phase == .micSilent {
+                    publishListenHealth(phase: .hearingYou, detail: "Local speech detected")
+                }
+            }
+        }
+
+        var shouldCommit = false
         if clientVAD.observe(
             peak: stats.peak,
-            zcr: outboundZcrHeard,
-            ringBytes: outboundRing.count,
+            zcr: stats.zcr,
+            rms: stats.rms,
+            ringBytes: clientTurnAudio.count,
             now: now
         ) == .commit {
             pendingClientCommit = true
+            shouldCommit = !assistantSpeaking
         }
 
-        // Voice barge-in is purely additive: sustained mic energy while the
-        // assistant is talking (AEC removes Nova's own voice from the mic).
+        var bargeIn = false
         if assistantSpeaking {
-            return clientVAD.observeBargeIn(
+            bargeIn = clientVAD.observeBargeIn(
                 peak: stats.peak,
-                zcr: outboundZcrHeard,
+                rms: stats.rms,
+                zcr: stats.zcr,
                 now: now
             )
         }
-        return false
+        return (bargeIn, shouldCommit)
     }
 
     private func noteAppendResult(sent: Bool) {
@@ -1035,56 +1087,38 @@ public actor ConversationOrchestrator {
             return
         }
 
-        if heardRecently || micPeakHeard >= 0.02 {
+        if heardRecently || clientVAD.speechActive || !clientTurnAudio.isEmpty {
             // Advance VAD when chunks pause but the mic level is still readable,
             // and recover if a prior commit never got a server ACK.
             let pollPeak: Float
+            let pollRms: Float
             let pollZcr: Float
             if let lastChunkAt, now - lastChunkAt < .milliseconds(250) {
                 pollPeak = max(liveLevel, lastOutboundPeak)
-                pollZcr = lastOutboundZcr
+                pollRms = lastOutboundRms
+                pollZcr = lastOutboundInstantZcr
             } else {
+                // Mic meter peak alone can look "speechy" on rustles; without a
+                // fresh chunk we have no RMS — treat as quiet so we do not commit.
                 pollPeak = liveLevel
-                pollZcr = liveLevel >= 0.05 ? lastOutboundZcr : 0
+                pollRms = liveLevel >= clientVAD.speechPeak ? lastOutboundRms : 0
+                pollZcr = liveLevel >= clientVAD.speechPeak ? lastOutboundInstantZcr : 0
             }
             if clientVAD.observe(
                 peak: pollPeak,
                 zcr: pollZcr,
-                ringBytes: outboundRing.count,
+                rms: pollRms,
+                ringBytes: clientTurnAudio.count,
                 now: now
             ) == .commit {
                 pendingClientCommit = true
             }
 
             if pendingClientCommit, !assistantSpeaking {
-                pendingClientCommit = false
-                let clip = outboundRing
-                NovaLog.session.info(
-                    "Client VAD end-of-speech; committing input buffer zcr=\(self.outboundZcrHeard)"
-                )
-                onTranscript?(
-                    "[diag] End of speech — committing (client VAD, \(NovaBuildStamp.id))",
-                    .system
-                )
-                await ai.commitInputAudio()
-                await ai.createResponse()
-                if let audioDiagnose, !clip.isEmpty {
-                    let meta = [
-                        "build": NovaBuildStamp.id,
-                        "peak": String(format: "%.3f", outboundPeakHeard),
-                        "rms": String(format: "%.3f", outboundRmsHeard),
-                        "zcr": String(format: "%.3f", outboundZcrHeard),
-                        "route": route,
-                        "ws_ok": "\(micChunksAppendOK)",
-                        "ws_fail": "\(micChunksAppendFailed)",
-                    ]
-                    Task { await audioDiagnose(clip, 24_000, meta) }
-                }
-                publishListenHealth(
-                    phase: .hearingYou,
-                    micLevel: liveLevel,
-                    inputRoute: route,
-                    detail: "Client VAD commit — waiting for transcript…"
+                await performClientCommit(
+                    route: route,
+                    liveLevel: liveLevel,
+                    reason: "client VAD"
                 )
                 return
             }
@@ -1092,42 +1126,77 @@ public actor ConversationOrchestrator {
             if userTranscriptChars == 0,
                let energyAt = lastMicEnergyAt,
                now - energyAt > .seconds(5),
-               !didAnnounceCloudQuiet
+               !assistantSpeaking
             {
-                didAnnounceCloudQuiet = true
-                let vad = cloudVadSpeechEvents > 0
-                    ? "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
-                    : "Client VAD waiting — no transcript yet after local speech"
-                let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
-                let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard)) rms=\(String(format: "%.3f", outboundRmsHeard)) zcr=\(String(format: "%.3f", outboundZcrHeard))"
-                let shapeHint = outboundZcrHeard < 0.01
-                    ? " Audio looks like DC/noise (zcr≈0), not speech — mic converter suspect."
-                    : ""
-                let message = """
-                Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks).\(shapeHint) Build \(NovaBuildStamp.id).
-                """
-                lastError = message
-                onError?(message)
-                onTranscript?("[diag] \(message)", .system)
-                if let audioDiagnose, !outboundRing.isEmpty {
-                    let clip = outboundRing
-                    let meta = [
-                        "build": NovaBuildStamp.id,
-                        "peak": String(format: "%.3f", outboundPeakHeard),
-                        "rms": String(format: "%.3f", outboundRmsHeard),
-                        "zcr": String(format: "%.3f", outboundZcrHeard),
-                        "route": route,
-                        "note": "cloud_quiet",
-                    ]
-                    Task { await audioDiagnose(clip, 24_000, meta) }
+                // VAD never segmented the turn — force one commit from whatever
+                // is still in the Realtime input buffer before raising the banner.
+                // Skip if STT already completed empty (noise commits) — forcing
+                // another commit just repeats the empty-transcript loop.
+                if !didForceCommitOnCloudQuiet,
+                   clientCommitAttempts == 0,
+                   sttCompletionCount == 0,
+                   clientTurnAudio.count >= clientVAD.minRingBytes,
+                   clientTurnPeak >= clientVAD.speechPeak,
+                   clientTurnRms >= clientVAD.speechRms,
+                   clientTurnZcr >= clientVAD.speechZcr,
+                   clientTurnZcr <= clientVAD.maxSpeechZcr
+                {
+                    didForceCommitOnCloudQuiet = true
+                    clientVAD.unlockForRetry()
+                    await performClientCommit(
+                        route: route,
+                        liveLevel: liveLevel,
+                        reason: "cloud-quiet recovery"
+                    )
+                    // Give STT a few seconds before announcing failure.
+                    lastMicEnergyAt = .now
+                    return
                 }
-                publishListenHealth(
-                    phase: .cloudQuiet,
-                    micLevel: liveLevel,
-                    inputRoute: route,
-                    detail: message
-                )
-                return
+
+                if !didAnnounceCloudQuiet {
+                    didAnnounceCloudQuiet = true
+                    let vad: String
+                    if cloudVadSpeechEvents > 0 {
+                        vad = "Cloud VAD heard speech (\(cloudVadSpeechEvents)×) but STT produced no text"
+                    } else if sttCompletionCount > 0, userTranscriptChars == 0 {
+                        vad = "STT returned empty \(sttCompletionCount)× after client commit — speak closer/louder or reduce background noise"
+                    } else if clientCommitAttempts > 0 {
+                        vad = "Client committed \(clientCommitAttempts)× but STT produced no text"
+                    } else {
+                        vad = "Client VAD waiting — no transcript yet after local speech"
+                    }
+                    let sends = "ws ok/fail \(micChunksAppendOK)/\(micChunksAppendFailed)"
+                    let peaks = "localPeak=\(String(format: "%.3f", micPeakHeard)) outPeak=\(String(format: "%.3f", outboundPeakHeard)) rms=\(String(format: "%.3f", outboundRmsHeard)) zcr=\(String(format: "%.3f", outboundZcrHeard))"
+                    let shapeHint = outboundZcrHeard < 0.01
+                        ? " Audio looks like DC/noise (zcr≈0), not speech — mic converter suspect."
+                        : ""
+                    let message = """
+                    Hearing you on \(route), but no cloud transcript yet. \(vad). \(sends). \(peaks).\(shapeHint) Build \(NovaBuildStamp.id).
+                    """
+                    lastError = message
+                    onError?(message)
+                    onTranscript?("[diag] \(message)", .system)
+                    if let audioDiagnose, !outboundRing.isEmpty {
+                        let clip = outboundRing
+                        let meta = [
+                            "build": NovaBuildStamp.id,
+                            "peak": String(format: "%.3f", outboundPeakHeard),
+                            "rms": String(format: "%.3f", outboundRmsHeard),
+                            "zcr": String(format: "%.3f", outboundZcrHeard),
+                            "route": route,
+                            "note": "cloud_quiet",
+                            "commits": "\(clientCommitAttempts)",
+                        ]
+                        Task { await audioDiagnose(clip, 24_000, meta) }
+                    }
+                    publishListenHealth(
+                        phase: .cloudQuiet,
+                        micLevel: liveLevel,
+                        inputRoute: route,
+                        detail: message
+                    )
+                    return
+                }
             }
             publishListenHealth(
                 phase: userTranscriptChars > 0 ? .hearingYou : .hearingYou,
@@ -1166,6 +1235,93 @@ public actor ConversationOrchestrator {
         listenHealth = next
         onListenHealth?(next)
         onMetricsTick?()
+    }
+
+    /// Commit + create_response from local energy VAD (or cloud-quiet recovery).
+    private func performClientCommit(
+        route: String?,
+        liveLevel: Float?,
+        reason: String
+    ) async {
+        guard streaming, isRunning, !assistantSpeaking else {
+            // Keep pendingClientCommit so the health poll can flush once playback ends.
+            return
+        }
+        pendingClientCommit = false
+        let clip = clientTurnAudio
+        let turnPeak = clientTurnPeak
+        let turnRms = clientTurnRms
+        let turnZcr = clientTurnZcr
+        resetClientTurnAudio()
+        // Safety net: never ship a near-silent / hiss-only buffer to Realtime STT.
+        // False commits were the main source of "hearing you, no transcript".
+        if clip.count < clientVAD.minRingBytes
+            || turnPeak < clientVAD.speechPeak
+            || turnRms < clientVAD.speechRms
+            || turnZcr < clientVAD.speechZcr
+            || turnZcr > clientVAD.maxSpeechZcr
+        {
+            clientVAD.unlockForRetry()
+            NovaLog.session.info(
+                "Skipped weak commit (\(reason)); peak=\(turnPeak) rms=\(turnRms) zcr=\(turnZcr) bytes=\(clip.count)"
+            )
+            onTranscript?(
+                "[diag] Skipped weak commit (\(reason)) — peak=\(String(format: "%.3f", turnPeak)) rms=\(String(format: "%.3f", turnRms)) zcr=\(String(format: "%.3f", turnZcr))",
+                .system
+            )
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Ignored subtle sound — waiting for clearer speech"
+            )
+            return
+        }
+        clientCommitAttempts += 1
+        let resolvedRoute: String
+        if let route {
+            resolvedRoute = route
+        } else if let mic = ingress as? any MicRouteControlling {
+            resolvedRoute = await mic.inputRouteLabel()
+        } else {
+            resolvedRoute = "unknown"
+        }
+        NovaLog.session.info(
+            "Client commit (\(reason)); buffer zcr=\(self.outboundZcrHeard) attempt=\(self.clientCommitAttempts)"
+        )
+        onTranscript?(
+            "[diag] End of speech — committing (\(reason), \(NovaBuildStamp.id))",
+            .system
+        )
+        await ai.commitInputAudio()
+        await ai.createResponse()
+        if let audioDiagnose, !clip.isEmpty {
+            let meta = [
+                "build": NovaBuildStamp.id,
+                "peak": String(format: "%.3f", outboundPeakHeard),
+                "rms": String(format: "%.3f", outboundRmsHeard),
+                "zcr": String(format: "%.3f", outboundZcrHeard),
+                "route": resolvedRoute,
+                "ws_ok": "\(micChunksAppendOK)",
+                "ws_fail": "\(micChunksAppendFailed)",
+                "reason": reason,
+                "commits": "\(clientCommitAttempts)",
+            ]
+            Task { await audioDiagnose(clip, 24_000, meta) }
+        }
+        publishListenHealth(
+            phase: .hearingYou,
+            micLevel: liveLevel,
+            inputRoute: resolvedRoute,
+            detail: "\(reason) commit — waiting for transcript…"
+        )
+    }
+
+    private func resetClientTurnAudio() {
+        clientTurnAudio = Data()
+        clientTurnPeak = 0
+        clientTurnRms = 0
+        clientTurnZcr = 0
     }
 
     private static func pcmPeak(_ pcm16: Data) -> Float {
@@ -1272,9 +1428,11 @@ public actor ConversationOrchestrator {
             utteranceEpoch &+= 1
             speechStoppedFallbackTask?.cancel()
             speechStoppedFallbackTask = nil
+            sttCompletionCount += 1
             userTranscriptChars += transcript.count
             clientVAD.acknowledgeTurnFinished()
             pendingClientCommit = false
+            resetClientTurnAudio()
             if !transcript.isEmpty {
                 // Completed events sometimes arrive without deltas — surface the
                 // full turn so the UI is never blank when STT succeeded.
@@ -1282,6 +1440,14 @@ public actor ConversationOrchestrator {
                     onTranscript?(transcript, .user)
                 }
                 publishListenHealth(phase: .hearingYou, detail: "Heard: \(transcript.prefix(80))")
+            } else {
+                // Empty STT after a commit — clear "hearing you" so ambient energy
+                // does not keep the cloud-quiet banner path armed.
+                lastMicEnergyAt = nil
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "No words detected — waiting for clearer speech"
+                )
             }
             await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
@@ -1301,14 +1467,17 @@ public actor ConversationOrchestrator {
             // Don't carry a mid-reply energy commit into the next listen window.
             pendingClientCommit = false
             clientVAD.reset()
+            resetClientTurnAudio()
         case .responseEnded:
             assistantSpeaking = false
             clientVAD.acknowledgeTurnFinished()
-            pendingClientCommit = false
+            // Keep pendingClientCommit: speech segmented during playback should
+            // flush on the next health tick / ingress commit once we are listening.
             // If a "Nova, stop" just landed, this is the cancelled response
             // completing. Don't reopen the listening window or emit follow-ups —
             // stay stood down until the wake word is heard again.
             if listeningSuspended {
+                pendingClientCommit = false
                 outputTranscript = ""
                 inputTranscript = ""
                 break
@@ -1459,11 +1628,14 @@ public actor ConversationOrchestrator {
     /// grace window (the wake word was spoken, or either side replied, within
     /// `wakeWordGraceWindow`), the utterance is treated as addressed to Nova.
     private func handleUserUtterance(_ transcript: String) async {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
         // 0) Master control channel — always, even when Listen disables the
         //    wake-word reply gate. Otherwise "Nova, let me talk to Claude" is
         //    ignored and the model invents a "configuration" excuse.
         if let director = agentDirector {
-            switch director.control(for: transcript) {
+            switch director.control(for: trimmed) {
             case .switchTo(let id):
                 await ai.interrupt()
                 await switchAgent(toId: id, greet: true)
@@ -1484,14 +1656,14 @@ public actor ConversationOrchestrator {
         //    stop" is treated as stop, not a hand-off.)
         if let master = masterAgent, let active = activeAgent, !active.isMaster,
            let masterDetector {
-            let masterIntent = masterDetector.detect(transcript)
+            let masterIntent = masterDetector.detect(trimmed)
             if masterIntent != .ignore {
                 if case .stop = masterIntent {
                     await handleStopCommand()
                     return
                 }
                 listeningSuspended = false
-                let command = Self.commandText(for: masterIntent, fallback: transcript)
+                let command = Self.commandText(for: masterIntent, fallback: trimmed)
                 await ai.interrupt()
                 await switchAgent(toId: master.id, greet: false, actOnText: command)
                 return
@@ -1503,13 +1675,13 @@ public actor ConversationOrchestrator {
         guard sessionConfig.requireWakeWord else { return }
 
         // 2) Strict pass: did the utterance actually contain the active wake word?
-        let strict = detector.detect(transcript)
+        let strict = detector.detect(trimmed)
         var intent = strict
         if case .ignore = strict {
             // No wake word. Honor listening mode only if a "Nova, stop" hasn't
             // suspended it — otherwise follow-ups must re-address the agent by name.
             if !listeningSuspended, isWithinGraceWindow() {
-                intent = detector.detectAssumingAddressed(transcript)
+                intent = detector.detectAssumingAddressed(trimmed)
             }
         } else {
             // The wake word was spoken explicitly — resume normal listening.
@@ -1520,12 +1692,7 @@ public actor ConversationOrchestrator {
             // model may already be answering; STT often drops or mishears "Nova",
             // and interrupt() produced Listen-green silence. Drop the transcript
             // only — barge-in / "Nova, stop" still cancel speech elsewhere.
-            let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                NovaLog.session.info("Wake gate: empty STT; leaving VAD auto-response alone")
-            } else {
-                NovaLog.session.info("Wake gate: ignore '\(trimmed, privacy: .public)'; leaving VAD auto-response alone")
-            }
+            NovaLog.session.info("Wake gate: ignore '\(trimmed, privacy: .public)'; leaving VAD auto-response alone")
             inputTranscript = ""
             return
         }
@@ -1539,7 +1706,7 @@ public actor ConversationOrchestrator {
         // Addressed: (re)open the listening window and act on the intent.
         lastEngagement = .now
         // A saved skill or bookmark request takes precedence over a plain reply.
-        if await handleSkillOrBookmark(transcript) { return }
+        if await handleSkillOrBookmark(trimmed) { return }
         await act(on: intent)
     }
 
