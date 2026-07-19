@@ -23,8 +23,12 @@ final class StudyViewModelTests: XCTestCase {
         XCTAssertEqual(vm.currentReviewCard?.back, "4")
 
         await vm.gradeCurrent(.good)
-        XCTAssertEqual(vm.reviewIndex, 1)
         XCTAssertFalse(vm.isRevealed)
+        // Grading drops the card from the due set; reconcile re-points the shared
+        // queue at the next due card (index normalises to 0) instead of leaving a
+        // stale slot, so assert on the visible card rather than the raw index.
+        XCTAssertEqual(vm.currentReviewCard?.front, "3+3?")
+        XCTAssertEqual(vm.dueTotal, 1)
 
         await vm.gradeCurrent(.easy)
         XCTAssertFalse(vm.isReviewing)
@@ -55,8 +59,10 @@ final class StudyViewModelTests: XCTestCase {
 
         _ = await store.grade(id: a.id, grade: .good)
         await vm.syncGradeFromVoice(cardId: a.id)
-        XCTAssertEqual(vm.reviewIndex, 1)
+        // Reconcile drops the voice-graded card and advances the shared queue to
+        // the next due card (index normalises to 0).
         XCTAssertEqual(vm.currentReviewCard?.front, "Who?")
+        XCTAssertEqual(vm.dueTotal, 1)
     }
 }
 

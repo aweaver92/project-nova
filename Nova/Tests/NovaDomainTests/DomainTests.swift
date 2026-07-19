@@ -629,10 +629,14 @@ final class WakeWordTests: XCTestCase {
         let operations = await provider.audioOperations
         XCTAssertEqual(operations.filter { $0 == "commit" }.count, 1)
         XCTAssertEqual(operations.filter { $0 == "response" }.count, 1)
-        XCTAssertEqual(operations.last, "response")
+        // The mic keeps streaming, so trailing silence appends after the turn are
+        // expected. Assert the commit is wrapped as append→commit→response rather
+        // than requiring "response" to be the very last recorded operation.
         if let commitIndex = operations.firstIndex(of: "commit") {
             XCTAssertGreaterThan(commitIndex, 0)
             XCTAssertEqual(operations[commitIndex - 1], "append")
+            XCTAssertLessThan(commitIndex + 1, operations.count)
+            XCTAssertEqual(operations[commitIndex + 1], "response")
         } else {
             XCTFail("expected client VAD commit")
         }
