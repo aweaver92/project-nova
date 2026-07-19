@@ -34,6 +34,7 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(scholar.toolNames!.contains("delete_study_card"))
         XCTAssertTrue(scholar.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(claude.toolNames!.contains("push_to_cursor"))
+        XCTAssertTrue(claude.toolNames!.contains("get_cursor_session_history"))
         XCTAssertTrue(claude.toolNames!.contains("list_repos"))
         XCTAssertTrue(claude.toolNames!.contains("create_web_project"))
         XCTAssertTrue(claude.toolNames!.contains("publish_repo"))

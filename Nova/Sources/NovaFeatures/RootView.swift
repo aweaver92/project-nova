@@ -253,7 +253,10 @@ public struct RootView: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else { return }
-                Task { await coding.resumePendingClaudeIfNeeded() }
+                Task {
+                    await coding.resumePendingClaudeIfNeeded()
+                    await coding.resumePendingCursorRunIfNeeded()
+                }
             }
         }
     }

@@ -941,8 +941,12 @@ public protocol AgentBridging: Sendable {
     func resumePendingClaudeCode() async -> BridgeResult?
     func pushToCursor(command: String, sessionId: String?, workingDirectory: String?, repoId: String?) async -> BridgeResult
     func listCursorSessions() async -> BridgeResult
+    /// Workspace-aware session listing. Repository-local Cursor stores require
+    /// the same repo context used when the session was created.
+    func listCursorSessions(repoId: String?) async -> BridgeResult
     /// Transcript history for a Cursor agent session (`GET /cursor/sessions/:id/messages`).
     func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult
+    func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult
     /// Streaming Cursor run (`POST /cursor/runs`). Invokes `onEvent` for each SSE payload.
     func streamCursorRun(
         command: String,
@@ -1004,6 +1008,9 @@ public extension AgentBridging {
     func listCursorSessions() async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
+    func listCursorSessions(repoId: String?) async -> BridgeResult {
+        await listCursorSessions()
+    }
     func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
@@ -1027,6 +1034,9 @@ public extension AgentBridging {
     }
     func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult {
+        await fetchCursorSessionMessages(sessionId: sessionId)
     }
     func streamCursorRun(
         command: String,

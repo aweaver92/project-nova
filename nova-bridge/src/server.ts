@@ -115,6 +115,13 @@ function resolveRequestCwd(body: { repoId?: unknown; cwd?: unknown }): string {
   return repos.resolveCwd(repoId || null, legacyCwd || null);
 }
 
+function resolveQueryCwd(req: Request): string {
+  return resolveRequestCwd({
+    repoId: typeof req.query.repoId === "string" ? req.query.repoId : undefined,
+    cwd: typeof req.query.cwd === "string" ? req.query.cwd : undefined,
+  });
+}
+
 // --- Health (no auth) -------------------------------------------------------
 app.get("/health", (_req, res) => {
   const ready = repos.readiness();
@@ -811,7 +818,10 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
   try {
     const { Agent } = await import("@cursor/sdk");
     const agent = sessionId
-      ? await Agent.resume(sessionId, { apiKey: CURSOR_API_KEY })
+      ? await Agent.resume(sessionId, {
+          apiKey: CURSOR_API_KEY,
+          local: { cwd },
+        })
       : await Agent.create({
           apiKey: CURSOR_API_KEY,
           model: { id: CURSOR_MODEL },
@@ -970,7 +980,10 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       agent = sessionId
         ? await withTimeout(
             "agent_resume",
-            Agent.resume(sessionId, { apiKey: CURSOR_API_KEY }),
+            Agent.resume(sessionId, {
+              apiKey: CURSOR_API_KEY,
+              local: { cwd },
+            }),
             90_000,
           )
         : await withTimeout(
@@ -983,30 +996,19 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
             90_000,
           );
     } catch (err) {
-      // Stale/corrupt session pins often hang or fail resume. Fall back once.
       if (sessionId) {
         console.log(
-          `[cursor/runs] resume failed (${describe(err)}); creating fresh agent`,
+          `[cursor/runs] resume failed (${describe(err)}); preserving session context`,
         );
         write({
           type: "activity",
           phase: "status",
-          text: "Resume failed — starting a new session…",
+          text: "Resume failed — session context was not discarded",
           detail: describe(err),
-          done: false,
+          done: true,
         });
-        agent = await withTimeout(
-          "agent_create_fallback",
-          Agent.create({
-            apiKey: CURSOR_API_KEY,
-            model: { id: CURSOR_MODEL },
-            local: { cwd },
-          }),
-          90_000,
-        );
-      } else {
-        throw err;
       }
+      throw err;
     }
 
     resolvedSessionId = agent.agentId;
@@ -1307,16 +1309,23 @@ app.post("/cursor/runs/:runId/cancel", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/cursor/sessions", requireAuth, async (_req, res) => {
+app.get("/cursor/sessions", requireAuth, async (req, res) => {
   if (!CURSOR_API_KEY) {
     res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
+    return;
+  }
+  let cwd: string;
+  try {
+    cwd = resolveQueryCwd(req);
+  } catch (err) {
+    sendRepoError(res, err);
     return;
   }
   try {
     const { Agent } = await import("@cursor/sdk");
     const list = await Agent.list({
       runtime: "local",
-      cwd: DEFAULT_CWD,
+      cwd,
     });
     const sessions = list.items.map((a) => ({
       id: a.agentId,
@@ -1341,11 +1350,18 @@ app.get("/cursor/sessions/:id/messages", requireAuth, async (req, res) => {
     res.status(500).json({ ok: false, error: "cursor_api_key_missing" });
     return;
   }
+  let cwd: string;
+  try {
+    cwd = resolveQueryCwd(req);
+  } catch (err) {
+    sendRepoError(res, err);
+    return;
+  }
   try {
     const { Agent } = await import("@cursor/sdk");
     const raw = await Agent.messages.list(id, {
       runtime: "local",
-      cwd: DEFAULT_CWD,
+      cwd,
       limit: Number(req.query.limit ?? 200) || 200,
     });
     const messages = raw

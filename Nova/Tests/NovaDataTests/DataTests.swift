@@ -613,6 +613,27 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertNil(cleared)
     }
 
+    func testCodingSessionPinsAreScopedPerRepository() async {
+        let suite = "nova.test.codingPinsByRepo.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+
+        await store.setCodingSelectedRepoId("repo-a")
+        await store.setCodingSessionId("session-a")
+        await store.setCodingSelectedRepoId("repo-b")
+        let initialRepoB = await store.codingSessionId()
+        XCTAssertNil(initialRepoB)
+        await store.setCodingSessionId("session-b")
+
+        await store.setCodingSelectedRepoId("repo-a")
+        let restoredRepoA = await store.codingSessionId()
+        XCTAssertEqual(restoredRepoA, "session-a")
+        await store.setCodingSelectedRepoId("repo-b")
+        let restoredRepoB = await store.codingSessionId()
+        XCTAssertEqual(restoredRepoB, "session-b")
+    }
+
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
         let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1", codingSelectedRepoId: "abcdef0123456789")
         let bridge = PinCapturingBridge()
@@ -625,6 +646,23 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertEqual(usedRepo, "abcdef0123456789")
         let updated = await settings.codingSessionId()
         XCTAssertEqual(updated, "returned-99")
+    }
+
+    func testCursorHistoryToolUsesPinnedSessionAndSelectedRepository() async throws {
+        let settings = FakeCodingSettingsStore(
+            codingSessionId: "pinned-history",
+            codingSelectedRepoId: "repo-history"
+        )
+        let bridge = PinCapturingBridge()
+        let tool = GetCursorSessionHistoryTool(bridge: bridge, settings: settings)
+
+        let payload = try await tool.invoke(argumentsJSON: #"{}"#)
+
+        XCTAssertTrue(payload.contains("prior decision"))
+        let historySessionId = await bridge.lastHistorySessionId
+        let historyRepoId = await bridge.lastHistoryRepoId
+        XCTAssertEqual(historySessionId, "pinned-history")
+        XCTAssertEqual(historyRepoId, "repo-history")
     }
 
 }
@@ -689,6 +727,8 @@ private actor FakeCodingSettingsStore: SettingsStoring {
 private actor PinCapturingBridge: AgentBridging {
     private(set) var lastSessionId: String?
     private(set) var lastRepoId: String?
+    private(set) var lastHistorySessionId: String?
+    private(set) var lastHistoryRepoId: String?
 
     func isConfigured() async -> Bool { true }
     func health() async -> BridgeResult {
@@ -712,6 +752,14 @@ private actor PinCapturingBridge: AgentBridging {
     }
     func listCursorSessions() async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true,"sessions":[]}"#)
+    }
+    func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult {
+        lastHistorySessionId = sessionId
+        lastHistoryRepoId = repoId
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"messages":[{"role":"assistant","text":"prior decision"}]}"#
+        )
     }
     func selectRepository(repoId: String) async -> BridgeResult {
         BridgeResult(

@@ -1623,7 +1623,8 @@ public actor ConversationOrchestrator {
         NovaLog.ai.info("tool \(name, privacy: .public) ok=\(result.ok)")
         await memory?.append(ConversationTurn(
             role: .system,
-            text: "tool:\(name) → \(result.payloadJSON)"
+            text: "tool:\(name) → \(result.payloadJSON)",
+            workspaceId: await memoryScopeId()
         ))
         // switch_agent rebuilds the Realtime session; the old call_id is gone.
         if name != "switch_agent" {

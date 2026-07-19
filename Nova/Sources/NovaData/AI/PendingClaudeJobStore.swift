@@ -49,7 +49,50 @@ enum PendingClaudeJobStore {
     }
 }
 
-/// Short iOS background execution window for the Claude start handshake / poll tick.
+/// Persists an in-flight Cursor Coding run so lock / navigate-away / unlock can
+/// reattach without replaying the prompt (which would duplicate edits).
+struct PendingCursorRun: Codable, Equatable, Sendable {
+    var runId: String
+    var sessionId: String?
+    var repoId: String?
+    var startedAt: Date
+
+    init(
+        runId: String,
+        sessionId: String?,
+        repoId: String?,
+        startedAt: Date = Date()
+    ) {
+        self.runId = runId
+        self.sessionId = sessionId
+        self.repoId = repoId
+        self.startedAt = startedAt
+    }
+}
+
+enum PendingCursorRunStore {
+    private static let key = "nova.pendingCursorRun"
+    private static let defaults = UserDefaults.standard
+
+    static func save(_ run: PendingCursorRun) {
+        guard let data = try? JSONEncoder().encode(run) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    static func load() -> PendingCursorRun? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(PendingCursorRun.self, from: data)
+    }
+
+    static func clear(runId: String? = nil) {
+        if let runId, let current = load(), current.runId != runId {
+            return
+        }
+        defaults.removeObject(forKey: key)
+    }
+}
+
+/// Short iOS background execution window for bridge start / poll / SSE ticks.
 enum BackgroundTask {
     struct Handle: @unchecked Sendable {
         #if canImport(UIKit)
@@ -71,6 +114,13 @@ enum BackgroundTask {
         #else
         return Handle(rawValue: -1)
         #endif
+    }
+
+    /// End the previous window and open a fresh one so long polls stay alive.
+    @MainActor
+    static func renew(_ handle: Handle, name: String) -> Handle {
+        end(handle)
+        return begin(name: name)
     }
 
     @MainActor

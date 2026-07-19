@@ -45,7 +45,15 @@ public struct AgentsView: View {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Coding")
-                                    Text(coding.pinnedSessionId == nil ? "Cursor session preview" : coding.shortSessionId)
+                                    Text(
+                                        coding.isCodeViewSessionActive
+                                            ? (coding.isRunning
+                                                ? "Session active · agent working"
+                                                : (coding.pinnedSessionId == nil
+                                                    ? "Session open — send a prompt"
+                                                    : coding.shortSessionId))
+                                            : "New session on open"
+                                    )
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .monospaced()

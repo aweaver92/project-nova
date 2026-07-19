@@ -331,7 +331,8 @@ public final class AppContainer {
             PublishRepoTool(bridge: bridge, settings: settingsStore),
             RunClaudeCodeTool(bridge: bridge, settings: settingsStore),
             PushToCursorTool(bridge: bridge, settings: settingsStore),
-            ListCursorSessionsTool(bridge: bridge),
+            ListCursorSessionsTool(bridge: bridge, settings: settingsStore),
+            GetCursorSessionHistoryTool(bridge: bridge, settings: settingsStore),
             // Max's workout + plan tools.
             StartWorkoutSessionTool(store: workoutStore),
             LogWorkoutSetTool(store: workoutStore),

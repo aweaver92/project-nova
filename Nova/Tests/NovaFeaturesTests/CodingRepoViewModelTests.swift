@@ -20,11 +20,15 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(calls, 0)
     }
 
-    func testSelectRepositoryClearsPinnedSession() async {
+    func testSelectRepositoryDoesNotReuseAnotherReposPinnedSession() async {
         let bridge = DirtyRepoBridge()
         let settings = MemorySettings(repoId: "1111111111111111", sessionId: "stale")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
+        // Code view sessions start fresh — persisted pins are not auto-restored.
+        XCTAssertNil(vm.pinnedSessionId)
+
+        await vm.attach(sessionId: "stale")
         XCTAssertEqual(vm.pinnedSessionId, "stale")
 
         await vm.selectRepository("abcdef0123456789")
@@ -34,10 +38,119 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertNil(sessionAfter)
     }
 
+    func testBeginCodeViewSessionClearsPriorPin() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789", sessionId: "old-agent")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+        XCTAssertNil(vm.pinnedSessionId)
+        let cleared = await settings.codingSessionId()
+        XCTAssertNil(cleared)
+        XCTAssertTrue(vm.items.isEmpty)
+    }
+
+    func testReenteringCodeViewPreservesActiveSessionAndRun() async {
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.25)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "long job"
+        let sendTask = Task { await vm.send() }
+        try? await Task.sleep(for: .milliseconds(40))
+        XCTAssertTrue(vm.isRunning)
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        let itemsBefore = vm.items.count
+
+        // Simulate leaving Coding and coming back (NavigationLink pop/push).
+        await vm.beginCodeViewSession()
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        XCTAssertTrue(vm.isRunning)
+        XCTAssertEqual(vm.items.count, itemsBefore)
+
+        await sendTask.value
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["long job"])
+    }
+
+    func testMultiplePromptsReuseTheSameSession() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first prompt"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+
+        vm.draft = "follow-up in same chat"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        let commands = await bridge.receivedCommands
+        let sessionIds = await bridge.receivedSessionIds
+        XCTAssertEqual(commands, ["first prompt", "follow-up in same chat"])
+        XCTAssertEqual(sessionIds.first, nil)
+        XCTAssertEqual(sessionIds.last, "agent-test")
+    }
+
+    func testPromptSubmittedDuringActiveRunQueuesAndUsesSameSession() async {
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.2)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first prompt"
+        let firstSend = Task { await vm.send() }
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(vm.isRunning)
+
+        vm.draft = "queued follow-up"
+        await vm.send()
+
+        XCTAssertEqual(vm.queuedPromptCount, 1)
+        XCTAssertTrue(vm.draft.isEmpty)
+        await firstSend.value
+
+        let commands = await bridge.receivedCommands
+        let sessionIds = await bridge.receivedSessionIds
+        XCTAssertEqual(commands, ["first prompt", "queued follow-up"])
+        XCTAssertEqual(sessionIds, [nil, "agent-test"])
+        XCTAssertEqual(vm.queuedPromptCount, 0)
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testEndSessionRequiresCodeViewToReopenBeforeNextChat() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+        vm.draft = "open chat"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+
+        await vm.endSession()
+        XCTAssertNil(vm.pinnedSessionId)
+        XCTAssertTrue(vm.items.isEmpty)
+        XCTAssertFalse(vm.isCodeViewSessionActive)
+
+        vm.draft = "must not start silently"
+        await vm.send()
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["open chat"])
+    }
+
     func testImageOnlyPromptSendsAttachmentAndClearsComposer() async {
         let bridge = DirtyRepoBridge()
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
         vm.addImage(
             data: Data([0x89, 0x50, 0x4E, 0x47]),
             mimeType: "image/png",
@@ -60,6 +173,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let vm = CodingViewModel(bridge: bridge, settings: settings)
 
         XCTAssertFalse(vm.canRetry)
+        await vm.beginCodeViewSession()
         vm.draft = "fix the build"
         await vm.send()
         XCTAssertTrue(vm.canRetry)
@@ -99,6 +213,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let prompts = InMemoryCodingPromptStore()
         let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
         await vm.load()
+        await vm.beginCodeViewSession()
         await vm.pinPath("src/App.tsx", isDirectory: false)
 
         vm.draft = "Add a button"
@@ -118,6 +233,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
+        await vm.beginCodeViewSession()
 
         vm.draft = "edit files"
         await vm.send()
@@ -142,6 +258,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         vm.confirmPublish = { _, _ in true }
         await vm.load()
+        await vm.beginCodeViewSession()
         vm.draft = "edit"
         await vm.send()
 
@@ -191,6 +308,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         vm.stallSoftSeconds = 0.05
         vm.stallHardSeconds = 0.15
         vm.stallPollSeconds = 0.03
+        await vm.beginCodeViewSession()
 
         let sendTask = Task {
             vm.draft = "long job"
@@ -212,6 +330,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let bridge = DirtyRepoBridge(emitAfterCancel: true)
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
 
         let sendTask = Task {
             vm.draft = "hello"
@@ -229,6 +348,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
         vm.draft = "make one safe edit"
 
         await vm.send()
@@ -247,6 +367,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
         await vm.load()
+        await vm.beginCodeViewSession()
 
         vm.draft = "Ship a dark mode toggle"
         await vm.saveCurrentDraftAsTemplate(title: "Dark mode")
@@ -273,21 +394,36 @@ final class CodingRepoViewModelTests: XCTestCase {
 
 private actor MemorySettings: SettingsStoring {
     private var repoId: String?
-    private var sessionId: String?
+    private var sessionIdsByRepo: [String: String]
+    private var unscopedSessionId: String?
     private var autoOpenPreview: Bool
 
     init(repoId: String?, sessionId: String? = nil, autoOpenPreview: Bool = false) {
         self.repoId = repoId
-        self.sessionId = sessionId
+        if let repoId, let sessionId {
+            self.sessionIdsByRepo = [repoId: sessionId]
+            self.unscopedSessionId = nil
+        } else {
+            self.sessionIdsByRepo = [:]
+            self.unscopedSessionId = sessionId
+        }
         self.autoOpenPreview = autoOpenPreview
     }
 
     func spokenFollowUps() async -> Bool { false }
     func setSpokenFollowUps(_ enabled: Bool) async {}
-    func codingSessionId() async -> String? { sessionId }
+    func codingSessionId() async -> String? {
+        guard let repoId else { return unscopedSessionId }
+        return sessionIdsByRepo[repoId]
+    }
     func setCodingSessionId(_ value: String?) async {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        sessionId = (trimmed?.isEmpty == false) ? trimmed : nil
+        let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
+        if let repoId {
+            sessionIdsByRepo[repoId] = normalized
+        } else {
+            unscopedSessionId = normalized
+        }
     }
     func codingSelectedRepoId() async -> String? { repoId }
     func setCodingSelectedRepoId(_ value: String?) async {
@@ -302,6 +438,7 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var receivedImageCount = 0
     private(set) var receivedCommands: [String] = []
+    private(set) var receivedSessionIds: [String?] = []
     private(set) var receivedPreviewPath: String?
     private(set) var keptPaths: [String] = []
     private(set) var restoredPaths: [String] = []
@@ -474,6 +611,7 @@ private actor DirtyRepoBridge: AgentBridging {
     ) async -> BridgeResult {
         receivedImageCount = images.count
         receivedCommands.append(command)
+        receivedSessionIds.append(sessionId)
         cancelled = false
         await onEvent(CodingStreamEvent(
             type: "status",

@@ -7,6 +7,9 @@ import NovaDomain
 public struct TrainingView: View {
     @Bindable var training: TrainingViewModel
     var embedded: Bool = false
+    @State private var editingPlan: WorkoutPlan?
+    @State private var showNewPlan = false
+    @State private var planPendingDelete: WorkoutPlan?
 
     private static let heat = LinearGradient(
         colors: [Color(red: 0.85, green: 0.15, blue: 0.10), Color(red: 0.95, green: 0.45, blue: 0.10)],
@@ -59,6 +62,47 @@ public struct TrainingView: View {
         .navigationTitle(training.hasActiveSession ? "Live workout" : "Training")
         .navigationBarTitleDisplayMode(.inline)
         .tint(.orange)
+        .toolbar {
+            if !training.hasActiveSession {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showNewPlan = true
+                    } label: {
+                        Label("New routine", systemImage: "plus")
+                    }
+                }
+            }
+        }
+        .sheet(item: $editingPlan) { plan in
+            WorkoutPlanEditorSheet(plan: plan) { saved in
+                Task { await training.savePlan(saved) }
+            }
+        }
+        .sheet(isPresented: $showNewPlan) {
+            WorkoutPlanEditorSheet(plan: WorkoutPlan(name: "", exercises: [PlannedExercise(name: "")])) { saved in
+                Task { await training.savePlan(saved) }
+            }
+        }
+        .alert(
+            "Delete routine?",
+            isPresented: Binding(
+                get: { planPendingDelete != nil },
+                set: { if !$0 { planPendingDelete = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let plan = planPendingDelete {
+                    Task { await training.deletePlan(plan) }
+                }
+                planPendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                planPendingDelete = nil
+            }
+        } message: {
+            Text(planPendingDelete.map { "Remove \"\($0.name)\" from your saved routines." }
+                 ?? "Remove this routine.")
+        }
         .task {
             await training.load()
         }
@@ -321,11 +365,22 @@ public struct TrainingView: View {
     @ViewBuilder
     private var plansCarousel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("PLANS")
-                .font(.caption.weight(.heavy))
-                .foregroundStyle(.secondary)
+            HStack {
+                Text("ROUTINES")
+                    .font(.caption.weight(.heavy))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    showNewPlan = true
+                } label: {
+                    Label("New", systemImage: "plus.circle.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+            }
             if training.plans.isEmpty {
-                Text("No saved plans yet — ask Max to build one.")
+                Text("No saved routines yet — tap New to build one.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -340,15 +395,34 @@ public struct TrainingView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 Spacer(minLength: 0)
-                                Button("Start") {
-                                    Task { await training.startFromPlan(plan) }
+                                HStack(spacing: 8) {
+                                    Button("Start") {
+                                        Task { await training.startFromPlan(plan) }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                    Button("Edit") {
+                                        editingPlan = plan
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
                             }
                             .padding(12)
-                            .frame(width: 150, height: 120, alignment: .leading)
+                            .frame(width: 168, height: 132, alignment: .leading)
                             .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+                            .contextMenu {
+                                Button {
+                                    editingPlan = plan
+                                } label: {
+                                    Label("Edit", systemImage: "pencil")
+                                }
+                                Button(role: .destructive) {
+                                    planPendingDelete = plan
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                         }
                     }
                 }
@@ -458,5 +532,112 @@ public struct TrainingView: View {
         df.dateStyle = .medium
         df.timeStyle = .none
         return df.string(from: date)
+    }
+}
+
+// MARK: - Routine editor
+
+private struct WorkoutPlanEditorSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var plan: WorkoutPlan
+    var onSave: (WorkoutPlan) -> Void
+
+    init(plan: WorkoutPlan, onSave: @escaping (WorkoutPlan) -> Void) {
+        _plan = State(initialValue: plan)
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Routine") {
+                    TextField("Name", text: $plan.name)
+                    TextField("Notes", text: Binding(
+                        get: { plan.notes ?? "" },
+                        set: { plan.notes = $0.isEmpty ? nil : $0 }
+                    ), axis: .vertical)
+                    .lineLimit(2...4)
+                }
+                Section("Exercises") {
+                    ForEach($plan.exercises) { $exercise in
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextField("Exercise", text: $exercise.name)
+                            HStack {
+                                labeledIntField("Sets", value: $exercise.sets)
+                                labeledIntField("Reps", value: $exercise.reps)
+                            }
+                            HStack {
+                                labeledDoubleField("Weight lb", value: $exercise.weight)
+                                labeledIntField("Rest sec", value: $exercise.restSeconds)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .onDelete { offsets in
+                        plan.exercises.remove(atOffsets: offsets)
+                    }
+                    Button {
+                        plan.exercises.append(PlannedExercise(name: ""))
+                    } label: {
+                        Label("Add exercise", systemImage: "plus.circle.fill")
+                    }
+                }
+            }
+            .navigationTitle(plan.name.isEmpty ? "New routine" : "Edit routine")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let cleaned = plan.exercises.filter {
+                            !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        }
+                        var saved = plan
+                        saved.name = plan.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        saved.exercises = cleaned
+                        guard !saved.name.isEmpty, !saved.exercises.isEmpty else { return }
+                        onSave(saved)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private func labeledIntField(_ label: String, value: Binding<Int?>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField(label, text: Binding(
+                get: { value.wrappedValue.map(String.init) ?? "" },
+                set: { value.wrappedValue = Int($0) }
+            ))
+            .keyboardType(.numberPad)
+            .textFieldStyle(.roundedBorder)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func labeledDoubleField(_ label: String, value: Binding<Double?>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField(label, text: Binding(
+                get: {
+                    guard let v = value.wrappedValue else { return "" }
+                    return v.truncatingRemainder(dividingBy: 1) == 0
+                        ? String(Int(v))
+                        : String(v)
+                },
+                set: { value.wrappedValue = Double($0) }
+            ))
+            .keyboardType(.decimalPad)
+            .textFieldStyle(.roundedBorder)
+        }
+        .frame(maxWidth: .infinity)
     }
 }

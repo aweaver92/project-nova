@@ -8,8 +8,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
+    "dev": "node ./node_modules/tsx/dist/cli.mjs watch src/server.ts",
+    "start": "node ./node_modules/tsx/dist/cli.mjs src/server.ts",
     "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-bridge-service.ps1",
     "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-service.ps1",
     "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-bridge.ps1",

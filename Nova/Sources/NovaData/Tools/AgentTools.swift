@@ -54,16 +54,21 @@ public struct PushToCursorTool: Tool {
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         let explicit = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
         let pinned = await settings.codingSessionId()
-        let sessionId = (explicit?.isEmpty == false) ? explicit : pinned
         let selected = await settings.codingSelectedRepoId()
         let repoId = args.repo_id ?? selected
+        let sessionId = (explicit?.isEmpty == false)
+            ? explicit
+            : (repoId == selected ? pinned : nil)
         let result = await bridge.pushToCursor(
             command: args.command,
             sessionId: sessionId,
             workingDirectory: nil,
             repoId: repoId
         )
-        if let returned = Self.sessionId(from: result.payloadJSON), !returned.isEmpty {
+        if repoId == selected,
+           let returned = Self.sessionId(from: result.payloadJSON),
+           !returned.isEmpty
+        {
             await settings.setCodingSessionId(returned)
         }
         return result.payloadJSON
@@ -82,13 +87,63 @@ public struct PushToCursorTool: Tool {
 /// List the user's active Cursor sessions so a command can target a specific one.
 public struct ListCursorSessionsTool: Tool {
     public let name = "list_cursor_sessions"
-    public let description = "List the user's currently active Cursor sessions (id, project, and title)."
+    public let description = "List Cursor sessions in the selected repository (id, status, title, and summary). Use get_cursor_session_history before making decisions that depend on an earlier coding conversation."
     public let requiresConfirmation = false
     private let bridge: any AgentBridging
-    public init(bridge: any AgentBridging) { self.bridge = bridge }
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
 
     public func invoke(argumentsJSON: String) async throws -> String {
-        await bridge.listCursorSessions().payloadJSON
+        let repoId = await settings.codingSelectedRepoId()
+        return await bridge.listCursorSessions(repoId: repoId).payloadJSON
+    }
+}
+
+/// Read a bounded Cursor transcript so Claude can ground follow-up coding
+/// decisions in what the user and coding agent already discussed.
+public struct GetCursorSessionHistoryTool: Tool {
+    public let name = "get_cursor_session_history"
+    public let description = "Read the user/assistant chat history for a Cursor session in the selected repository. Use this when the request refers to prior discussion, earlier decisions, 'that change', or an existing session."
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"session_id":{"type":"string","description":"Optional Cursor session id. Omit to read the Coding tab's pinned session."},"repo_id":{"type":"string","description":"Optional repository id. Defaults to the Coding tab selection."}},"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let session_id: String?
+            let repo_id: String?
+        }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8)))
+            ?? Args(session_id: nil, repo_id: nil)
+        let selectedRepoId = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selectedRepoId
+        let explicitSession = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionId: String?
+        if explicitSession?.isEmpty == false {
+            sessionId = explicitSession
+        } else if repoId == selectedRepoId {
+            sessionId = await settings.codingSessionId()
+        } else {
+            sessionId = nil
+        }
+        guard let sessionId, !sessionId.isEmpty else {
+            return #"{"ok":false,"error":"no_cursor_session_selected","hint":"Call list_cursor_sessions, then provide session_id, or attach a session in Coding."}"#
+        }
+        return await bridge.fetchCursorSessionMessages(
+            sessionId: sessionId,
+            repoId: repoId
+        ).payloadJSON
     }
 }
 
@@ -108,7 +163,7 @@ public struct ListReposTool: Tool {
 /// Select a repository by opaque id for subsequent coding runs.
 public struct SelectRepoTool: Tool {
     public let name = "select_repo"
-    public let description = "Select a repository (by id from list_repos) as the active Coding workspace. Clears the pinned Cursor session because resumed sessions keep their original directory."
+    public let description = "Select a repository (by id from list_repos) as the active Coding workspace."
     public let requiresConfirmation = true
     public let parametersJSON = """
     {"type":"object","properties":{"repo_id":{"type":"string","description":"Opaque repository id from list_repos."}},"required":["repo_id"],"additionalProperties":false}
@@ -126,6 +181,8 @@ public struct SelectRepoTool: Tool {
         let result = await bridge.selectRepository(repoId: args.repo_id)
         if result.ok {
             await settings.setCodingSelectedRepoId(args.repo_id)
+            // Code view owns chat session lifecycle; clear the pin so the next
+            // prompt starts a fresh Cursor agent for this workspace.
             await settings.setCodingSessionId(nil)
         }
         return result.payloadJSON

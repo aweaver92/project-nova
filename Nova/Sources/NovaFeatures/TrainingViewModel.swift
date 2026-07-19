@@ -85,6 +85,34 @@ public final class TrainingViewModel {
         await load()
     }
 
+    public func savePlan(_ plan: WorkoutPlan) async {
+        let name = plan.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            statusMessage = "Give the routine a name."
+            return
+        }
+        let exercises = plan.exercises.filter {
+            !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !exercises.isEmpty else {
+            statusMessage = "Add at least one exercise."
+            return
+        }
+        var saved = plan
+        saved.name = name
+        saved.exercises = exercises
+        saved.updatedAt = Date()
+        _ = await plansStore.upsert(saved)
+        statusMessage = "Saved \(name)."
+        await load()
+    }
+
+    public func deletePlan(_ plan: WorkoutPlan) async {
+        await plansStore.delete(id: plan.id)
+        statusMessage = "Deleted \(plan.name)."
+        await load()
+    }
+
     public func logSet() async {
         let name = logExercise.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {

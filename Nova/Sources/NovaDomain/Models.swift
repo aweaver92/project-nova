@@ -749,7 +749,7 @@ public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
     /// v12: open_app_screen on specialists (scoped UI navigation).
-    static let seedCapabilitiesVersion = 12
+    static let seedCapabilitiesVersion = 13
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -792,11 +792,12 @@ public extension Agent {
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and web designer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent. When the user asks to see Coding / Cursor / repos on the phone, call open_app_screen with coding. When the user asks for a new website or project, use create_web_project after confirming the name and template; it creates a PUBLIC GitHub repo, so state that clearly. Prefer react-vite for interactive frontends, nextjs for full-stack/SEO sites, vite for lightweight JavaScript, and static for simple landing pages. When the user says work on an existing repo, call list_repos / select_repo or clone_repo first (HTTPS GitHub URLs only), then run coding tools against that selection — never invent filesystem paths. Prefer run_claude_code for edits and investigation; use push_to_cursor / list_cursor_sessions to drive Cursor. Before shipping changes, call repo_status and repo_diff, then publish_repo to open a pull request on a nova/* branch — never push directly to main/master. Briefly announce long-running tool calls and confirm results concisely. Confirm before create/clone/select/publish and irreversible actions.",
+                personality: "You are Claude, a senior software engineer and web designer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent. When the user asks to see Coding / Cursor / repos on the phone, call open_app_screen with coding. When the user asks for a new website or project, use create_web_project after confirming the name and template; it creates a PUBLIC GitHub repo, so state that clearly. Prefer react-vite for interactive frontends, nextjs for full-stack/SEO sites, vite for lightweight JavaScript, and static for simple landing pages. When the user says work on an existing repo, call list_repos / select_repo or clone_repo first (HTTPS GitHub URLs only), then run coding tools against that selection — never invent filesystem paths. Prefer run_claude_code for edits and investigation; use push_to_cursor / list_cursor_sessions to drive Cursor. When a request refers to prior discussion, an earlier decision, or an existing coding session, call get_cursor_session_history before deciding what to do; do not guess from a title or summary. Before shipping changes, call repo_status and repo_diff, then publish_repo to open a pull request on a nova/* branch — never push directly to main/master. Briefly announce long-running tool calls and confirm results concisely. Confirm before create/clone/select/publish and irreversible actions.",
                 toolNames: [
                     "list_repos", "select_repo", "clone_repo", "create_web_project",
                     "repo_status", "repo_diff", "publish_repo",
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
+                    "get_cursor_session_history",
                     "open_app_screen",
                     "web_search", "inspect_nova_codebase", "search_knowledge", "save_note", "list_notes",
                     "remember_fact", "recall_facts", "create_reminder", "draft_message",

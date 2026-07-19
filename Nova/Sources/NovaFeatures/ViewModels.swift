@@ -1092,11 +1092,21 @@ public struct CodingSessionInfo: Identifiable, Equatable, Sendable {
     }
 }
 
+private struct QueuedCodingPrompt {
+    let userText: String
+    let bridgeCommand: String
+    let images: [CodingImageAttachment]
+    let repoId: String?
+    let workingDirectory: String
+}
+
 @MainActor
 @Observable
 public final class CodingViewModel {
     public private(set) var sessions: [CodingSessionInfo] = []
     public private(set) var pinnedSessionId: String?
+    /// True only between Code view opening and the explicit End session action.
+    public private(set) var isCodeViewSessionActive = false
     public private(set) var workingDirectory: String = ""
     public private(set) var selectedRepoId: String?
     public private(set) var repositories: [BridgeRepoSummary] = []
@@ -1130,6 +1140,8 @@ public final class CodingViewModel {
     public private(set) var runStatus: String = "idle"
     public private(set) var activeRunId: String?
     public private(set) var isRunning = false
+    /// Prompts waiting behind the active coding run.
+    public private(set) var queuedPromptCount = 0
     public private(set) var isLoading = false
     public private(set) var statusMessage: String = ""
     /// Set while a run is in flight; drives the elapsed-time readout.
@@ -1162,6 +1174,9 @@ public final class CodingViewModel {
     private var streamingThinkingId: UUID?
     private var lastSpokenAt: Date = .distantPast
     private var runGeneration = 0
+    private var queuedPrompts: [QueuedCodingPrompt] = []
+    private var isProcessingPromptQueue = false
+    private var isResumingCursorRun = false
     private var previewOpenGeneration = 0
     private var watchdogTask: Task<Void, Never>?
     var stallSoftSeconds: TimeInterval = 45
@@ -1234,20 +1249,43 @@ public final class CodingViewModel {
     }
 
     public func load() async {
-        pinnedSessionId = await settings.codingSessionId()
         workingDirectory = await settings.codingWorkingDirectory() ?? ""
         selectedRepoId = await settings.codingSelectedRepoId()
         autoOpenPreview = await settings.codingAutoOpenPreview()
         await refreshRepositories()
         await refreshSessions()
         await reloadPromptState()
-        if let id = pinnedSessionId {
-            await loadMessages(sessionId: id)
-        }
         if selectedRepoId != nil {
             await refreshRepoStatusAndDiff()
         }
         await resumePendingClaudeIfNeeded()
+    }
+
+    /// Starts a coding chat session when Code view opens. Multiple prompts in
+    /// this view share one Cursor agent until `endSession()` is called.
+    /// Re-entering Code view while a session is already active (navigate away,
+    /// lock/unlock) must NOT reset the chat or bump `runGeneration` — that was
+    /// aborting in-flight Cursor runs and looking like a disconnect.
+    public func beginCodeViewSession() async {
+        if isCodeViewSessionActive {
+            if isRunning || activeRunId != nil || PendingCursorRunStore.load() != nil {
+                statusMessage = isRunning
+                    ? "Session still active — agent keeps working on your PC."
+                    : "Session restored."
+                await resumePendingCursorRunIfNeeded()
+            }
+            return
+        }
+        // A Cursor run may still be alive from a previous app session / lock.
+        if PendingCursorRunStore.load() != nil {
+            isCodeViewSessionActive = true
+            statusMessage = "Reconnecting to the coding run that kept going on your PC…"
+            await resumePendingCursorRunIfNeeded()
+            return
+        }
+        isCodeViewSessionActive = true
+        await startNewSession()
+        statusMessage = "Session started — send a prompt to begin the chat."
     }
 
     /// After unlock/foreground: reattach to a Claude Code job the bridge kept running.
@@ -1269,6 +1307,95 @@ public final class CodingViewModel {
         }
         statusMessage = result.ok ? "Claude Code finished (recovered after unlock)" : "Claude Code still running / recovered"
         await refreshRepoStatusAndDiff()
+    }
+
+    /// After unlock/foreground or re-entering Code view: poll a Cursor run that
+    /// survived phone lock / SSE drop without replaying the prompt.
+    public func resumePendingCursorRunIfNeeded() async {
+        // An in-flight execute() already owns recovery for its generation.
+        if isRunning, isProcessingPromptQueue { return }
+        if isResumingCursorRun { return }
+
+        guard let pending = PendingCursorRunStore.load() else { return }
+        let runId = pending.runId
+        guard !runId.isEmpty else {
+            PendingCursorRunStore.clear()
+            return
+        }
+
+        isResumingCursorRun = true
+        defer { isResumingCursorRun = false }
+
+        if !isCodeViewSessionActive {
+            isCodeViewSessionActive = true
+        }
+        if let sessionId = pending.sessionId, !sessionId.isEmpty {
+            pinnedSessionId = sessionId
+            await settings.setCodingSessionId(sessionId)
+        }
+        if let repoId = pending.repoId, !repoId.isEmpty, selectedRepoId != repoId {
+            selectedRepoId = repoId
+            await settings.setCodingSelectedRepoId(repoId)
+        }
+
+        runGeneration += 1
+        let generation = runGeneration
+        isRunning = true
+        activeRunId = runId
+        runStatus = "reconnecting"
+        stallPhase = .stillWorking
+        runStartedAt = runStartedAt ?? pending.startedAt
+        lastSSEActivityAt = Date()
+        statusMessage = "Reconnecting to the coding run that kept going on your PC…"
+        upsertActivity(
+            phase: "status",
+            text: "Reconnecting after unlock…",
+            detail: runId,
+            done: false
+        )
+        startWatchdog(generation: generation)
+
+        guard let recovered = await recoverRunAfterDisconnect(
+            runId: runId,
+            generation: generation,
+            pollImmediately: true
+        ) else {
+            return
+        }
+        guard generation == runGeneration else { return }
+
+        stopWatchdog()
+        isRunning = false
+        runStartedAt = nil
+        stallPhase = .idle
+        PendingCursorRunStore.clear(runId: runId)
+        activeRunId = nil
+
+        if let sid = Self.string(recovered.payloadJSON, key: "sessionId"), !sid.isEmpty {
+            pinnedSessionId = sid
+            await settings.setCodingSessionId(sid)
+            await loadMessages(sessionId: sid)
+        }
+        if let status = Self.string(recovered.payloadJSON, key: "status") {
+            runStatus = status
+        }
+        statusMessage = runStatus == "finished"
+            ? "Coding run finished (recovered after unlock)."
+            : "Coding run ended with status: \(runStatus)."
+        await refreshSessions()
+        await refreshRepoStatusAndDiff()
+        await refreshAgentReview()
+    }
+
+    private func persistPendingCursorRun(runId: String) {
+        guard !runId.isEmpty else { return }
+        PendingCursorRunStore.save(
+            PendingCursorRun(
+                runId: runId,
+                sessionId: pinnedSessionId,
+                repoId: selectedRepoId
+            )
+        )
     }
 
     private func reloadPromptState() async {
@@ -1311,6 +1438,9 @@ public final class CodingViewModel {
     public func selectRepository(_ repoId: String) async {
         let trimmed = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if isRunning || !queuedPrompts.isEmpty {
+            await cancel()
+        }
         let result = await bridge.selectRepository(repoId: trimmed)
         guard result.ok else {
             statusMessage = Self.summarize(result.payloadJSON)
@@ -1326,12 +1456,13 @@ public final class CodingViewModel {
         agentReview = nil
         activeBaselineId = nil
         await reloadPromptState()
-        // Resumed Cursor sessions keep their original cwd — start fresh.
+        // Cursor agents are workspace-scoped — switching repos opens a fresh
+        // chat within the current Code view session lifecycle.
         await startNewSession()
         await refreshRepositories()
         await refreshRepoStatusAndDiff()
         await refreshPreviews()
-        statusMessage = "Selected \(selectedRepoName). New Cursor session for this repo."
+        statusMessage = "Selected \(selectedRepoName). Send a prompt to continue this session."
     }
 
     public func cloneRepository() async {
@@ -1647,7 +1778,7 @@ public final class CodingViewModel {
     public func refreshSessions() async {
         isLoading = true
         defer { isLoading = false }
-        let result = await bridge.listCursorSessions()
+        let result = await bridge.listCursorSessions(repoId: selectedRepoId)
         guard result.ok,
               let data = result.payloadJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1673,6 +1804,10 @@ public final class CodingViewModel {
     }
 
     public func attach(sessionId: String) async {
+        guard isCodeViewSessionActive else {
+            statusMessage = "Reopen Code view to start a coding session."
+            return
+        }
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         pinnedSessionId = trimmed
@@ -1683,14 +1818,29 @@ public final class CodingViewModel {
     public func startNewSession() async {
         stopWatchdog()
         runGeneration += 1
+        clearQueuedPrompts()
+        PendingCursorRunStore.clear()
         pinnedSessionId = nil
         await settings.setCodingSessionId(nil)
         items = []
         activeRunId = nil
+        isRunning = false
+        runStartedAt = nil
         runStatus = "idle"
         stallPhase = .idle
         lastSSEActivityAt = nil
         statusMessage = "New session — send a prompt to create one."
+    }
+
+    /// Ends the current Code view chat session. A new one starts only when Code view reopens.
+    public func endSession() async {
+        if isRunning {
+            await cancel()
+        }
+        isCodeViewSessionActive = false
+        PendingCursorRunStore.clear()
+        await startNewSession()
+        statusMessage = "Session ended. Reopen Code view to start a new chat."
     }
 
     /// Cancel the active stream, drop the Cursor session pin, and keep the last
@@ -1706,7 +1856,10 @@ public final class CodingViewModel {
     }
 
     public func loadMessages(sessionId: String) async {
-        let result = await bridge.fetchCursorSessionMessages(sessionId: sessionId)
+        let result = await bridge.fetchCursorSessionMessages(
+            sessionId: sessionId,
+            repoId: selectedRepoId
+        )
         guard result.ok,
               let data = result.payloadJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1728,8 +1881,12 @@ public final class CodingViewModel {
     }
 
     public func send() async {
+        guard isCodeViewSessionActive else {
+            statusMessage = "Reopen Code view to start a coding session."
+            return
+        }
         let command = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isRunning, !command.isEmpty || !pendingImages.isEmpty else { return }
+        guard !command.isEmpty || !pendingImages.isEmpty else { return }
         let images = pendingImages
         let userText = command.isEmpty
             ? "Analyze the attached image. Identify the visible error and recommend the next debugging steps."
@@ -1737,6 +1894,34 @@ public final class CodingViewModel {
         let bridgeCommand = CodingPromptComposer.command(userText: userText, pins: pinnedPaths)
         draft = ""
         pendingImages = []
+        queuedPrompts.append(
+            QueuedCodingPrompt(
+                userText: userText,
+                bridgeCommand: bridgeCommand,
+                images: images,
+                repoId: selectedRepoId,
+                workingDirectory: workingDirectory
+            )
+        )
+        queuedPromptCount = queuedPrompts.count
+
+        guard !isProcessingPromptQueue else {
+            statusMessage = "Added to queue · \(queuedPromptCount) waiting"
+            return
+        }
+
+        isProcessingPromptQueue = true
+        defer { isProcessingPromptQueue = false }
+        while isCodeViewSessionActive, !queuedPrompts.isEmpty {
+            let prompt = queuedPrompts.removeFirst()
+            queuedPromptCount = queuedPrompts.count
+            await execute(prompt)
+        }
+    }
+
+    private func execute(_ prompt: QueuedCodingPrompt) async {
+        let userText = prompt.userText
+        let images = prompt.images
         let imageSuffix = images.isEmpty
             ? ""
             : "\n📎 \(images.count) image\(images.count == 1 ? "" : "s")"
@@ -1760,11 +1945,8 @@ public final class CodingViewModel {
         streamingThinkingId = nil
         startWatchdog(generation: generation)
 
-        let persistedRepoId = await settings.codingSelectedRepoId()
-        let repoId = selectedRepoId ?? persistedRepoId
-        selectedRepoId = repoId
-        let cwd = await settings.codingWorkingDirectory()
-        workingDirectory = cwd ?? ""
+        let repoId = prompt.repoId
+        let cwd = prompt.workingDirectory
 
         if let repoId, !repoId.isEmpty {
             await prompts.appendHistory(
@@ -1799,7 +1981,7 @@ public final class CodingViewModel {
         }
 
         var result = await bridge.streamCursorRun(
-            command: bridgeCommand,
+            command: prompt.bridgeCommand,
             images: images,
             sessionId: pinnedSessionId,
             workingDirectory: repoId == nil ? cwd : nil,
@@ -1813,11 +1995,17 @@ public final class CodingViewModel {
         guard generation == runGeneration else { return }
         if !result.ok,
            Self.string(result.payloadJSON, key: "status")?.lowercased() == "running",
-           let runId = activeRunId,
+           let runId = (activeRunId ?? Self.string(result.payloadJSON, key: "runId")),
            !runId.isEmpty
         {
+            activeRunId = runId
+            persistPendingCursorRun(runId: runId)
             stopWatchdog()
-            if let recovered = await recoverRunAfterDisconnect(runId: runId, generation: generation) {
+            if let recovered = await recoverRunAfterDisconnect(
+                runId: runId,
+                generation: generation,
+                pollImmediately: true
+            ) {
                 result = recovered
                 if let sid = Self.string(recovered.payloadJSON, key: "sessionId"), !sid.isEmpty {
                     pinnedSessionId = sid
@@ -1835,6 +2023,7 @@ public final class CodingViewModel {
         stallPhase = .idle
         streamingAssistantId = nil
         streamingThinkingId = nil
+        PendingCursorRunStore.clear(runId: activeRunId)
         if let sid = Self.string(result.payloadJSON, key: "sessionId"), !sid.isEmpty {
             pinnedSessionId = sid
             await settings.setCodingSessionId(sid)
@@ -1860,30 +2049,56 @@ public final class CodingViewModel {
         await refreshAgentReview()
     }
 
-    /// Poll the existing run every 60 seconds after its SSE transport disappears.
+    /// Poll the existing run after its SSE transport disappears.
     /// This never sends the prompt again, so reconnects cannot duplicate edits.
-    private func recoverRunAfterDisconnect(runId: String, generation: Int) async -> BridgeResult? {
+    private func recoverRunAfterDisconnect(
+        runId: String,
+        generation: Int,
+        pollImmediately: Bool = false
+    ) async -> BridgeResult? {
         var attempt = 0
+        var delayBeforePoll = !pollImmediately
         while generation == runGeneration, isRunning {
             attempt += 1
             runStatus = "reconnecting"
             stallPhase = .stillWorking
-            statusMessage = "Connection lost. Reconnecting to the existing action in 60 seconds…"
-            upsertActivity(
-                phase: "status",
-                text: "Reconnecting…",
-                detail: "Attempt \(attempt) · run \(runId)",
-                done: false
-            )
+            if delayBeforePoll {
+                statusMessage = "Connection lost. Checking the existing action again shortly…"
+                upsertActivity(
+                    phase: "status",
+                    text: "Reconnecting…",
+                    detail: "Attempt \(attempt) · run \(runId)",
+                    done: false
+                )
+                let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                guard generation == runGeneration, isRunning else { return nil }
+            } else {
+                statusMessage = "Checking the coding run that kept going on your PC…"
+                upsertActivity(
+                    phase: "status",
+                    text: "Reconnecting…",
+                    detail: "Attempt \(attempt) · run \(runId)",
+                    done: false
+                )
+                delayBeforePoll = true
+            }
 
-            let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanos)
-            guard generation == runGeneration, isRunning else { return nil }
-
+            let bg = await BackgroundTask.begin(name: "nova.cursor-recover")
             let statusResult = await bridge.cursorRunStatus(runId: runId)
+            await BackgroundTask.end(bg)
             guard generation == runGeneration, isRunning else { return nil }
+            if !statusResult.ok,
+               statusResult.payloadJSON.contains("run_not_found")
+            {
+                PendingCursorRunStore.clear(runId: runId)
+                runStatus = "error"
+                statusMessage = "That coding run is no longer on the bridge."
+                upsertActivity(phase: "status", text: "Run not found", detail: runId, done: true)
+                return statusResult
+            }
             guard statusResult.ok else {
-                statusMessage = "Bridge still unavailable. Retrying in 60 seconds…"
+                statusMessage = "Bridge still unavailable. Retrying shortly…"
                 continue
             }
 
@@ -1891,10 +2106,11 @@ public final class CodingViewModel {
             if let sid = Self.string(statusResult.payloadJSON, key: "sessionId"), !sid.isEmpty {
                 pinnedSessionId = sid
                 await settings.setCodingSessionId(sid)
+                persistPendingCursorRun(runId: runId)
             }
             if status == "running" {
                 runStatus = "running"
-                statusMessage = "Reconnected. The existing action is still running; checking again in 60 seconds."
+                statusMessage = "Reconnected. The existing action is still running on your PC."
                 upsertActivity(
                     phase: "status",
                     text: "Reconnected — still working…",
@@ -1919,9 +2135,16 @@ public final class CodingViewModel {
         return nil
     }
 
+    private func clearQueuedPrompts() {
+        queuedPrompts.removeAll()
+        queuedPromptCount = 0
+    }
+
     public func cancel() async {
         runGeneration += 1
+        clearQueuedPrompts()
         stopWatchdog()
+        PendingCursorRunStore.clear(runId: activeRunId)
         // Always abort the HTTP stream first — activeRunId is only set after the
         // first RUNNING event, which never arrives if SSE apply is wedged.
         _ = await bridge.cancelActiveStream()
@@ -1930,6 +2153,7 @@ public final class CodingViewModel {
         }
         runStatus = "cancelled"
         isRunning = false
+        activeRunId = nil
         runStartedAt = nil
         stallPhase = .idle
         for idx in activitySteps.indices where !activitySteps[idx].isDone {
@@ -1940,13 +2164,15 @@ public final class CodingViewModel {
 
     /// Re-send the last prompt (used by the Retry button on error rows).
     public func retryLast() async {
-        guard !isRunning, !lastSentCommand.isEmpty else { return }
+        guard !lastSentCommand.isEmpty else { return }
         draft = lastSentCommand
         pendingImages = lastSentImages
         await send()
     }
 
-    public var canRetry: Bool { !lastSentCommand.isEmpty && !isRunning }
+    public var canRetry: Bool {
+        isCodeViewSessionActive && !lastSentCommand.isEmpty
+    }
 
     /// Built-in task templates plus any user-saved templates for the repo.
     public var suggestedPrompts: [String] {
@@ -1995,7 +2221,6 @@ public final class CodingViewModel {
     }
 
     public func runHistoryEntry(_ entry: CodingPromptHistoryEntry) async {
-        guard !isRunning else { return }
         draft = entry.text
         await send()
     }
@@ -2043,6 +2268,9 @@ public final class CodingViewModel {
             statusMessage = Self.summarize(result.payloadJSON)
             return
         }
+        if let expanded = expandedReviewPath, paths.contains(expanded) {
+            expandedReviewPath = nil
+        }
         await refreshAgentReview()
         await refreshRepoStatusAndDiff()
         statusMessage = paths.count == 1 ? "Kept \(paths[0])" : "Kept \(paths.count) files"
@@ -2067,6 +2295,9 @@ public final class CodingViewModel {
         guard result.ok else {
             statusMessage = Self.summarize(result.payloadJSON)
             return
+        }
+        if let expanded = expandedReviewPath, paths.contains(expanded) {
+            expandedReviewPath = nil
         }
         await refreshAgentReview()
         await refreshRepoStatusAndDiff()
@@ -2207,6 +2438,7 @@ public final class CodingViewModel {
             }
             if let runId = event.runId, !runId.isEmpty {
                 activeRunId = runId
+                persistPendingCursorRun(runId: runId)
             }
             if let sid = event.sessionId, !sid.isEmpty {
                 pinnedSessionId = sid
@@ -2239,6 +2471,7 @@ public final class CodingViewModel {
             if let runId = event.runId, !runId.isEmpty {
                 activeRunId = runId
             }
+            PendingCursorRunStore.clear(runId: event.runId ?? activeRunId)
             runStatus = (event.status ?? "finished").lowercased()
             streamingAssistantId = nil
             streamingThinkingId = nil

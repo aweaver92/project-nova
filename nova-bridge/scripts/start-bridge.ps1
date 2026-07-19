@@ -36,11 +36,37 @@ function Get-NpmPath {
     throw "npm.cmd not found. Install Node.js or add it to PATH."
 }
 
+function Ensure-NodeOnPath {
+    $nodeDir = Join-Path $env:ProgramFiles "nodejs"
+    if ((Test-Path (Join-Path $nodeDir "node.exe")) -and ($env:Path -notlike "*$nodeDir*")) {
+        $env:Path = "$nodeDir;$env:Path"
+    }
+}
+
+function Ensure-BridgeDependencies {
+    $tsxCli = Join-Path $root "node_modules\tsx\dist\cli.mjs"
+    $express = Join-Path $root "node_modules\express\package.json"
+    if ((Test-Path $tsxCli) -and (Test-Path $express)) { return }
+    Write-Host "Installing nova-bridge dependencies (node_modules incomplete)…"
+    Push-Location $root
+    try {
+        & (Get-NpmPath) install --no-fund --no-audit
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm install failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path $tsxCli)) {
+        throw "tsx still missing after npm install. Check nova-bridge/package.json."
+    }
+}
+
 # Kill any existing bridge node processes (matched by their server.ts command
 # line) so restarts are clean and the port is never double-bound.
 function Stop-StaleBridge {
     $procs = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine -match 'src[\\/]server\.ts' }
+        Where-Object { $_.CommandLine -and ($_.CommandLine -match 'src[\\/]server\.ts' -or $_.CommandLine -match 'tsx.*server\.ts') }
     foreach ($p in $procs) {
         try {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
@@ -51,8 +77,10 @@ function Stop-StaleBridge {
     }
 }
 
+Ensure-NodeOnPath
 $port = Get-BridgePort
 $npm = Get-NpmPath
+Ensure-BridgeDependencies
 
 Stop-StaleBridge
 Start-Sleep -Milliseconds 500
@@ -60,6 +88,8 @@ Start-Sleep -Milliseconds 500
 $outLog = Join-Path $logDir "bridge.out.log"
 $errLog = Join-Path $logDir "bridge.err.log"
 
+# Start-Process does not always inherit this session's PATH; force Node onto the
+# child environment so `npm run start` can resolve local tsx.
 $process = Start-Process -FilePath $npm `
     -ArgumentList "run", "start" `
     -WorkingDirectory $root `

@@ -110,6 +110,8 @@ public actor NovaBridgeClient: AgentBridging {
     /// Resume a Claude job after the app returns to the foreground (phone unlock).
     public func resumePendingClaudeCode() async -> BridgeResult? {
         guard let pending = PendingClaudeJobStore.load() else { return nil }
+        let bg = await BackgroundTask.begin(name: "nova.claude-code-resume")
+        defer { Task { await BackgroundTask.end(bg) } }
         let status = await send(
             path: "claude-code/\(pending.actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? pending.actionId)",
             method: "GET",
@@ -132,6 +134,8 @@ public actor NovaBridgeClient: AgentBridging {
 
     private func pollClaudeJob(actionId: String) async -> BridgeResult {
         let escaped = actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? actionId
+        var bg = await BackgroundTask.begin(name: "nova.claude-code-poll")
+        defer { Task { await BackgroundTask.end(bg) } }
         while !Task.isCancelled {
             let status = await send(
                 path: "claude-code/\(escaped)",
@@ -147,7 +151,8 @@ public actor NovaBridgeClient: AgentBridging {
                 PendingClaudeJobStore.clear(actionId: actionId)
                 return status
             }
-            // Still running or transient network — wait and retry.
+            // Renew the background window each tick so lock does not freeze the poll.
+            bg = await BackgroundTask.renew(bg, name: "nova.claude-code-poll")
             do {
                 try await Task.sleep(nanoseconds: 2_000_000_000)
             } catch {
@@ -192,16 +197,35 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func listCursorSessions() async -> BridgeResult {
-        await send(path: "cursor/sessions", method: "GET", body: nil, timeout: 30)
+        await listCursorSessions(repoId: nil)
+    }
+
+    public func listCursorSessions(repoId: String?) async -> BridgeResult {
+        let queryItems = repoId.flatMap { $0.isEmpty ? nil : URLQueryItem(name: "repoId", value: $0) }
+            .map { [$0] } ?? []
+        return await send(
+            path: "cursor/sessions",
+            method: "GET",
+            body: nil,
+            timeout: 30,
+            queryItems: queryItems
+        )
     }
 
     public func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
+        await fetchCursorSessionMessages(sessionId: sessionId, repoId: nil)
+    }
+
+    public func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult {
         let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
+        let queryItems = repoId.flatMap { $0.isEmpty ? nil : URLQueryItem(name: "repoId", value: $0) }
+            .map { [$0] } ?? []
         return await send(
             path: "cursor/sessions/\(escaped)/messages",
             method: "GET",
             body: nil,
-            timeout: 60
+            timeout: 60,
+            queryItems: queryItems
         )
     }
 
@@ -271,8 +295,13 @@ public actor NovaBridgeClient: AgentBridging {
         config.timeoutIntervalForRequest = 120
         config.timeoutIntervalForResource = Self.streamTimeout
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        // Fail fast when the PC bridge is down. waitsForConnectivity=true
+        // hung until the request timeout and surfaced as "bridge took too long".
         config.waitsForConnectivity = false
         config.httpAdditionalHeaders = ["Accept": "text/event-stream", "Cache-Control": "no-cache"]
+
+        let bg = await BackgroundTask.begin(name: "nova.cursor-run")
+        defer { Task { await BackgroundTask.end(bg) } }
 
         let pump = SSEURLSessionPump()
         let streamSession = URLSession(configuration: config, delegate: pump, delegateQueue: nil)
@@ -387,9 +416,14 @@ public actor NovaBridgeClient: AgentBridging {
             let encoded = Self.encodeTransportError(error)
             var payload = (encoded.data(using: .utf8)
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
+            // Preserve run identity so the phone can poll without replaying the prompt.
             payload["sessionId"] = lastSessionId
-            payload["runId"] = lastRunId
-            payload["status"] = lastStatus.lowercased()
+            if !lastRunId.isEmpty {
+                payload["runId"] = lastRunId
+                payload["status"] = "running"
+            } else {
+                payload["status"] = lastStatus.lowercased()
+            }
             let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             return BridgeResult(ok: false, payloadJSON: String(decoding: data, as: UTF8.self))
         }
@@ -620,12 +654,21 @@ public actor NovaBridgeClient: AgentBridging {
         path: String,
         method: String,
         body: [String: Any]?,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        queryItems: [URLQueryItem] = []
     ) async -> BridgeResult {
         let (base, token) = await configProvider()
         guard let base else { return Self.notConfigured }
 
-        var request = URLRequest(url: Self.url(base: base, path: path))
+        let endpoint = Self.url(base: base, path: path)
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        if !queryItems.isEmpty {
+            components?.queryItems = queryItems
+        }
+        guard let url = components?.url else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"invalid_bridge_url"}"#)
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")

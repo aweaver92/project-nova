@@ -44,6 +44,28 @@ final class TrainingViewModelTests: XCTestCase {
         await vm.skipRest()
         XCTAssertEqual(vm.restRemainingSeconds, 0)
     }
+
+    func testSaveAndDeletePlanFromUI() async {
+        let plans = InMemoryWorkoutPlanStore()
+        let vm = TrainingViewModel(
+            workouts: InMemoryWorkoutStore(),
+            plans: plans,
+            timers: InMemoryTimerService()
+        )
+
+        await vm.savePlan(WorkoutPlan(
+            name: "Pull",
+            exercises: [PlannedExercise(name: "Row", sets: 3, reps: 10)]
+        ))
+        XCTAssertEqual(vm.plans.count, 1)
+        XCTAssertEqual(vm.plans.first?.name, "Pull")
+
+        guard let saved = vm.plans.first else {
+            return XCTFail("expected saved plan")
+        }
+        await vm.deletePlan(saved)
+        XCTAssertTrue(vm.plans.isEmpty)
+    }
 }
 
 // MARK: - Test doubles

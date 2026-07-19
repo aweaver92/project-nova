@@ -18,6 +18,7 @@ public struct CodingView: View {
     @State private var showTemplates = false
     @State private var showKeepAllConfirm = false
     @State private var showRevertAllConfirm = false
+    @State private var showEndSessionConfirm = false
     @State private var saveTemplateTitle = ""
     @State private var showSaveTemplate = false
     /// Repository browser action: preview a path, or pin it into prompts.
@@ -73,6 +74,7 @@ public struct CodingView: View {
                 } label: {
                     Label("Sessions", systemImage: "list.bullet")
                 }
+                .disabled(!coding.isCodeViewSessionActive)
             }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
@@ -97,13 +99,16 @@ public struct CodingView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
+                Button("End session", role: .destructive) {
+                    showEndSessionConfirm = true
+                }
+                .disabled(!coding.isCodeViewSessionActive)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button("Repositories…") { showRepos = true }
                     Button("New web project…") { showCreateProject = true }
                     Button("Clone GitHub repo…") { showClone = true }
-                    Button("New session") {
-                        Task { await coding.startNewSession() }
-                    }
                     Button("Refresh") {
                         Task {
                             await coding.refreshSessions()
@@ -164,8 +169,17 @@ public struct CodingView: View {
         } message: {
             Text("Saves the current draft as a reusable prompt for this repository.")
         }
+        .alert("End coding session?", isPresented: $showEndSessionConfirm) {
+            Button("End session", role: .destructive) {
+                Task { await coding.endSession() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Ends this chat. Reopen Code view when you want to start another session.")
+        }
         .task {
             await coding.load()
+            await coding.beginCodeViewSession()
             await coding.refreshPreviews()
         }
     }
@@ -181,7 +195,7 @@ public struct CodingView: View {
                 Text(
                     coding.stallPhase == .looksStuck
                         ? "No agent activity for a while. You can restart the session and retry."
-                        : "The agent is quiet but still connected."
+                        : "The agent keeps working on your PC even if you lock the phone or leave this screen."
                 )
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -334,6 +348,7 @@ public struct CodingView: View {
 
     @ViewBuilder
     private func agentReviewPanel(_ review: BridgeAgentReview) -> some View {
+        let pending = review.files.filter { !$0.kept }
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Agent changes")
@@ -343,12 +358,17 @@ public struct CodingView: View {
                 Spacer()
                 Button("Keep all") { showKeepAllConfirm = true }
                     .font(.caption)
-                    .disabled(review.pendingCount == 0)
+                    .disabled(pending.isEmpty)
                 Button("Revert all", role: .destructive) { showRevertAllConfirm = true }
                     .font(.caption)
-                    .disabled(review.pendingCount == 0)
+                    .disabled(pending.isEmpty)
             }
-            ForEach(review.files) { file in
+            if pending.isEmpty {
+                Text(review.keptCount > 0 ? "All agent changes kept." : "No pending agent changes.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(pending) { file in
                 VStack(alignment: .leading, spacing: 6) {
                     Button {
                         coding.toggleReviewExpanded(file.path)
@@ -356,17 +376,12 @@ public struct CodingView: View {
                         HStack(spacing: 8) {
                             Text(file.change.uppercased())
                                 .font(.caption2.weight(.bold))
-                                .foregroundStyle(file.kept ? Color.secondary : Color.orange)
+                                .foregroundStyle(Color.orange)
                             Text(file.path)
                                 .font(.caption.monospaced())
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
-                            if file.kept {
-                                Text("Kept")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
                             Image(systemName: coding.expandedReviewPath == file.path ? "chevron.up" : "chevron.down")
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
@@ -391,18 +406,16 @@ public struct CodingView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                         }
-                        if !file.kept {
-                            HStack {
-                                Button("Keep") {
-                                    Task { await coding.keepReviewPaths([file.path]) }
-                                }
-                                .font(.caption.weight(.semibold))
-                                Button("Revert", role: .destructive) {
-                                    Task { await coding.revertReviewPaths([file.path]) }
-                                }
-                                .font(.caption.weight(.semibold))
-                                Spacer()
+                        HStack {
+                            Button("Keep") {
+                                Task { await coding.keepReviewPaths([file.path]) }
                             }
+                            .font(.caption.weight(.semibold))
+                            Button("Revert", role: .destructive) {
+                                Task { await coding.revertReviewPaths([file.path]) }
+                            }
+                            .font(.caption.weight(.semibold))
+                            Spacer()
                         }
                     }
                 }
@@ -962,6 +975,19 @@ public struct CodingView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if !coding.isCodeViewSessionActive {
+                Label("Session ended. Reopen Code view to start another chat.", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if coding.queuedPromptCount > 0 {
+                Label(
+                    "\(coding.queuedPromptCount) prompt\(coding.queuedPromptCount == 1 ? "" : "s") queued",
+                    systemImage: "list.number"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             if !coding.pinnedPaths.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -1059,7 +1085,7 @@ public struct CodingView: View {
                     Image(systemName: "photo.badge.plus")
                         .font(.title3)
                 }
-                .disabled(coding.isRunning || coding.pendingImages.count >= 4)
+                .disabled(coding.pendingImages.count >= 4)
                 .accessibilityLabel("Attach screenshot")
                 .onChange(of: selectedPhotoItems) { _, items in
                     guard !items.isEmpty else { return }
@@ -1070,7 +1096,6 @@ public struct CodingView: View {
                 TextField("Prompt Claude about code or an image…", text: $coding.draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
-                    .disabled(coding.isRunning)
                 Button {
                     Task { await coding.send() }
                 } label: {
@@ -1078,14 +1103,12 @@ public struct CodingView: View {
                         .font(.title2)
                 }
                 .disabled(
-                    coding.isRunning
-                        || (
-                            coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                && coding.pendingImages.isEmpty
-                        )
+                    coding.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && coding.pendingImages.isEmpty
                 )
             }
         }
+        .disabled(!coding.isCodeViewSessionActive)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
@@ -1391,7 +1414,6 @@ public struct CodingView: View {
                                     Task { await coding.runHistoryEntry(entry) }
                                 }
                                 .font(.caption.weight(.semibold))
-                                .disabled(coding.isRunning)
                             }
                         }
                         .padding(.vertical, 4)
@@ -1470,9 +1492,9 @@ public struct CodingView: View {
         NavigationStack {
             List {
                 Section {
-                    Button("New session") {
+                    Button("End session", role: .destructive) {
                         Task {
-                            await coding.startNewSession()
+                            await coding.endSession()
                             showSessions = false
                         }
                     }
