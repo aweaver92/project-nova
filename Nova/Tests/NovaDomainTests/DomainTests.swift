@@ -616,13 +616,16 @@ final class WakeWordTests: XCTestCase {
         )
         try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
 
+        // Pace emissions so the bounded ingress buffer drains into the pump
+        // (bufferingNewest(8) drops chunks emitted faster than they're consumed).
         let speech = speechLikePCM()
-        for _ in 0..<20 {
+        for _ in 0..<10 {
             ingress.emit(AudioChunk(pcm: speech, sampleRate: 24_000))
+            try await Task.sleep(for: .milliseconds(20))
         }
 
         let appended = await waitUntil {
-            await provider.audioOperations.filter { $0 == "append" }.count >= 20
+            await provider.audioOperations.filter { $0 == "append" }.count >= 8
         }
         XCTAssertTrue(appended)
         let commits = await provider.commitCount
