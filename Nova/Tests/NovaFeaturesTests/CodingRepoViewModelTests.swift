@@ -28,6 +28,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         // Code view sessions start fresh — persisted pins are not auto-restored.
         XCTAssertNil(vm.pinnedSessionId)
 
+        await vm.beginCodeViewSession()
         await vm.attach(sessionId: "stale")
         XCTAssertEqual(vm.pinnedSessionId, "stale")
 
@@ -94,8 +95,9 @@ final class CodingRepoViewModelTests: XCTestCase {
         let commands = await bridge.receivedCommands
         let sessionIds = await bridge.receivedSessionIds
         XCTAssertEqual(commands, ["first prompt", "follow-up in same chat"])
-        XCTAssertEqual(sessionIds.first, nil)
-        XCTAssertEqual(sessionIds.last, "agent-test")
+        XCTAssertEqual(sessionIds.count, 2)
+        XCTAssertNil(sessionIds[0])
+        XCTAssertEqual(sessionIds[1], "agent-test")
     }
 
     func testPromptSubmittedDuringActiveRunQueuesAndUsesSameSession() async {
