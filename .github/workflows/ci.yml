@@ -99,8 +99,12 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           if [ -n "$OPENAI_API_KEY" ]; then
-            printf 'OPENAI_API_KEY = %s\n' "$OPENAI_API_KEY" > Config/Secrets.xcconfig
-            echo "Wrote Config/Secrets.xcconfig (key length ${#OPENAI_API_KEY})"
+            # Trim whitespace/newlines; quote so xcconfig does not treat // as a comment.
+            KEY=$(printf '%s' "$OPENAI_API_KEY" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            # Escape double quotes inside the key (rare).
+            KEY_ESCAPED=${KEY//\"/\\\"}
+            printf 'OPENAI_API_KEY = "%s"\n' "$KEY_ESCAPED" > Config/Secrets.xcconfig
+            echo "Wrote Config/Secrets.xcconfig (key length ${#KEY})"
           else
             echo "No OPENAI_API_KEY secret — Voice V2 will require a key; Assistant can still use the bridge."
           fi

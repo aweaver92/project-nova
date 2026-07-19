@@ -30,14 +30,15 @@ public enum OpenAICredentials {
     public static func apiKey(bundle: Bundle = .main) -> String? {
         let env = ProcessInfo.processInfo.environment
         if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"],
-           !key.isEmpty {
-            return key
+           !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return key.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String,
-           !key.isEmpty,
-           // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
-           !key.hasPrefix("$(") {
-            return key
+        if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String {
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
+            if !trimmed.isEmpty, !trimmed.hasPrefix("$(") {
+                return trimmed
+            }
         }
         return nil
     }
@@ -77,7 +78,9 @@ public struct DirectOpenAITokenService: TokenService {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NovaError.credentials("OpenAI client_secrets failed (HTTP \(code))")
+            let detail = Self.safeErrorDetail(from: data)
+            let suffix = detail.map { ": \($0)" } ?? ""
+            throw NovaError.credentials("OpenAI client_secrets failed (HTTP \(code))\(suffix)")
         }
         struct Payload: Decodable {
             let value: String?
@@ -90,6 +93,29 @@ public struct DirectOpenAITokenService: TokenService {
         let expiresAt = payload.expires_at.map { Date(timeIntervalSince1970: $0) }
             ?? Date().addingTimeInterval(60)
         return EphemeralCredential(token: secret, expiresAt: expiresAt)
+    }
+
+    /// Pull a short, user-safe message from an OpenAI error JSON body.
+    private static func safeErrorDetail(from data: Data) -> String? {
+        guard
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let err = obj["error"] as? [String: Any]
+        else { return nil }
+        let message = (err["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let message, !message.isEmpty else { return nil }
+        // OpenAI often echoes a key prefix; redact anything that looks like a secret.
+        let redacted = message
+            .replacingOccurrences(
+                of: #"sk-[A-Za-z0-9_\-]+"#,
+                with: "sk-[REDACTED]",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"ek_[A-Za-z0-9_\-]+"#,
+                with: "ek-[REDACTED]",
+                options: .regularExpression
+            )
+        return String(redacted.prefix(180))
     }
 }
 
