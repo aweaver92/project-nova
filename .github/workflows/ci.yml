@@ -98,13 +98,20 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          # Prefer injecting into the built Info.plist later (avoids xcconfig quote
+          # leakage into the Bearer token). Still write an unquoted xcconfig so
+          # $(OPENAI_API_KEY) expands during the build when the key has no //.
           if [ -n "$OPENAI_API_KEY" ]; then
-            # Trim whitespace/newlines; quote so xcconfig does not treat // as a comment.
-            KEY=$(printf '%s' "$OPENAI_API_KEY" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # Escape double quotes inside the key (rare).
-            KEY_ESCAPED=${KEY//\"/\\\"}
-            printf 'OPENAI_API_KEY = "%s"\n' "$KEY_ESCAPED" > Config/Secrets.xcconfig
-            echo "Wrote Config/Secrets.xcconfig (key length ${#KEY})"
+            KEY=$(printf '%s' "$OPENAI_API_KEY" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//;s/^'\''//;s/'\''$//')
+            # If the key contains //, leave xcconfig empty and rely on post-build inject.
+            if printf '%s' "$KEY" | grep -q '//'; then
+              echo "Key contains // — skipping xcconfig; will inject via PlistBuddy after build"
+              rm -f Config/Secrets.xcconfig
+            else
+              printf 'OPENAI_API_KEY = %s\n' "$KEY" > Config/Secrets.xcconfig
+              echo "Wrote Config/Secrets.xcconfig (key length ${#KEY})"
+            fi
+            echo "OPENAI_API_KEY_LEN=${#KEY}" >> "$GITHUB_ENV"
           else
             echo "No OPENAI_API_KEY secret — Voice V2 will require a key; Assistant can still use the bridge."
           fi
@@ -163,12 +170,34 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Package unsigned .ipa into App/
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           APP="build/Build/Products/Release-iphoneos/NovaApp.app"
           if [ ! -d "$APP" ]; then
             echo "::error::App not found at $APP"
             ls -R build/Build/Products || true
             exit 1
+          fi
+          # Inject the key into Info.plist after the build so Voice V2 never ships
+          # a quoted/truncated Bearer token from xcconfig expansion.
+          if [ -n "$OPENAI_API_KEY" ]; then
+            export APP
+            export KEY=$(printf '%s' "$OPENAI_API_KEY" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//;s/^'\''//;s/'\''$//')
+            python3 - <<'PY'
+          import os, plistlib, sys
+          path = os.path.join(os.environ["APP"], "Info.plist")
+          key = os.environ["KEY"]
+          with open(path, "rb") as f:
+              pl = plistlib.load(f)
+          pl["OpenAIAPIKey"] = key
+          with open(path, "wb") as f:
+              plistlib.dump(pl, f)
+          print(f"Injected OpenAIAPIKey len={len(key)} first={key[:1]!r}")
+          if not key.startswith("sk-"):
+              print("::error::OpenAIAPIKey must start with sk-", file=sys.stderr)
+              sys.exit(1)
+          PY
           fi
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" || true
           mkdir -p App

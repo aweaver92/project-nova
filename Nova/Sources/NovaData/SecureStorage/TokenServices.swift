@@ -29,18 +29,33 @@ public struct StubTokenService: TokenService {
 public enum OpenAICredentials {
     public static func apiKey(bundle: Bundle = .main) -> String? {
         let env = ProcessInfo.processInfo.environment
-        if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"],
-           !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"] {
+            let normalized = normalize(key)
+            if !normalized.isEmpty { return normalized }
         }
         if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String {
-            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalized = normalize(key)
             // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
-            if !trimmed.isEmpty, !trimmed.hasPrefix("$(") {
-                return trimmed
+            if !normalized.isEmpty, !normalized.hasPrefix("$(") {
+                return normalized
             }
         }
         return nil
+    }
+
+    /// Trim whitespace and strip wrapping quotes that Info.plist / xcconfig
+    /// sometimes leave on the value (which then produce Bearer `"sk-...` → HTTP 401).
+    static func normalize(_ raw: String) -> String {
+        var key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.count >= 2 {
+            let first = key.first!
+            let last = key.last!
+            if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                key = String(key.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return key
     }
 }
 
