@@ -505,6 +505,81 @@ final class NovaBridgeClientTests: XCTestCase {
         XCTAssertEqual(d?.runId, "r1")
         XCTAssertEqual(d?.status, "finished")
     }
+
+    func testClaudeCodeConnectionRetryReusesActionId() async {
+        ClaudeRetryURLProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ClaudeRetryURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let bridge = NovaBridgeClient(
+            configProvider: { (URL(string: "http://bridge.test")!, "token") },
+            session: session,
+            reconnectRetrySeconds: 0.01
+        )
+
+        let result = await bridge.runClaudeCode(
+            prompt: "make one edit",
+            workingDirectory: nil,
+            repoId: "repo-1"
+        )
+
+        XCTAssertTrue(result.ok)
+        let captured = ClaudeRetryURLProtocol.capturedActionIds()
+        XCTAssertEqual(captured.count, 2)
+        XCTAssertEqual(Set(captured).count, 1, "retry must attach to the original action")
+    }
+}
+
+private final class ClaudeRetryURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var attempts = 0
+    private static var actionIds: [String] = []
+
+    static func reset() {
+        lock.lock()
+        attempts = 0
+        actionIds = []
+        lock.unlock()
+    }
+
+    static func capturedActionIds() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return actionIds
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let actionId: String = request.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            .flatMap { $0["actionId"] as? String } ?? ""
+
+        Self.lock.lock()
+        Self.attempts += 1
+        let attempt = Self.attempts
+        Self.actionIds.append(actionId)
+        Self.lock.unlock()
+
+        if attempt == 1 {
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            return
+        }
+
+        let body = #"{"ok":true,"actionId":"test","result":"done","exitCode":0}"#.data(using: .utf8)!
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 final class CodingSessionPinTests: XCTestCase {

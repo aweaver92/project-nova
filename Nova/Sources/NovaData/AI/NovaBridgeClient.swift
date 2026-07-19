@@ -45,13 +45,16 @@ public actor NovaBridgeClient: AgentBridging {
     /// Dedicated session for the live SSE run so Stop can invalidate it before a runId exists.
     private var streamSession: URLSession?
     private static let streamTimeout: TimeInterval = 600
+    private let reconnectRetrySeconds: TimeInterval
 
     public init(
         configProvider: @escaping @Sendable () async -> (url: URL?, token: String?),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        reconnectRetrySeconds: TimeInterval = 60
     ) {
         self.configProvider = configProvider
         self.session = session
+        self.reconnectRetrySeconds = reconnectRetrySeconds
     }
 
     public func isConfigured() async -> Bool {
@@ -63,7 +66,13 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
-        var body: [String: Any] = ["prompt": prompt]
+        // The action id makes every retry idempotent on the bridge: if the phone
+        // loses HTTP mid-edit, the same Claude process is awaited instead of
+        // spawning a second process with the same prompt.
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "actionId": UUID().uuidString,
+        ]
         if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
         // Legacy cwd is only sent when no repoId is available (bridge validates containment).
         if repoId == nil || repoId?.isEmpty == true,
@@ -71,7 +80,20 @@ public actor NovaBridgeClient: AgentBridging {
         {
             body["cwd"] = workingDirectory
         }
-        return await post(path: "claude-code", body: body, timeout: 600)
+        while !Task.isCancelled {
+            let result = await post(path: "claude-code", body: body, timeout: 600)
+            guard Self.isRetryableConnectionFailure(result) else { return result }
+            let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: nanos)
+            } catch {
+                break
+            }
+        }
+        return BridgeResult(
+            ok: false,
+            payloadJSON: #"{"ok":false,"error":"cancelled","hint":"Claude Code reconnect was cancelled."}"#
+        )
     }
 
     public func pushToCursor(
@@ -180,15 +202,16 @@ public actor NovaBridgeClient: AgentBridging {
         let chunks = pump.chunks
         streamSession.dataTask(with: request).resume()
 
+        var lastSessionId = sessionId ?? ""
+        var lastRunId = ""
+        var lastStatus = "running"
+        var lastResult = ""
+        var sawDone = false
+        var sawHeaders = false
+
         do {
             var lineBuffer = ""
             var eventBuffer = ""
-            var lastSessionId = sessionId ?? ""
-            var lastRunId = ""
-            var lastStatus = "running"
-            var lastResult = ""
-            var sawDone = false
-            var sawHeaders = false
 
             for try await chunk in chunks {
                 switch chunk {
@@ -219,12 +242,12 @@ public actor NovaBridgeClient: AgentBridging {
                         if line.isEmpty {
                             if let event = Self.parseSSEBuffer(eventBuffer) {
                                 await onEvent(event)
+                                lastSessionId = event.sessionId ?? lastSessionId
+                                lastRunId = event.runId ?? lastRunId
+                                lastStatus = event.status ?? lastStatus
+                                lastResult = event.result ?? lastResult
                                 if event.type == "done" {
                                     sawDone = true
-                                    lastSessionId = event.sessionId ?? lastSessionId
-                                    lastRunId = event.runId ?? lastRunId
-                                    lastStatus = event.status ?? lastStatus
-                                    lastResult = event.result ?? lastResult
                                 }
                             }
                             eventBuffer = ""
@@ -243,12 +266,12 @@ public actor NovaBridgeClient: AgentBridging {
 
             if let event = Self.parseSSEBuffer(eventBuffer) {
                 await onEvent(event)
+                lastSessionId = event.sessionId ?? lastSessionId
+                lastRunId = event.runId ?? lastRunId
+                lastStatus = event.status ?? lastStatus
+                lastResult = event.result ?? lastResult
                 if event.type == "done" {
                     sawDone = true
-                    lastSessionId = event.sessionId ?? lastSessionId
-                    lastRunId = event.runId ?? lastRunId
-                    lastStatus = event.status ?? lastStatus
-                    lastResult = event.result ?? lastResult
                 }
             }
 
@@ -283,7 +306,14 @@ public actor NovaBridgeClient: AgentBridging {
         } catch {
             self.streamSession = nil
             streamSession.invalidateAndCancel()
-            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
+            let encoded = Self.encodeTransportError(error)
+            var payload = (encoded.data(using: .utf8)
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
+            payload["sessionId"] = lastSessionId
+            payload["runId"] = lastRunId
+            payload["status"] = lastStatus.lowercased()
+            let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            return BridgeResult(ok: false, payloadJSON: String(decoding: data, as: UTF8.self))
         }
     }
 
@@ -293,6 +323,16 @@ public actor NovaBridgeClient: AgentBridging {
             path: "cursor/runs/\(escaped)/cancel",
             method: "POST",
             body: [:],
+            timeout: 30
+        )
+    }
+
+    public func cursorRunStatus(runId: String) async -> BridgeResult {
+        let escaped = runId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runId
+        return await send(
+            path: "cursor/runs/\(escaped)",
+            method: "GET",
+            body: nil,
             timeout: 30
         )
     }
@@ -541,6 +581,22 @@ public actor NovaBridgeClient: AgentBridging {
         let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
         return CodingStreamEvent.decodeSSEData(data)
+    }
+
+    private static func isRetryableConnectionFailure(_ result: BridgeResult) -> Bool {
+        guard !result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = json["error"] as? String
+        else { return false }
+        return [
+            "bridge_timeout",
+            "bridge_unreachable",
+            "bridge_connection_lost",
+            "bridge_no_response",
+            "no_response",
+            "transport_error",
+        ].contains(error)
     }
 
     /// Join slash-separated path segments without percent-encoding the separators.

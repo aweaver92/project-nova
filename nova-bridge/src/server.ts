@@ -572,8 +572,21 @@ function pcm16ToWav(pcm: Buffer, sampleRate: number) {
 }
 
 // --- Claude Code ------------------------------------------------------------
+type ClaudeJobResult = {
+  ok: boolean;
+  exitCode?: number;
+  result?: string;
+  stderr?: string;
+  error?: string;
+};
+const claudeJobs = new Map<string, Promise<ClaudeJobResult>>();
+const CLAUDE_JOB_TTL_MS = 30 * 60_000;
+
 app.post("/claude-code", requireAuth, async (req, res) => {
   const prompt = String(req.body?.prompt ?? "").trim();
+  const suppliedActionId = String(req.body?.actionId ?? "").trim();
+  const actionId =
+    suppliedActionId || `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   if (!prompt) {
     res.status(400).json({ ok: false, error: "missing_prompt" });
     return;
@@ -585,17 +598,26 @@ app.post("/claude-code", requireAuth, async (req, res) => {
     sendRepoError(res, err);
     return;
   }
-  try {
-    const result = await runClaude(prompt, cwd);
-    res.json({
-      ok: result.code === 0,
-      exitCode: result.code,
-      result: result.stdout.trim(),
-      ...(result.stderr.trim() ? { stderr: result.stderr.trim() } : {}),
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: describe(err) });
+  let job = claudeJobs.get(actionId);
+  if (!job) {
+    job = runClaude(prompt, cwd)
+      .then((result): ClaudeJobResult => ({
+        ok: result.code === 0,
+        exitCode: result.code,
+        result: result.stdout.trim(),
+        ...(result.stderr.trim() ? { stderr: result.stderr.trim() } : {}),
+      }))
+      .catch((err): ClaudeJobResult => ({ ok: false, error: describe(err) }));
+    claudeJobs.set(actionId, job);
+    const timer = setTimeout(() => claudeJobs.delete(actionId), CLAUDE_JOB_TTL_MS);
+    timer.unref?.();
   }
+
+  // Repeated requests with the same actionId await the original process. This
+  // makes phone-side reconnect retries idempotent instead of spawning duplicate
+  // Claude Code edits after an HTTP connection loss.
+  const result = await job;
+  res.json({ ...result, actionId });
 });
 
 function runClaude(
@@ -636,11 +658,34 @@ function runClaude(
 
 // --- Cursor (via @cursor/sdk) ----------------------------------------------
 
+type CursorRunSnapshot = {
+  runId: string;
+  agentId: string;
+  cwd: string;
+  status: "running" | "finished" | "error" | "cancelled";
+  result: string;
+  updatedAt: number;
+};
+
 /** In-flight runs keyed by runId for best-effort cancel. */
 const activeRuns = new Map<
   string,
-  { cancel: () => Promise<void>; agentId: string }
+  { cancel: () => Promise<void>; agentId: string; cwd: string }
 >();
+/** Recent status survives an SSE client disconnect so the phone can reattach. */
+const runSnapshots = new Map<string, CursorRunSnapshot>();
+const RUN_SNAPSHOT_TTL_MS = 30 * 60_000;
+
+function saveRunSnapshot(snapshot: CursorRunSnapshot): void {
+  runSnapshots.set(snapshot.runId, snapshot);
+  const timer = setTimeout(() => {
+    const current = runSnapshots.get(snapshot.runId);
+    if (current && Date.now() - current.updatedAt >= RUN_SNAPSHOT_TTL_MS) {
+      runSnapshots.delete(snapshot.runId);
+    }
+  }, RUN_SNAPSHOT_TTL_MS + 1_000);
+  timer.unref?.();
+}
 
 type PromptImage = {
   data: string;
@@ -953,7 +998,16 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     runId = run.id;
     activeRuns.set(runId, {
       agentId: resolvedSessionId,
+      cwd,
       cancel: () => run.cancel(),
+    });
+    saveRunSnapshot({
+      runId,
+      agentId: resolvedSessionId,
+      cwd,
+      status: "running",
+      result: "",
+      updatedAt: Date.now(),
     });
     setKeepaliveMs(12_000);
     console.log(`[cursor/runs] run started id=${runId}`);
@@ -1028,6 +1082,14 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
     }
     await streamDrain.catch(() => undefined);
     console.log(`[cursor/runs] run ${runId} finished status=${result.status}`);
+    saveRunSnapshot({
+      runId,
+      agentId: resolvedSessionId,
+      cwd,
+      status: result.status,
+      result: result.result ?? "",
+      updatedAt: Date.now(),
+    });
 
     // If neither deltas nor stream produced assistant text, fall back to wait().
     if (!sawAssistant && result.result?.trim()) {
@@ -1049,6 +1111,16 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   } catch (err) {
     const message = describe(err);
     console.log(`[cursor/runs] error: ${message}`);
+    if (runId) {
+      saveRunSnapshot({
+        runId,
+        agentId: resolvedSessionId,
+        cwd,
+        status: "error",
+        result: message,
+        updatedAt: Date.now(),
+      });
+    }
     const friendly =
       message.includes("timeout_after_")
         ? `Cursor agent timed out (${message}). Tap New session and try again.`
@@ -1082,6 +1154,57 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
   }
 });
 
+/** Read-only recovery endpoint: inspect an existing run without sending again. */
+app.get("/cursor/runs/:runId", requireAuth, async (req, res) => {
+  const runId = String(req.params.runId ?? "").trim();
+  if (!runId) {
+    res.status(400).json({ ok: false, error: "missing_run_id" });
+    return;
+  }
+
+  const cached = runSnapshots.get(runId);
+  if (cached) {
+    res.json({
+      ok: true,
+      runId: cached.runId,
+      sessionId: cached.agentId,
+      status: cached.status,
+      result: cached.result,
+    });
+    return;
+  }
+
+  // Also recover after a bridge restart when the local Cursor SDK persisted the
+  // run. No prompt is sent here: getRun is an idempotent read/reattach operation.
+  try {
+    const { Agent } = await import("@cursor/sdk");
+    const run = await Agent.getRun(runId, { runtime: "local" });
+    const snapshot: CursorRunSnapshot = {
+      runId,
+      agentId: run.agentId,
+      cwd: "",
+      status: run.status,
+      result: run.result ?? "",
+      updatedAt: Date.now(),
+    };
+    saveRunSnapshot(snapshot);
+    res.json({
+      ok: true,
+      runId,
+      sessionId: run.agentId,
+      status: run.status,
+      result: run.result ?? "",
+    });
+  } catch (err) {
+    res.status(404).json({
+      ok: false,
+      error: "run_not_found",
+      detail: describe(err),
+      runId,
+    });
+  }
+});
+
 app.post("/cursor/runs/:runId/cancel", requireAuth, async (req, res) => {
   const runId = String(req.params.runId ?? "").trim();
   if (!runId) {
@@ -1092,6 +1215,14 @@ app.post("/cursor/runs/:runId/cancel", requireAuth, async (req, res) => {
   if (tracked) {
     try {
       await tracked.cancel();
+      saveRunSnapshot({
+        runId,
+        agentId: tracked.agentId,
+        cwd: tracked.cwd,
+        status: "cancelled",
+        result: "",
+        updatedAt: Date.now(),
+      });
       res.json({ ok: true, runId, cancelled: true, source: "active" });
       return;
     } catch (err) {
@@ -1109,6 +1240,14 @@ app.post("/cursor/runs/:runId/cancel", requireAuth, async (req, res) => {
       runtime: "local",
       cwd: DEFAULT_CWD,
     });
+    const existing = runSnapshots.get(runId);
+    if (existing) {
+      saveRunSnapshot({
+        ...existing,
+        status: "cancelled",
+        updatedAt: Date.now(),
+      });
+    }
     res.json({ ok: true, runId, cancelled: true, source: "sdk" });
   } catch (err) {
     res.status(500).json({ ok: false, error: describe(err) });

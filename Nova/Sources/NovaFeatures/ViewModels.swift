@@ -1168,6 +1168,8 @@ public final class CodingViewModel {
     var stallHardSeconds: TimeInterval = 90
     /// Watchdog poll interval (shortened in unit tests).
     var stallPollSeconds: TimeInterval = 5
+    /// Delay between duplicate-safe status reconnect attempts (shortened in tests).
+    var reconnectRetrySeconds: TimeInterval = 60
 
     public init(
         bridge: any AgentBridging,
@@ -1774,7 +1776,7 @@ public final class CodingViewModel {
             }
         }
 
-        let result = await bridge.streamCursorRun(
+        var result = await bridge.streamCursorRun(
             command: bridgeCommand,
             images: images,
             sessionId: pinnedSessionId,
@@ -1786,6 +1788,24 @@ public final class CodingViewModel {
         eventContinuation.finish()
         await applyTask.value
 
+        guard generation == runGeneration else { return }
+        if !result.ok,
+           Self.string(result.payloadJSON, key: "status")?.lowercased() == "running",
+           let runId = activeRunId,
+           !runId.isEmpty
+        {
+            stopWatchdog()
+            if let recovered = await recoverRunAfterDisconnect(runId: runId, generation: generation) {
+                result = recovered
+                if let sid = Self.string(recovered.payloadJSON, key: "sessionId"), !sid.isEmpty {
+                    pinnedSessionId = sid
+                    await settings.setCodingSessionId(sid)
+                    await loadMessages(sessionId: sid)
+                }
+            } else {
+                return
+            }
+        }
         guard generation == runGeneration else { return }
         stopWatchdog()
         isRunning = false
@@ -1816,6 +1836,65 @@ public final class CodingViewModel {
         await refreshSessions()
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+    }
+
+    /// Poll the existing run every 60 seconds after its SSE transport disappears.
+    /// This never sends the prompt again, so reconnects cannot duplicate edits.
+    private func recoverRunAfterDisconnect(runId: String, generation: Int) async -> BridgeResult? {
+        var attempt = 0
+        while generation == runGeneration, isRunning {
+            attempt += 1
+            runStatus = "reconnecting"
+            stallPhase = .stillWorking
+            statusMessage = "Connection lost. Reconnecting to the existing action in 60 seconds…"
+            upsertActivity(
+                phase: "status",
+                text: "Reconnecting…",
+                detail: "Attempt \(attempt) · run \(runId)",
+                done: false
+            )
+
+            let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard generation == runGeneration, isRunning else { return nil }
+
+            let statusResult = await bridge.cursorRunStatus(runId: runId)
+            guard generation == runGeneration, isRunning else { return nil }
+            guard statusResult.ok else {
+                statusMessage = "Bridge still unavailable. Retrying in 60 seconds…"
+                continue
+            }
+
+            let status = Self.string(statusResult.payloadJSON, key: "status")?.lowercased() ?? "running"
+            if let sid = Self.string(statusResult.payloadJSON, key: "sessionId"), !sid.isEmpty {
+                pinnedSessionId = sid
+                await settings.setCodingSessionId(sid)
+            }
+            if status == "running" {
+                runStatus = "running"
+                statusMessage = "Reconnected. The existing action is still running; checking again in 60 seconds."
+                upsertActivity(
+                    phase: "status",
+                    text: "Reconnected — still working…",
+                    detail: runId,
+                    done: false
+                )
+                continue
+            }
+
+            runStatus = status
+            statusMessage = status == "finished"
+                ? "Connection restored. Action finished."
+                : "Connection restored. Action ended with status: \(status)."
+            upsertActivity(
+                phase: "status",
+                text: status == "finished" ? "Finished after reconnect" : status.capitalized,
+                detail: runId,
+                done: true
+            )
+            return statusResult
+        }
+        return nil
     }
 
     public func cancel() async {

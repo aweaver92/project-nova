@@ -224,6 +224,23 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertFalse(vm.items.contains(where: { $0.kind == .assistant && $0.text.contains("late") }))
     }
 
+    func testConnectionLossPollsExistingRunWithoutResendingPrompt() async {
+        let bridge = DirtyRepoBridge(disconnectAfterStart: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        vm.draft = "make one safe edit"
+
+        await vm.send()
+
+        let commands = await bridge.receivedCommands
+        let statusChecks = await bridge.runStatusCheckCount
+        XCTAssertEqual(commands, ["make one safe edit"], "auto-recovery must never resend")
+        XCTAssertEqual(statusChecks, 2)
+        XCTAssertEqual(vm.runStatus, "finished")
+        XCTAssertFalse(vm.isRunning)
+    }
+
     func testTemplatesAndHistoryPersistPerRepo() async {
         let prompts = InMemoryCodingPromptStore()
         let bridge = DirtyRepoBridge()
@@ -290,21 +307,25 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var restoredPaths: [String] = []
     private(set) var lastPublishPaths: [String] = []
     private(set) var cancelStreamCount = 0
+    private(set) var runStatusCheckCount = 0
     private var reviewKept = false
     private let streamDelaySeconds: Double
     private let emitAfterCancel: Bool
     private let previewBecomesReadyAfterPolls: Int
+    private let disconnectAfterStart: Bool
     private var previewPolls = 0
     private var cancelled = false
 
     init(
         streamDelaySeconds: Double = 0,
         emitAfterCancel: Bool = false,
-        previewBecomesReadyAfterPolls: Int = 0
+        previewBecomesReadyAfterPolls: Int = 0,
+        disconnectAfterStart: Bool = false
     ) {
         self.streamDelaySeconds = streamDelaySeconds
         self.emitAfterCancel = emitAfterCancel
         self.previewBecomesReadyAfterPolls = previewBecomesReadyAfterPolls
+        self.disconnectAfterStart = disconnectAfterStart
     }
 
     func isConfigured() async -> Bool { true }
@@ -434,6 +455,15 @@ private actor DirtyRepoBridge: AgentBridging {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
     }
 
+    func cursorRunStatus(runId: String) async -> BridgeResult {
+        runStatusCheckCount += 1
+        let status = runStatusCheckCount == 1 ? "running" : "finished"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"\#(runId)","status":"\#(status)","result":"ok"}"#
+        )
+    }
+
     func streamCursorRun(
         command: String,
         images: [CodingImageAttachment],
@@ -445,7 +475,18 @@ private actor DirtyRepoBridge: AgentBridging {
         receivedImageCount = images.count
         receivedCommands.append(command)
         cancelled = false
-        await onEvent(CodingStreamEvent(type: "status", status: "running", runId: "run-test"))
+        await onEvent(CodingStreamEvent(
+            type: "status",
+            status: "running",
+            sessionId: "agent-test",
+            runId: "run-test"
+        ))
+        if disconnectAfterStart {
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_connection_lost","sessionId":"agent-test","runId":"run-test","status":"running"}"#
+            )
+        }
         if streamDelaySeconds > 0 {
             let nanos = UInt64(streamDelaySeconds * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
