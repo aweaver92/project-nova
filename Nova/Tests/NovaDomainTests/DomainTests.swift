@@ -328,6 +328,52 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testAgentSwitchCancelDuringLightReconnectFallsBackAndGreets() async throws {
+        // Regression: CancellationError during the light AI-only reconnect must NOT
+        // be treated as success. That left streaming=true with a dead socket so
+        // sendUserText (greeting) and mic appends no-op'd — new agent never replied.
+        let provider = MockProvider()
+        let ingress = CountingIngress()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        _ = await waitUntil { await provider.connectCount == 1 }
+
+        // Next connect is the light agent-switch reconnect — cancel it so the
+        // orchestrator must tear down and full-engage.
+        await provider.setConnectCancelOnCount(2)
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let recovered = await waitUntil { await provider.connectCount >= 3 }
+        XCTAssertTrue(recovered, "cancel on light reconnect must fall back to full engage")
+
+        let active = await orch.currentAgent
+        XCTAssertEqual(active?.name, "Claude")
+        let streaming = await orch.isStreaming
+        XCTAssertTrue(streaming, "session must be live after fallback, not half-dead")
+        let greeted = await waitUntil {
+            await provider.userTextCount >= 1
+        }
+        XCTAssertTrue(greeted, "new agent must receive a handoff greeting after recovery")
+        let voice = await provider.lastVoice
+        XCTAssertEqual(voice, "cedar")
+
+        await orch.stop()
+    }
+
     func testGraceWindowDisabledRequiresWakeWordEveryTurn() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
@@ -696,9 +742,12 @@ private actor MockProvider: ConversationalAIProvider {
     private(set) var lastVoice = ""
     private(set) var lastToolDefinitions: [ToolDefinition] = []
     private(set) var toolOutputs: [(callId: String, output: String)] = []
+    private(set) var userTexts: [String] = []
     private var connectShouldFail = false
+    private var connectCancelOnCount: Int?
     private var appendShouldSucceed = true
     var toolOutputCount: Int { toolOutputs.count }
+    var userTextCount: Int { userTexts.count }
 
     init() {
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -707,6 +756,7 @@ private actor MockProvider: ConversationalAIProvider {
     }
 
     func setConnectShouldFail(_ value: Bool) { connectShouldFail = value }
+    func setConnectCancelOnCount(_ value: Int?) { connectCancelOnCount = value }
     func setAppendShouldSucceed(_ value: Bool) { appendShouldSucceed = value }
 
     func connect(config: AISessionConfig) async throws {
@@ -714,6 +764,9 @@ private actor MockProvider: ConversationalAIProvider {
         lastInstructions = config.instructions
         lastVoice = config.voice
         lastToolDefinitions = config.toolDefinitions
+        if let cancelAt = connectCancelOnCount, connectCount == cancelAt {
+            throw CancellationError()
+        }
         if connectShouldFail {
             throw NovaError.aiProvider("mock connect failed")
         }
@@ -742,6 +795,9 @@ private actor MockProvider: ConversationalAIProvider {
     }
     func sendToolOutput(callId: String, outputJSON: String) async {
         toolOutputs.append((callId, outputJSON))
+    }
+    func sendUserText(_ text: String) async {
+        userTexts.append(text)
     }
     func emit(_ event: AIConversationEvent) { continuation.yield(event) }
 }

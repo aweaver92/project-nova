@@ -919,7 +919,9 @@ public actor ConversationOrchestrator {
     /// mic ingress and playback engines running. Used for agent switching: tearing
     /// down and restarting Core Audio raced the greeting's playback route change
     /// and stalled the mic after ~20 chunks. Returns false if not currently
-    /// streaming (caller should fall back to a full engage).
+    /// streaming, or if reconnect was cancelled / left the socket dead (caller
+    /// should fall back to a full engage — treating cancel as success previously
+    /// left Listen "armed" with no Realtime session, so the new agent never replied).
     private func reconnectAIForActiveAgent() async -> Bool {
         guard streaming else { return false }
         // Keep the SAME generation so the running ingress pump keeps forwarding to
@@ -932,8 +934,10 @@ public actor ConversationOrchestrator {
             publishListenHealth(phase: .connecting, detail: "Switching voice — reconnecting Realtime…")
             try await ai.connect(config: effective)
             guard gen == streamGeneration, isRunning else {
+                // Stale or stopped mid-reconnect: socket may be up for a dead
+                // generation — drop it and signal failure so the caller restores.
                 await ai.disconnect()
-                return true
+                return false
             }
             // Fresh turn state for the new session; leave mic/egress untouched.
             assistantSpeaking = false
@@ -942,7 +946,11 @@ public actor ConversationOrchestrator {
             publishListenHealth(phase: .waitingForSpeech, detail: "Switched agent — speak or type.")
             return true
         } catch is CancellationError {
-            return true
+            // Cancel after `disconnect()` leaves streaming=true with no socket.
+            // Must return false so performSwitchAgent full-reconnects / restores
+            // instead of sendUserText-no-op on a dead provider.
+            NovaLog.session.info("Agent-switch AI reconnect cancelled — falling back to full engage")
+            return false
         } catch {
             NovaLog.session.error("Agent-switch AI reconnect failed: \(String(describing: error), privacy: .public)")
             return false
