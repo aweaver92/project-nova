@@ -572,7 +572,7 @@ public final class AppContainer {
                     }
                     try await orchestrator.reopenRealtime()
                 }
-                try await orchestrator.askAboutFrame(frame, prompt: prompt)
+                return try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },
             captureStill: { [capture] in
                 try await capture.captureStill()
