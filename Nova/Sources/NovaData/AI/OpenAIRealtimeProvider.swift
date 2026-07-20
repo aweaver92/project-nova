@@ -39,6 +39,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     /// until the app is active again so lock-screen suspend cannot burn the budget.
     private var appIsActive = true
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectGeneration = 0
     private var waitingForSessionUpdated = false
     /// Set when an `error` event arrives while waiting for `session.updated`.
     private var sessionUpdateError: String?
@@ -515,12 +516,15 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             await existing.value
             return
         }
-        let task = Task { [weak self] in
-            await self?.runReconnectLoop()
+        reconnectGeneration += 1
+        let myGeneration = reconnectGeneration
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.runReconnectLoop()
         }
         reconnectTask = task
         await task.value
-        if reconnectTask == task {
+        if reconnectGeneration == myGeneration {
             reconnectTask = nil
         }
     }
