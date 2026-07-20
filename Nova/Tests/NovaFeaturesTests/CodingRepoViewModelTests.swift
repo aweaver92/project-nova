@@ -616,7 +616,7 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(vm.promptHistory.first?.text, "history prompt")
     }
 
-    func testOpenHistoryEntryRestoresTranscriptWithoutResending() async {
+    func testOpenHistoryEntryRestoresTranscriptWithoutResending() async throws {
         let prompts = InMemoryCodingPromptStore()
         let bridge = DirtyRepoBridge()
         let settings = MemorySettings(repoId: "abcdef0123456789")
