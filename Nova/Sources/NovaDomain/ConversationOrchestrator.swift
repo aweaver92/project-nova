@@ -370,15 +370,18 @@ public actor ConversationOrchestrator {
         Task { [weak self] in
             _ = await pendingTools?.value
             try? await Task.sleep(for: .milliseconds(350))
-            guard let self else { return }
-            guard self.textChatOnly, let wait = self.textChatWait else { return }
-            // Another model response started after tools — wait for that one.
-            if self.assistantSpeaking { return }
-            self.textChatWait = nil
-            let answer = self.textChatBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            self.textChatBuffer = ""
-            wait.resume(returning: answer)
+            await self?.finishTextChatWaitIfReady()
         }
+    }
+
+    private func finishTextChatWaitIfReady() {
+        guard textChatOnly, let wait = textChatWait else { return }
+        // Another model response started after tools — wait for that one.
+        if assistantSpeaking { return }
+        textChatWait = nil
+        let answer = textChatBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        textChatBuffer = ""
+        wait.resume(returning: answer)
     }
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
