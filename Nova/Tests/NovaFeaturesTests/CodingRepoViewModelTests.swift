@@ -344,7 +344,9 @@ final class CodingRepoViewModelTests: XCTestCase {
     }
 
     func testWatchdogTransitionsAndRestartSession() async {
-        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.35)
+        // Keep the mock stream open long enough that hard-stall can fire after the
+        // initial status SSE resets lastSSEActivityAt (CI can take >100ms to get there).
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 2.0)
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         vm.stallSoftSeconds = 0.05
@@ -356,8 +358,15 @@ final class CodingRepoViewModelTests: XCTestCase {
             vm.draft = "long job"
             await vm.send()
         }
-        try? await Task.sleep(for: .milliseconds(250))
-        XCTAssertEqual(vm.stallPhase, .looksStuck)
+        var reachedStuck = false
+        for _ in 0..<40 {
+            if vm.stallPhase == .looksStuck {
+                reachedStuck = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(reachedStuck, "Expected looksStuck while stream is quiet, got \(vm.stallPhase)")
 
         await vm.restartSession()
         XCTAssertNil(vm.pinnedSessionId)
