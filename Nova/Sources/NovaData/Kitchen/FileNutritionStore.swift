@@ -32,13 +32,13 @@ public actor FileNutritionStore: NutritionStoring {
     }
 
     @discardableResult
-    public func logMeal(description: String, recipeId: UUID?) -> MealLogEntry {
-        logMeal(description: description, recipeId: recipeId, nutrition: nil, kind: .suggested())
+    public func logMeal(description: String, recipeId: UUID?) async -> MealLogEntry {
+        await logMeal(description: description, recipeId: recipeId, nutrition: nil, kind: .suggested())
     }
 
     @discardableResult
-    public func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) -> MealLogEntry {
-        logMeal(description: description, recipeId: recipeId, nutrition: nutrition, kind: .suggested())
+    public func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) async -> MealLogEntry {
+        await logMeal(description: description, recipeId: recipeId, nutrition: nutrition, kind: .suggested())
     }
 
     @discardableResult
@@ -47,7 +47,7 @@ public actor FileNutritionStore: NutritionStoring {
         recipeId: UUID?,
         nutrition: MealNutrition?,
         kind: MealLogKind
-    ) -> MealLogEntry {
+    ) async -> MealLogEntry {
         let entry = MealLogEntry(
             description: description,
             recipeId: recipeId,
@@ -63,7 +63,7 @@ public actor FileNutritionStore: NutritionStoring {
     }
 
     @discardableResult
-    public func updateMeal(_ entry: MealLogEntry) -> MealLogEntry? {
+    public func updateMeal(_ entry: MealLogEntry) async -> MealLogEntry? {
         guard let index = state.meals.firstIndex(where: { $0.id == entry.id }) else { return nil }
         state.meals[index] = entry
         persist()

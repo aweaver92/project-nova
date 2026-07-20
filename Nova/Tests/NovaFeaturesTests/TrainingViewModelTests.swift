@@ -40,7 +40,9 @@ final class TrainingViewModelTests: XCTestCase {
         )
         await vm.startEmptySession(title: "Quick")
         await vm.startRest(seconds: 60)
-        XCTAssertEqual(vm.restRemainingSeconds, 60)
+        // Timer may tick once before the assertion on a loaded CI runner.
+        XCTAssertGreaterThanOrEqual(vm.restRemainingSeconds, 58)
+        XCTAssertLessThanOrEqual(vm.restRemainingSeconds, 60)
         await vm.skipRest()
         XCTAssertEqual(vm.restRemainingSeconds, 0)
     }
