@@ -55,8 +55,7 @@ final class CodingRepoViewModelTests: XCTestCase {
     }
 
     func testCommitAndBuildFailureNotifies() async {
-        let bridge = DirtyRepoBridge()
-        bridge.commitAndBuildShouldFail = true
+        let bridge = DirtyRepoBridge(commitAndBuildShouldFail: true)
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         var notified: (Bool, String)?
@@ -548,7 +547,7 @@ private actor MemorySettings: SettingsStoring {
 private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var commitAndBuildCallCount = 0
-    var commitAndBuildShouldFail = false
+    private let commitAndBuildShouldFail: Bool
     private(set) var receivedImageCount = 0
     private(set) var receivedCommands: [String] = []
     private(set) var receivedSessionIds: [String?] = []
@@ -570,12 +569,14 @@ private actor DirtyRepoBridge: AgentBridging {
         streamDelaySeconds: Double = 0,
         emitAfterCancel: Bool = false,
         previewBecomesReadyAfterPolls: Int = 0,
-        disconnectAfterStart: Bool = false
+        disconnectAfterStart: Bool = false,
+        commitAndBuildShouldFail: Bool = false
     ) {
         self.streamDelaySeconds = streamDelaySeconds
         self.emitAfterCancel = emitAfterCancel
         self.previewBecomesReadyAfterPolls = previewBecomesReadyAfterPolls
         self.disconnectAfterStart = disconnectAfterStart
+        self.commitAndBuildShouldFail = commitAndBuildShouldFail
     }
 
     func isConfigured() async -> Bool { true }
