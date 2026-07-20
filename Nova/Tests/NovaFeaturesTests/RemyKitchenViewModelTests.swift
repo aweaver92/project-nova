@@ -65,7 +65,8 @@ final class RemyKitchenViewModelTests: XCTestCase {
         XCTAssertEqual(vm.mealLogEditor?.description, "Salmon bowl")
         XCTAssertEqual(vm.mealLogEditor?.kind, .lunch)
         XCTAssertEqual(vm.mealLogEditor?.calories, 510)
-        XCTAssertEqual(await nutrition.recentMeals(limit: 5).count, 0)
+        let mealsBeforeSave = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(mealsBeforeSave.count, 0)
 
         guard var draft = vm.mealLogEditor else {
             return XCTFail("expected meal log editor")

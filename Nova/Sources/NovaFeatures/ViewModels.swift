@@ -3090,9 +3090,15 @@ public final class CodingViewModel {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return payloadJSON
         }
-        if let hint = obj["hint"] as? String { return hint }
-        if let error = obj["error"] as? String { return error }
-        if let detail = obj["detail"] as? String { return detail }
+        if let hint = obj["hint"] as? String, !hint.isEmpty { return hint }
+        let error = (obj["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = (obj["detail"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Prefer actionable detail for opaque bridge codes (e.g. ipa_build_failed).
+        if let error, let detail, !detail.isEmpty, detail != error {
+            return "\(error): \(detail)"
+        }
+        if let error, !error.isEmpty { return error }
+        if let detail, !detail.isEmpty { return detail }
         return payloadJSON
     }
 

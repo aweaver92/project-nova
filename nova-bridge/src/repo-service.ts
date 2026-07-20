@@ -1636,11 +1636,10 @@ export class RepoService {
       },
     );
     if (build.code !== 0 || !existsSync(ipaPath)) {
-      throw new RepoError(
-        "ipa_build_failed",
-        (build.stderr || build.stdout || "IPA build failed").trim().slice(0, 500),
-        502,
-      );
+      const combined = `${build.stderr}\n${build.stdout}`.trim();
+      // Prefer the tail — PowerShell / gh often put the real failure last.
+      const detail = (combined.slice(-500) || "IPA build failed").trim();
+      throw new RepoError("ipa_build_failed", detail, 502);
     }
 
     const runMatch = (build.stdout + "\n" + build.stderr).match(
