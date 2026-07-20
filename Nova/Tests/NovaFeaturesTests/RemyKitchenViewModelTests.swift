@@ -21,7 +21,9 @@ final class RemyKitchenViewModelTests: XCTestCase {
         let extended = vm.primaryCookTimer
         XCTAssertEqual(extended?.label, "Pasta water")
         XCTAssertNotEqual(extended?.id, voiceTimer.id)
-        XCTAssertGreaterThanOrEqual(extended?.remainingSeconds ?? 0, 118)
+        // CI runners can tick a couple seconds before the assert runs.
+        XCTAssertGreaterThanOrEqual(extended?.remainingSeconds ?? 0, 110)
+        XCTAssertLessThanOrEqual(extended?.remainingSeconds ?? 0, 120)
 
         await vm.skipCookTimer()
         XCTAssertEqual(vm.primaryCookTimer?.label, "Dessert")
