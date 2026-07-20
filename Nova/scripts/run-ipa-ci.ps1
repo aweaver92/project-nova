@@ -31,7 +31,7 @@ function Find-Gh {
             $(if ($cmd) { $cmd.Source })
             "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
             "$env:ProgramFiles\GitHub CLI\gh.exe"
-            # Hardcoded fallbacks — bridge spawn env may omit ProgramFiles.
+            # Hardcoded fallbacks - bridge spawn env may omit ProgramFiles.
             "C:\Program Files\GitHub CLI\gh.exe"
             "${env:ProgramW6432}\GitHub CLI\gh.exe"
         ) | Where-Object { $_ -and (Test-Path $_) }
@@ -55,6 +55,12 @@ $gh = Find-Gh
 $git = Join-Path $gitBin "git.exe"
 if (-not (Test-Path $git)) { $git = "git" }
 
+# Fail early with a clear message when the bridge spawn can't use keyring auth.
+$authOut = & $gh auth status 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "gh is not authenticated in this environment. Run 'gh auth login' on the PC, or set GH_TOKEN for the bridge. Detail: $(($authOut | Out-String).Trim())"
+}
+
 Push-Location $RepoRoot
 try {
     if (-not $Ref) {
@@ -74,15 +80,48 @@ try {
     }
 
     Write-Host "Dispatching CI workflow (ios-ipa) on ref '$Ref'..."
-    $beforeJson = & $gh run list --workflow CI --event workflow_dispatch --limit 1 --json databaseId,createdAt
+
+    # Right after commit+push, GitHub can briefly 404 the branch for workflow_dispatch
+    # ("could not create workflow dispatch event" / "ref not found"). Wait until the
+    # remote tip is visible, then retry the dispatch with the real gh stderr.
+    $remoteReady = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $null = & $git ls-remote --exit-code origin "refs/heads/$Ref" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $remoteReady = $true
+            break
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $remoteReady) {
+        throw "Remote branch '$Ref' not visible on origin yet. Push may still be propagating - retry Commit and Build."
+    }
+
+    $beforeJson = & $gh run list --workflow CI --event workflow_dispatch --limit 1 --json databaseId,createdAt 2>&1
     $beforeId = $null
-    if ($beforeJson) {
-        $before = ($beforeJson | ConvertFrom-Json) | Select-Object -First 1
+    if ($LASTEXITCODE -eq 0 -and $beforeJson) {
+        $before = ("$beforeJson" | ConvertFrom-Json) | Select-Object -First 1
         if ($before) { $beforeId = [string]$before.databaseId }
     }
 
-    & $gh workflow run CI --ref $Ref
-    if ($LASTEXITCODE -ne 0) { throw "gh workflow run failed (exit $LASTEXITCODE)" }
+    $dispatchErr = $null
+    $dispatched = $false
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        $dispatchOut = & $gh workflow run CI --ref $Ref 2>&1
+        $dispatchCode = $LASTEXITCODE
+        if ($dispatchCode -eq 0) {
+            $dispatched = $true
+            if ($dispatchOut) { Write-Host ($dispatchOut | Out-String).TrimEnd() }
+            break
+        }
+        $dispatchErr = (($dispatchOut | Out-String).Trim())
+        if (-not $dispatchErr) { $dispatchErr = "(no gh output, exit $dispatchCode)" }
+        Write-Warning "gh workflow run attempt $attempt/6 failed: $dispatchErr"
+        Start-Sleep -Seconds ([Math]::Min(20, 2 * $attempt))
+    }
+    if (-not $dispatched) {
+        throw "gh workflow run failed for ref '$Ref': $dispatchErr"
+    }
 
     # Wait for the new run to appear in the list.
     $runId = $null
