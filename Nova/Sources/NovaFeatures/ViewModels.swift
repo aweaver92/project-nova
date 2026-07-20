@@ -1631,12 +1631,13 @@ public final class CodingViewModel {
         await resumePendingClaudeIfNeeded()
 
         // Still running the same live SSE we kept open across background — leave it.
-        let heldLive = isHoldingBackgroundCodingConnection
-            && isRunning
-            && isProcessingPromptQueue
-            && runStatus == "running"
+        // Do not require isProcessingPromptQueue here: unlock can race a quiet SSE
+        // window, and clearing the hold flag must not fall through into cancel.
+        if isHoldingBackgroundCodingConnection, isRunning, runStatus == "running" {
+            isHoldingBackgroundCodingConnection = false
+            return
+        }
         isHoldingBackgroundCodingConnection = false
-        if heldLive { return }
 
         for attempt in 0..<3 {
             await resumePendingCursorRunIfNeeded()
@@ -1656,14 +1657,15 @@ public final class CodingViewModel {
         let pending = PendingCursorRunStore.load()
         let runId = pending?.runId ?? activeRunId
 
-        // Skip when the live SSE execute still owns the job. Fresh events OR an
-        // intentional background hold mean we must not cancel/reconnect.
-        if isRunning,
-           isProcessingPromptQueue,
-           runStatus == "running",
-           hasFreshSSEActivity || isHoldingBackgroundCodingConnection
-        {
-            return
+        // Live execute still owns the SSE — never cancel/reconnect underneath it,
+        // even if events went quiet while the phone was locked.
+        if isRunning, runStatus == "running" {
+            if isProcessingPromptQueue
+                || hasFreshSSEActivity
+                || isHoldingBackgroundCodingConnection
+            {
+                return
+            }
         }
 
         guard let runId, !runId.isEmpty else { return }

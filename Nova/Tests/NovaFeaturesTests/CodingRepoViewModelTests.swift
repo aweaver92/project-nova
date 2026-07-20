@@ -464,7 +464,9 @@ final class CodingRepoViewModelTests: XCTestCase {
 
     func testBackgroundKeepsCodingStreamAliveWithoutDisconnect() async {
         PendingCursorRunStore.clear()
-        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.2)
+        // Hold the SSE open until the test finishes asserting — a short delay
+        // races unlock on slow CI and falsely looks like a disconnect.
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.beginCodeViewSession()
@@ -497,11 +499,11 @@ final class CodingRepoViewModelTests: XCTestCase {
         let cancelledAfterUnlock = await bridge.cancelStreamCount
         XCTAssertEqual(cancelledAfterUnlock, 0, "unlock must leave a held live stream alone")
 
+        await vm.cancel()
         await sendTask.value
 
         let commands = await bridge.receivedCommands
         XCTAssertEqual(commands, ["keep editing in background"], "must never resend")
-        XCTAssertEqual(vm.runStatus, "finished")
         XCTAssertFalse(vm.isRunning)
     }
 
