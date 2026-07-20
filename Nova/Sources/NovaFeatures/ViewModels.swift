@@ -144,6 +144,14 @@ public final class ConversationViewModel {
         await orchestrator.setErrorHandler { message in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Soft lock-screen reconnect notes — keep Stop visible.
+                if message.localizedCaseInsensitiveContains("unlock the phone")
+                    || message.localizedCaseInsensitiveContains("Realtime paused")
+                {
+                    self.errorMessage = nil
+                    self.isRunning = true
+                    return
+                }
                 self.errorMessage = message
                 // Transport exhaustion tears the stream down; reflect that in the UI
                 // so Start can be tapped again without a manual Stop.
@@ -253,6 +261,21 @@ public final class ConversationViewModel {
         usage?.markSessionStopped()
         refreshLatency()
         refreshUsage()
+    }
+
+    /// Screen unlock: resume Realtime if Listen was still armed when the socket died.
+    public func resumeAfterForeground() async {
+        let sessionActive = await orchestrator.isSessionActive
+        guard sessionActive || isRunning else { return }
+        isRunning = true
+        listenHealth = ListenHealth(phase: .connecting, detail: "Resuming after unlock…")
+        await orchestrator.resumeAfterForeground()
+        refreshLatency()
+    }
+
+    public func noteEnteredBackground() async {
+        guard isRunning else { return }
+        await orchestrator.noteEnteredBackground()
     }
 
     public func clearTranscript() {
@@ -1317,10 +1340,12 @@ public final class CodingViewModel {
     public private(set) var repoDiff: BridgeRepoDiff?
     public private(set) var showDiff = false
     public private(set) var lastPublishResult: BridgePublishResult?
+    public private(set) var lastCommitAndBuildResult: BridgeCommitAndBuildResult?
     public private(set) var lastCreatedProject: BridgeCreateProjectResult?
     public private(set) var isRefreshingRepo = false
     public private(set) var isCreatingProject = false
     public private(set) var isPublishing = false
+    public private(set) var isCommitAndBuilding = false
     /// Live preview server for the selected repo ("Preview in browser").
     public private(set) var activePreview: BridgePreviewInfo?
     public private(set) var isStartingPreview = false
@@ -1365,7 +1390,7 @@ public final class CodingViewModel {
     public var publishPRBody: String = ""
     /// Optional spoken progress (wired when Claude is active + Realtime open).
     public var onSpokenProgress: ((String) async -> Void)?
-    /// Optional confirmation gate for publish (Create PR).
+    /// Optional confirmation gate for publish (Create PR) and commit-and-build.
     public var confirmPublish: ((String, String) async -> Bool)?
     /// Opens URLs (Safari) — injected from AppContainer.
     public var openURL: ((URL) async -> Bool)?
@@ -1556,9 +1581,12 @@ public final class CodingViewModel {
     /// After unlock/foreground or re-entering Code view: poll a Cursor run that
     /// survived phone lock / SSE drop without replaying the prompt.
     public func resumePendingCursorRunIfNeeded() async {
-        // An in-flight execute() already owns recovery for its generation.
-        if isRunning, isProcessingPromptQueue { return }
+        // An in-flight execute() already owns recovery for its generation —
+        // except when it died mid-"reconnecting" after a lock (isRunning stuck).
         if isResumingCursorRun { return }
+        if isRunning, isProcessingPromptQueue, runStatus != "reconnecting" {
+            return
+        }
 
         guard let pending = PendingCursorRunStore.load() else { return }
         let runId = pending.runId
@@ -2025,6 +2053,79 @@ public final class CodingViewModel {
         statusMessage = "Opened PR \(published.prUrl)"
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+    }
+
+    /// Commit all Nova checkout changes, push the current branch, then build the
+    /// unsigned IPA via GitHub Actions into `Nova/App/NovaApp.ipa`.
+    /// - Parameter userAlreadyConfirmed: set when the Coding UI already showed
+    ///   its Are You Sure alert so we don't prompt twice.
+    public func commitAndBuildIpa(userAlreadyConfirmed: Bool = false) async {
+        await refreshRepoStatusAndDiff()
+        let status = repoStatus
+        let branch = status?.branch ?? "current branch"
+        let changed = status?.changedFiles.count ?? 0
+        let ahead = status?.ahead ?? 0
+        let detail = """
+        Are you sure?
+
+        This will:
+        • Commit ALL uncommitted files on \(branch) (\(changed) changed)
+        • Push \(branch) to origin\(ahead > 0 ? " (\(ahead) commit(s) ahead)" : "")
+        • Trigger the GitHub Actions IPA job (~10–25 min)
+        • Overwrite Nova/App/NovaApp.ipa for SideStore
+
+        Do not force-push or rewrite history — this uses a normal push only.
+        """
+        if !userAlreadyConfirmed, let confirmPublish {
+            let allowed = await confirmPublish("Commit and build IPA?", detail)
+            guard allowed else {
+                statusMessage = "Commit and build cancelled."
+                return
+            }
+        }
+        isCommitAndBuilding = true
+        statusMessage = "Committing, pushing, and building IPA…"
+        defer { isCommitAndBuilding = false }
+        let request = BridgeCommitAndBuildRequest(
+            statusToken: nil,
+            commitMessage: "Nova: commit and build IPA"
+        )
+        let result = await bridge.commitAndBuildIpa(request: request)
+        guard result.ok, let built = Self.decodeCommitAndBuildResult(result.payloadJSON) else {
+            statusMessage = Self.summarize(result.payloadJSON)
+            return
+        }
+        lastCommitAndBuildResult = built
+        statusMessage = built.detail
+        await refreshRepoStatusAndDiff()
+        await refreshAgentReview()
+    }
+
+    private static func decodeCommitAndBuildResult(_ payloadJSON: String) -> BridgeCommitAndBuildResult? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        // Endpoint returns fields at the top level alongside ok.
+        guard let repoId = obj["repoId"] as? String,
+              let branch = obj["branch"] as? String,
+              let commitSha = obj["commitSha"] as? String,
+              let ipaPath = obj["ipaPath"] as? String,
+              let ipaRelativePath = obj["ipaRelativePath"] as? String,
+              let buildStatus = obj["buildStatus"] as? String,
+              let detail = obj["detail"] as? String
+        else { return nil }
+        return BridgeCommitAndBuildResult(
+            repoId: repoId,
+            branch: branch,
+            commitSha: commitSha,
+            committed: obj["committed"] as? Bool ?? false,
+            pushed: obj["pushed"] as? Bool ?? false,
+            ipaPath: ipaPath,
+            ipaRelativePath: ipaRelativePath,
+            workflowRunId: obj["workflowRunId"] as? String,
+            buildStatus: buildStatus,
+            detail: detail
+        )
     }
 
     public func refreshSessions() async {

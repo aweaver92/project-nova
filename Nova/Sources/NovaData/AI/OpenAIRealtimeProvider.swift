@@ -33,8 +33,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     // same session shape.
     private var lastConfig: AISessionConfig?
     private var reconnectAttempts = 0
-    private let maxReconnectAttempts = 5
+    private let maxReconnectAttempts = 8
     private var reconnectStartedAt: ContinuousClock.Instant?
+    /// False while the phone is locked / backgrounded. Exhaustion is deferred
+    /// until the app is active again so lock-screen suspend cannot burn the budget.
+    private var appIsActive = true
+    private var reconnectTask: Task<Void, Never>?
     private var waitingForSessionUpdated = false
     /// Set when an `error` event arrives while waiting for `session.updated`.
     private var sessionUpdateError: String?
@@ -105,13 +109,14 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         try? tokenStore.clear()
         let credential = try await resolveCredential()
         let configuration = URLSessionConfiguration.default
-        configuration.waitsForConnectivity = false
-        configuration.timeoutIntervalForRequest = 20
-        configuration.timeoutIntervalForResource = 25
+        // After unlock, cellular/Wi‑Fi can lag; waiting briefly beats instant fails.
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 45
         let session = URLSession(configuration: configuration)
         self.session = session
         var request = URLRequest(url: url)
-        request.timeoutInterval = 20
+        request.timeoutInterval = 30
         request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
 
         let task = session.webSocketTask(with: request)
@@ -237,9 +242,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         // cannot stall behind a continuation that will never see `.committed`.
         finishCommitWait(generation: commitWaitGeneration)
         failAnalyzeWait(NovaError.cancelled)
+        reconnectTask?.cancel()
+        reconnectTask = nil
         if clearConfig {
             lastConfig = nil
             reconnectStartedAt = nil
+            reconnectAttempts = 0
         }
         waitingForSessionUpdated = false
         sessionUpdateError = nil
@@ -457,7 +465,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     private func sendJSON(_ object: [String: Any]) async throws {
-        guard let socket else { throw NovaError.aiProvider("Not connected") }
+        guard let socket else {
+            throw NovaError.aiProvider(
+                "Voice isn’t connected — open Assistant, tap Listen, then try again."
+            )
+        }
         let data = try JSONSerialization.data(withJSONObject: object)
         guard let text = String(data: data, encoding: .utf8) else {
             throw NovaError.aiProvider("JSON encode failed")
@@ -492,8 +504,28 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     /// Re-establish a dropped socket with exponential backoff. Refreshes the
     /// ephemeral credential if it expired, re-sends `session.update`, and resumes
     /// the receive loop, emitting `.reconnected` on success or `.error` if the
-    /// attempts are exhausted.
+    /// attempts are exhausted *while the app is foregrounded*.
     private func reconnect() async {
+        guard lastConfig != nil else {
+            connected = false
+            return
+        }
+        // Coalesce overlapping reconnect kicks (receive-loop error + append failure).
+        if let existing = reconnectTask, !existing.isCancelled {
+            await existing.value
+            return
+        }
+        let task = Task { [weak self] in
+            await self?.runReconnectLoop()
+        }
+        reconnectTask = task
+        await task.value
+        if reconnectTask == task {
+            reconnectTask = nil
+        }
+    }
+
+    private func runReconnectLoop() async {
         guard let config = lastConfig else {
             connected = false
             return
@@ -509,17 +541,53 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
 
-        while reconnectAttempts < maxReconnectAttempts {
+        #if canImport(UIKit)
+        let bg = await MainActor.run { BackgroundTask.begin(name: "nova.realtime-reconnect") }
+        defer { Task { @MainActor in BackgroundTask.end(bg) } }
+        #endif
+
+        while lastConfig != nil {
+            if Task.isCancelled { return }
+            if reconnectAttempts >= maxReconnectAttempts {
+                if !appIsActive {
+                    // Keep lastConfig; unlock calls resumeTransportIfNeeded.
+                    NovaLog.ai.warning(
+                        "Realtime reconnect budget hit while backgrounded — waiting for unlock"
+                    )
+                    eventsContinuation?.yield(
+                        .error(message: "Realtime paused — unlock the phone to reconnect")
+                    )
+                    return
+                }
+                metrics?.increment(.reconnectExhausted)
+                metrics?.increment(.sessionFailures)
+                reconnectStartedAt = nil
+                eventsContinuation?.yield(
+                    .error(message: "Realtime disconnected (reconnect attempts exhausted)")
+                )
+                return
+            }
+
             reconnectAttempts += 1
             metrics?.increment(.reconnectAttempts)
             let delay = min(pow(2.0, Double(reconnectAttempts - 1)), 16)
-            // Small jitter so multiple devices don't reconnect in lockstep.
             let jitter = Double.random(in: 0...(delay * 0.2))
-            NovaLog.ai.warning("Realtime dropped; reconnect attempt \(self.reconnectAttempts) in \(delay + jitter)s")
+            NovaLog.ai.warning(
+                "Realtime dropped; reconnect attempt \(self.reconnectAttempts) in \(delay + jitter)s"
+            )
             try? await Task.sleep(for: .seconds(delay + jitter))
             if Task.isCancelled || lastConfig == nil { return }
+
+            // Prefer parking while locked over burning attempts on dead radio.
+            if !appIsActive {
+                NovaLog.ai.info("Deferring Realtime reconnect until the phone is unlocked")
+                eventsContinuation?.yield(
+                    .error(message: "Realtime paused — unlock the phone to reconnect")
+                )
+                return
+            }
+
             do {
-                // Drop any cached secret — OpenAI ephemeral tokens are one WS each.
                 try? tokenStore.clear()
                 try await openSocket(config: config)
                 reconnectAttempts = 0
@@ -530,10 +598,24 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 NovaLog.ai.error("Reconnect failed: \(String(describing: error), privacy: .public)")
             }
         }
-        metrics?.increment(.reconnectExhausted)
-        metrics?.increment(.sessionFailures)
-        reconnectStartedAt = nil
-        eventsContinuation?.yield(.error(message: "Realtime disconnected (reconnect attempts exhausted)"))
+    }
+
+    public func noteAppLifecycle(isActive: Bool) async {
+        let wasActive = appIsActive
+        appIsActive = isActive
+        if isActive, !wasActive {
+            // Fresh radio + user attention — reset budget. Orchestrator calls
+            // `resumeTransportIfNeeded` to actually reopen the socket.
+            reconnectAttempts = 0
+        }
+    }
+
+    public func resumeTransportIfNeeded() async -> Bool {
+        guard lastConfig != nil else { return false }
+        if connected { return true }
+        reconnectAttempts = 0
+        await reconnect()
+        return connected
     }
 
     private func handleMessage(_ text: String) async {

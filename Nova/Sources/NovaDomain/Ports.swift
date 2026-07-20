@@ -19,6 +19,13 @@ public protocol ConversationalAIProvider: Sendable {
     /// Inject a user-role text turn and ask the model to respond. Used for tapped
     /// follow-up suggestions and local skill confirmations.
     func sendUserText(_ text: String) async
+    /// Phone active/inactive (screen unlock / lock). Providers may pause reconnect
+    /// exhaustion while suspended and force a fresh attempt on unlock.
+    func noteAppLifecycle(isActive: Bool) async
+    /// If the socket died while the user still expects a live session, reconnect.
+    /// Returns true when a reconnect was started or the socket is already up.
+    @discardableResult
+    func resumeTransportIfNeeded() async -> Bool
     var events: AsyncStream<AIConversationEvent> { get }
 }
 
@@ -27,12 +34,21 @@ public extension ConversationalAIProvider {
     func commitInputAudio() async {}
     func sendToolOutput(callId: String, outputJSON: String) async {}
     func sendUserText(_ text: String) async {}
+    func noteAppLifecycle(isActive: Bool) async {}
+    func resumeTransportIfNeeded() async -> Bool { false }
 }
 
 public protocol AudioIngress: Sendable {
     var chunks: AsyncStream<AudioChunk> { get }
     func start() async throws
     func stop() async
+    /// Soft nudge after transport resume (e.g. re-arm HFP tap without replacing
+    /// the chunk stream the orchestrator is already consuming).
+    func nudgeAfterTransportResume() async
+}
+
+public extension AudioIngress {
+    func nudgeAfterTransportResume() async {}
 }
 
 public protocol AudioEgress: Sendable {
@@ -640,6 +656,53 @@ public struct BridgePublishResult: Sendable, Equatable, Codable {
     }
 }
 
+public struct BridgeCommitAndBuildRequest: Sendable, Equatable, Codable {
+    public let statusToken: String?
+    public let commitMessage: String?
+
+    public init(statusToken: String? = nil, commitMessage: String? = nil) {
+        self.statusToken = statusToken
+        self.commitMessage = commitMessage
+    }
+}
+
+public struct BridgeCommitAndBuildResult: Sendable, Equatable, Codable {
+    public let repoId: String
+    public let branch: String
+    public let commitSha: String
+    public let committed: Bool
+    public let pushed: Bool
+    public let ipaPath: String
+    public let ipaRelativePath: String
+    public let workflowRunId: String?
+    public let buildStatus: String
+    public let detail: String
+
+    public init(
+        repoId: String,
+        branch: String,
+        commitSha: String,
+        committed: Bool,
+        pushed: Bool,
+        ipaPath: String,
+        ipaRelativePath: String,
+        workflowRunId: String?,
+        buildStatus: String,
+        detail: String
+    ) {
+        self.repoId = repoId
+        self.branch = branch
+        self.commitSha = commitSha
+        self.committed = committed
+        self.pushed = pushed
+        self.ipaPath = ipaPath
+        self.ipaRelativePath = ipaRelativePath
+        self.workflowRunId = workflowRunId
+        self.buildStatus = buildStatus
+        self.detail = detail
+    }
+}
+
 /// One agent-only file delta from a pre-run baseline review.
 public struct BridgeAgentReviewFile: Identifiable, Sendable, Equatable, Codable {
     public let path: String
@@ -1028,6 +1091,8 @@ public protocol AgentBridging: Sendable {
     func searchNovaCode(query: String) async -> BridgeResult
     func readNovaCode(path: String, startLine: Int, endLine: Int) async -> BridgeResult
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
+    /// Commit + push the Nova source checkout, then build/download `Nova/App/NovaApp.ipa`.
+    func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult
     func createBaseline(repoId: String) async -> BridgeResult
     func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult
     func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult
@@ -1160,6 +1225,9 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func createBaseline(repoId: String) async -> BridgeResult {

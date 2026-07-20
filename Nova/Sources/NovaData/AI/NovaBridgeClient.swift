@@ -564,6 +564,18 @@ public actor NovaBridgeClient: AgentBridging {
         return await post(path: "repos/\(escaped)/publish", body: body, timeout: 320)
     }
 
+    public func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        var body: [String: Any] = [:]
+        if let statusToken = request.statusToken, !statusToken.isEmpty {
+            body["statusToken"] = statusToken
+        }
+        if let commitMessage = request.commitMessage, !commitMessage.isEmpty {
+            body["commitMessage"] = commitMessage
+        }
+        // macOS IPA CI often takes 10–25 minutes; leave headroom for download.
+        return await post(path: "nova/commit-and-build", body: body, timeout: 50 * 60)
+    }
+
     public func createBaseline(repoId: String) async -> BridgeResult {
         let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
         return await post(path: "repos/\(escaped)/baselines", body: [:], timeout: 60)

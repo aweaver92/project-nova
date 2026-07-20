@@ -640,6 +640,69 @@ public actor ConversationOrchestrator {
         }
     }
 
+    /// Screen unlock / foreground: keep Listen alive across lock by resuming the
+    /// Realtime socket (and mic) if iOS suspended the WebSocket.
+    public func resumeAfterForeground() async {
+        await ai.noteAppLifecycle(isActive: true)
+        guard isRunning else { return }
+
+        if streaming {
+            publishListenHealth(
+                phase: .connecting,
+                detail: "Checking Realtime after unlock…"
+            )
+            // Do not hold the lifecycle lock across token mint / WS open — that
+            // would block Stop and agent switch for the whole reconnect window.
+            let ok = await ai.resumeTransportIfNeeded()
+            await ingress.nudgeAfterTransportResume()
+            if ok {
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "Realtime connected — speak or type."
+                )
+                return
+            }
+            await withLifecycle {
+                guard isRunning else { return }
+                await teardownStreaming(cancelToolTask: false)
+                do {
+                    var engaged = sessionConfig
+                    engaged.requireWakeWord = false
+                    sessionConfig.requireWakeWord = false
+                    try await beginStreaming(engaged)
+                } catch {
+                    NovaLog.session.error(
+                        "Foreground Realtime rebuild failed: \(String(describing: error), privacy: .public)"
+                    )
+                    publishListenHealth(
+                        phase: .error,
+                        detail: "Could not reconnect — tap Listen."
+                    )
+                }
+            }
+            return
+        }
+
+        // Local wake-word standby or half-torn session: reopen cloud.
+        do {
+            try await reopenRealtime()
+        } catch {
+            NovaLog.session.error(
+                "Foreground reopen failed: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
+    public func noteEnteredBackground() async {
+        await ai.noteAppLifecycle(isActive: false)
+        if isRunning, streaming {
+            publishListenHealth(
+                phase: .connecting,
+                detail: "Screen off — keeping audio session; reconnecting if the socket drops…"
+            )
+        }
+    }
+
     // MARK: - Streaming (engaged state)
 
     /// Compose the effective session config for the active agent: persona voice +
@@ -1275,6 +1338,19 @@ public actor ConversationOrchestrator {
             }
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
+            // Soft lifecycle notes — keep Listen armed; do not stand down.
+            if message.localizedCaseInsensitiveContains("unlock the phone to reconnect")
+                || message.localizedCaseInsensitiveContains("Realtime paused")
+            {
+                publishListenHealth(
+                    phase: .connecting,
+                    detail: "Phone locked — unlock to finish reconnecting."
+                )
+                lastError = message
+                onError?(message)
+                onMetricsTick?()
+                break
+            }
             lastError = message
             onError?(message)
             if message.localizedCaseInsensitiveContains("reconnect attempts exhausted") {
@@ -1284,6 +1360,13 @@ public actor ConversationOrchestrator {
         case .reconnected:
             lastError = nil
             NovaLog.session.info("AI stream reconnected")
+            if streaming, isRunning {
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "Realtime reconnected — speak or type."
+                )
+                await ingress.nudgeAfterTransportResume()
+            }
             onMetricsTick?()
         }
     }

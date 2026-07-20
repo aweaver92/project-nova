@@ -13,6 +13,7 @@ public struct CodingView: View {
     @State private var showClone = false
     @State private var showCreateProject = false
     @State private var showPublish = false
+    @State private var showCommitAndBuildConfirm = false
     @State private var showRepoFiles = false
     @State private var showPromptHistory = false
     @State private var showTemplates = false
@@ -116,6 +117,10 @@ public struct CodingView: View {
                     Button("Repositories…") { showRepos = true }
                     Button("New web project…") { showCreateProject = true }
                     Button("Clone GitHub repo…") { showClone = true }
+                    Button("Commit and Build…") {
+                        showCommitAndBuildConfirm = true
+                    }
+                    .disabled(coding.isCommitAndBuilding || coding.isPublishing)
                     Button("Refresh") {
                         Task {
                             await coding.refreshSessions()
@@ -184,11 +189,31 @@ public struct CodingView: View {
         } message: {
             Text("Ends this chat. Reopen Code view when you want to start another session.")
         }
+        .alert("Commit and build IPA?", isPresented: $showCommitAndBuildConfirm) {
+            Button("Commit & Build", role: .destructive) {
+                Task { await coding.commitAndBuildIpa(userAlreadyConfirmed: true) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(commitAndBuildDisclaimer)
+        }
         .task {
             await coding.load()
             await coding.beginCodeViewSession()
             await coding.refreshPreviews()
         }
+    }
+
+    private var commitAndBuildDisclaimer: String {
+        let branch = coding.repoStatus?.branch ?? "this branch"
+        let changed = coding.repoStatus?.changedFiles.count ?? 0
+        return """
+        Are you sure?
+
+        This commits ALL local changes on \(branch) (\(changed) file(s)), pushes to origin, runs the GitHub Actions IPA job (often 10–25 minutes), and overwrites Nova/App/NovaApp.ipa for SideStore.
+
+        Cancel if you are not ready to publish these changes.
+        """
     }
 
     @ViewBuilder
@@ -333,6 +358,11 @@ public struct CodingView: View {
                         .disabled(coding.repoDiff?.diff.isEmpty != false && status.clean)
                     }
                     Spacer()
+                    Button("Commit and Build") {
+                        showCommitAndBuildConfirm = true
+                    }
+                    .font(.caption.weight(.semibold))
+                    .disabled(coding.isCommitAndBuilding || coding.isPublishing)
                     Button("Create pull request") {
                         coding.preparePublishDraft()
                         showPublish = true
@@ -340,6 +370,7 @@ public struct CodingView: View {
                     .font(.caption.weight(.semibold))
                     .disabled(
                         coding.isPublishing
+                            || coding.isCommitAndBuilding
                             || (coding.agentReview.map { $0.files.isEmpty } ?? status.clean)
                     )
                 }
@@ -380,6 +411,17 @@ public struct CodingView: View {
                     Text(pr.prUrl)
                         .font(.caption)
                 }
+            }
+
+            if let built = coding.lastCommitAndBuildResult {
+                Text(built.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if coding.isCommitAndBuilding {
+                ProgressView("Building IPA…")
+                    .font(.caption)
             }
 
             if !coding.statusMessage.isEmpty {

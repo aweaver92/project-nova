@@ -564,6 +564,14 @@ public final class AppContainer {
             nutrition: nutritionStore,
             timers: timerService,
             analyzeImage: { [orchestrator] frame, prompt in
+                // Fridge / meal photo analysis needs an open Realtime socket.
+                // Listen may only arm on-device wake word, so reopen if idle.
+                if await !orchestrator.isStreaming {
+                    if await !orchestrator.isSessionActive {
+                        try await orchestrator.start()
+                    }
+                    try await orchestrator.reopenRealtime()
+                }
                 try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },
             captureStill: { [capture] in

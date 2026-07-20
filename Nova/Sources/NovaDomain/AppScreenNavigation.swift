@@ -82,12 +82,15 @@ public enum AppScreenCatalog: Sendable {
         ),
         AppScreenTarget(
             id: "fridge_scan",
-            aliases: ["scan_fridge", "scan"],
+            aliases: [
+                "scan_fridge", "scan", "scan_food", "scan food", "meal_photo",
+                "meal photo", "food_scan", "food scan",
+            ],
             ownerAgentId: Agent.SeedID.remy,
             ownerName: "Remy",
             routeKey: "kitchen",
             kitchenSection: "scan",
-            title: "Fridge scan"
+            title: "Scan"
         ),
         AppScreenTarget(
             id: "nutrition_profile",

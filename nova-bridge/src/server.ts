@@ -38,6 +38,7 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /repos/:repoId/status | /diff | /files?path=
  *   POST /self-code/search | /self-code/read       → read-only Nova grounding
  *   POST /repos/:repoId/publish
+ *   POST /nova/commit-and-build        → commit+push Nova checkout, build IPA
  *   POST /repos/:repoId/baselines                 → create pre-run snapshot
  *   GET  /repos/:repoId/baselines/:id/review      → agent-only file diffs
  *   POST /repos/:repoId/baselines/:id/keep        { paths }
@@ -328,6 +329,20 @@ app.post("/repos/:repoId/publish", requireAuth, async (req, res) => {
       paths: Array.isArray(req.body?.paths)
         ? req.body.paths.filter((p: unknown): p is string => typeof p === "string")
         : undefined,
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.post("/nova/commit-and-build", requireAuth, async (req, res) => {
+  try {
+    const result = await repos.commitAndBuildIpa({
+      statusToken:
+        typeof req.body?.statusToken === "string" ? req.body.statusToken : undefined,
+      commitMessage:
+        typeof req.body?.commitMessage === "string" ? req.body.commitMessage : undefined,
     });
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -1490,6 +1505,12 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`  repo roots:      ${ready.rootCount}`);
   console.log(`  default cwd:     ${DEFAULT_CWD}`);
 });
+
+// Commit-and-build waits on GitHub Actions IPA CI (often 10–25+ min). Node 18+
+// defaults requestTimeout to 5 minutes, which aborts those jobs mid-flight.
+server.requestTimeout = 55 * 60_000;
+server.headersTimeout = 56 * 60_000;
+server.keepAliveTimeout = 120_000;
 
 function shutdown(signal: string): void {
   console.log(`${signal}: stopping Nova Bridge`);

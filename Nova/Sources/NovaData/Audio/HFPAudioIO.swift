@@ -260,6 +260,10 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
 
     /// Reactivate the HFP session and restart the capture tap after an
     /// interruption or route change. Coalesces overlapping recoveries.
+    public func nudgeAfterTransportResume() async {
+        recover()
+    }
+
     private func recover() {
         lock.lock()
         recoveryGeneration &+= 1

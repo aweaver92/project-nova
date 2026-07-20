@@ -141,6 +141,29 @@ export type PublishResult = {
   prNumber: number | null;
 };
 
+export type CommitAndBuildRequest = {
+  /** Optional; when set must match the Nova checkout status token. */
+  statusToken?: string;
+  commitMessage?: string;
+};
+
+export type CommitAndBuildResult = {
+  repoId: string;
+  branch: string;
+  commitSha: string;
+  committed: boolean;
+  pushed: boolean;
+  /** Absolute path where SideStore expects the IPA. */
+  ipaPath: string;
+  /** Relative path from the Nova repo root. */
+  ipaRelativePath: string;
+  workflowRunId: string | null;
+  buildStatus: "completed" | "failed";
+  detail: string;
+};
+
+const IPA_BUILD_TIMEOUT_MS = 45 * 60_000;
+
 export const WEB_PROJECT_TEMPLATES = [
   "static",
   "vite",
@@ -1476,6 +1499,166 @@ export class RepoService {
         prNumber: numMatch ? Number(numMatch[1]) : null,
       };
     });
+  }
+
+  /**
+   * Commit every dirty path on the current branch, push to origin, then run the
+   * GitHub Actions IPA job and download `Nova/App/NovaApp.ipa` (SideStore path).
+   * Always targets the Meta GPT / Nova source checkout — not an arbitrary repo.
+   */
+  async commitAndBuildIpa(req: CommitAndBuildRequest): Promise<CommitAndBuildResult> {
+    const nova = this.resolveNovaRepo();
+    this.requireGh(); // fail fast — run-ipa-ci.ps1 needs authenticated gh
+
+    const pushed = await this.withLock(nova.id, async () => {
+      const git = this.requireGit();
+      const repo = nova;
+
+      const current = await this.statusUnlocked(repo.path, repo.id, repo.name);
+      const token = (req.statusToken ?? "").trim();
+      if (token && token !== current.statusToken) {
+        throw new RepoError("stale_status", "status_token_mismatch", 409);
+      }
+
+      const branch = current.branch;
+      if (!branch || branch === "HEAD") {
+        throw new RepoError("invalid_branch", "detached_head", 400);
+      }
+
+      let committed = false;
+      if (!current.clean) {
+        const message =
+          (req.commitMessage ?? "").trim() ||
+          `Nova: commit and build IPA (${new Date().toISOString().slice(0, 16)})`;
+        if (message.startsWith("-")) {
+          throw new RepoError("invalid_commit", "leading_option_rejected");
+        }
+
+        const add = await runProcess(git, ["add", "-A", "--"], { cwd: repo.path });
+        if (add.code !== 0) {
+          throw new RepoError(
+            "stage_failed",
+            add.stderr.trim().slice(0, 400) || "git_add_failed",
+            502,
+          );
+        }
+
+        const commit = await runProcess(
+          git,
+          ["commit", "-m", message, "--no-verify"],
+          {
+            cwd: repo.path,
+            env: {
+              GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Nova Bridge",
+              GIT_AUTHOR_EMAIL:
+                process.env.GIT_AUTHOR_EMAIL ?? "nova-bridge@local",
+              GIT_COMMITTER_NAME:
+                process.env.GIT_COMMITTER_NAME ?? "Nova Bridge",
+              GIT_COMMITTER_EMAIL:
+                process.env.GIT_COMMITTER_EMAIL ?? "nova-bridge@local",
+            },
+          },
+        );
+        if (commit.code !== 0) {
+          throw new RepoError(
+            "commit_failed",
+            commit.stderr.trim().slice(0, 400) || "git_commit_failed",
+            502,
+          );
+        }
+        committed = true;
+      }
+
+      const shaRes = await runProcess(git, ["rev-parse", "HEAD"], {
+        cwd: repo.path,
+      });
+      const commitSha = shaRes.stdout.trim();
+      if (!commitSha) {
+        throw new RepoError("commit_failed", "missing_head_sha", 502);
+      }
+
+      let didPush = false;
+      const needsPush = committed || current.ahead > 0 || !current.upstream;
+      if (needsPush) {
+        const push = await runProcess(
+          git,
+          ["push", "-u", "origin", branch, "--"],
+          { cwd: repo.path, timeoutMs: PUBLISH_TIMEOUT_MS },
+        );
+        if (push.code !== 0) {
+          throw new RepoError(
+            "push_failed",
+            push.stderr.trim().slice(0, 400) || "git_push_failed",
+            502,
+          );
+        }
+        didPush = true;
+      }
+
+      return {
+        repoId: repo.id,
+        repoPath: repo.path,
+        branch,
+        commitSha,
+        committed,
+        pushed: didPush,
+      };
+    });
+
+    // IPA CI is long-running — do not hold the repo lock while waiting.
+    const ipaRelativePath = "Nova/App/NovaApp.ipa";
+    const ipaPath = join(pushed.repoPath, "Nova", "App", "NovaApp.ipa");
+    const scriptPath = join(pushed.repoPath, "Nova", "scripts", "run-ipa-ci.ps1");
+    if (!existsSync(scriptPath)) {
+      throw new RepoError(
+        "ipa_script_missing",
+        "Nova/scripts/run-ipa-ci.ps1 not found",
+        500,
+      );
+    }
+
+    const ps = process.platform === "win32" ? "powershell.exe" : "pwsh";
+    const build = await runProcess(
+      ps,
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        scriptPath,
+        "-Ref",
+        pushed.branch,
+      ],
+      {
+        cwd: join(pushed.repoPath, "Nova"),
+        timeoutMs: IPA_BUILD_TIMEOUT_MS,
+        maxStdout: 1_000_000,
+      },
+    );
+    if (build.code !== 0 || !existsSync(ipaPath)) {
+      throw new RepoError(
+        "ipa_build_failed",
+        (build.stderr || build.stdout || "IPA build failed").trim().slice(0, 500),
+        502,
+      );
+    }
+
+    const runMatch = (build.stdout + "\n" + build.stderr).match(
+      /Run\s+(\d+)\s+started/i,
+    );
+
+    return {
+      repoId: pushed.repoId,
+      branch: pushed.branch,
+      commitSha: pushed.commitSha,
+      committed: pushed.committed,
+      pushed: pushed.pushed,
+      ipaPath,
+      ipaRelativePath,
+      workflowRunId: runMatch?.[1] ?? null,
+      buildStatus: "completed",
+      detail: `IPA ready at Nova/App/NovaApp.ipa (${pushed.commitSha.slice(0, 7)} on ${pushed.branch})`,
+    };
   }
 
   async createPublicWebProject(

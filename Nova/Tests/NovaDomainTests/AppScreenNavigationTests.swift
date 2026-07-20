@@ -8,6 +8,12 @@ final class AppScreenNavigationTests: XCTestCase {
         XCTAssertEqual(AppScreenCatalog.resolve("my shopping list")?.id, "shopping_list")
     }
 
+    func testResolvesScanFoodToKitchenScan() {
+        XCTAssertEqual(AppScreenCatalog.resolve("scan_food")?.kitchenSection, "scan")
+        XCTAssertEqual(AppScreenCatalog.resolve("meal photo")?.id, "fridge_scan")
+        XCTAssertEqual(AppScreenCatalog.resolve("food scan")?.title, "Scan")
+    }
+
     func testRemyOwnsKitchenScreensNotCoding() {
         let shopping = AppScreenCatalog.resolve("shopping_list")!
         XCTAssertEqual(shopping.ownerAgentId, Agent.SeedID.remy)

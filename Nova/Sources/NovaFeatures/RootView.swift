@@ -253,10 +253,17 @@ public struct RootView: View {
                 // header toggle) to open Realtime on demand.
             }
             .onChange(of: scenePhase) { _, phase in
-                guard phase == .active else { return }
                 Task {
-                    await coding.resumePendingClaudeIfNeeded()
-                    await coding.resumePendingCursorRunIfNeeded()
+                    switch phase {
+                    case .active:
+                        await conversation.resumeAfterForeground()
+                        await coding.resumePendingClaudeIfNeeded()
+                        await coding.resumePendingCursorRunIfNeeded()
+                    case .background, .inactive:
+                        await conversation.noteEnteredBackground()
+                    @unknown default:
+                        break
+                    }
                 }
             }
         }
@@ -277,8 +284,7 @@ public struct RootView: View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Text(agents.activeName)
-                        .font(.subheadline.weight(.semibold))
+                    agentPickerMenu
                     Text("·")
                         .foregroundStyle(.tertiary)
                     Text(workspaces.activeName)
@@ -289,6 +295,17 @@ public struct RootView: View {
                     if recording.isRecording {
                         NovaUI.StatusChip(title: "Rec", value: "ON", color: .red)
                     }
+                }
+                if let feature = activeAgentFeature {
+                    Button {
+                        agents.requestRoute(feature.route)
+                        selectedTab = .agents
+                    } label: {
+                        Label(feature.title, systemImage: feature.systemImage)
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -311,6 +328,50 @@ public struct RootView: View {
                 }
             }
             .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        }
+    }
+
+    private var agentPickerMenu: some View {
+        Menu {
+            ForEach(agents.agents) { agent in
+                Button {
+                    Task { await agents.activate(agent) }
+                } label: {
+                    if agent.id == agents.activeAgent?.id {
+                        Label(agent.name, systemImage: "checkmark")
+                    } else {
+                        Text(agent.name)
+                    }
+                }
+                .disabled(!agent.enabled)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(agents.activeName)
+                    .font(.subheadline.weight(.semibold))
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityLabel("Active agent, \(agents.activeName)")
+        .accessibilityHint("Opens agent picker")
+    }
+
+    private var activeAgentFeature: (route: AgentsPendingRoute, title: String, systemImage: String)? {
+        switch agents.activeAgent?.id {
+        case Agent.SeedID.claude:
+            return (.coding, "Open Coding", "chevron.left.forwardslash.chevron.right")
+        case Agent.SeedID.max:
+            return (.training, "Open Training", "figure.strengthtraining.traditional")
+        case Agent.SeedID.sage:
+            return (.wellness, "Open Wellness", "leaf")
+        case Agent.SeedID.remy:
+            return (.kitchen, "Open Kitchen", "fork.knife")
+        case Agent.SeedID.scholar:
+            return (.study, "Open Study", "text.book.closed")
+        default:
+            return nil
         }
     }
 

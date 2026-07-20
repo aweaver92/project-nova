@@ -418,7 +418,41 @@ public struct RemyKitchenView: View {
             Button {
                 Task { await kitchen.scanWithGlasses() }
             } label: {
-                Label("Scan with glasses", systemImage: "eyeglasses")
+                Label("Scan fridge with glasses", systemImage: "eyeglasses")
+            }
+            .disabled(kitchen.isScanning)
+        }
+
+        Section("Meal photo") {
+            Text("Estimate calories and macros from a plate photo — totals show up under Profile → Today.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            PhotosPicker(selection: $mealPhotoItems, maxSelectionCount: 1, matching: .images) {
+                Label(
+                    kitchen.isScanning ? "Analyzing…" : "Scan meal from photo",
+                    systemImage: "camera.fill"
+                )
+            }
+            .disabled(kitchen.isScanning)
+            .onChange(of: mealPhotoItems) { _, items in
+                guard let item = items.first else { return }
+                Task {
+                    #if canImport(UIKit)
+                    if let data = try? await item.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data),
+                       let jpeg = image.jpegData(compressionQuality: 0.85) {
+                        await kitchen.logMealPhotoData(jpeg, mimeType: "image/jpeg")
+                    }
+                    #endif
+                    mealPhotoItems = []
+                }
+            }
+
+            Button {
+                Task { await kitchen.logMealWithGlasses() }
+            } label: {
+                Label("Scan meal with glasses", systemImage: "eyeglasses")
             }
             .disabled(kitchen.isScanning)
         }
@@ -734,34 +768,9 @@ public struct RemyKitchenView: View {
                 Task { await kitchen.logMeal(text) }
             }
             .disabled(kitchen.isScanning)
-
-            PhotosPicker(selection: $mealPhotoItems, maxSelectionCount: 1, matching: .images) {
-                Label(
-                    kitchen.isScanning ? "Analyzing…" : "Log meal from photo",
-                    systemImage: "camera.fill"
-                )
-            }
-            .disabled(kitchen.isScanning)
-            .onChange(of: mealPhotoItems) { _, items in
-                guard let item = items.first else { return }
-                Task {
-                    #if canImport(UIKit)
-                    if let data = try? await item.loadTransferable(type: Data.self),
-                       let image = UIImage(data: data),
-                       let jpeg = image.jpegData(compressionQuality: 0.85) {
-                        await kitchen.logMealPhotoData(jpeg, mimeType: "image/jpeg")
-                    }
-                    #endif
-                    mealPhotoItems = []
-                }
-            }
-
-            Button {
-                Task { await kitchen.logMealWithGlasses() }
-            } label: {
-                Label("Log meal with glasses", systemImage: "eyeglasses")
-            }
-            .disabled(kitchen.isScanning)
+            Text("Or scan a meal photo under Scan.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
 
         if !kitchen.recentMeals.isEmpty {
@@ -796,7 +805,7 @@ public struct RemyKitchenView: View {
             }
             .padding(.vertical, 4)
             if !kitchen.hasMacroData {
-                Text("Log a meal photo or ask Remy — she'll estimate calories and macros and they'll show up here.")
+                Text("Use Scan → meal photo or ask Remy — she'll estimate calories and macros and they'll show up here.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

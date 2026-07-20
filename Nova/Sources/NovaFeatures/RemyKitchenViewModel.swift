@@ -339,9 +339,29 @@ public final class RemyKitchenViewModel {
         if let nova = error as? NovaError, let tip = nova.errorDescription, !tip.isEmpty {
             return tip
         }
+        let ns = error as NSError
+        if let tip = ns.userInfo[NSLocalizedDescriptionKey] as? String,
+           !tip.isEmpty,
+           !tip.contains("NovaError error") {
+            return tip
+        }
+        // Bridged `NovaError` sometimes loses its associated tip; map known codes.
+        // Indices match `NovaError` case order (`aiProvider` == 3).
+        if ns.domain.contains("NovaError") {
+            switch ns.code {
+            case 3:
+                return "Voice isn’t connected — open Assistant, tap Listen, then try again."
+            case 4:
+                return "Credentials problem — check Settings / API keys."
+            case 5:
+                return "Vision failed — try a clearer photo or Scan with glasses again."
+            default:
+                break
+            }
+        }
         let localized = error.localizedDescription
         if localized.contains("NovaCore.NovaError") || localized.contains("NovaError error") {
-            return String(describing: error)
+            return "Something went wrong (error \(ns.code)). Open Assistant → Listen, then retry."
         }
         return localized
     }
@@ -752,7 +772,7 @@ public final class RemyKitchenViewModel {
             await load()
             let cal = estimate.nutrition.calories.map { " · \(Int($0)) kcal" } ?? ""
             statusMessage = "Logged \(estimate.description)\(cal)"
-            selectedSection = .profile
+            selectedSection = .scan
         case .failure(let failure):
             statusMessage = failure.message
         }
