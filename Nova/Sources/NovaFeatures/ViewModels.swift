@@ -3143,7 +3143,7 @@ private struct RepoStatusPayload: Decodable {
 public enum AgentsPendingRoute: String, Sendable, Hashable, Identifiable {
     case coding
     case training
-    case wellness
+    case tasks
     case kitchen
     case study
 

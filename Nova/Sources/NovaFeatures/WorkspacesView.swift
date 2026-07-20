@@ -2,7 +2,7 @@ import SwiftUI
 import NovaDomain
 
 /// Workspaces list: create/edit projects and set the active one.
-/// When `embedded` is true, omits its own `NavigationStack` (used inside Studio).
+/// When `embedded` is true, omits its own `NavigationStack`.
 public struct WorkspacesView: View {
     @Bindable var workspaces: WorkspacesViewModel
     var embedded: Bool

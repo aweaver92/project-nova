@@ -10,13 +10,13 @@ public struct OpenAppScreenTool: Tool {
     public let description = """
     Open a screen in this agent's part of the Nova app on the phone \
     (e.g. Remy: shopping_list, pantry, recipes; Claude: coding; Max: training; \
-    Sage: wellness; Scholar: study). Only works for screens you own — if the \
+    Sage: tasks; Scholar: study). Only works for screens you own — if the \
     user wants another specialist's screen, tell them to talk to that agent \
     (or ask Nova to switch_agent). Do not invent a configuration error.
     """
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"destination":{"type":"string","description":"Screen id or phrase, e.g. shopping_list, pantry, coding, training, wellness, study."}},"required":["destination"],"additionalProperties":false}
+    {"type":"object","properties":{"destination":{"type":"string","description":"Screen id or phrase, e.g. shopping_list, pantry, coding, training, tasks, study."}},"required":["destination"],"additionalProperties":false}
     """
 
     private let activeAgentId: @Sendable () async -> UUID?

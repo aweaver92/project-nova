@@ -130,12 +130,15 @@ public enum AppScreenCatalog: Sendable {
         ),
         // Sage
         AppScreenTarget(
-            id: "wellness",
-            aliases: ["mindfulness", "meditation", "breathing", "checkin"],
+            id: "tasks",
+            aliases: [
+                "task", "todos", "todo", "standup", "pickups", "pickup",
+                "task_manager", "task manager", "wellness"
+            ],
             ownerAgentId: Agent.SeedID.sage,
             ownerName: "Sage",
-            routeKey: "wellness",
-            title: "Wellness"
+            routeKey: "tasks",
+            title: "Tasks"
         ),
         // Scholar
         AppScreenTarget(

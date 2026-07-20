@@ -2,12 +2,12 @@ import SwiftUI
 import NovaDomain
 
 /// Agents tab: Nova (master) plus specialists. Each specialist opens a dedicated
-/// push destination when active (Coding / Training / Wellness / Kitchen / Study).
+/// push destination when active (Coding / Training / Tasks / Kitchen / Study).
 public struct AgentsView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
     @Bindable var training: TrainingViewModel
-    @Bindable var wellness: SageWellnessViewModel
+    @Bindable var tasks: SageTasksViewModel
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
     var showSettings: () -> Void
@@ -20,7 +20,7 @@ public struct AgentsView: View {
         agents: AgentsViewModel,
         coding: CodingViewModel,
         training: TrainingViewModel,
-        wellness: SageWellnessViewModel,
+        tasks: SageTasksViewModel,
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         showSettings: @escaping () -> Void = {}
@@ -28,7 +28,7 @@ public struct AgentsView: View {
         self.agents = agents
         self.coding = coding
         self.training = training
-        self.wellness = wellness
+        self.tasks = tasks
         self.kitchen = kitchen
         self.study = study
         self.showSettings = showSettings
@@ -96,25 +96,23 @@ public struct AgentsView: View {
                 if agents.isSageActive {
                     Section {
                         NavigationLink {
-                            SageWellnessView(wellness: wellness, embedded: true)
+                            SageTasksView(tasks: tasks, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Open Wellness")
-                                    Text(wellness.recent.isEmpty
-                                         ? "Check-ins and breath timers"
-                                         : "\(wellness.recent.count) recent check-ins")
+                                    Text("Open Tasks")
+                                    Text(tasks.resumeSubtitle)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             } icon: {
-                                Image(systemName: "leaf")
+                                Image(systemName: "checklist")
                             }
                         }
                     } header: {
                         Text("Sage")
                     } footer: {
-                        Text("Open Wellness while talking to Sage for mood check-ins and timers.")
+                        Text("Open Tasks while talking to Sage for pickups across agents.")
                             .font(.caption2)
                     }
                 }
@@ -228,7 +226,7 @@ public struct AgentsView: View {
                 await agents.load()
                 await coding.load()
                 await training.load()
-                await wellness.load()
+                await tasks.load()
                 await kitchen.load()
                 await study.load()
                 // A route requested before this tab appeared (e.g. an Assistant-tab
@@ -255,8 +253,8 @@ public struct AgentsView: View {
             CodingView(coding: coding, embedded: true)
         case .training:
             TrainingView(training: training, embedded: true)
-        case .wellness:
-            SageWellnessView(wellness: wellness, embedded: true)
+        case .tasks:
+            SageTasksView(tasks: tasks, embedded: true)
         case .kitchen:
             RemyKitchenView(kitchen: kitchen, embedded: true)
         case .study:

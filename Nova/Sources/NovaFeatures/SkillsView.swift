@@ -2,7 +2,7 @@ import SwiftUI
 import NovaDomain
 
 /// Skills list: reusable voice macros with trigger phrases and steps.
-/// When `embedded` is true, omits its own `NavigationStack` (used inside Studio).
+/// When `embedded` is true, omits its own `NavigationStack`.
 public struct SkillsView: View {
     @Bindable var skills: SkillsViewModel
     var embedded: Bool

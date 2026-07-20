@@ -8,7 +8,7 @@ import UIKit
 public enum RootTab: Hashable {
     case assistant
     case agents
-    case studio
+    case skills
     case library
     case media
 }
@@ -27,7 +27,7 @@ public struct RootView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
     @Bindable var training: TrainingViewModel
-    @Bindable var wellness: SageWellnessViewModel
+    @Bindable var tasks: SageTasksViewModel
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
     @Bindable var settings: SettingsViewModel
@@ -56,7 +56,7 @@ public struct RootView: View {
         agents: AgentsViewModel,
         coding: CodingViewModel,
         training: TrainingViewModel,
-        wellness: SageWellnessViewModel,
+        tasks: SageTasksViewModel,
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         settings: SettingsViewModel,
@@ -76,7 +76,7 @@ public struct RootView: View {
         self.agents = agents
         self.coding = coding
         self.training = training
-        self.wellness = wellness
+        self.tasks = tasks
         self.kitchen = kitchen
         self.study = study
         self.settings = settings
@@ -94,7 +94,7 @@ public struct RootView: View {
                 agents: agents,
                 coding: coding,
                 training: training,
-                wellness: wellness,
+                tasks: tasks,
                 kitchen: kitchen,
                 study: study,
                 showSettings: { showSettings = true }
@@ -102,9 +102,9 @@ public struct RootView: View {
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
                 .tag(RootTab.agents)
 
-            StudioView(workspaces: workspaces, skills: skills)
-                .tabItem { Label("Studio", systemImage: "slider.horizontal.3") }
-                .tag(RootTab.studio)
+            SkillsView(skills: skills)
+                .tabItem { Label("Skills", systemImage: "slider.horizontal.3") }
+                .tag(RootTab.skills)
 
             LibraryView(notes: notes, knowledge: knowledge, visual: visualMemory)
                 .tabItem { Label("Library", systemImage: "books.vertical") }
@@ -150,12 +150,14 @@ public struct RootView: View {
                         route: .training
                     )
                 }
-                if agents.isSageActive {
+                if agents.isSageActive || tasks.hasResumeSignal {
                     specialistResumeSection(
-                        title: "Open Wellness",
-                        systemImage: "leaf",
-                        footer: "Opens Wellness under Agents for check-ins and breath timers.",
-                        route: .wellness
+                        title: tasks.hasResumeSignal
+                            ? "Open Tasks · \(tasks.openCount) open"
+                            : "Open Tasks",
+                        systemImage: "checklist",
+                        footer: "Opens Tasks under Agents for pickups across specialists.",
+                        route: .tasks
                     )
                 }
                 if agents.isRemyActive || kitchen.cookingSession != nil {
@@ -245,7 +247,7 @@ public struct RootView: View {
                 await agents.load()
                 await coding.load()
                 await training.load()
-                await wellness.load()
+                await tasks.load()
                 await kitchen.load()
                 await study.load()
                 await settings.load()
@@ -364,7 +366,7 @@ public struct RootView: View {
         case Agent.SeedID.max:
             return (.training, "Open Training", "figure.strengthtraining.traditional")
         case Agent.SeedID.sage:
-            return (.wellness, "Open Wellness", "leaf")
+            return (.tasks, "Open Tasks", "checklist")
         case Agent.SeedID.remy:
             return (.kitchen, "Open Kitchen", "fork.knife")
         case Agent.SeedID.scholar:

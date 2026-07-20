@@ -24,9 +24,15 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(remy.toolNames!.contains("start_cooking"))
         XCTAssertTrue(remy.toolNames!.contains("get_nutrition_profile"))
         XCTAssertTrue(remy.toolNames!.contains("open_app_screen"))
-        XCTAssertTrue(sage.toolNames!.contains("log_wellness_checkin"))
+        XCTAssertTrue(sage.toolNames!.contains("list_tasks"))
+        XCTAssertTrue(sage.toolNames!.contains("create_task"))
+        XCTAssertTrue(sage.toolNames!.contains("update_task"))
+        XCTAssertTrue(sage.toolNames!.contains("agent_activity"))
+        XCTAssertTrue(sage.toolNames!.contains("switch_agent"))
         XCTAssertTrue(sage.toolNames!.contains("daily_briefing"))
         XCTAssertTrue(sage.toolNames!.contains("open_app_screen"))
+        XCTAssertTrue(sage.personality.contains("task manager") || sage.role.contains("task manager"))
+        XCTAssertFalse(sage.toolNames!.contains("log_wellness_checkin"))
         XCTAssertTrue(scholar.toolNames!.contains("start_quiz"))
         XCTAssertTrue(scholar.toolNames!.contains("reveal_card"))
         XCTAssertTrue(scholar.toolNames!.contains("list_study_cards"))
@@ -122,15 +128,40 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertEqual(all.first?.quantity, "12")
     }
 
-    func testWellnessLogAndHistory() async throws {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("well-\(UUID().uuidString).json")
+    func testTaskCreateListAndUpdate() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tasks-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
-        let store = FileWellnessStore(url: url)
-        let tool = LogWellnessCheckinTool(store: store)
-        _ = try await tool.invoke(argumentsJSON: #"{"mood":4,"note":"walked"}"#)
-        let hist = WellnessHistoryTool(store: store)
-        let json = try await hist.invoke(argumentsJSON: #"{"limit":5}"#)
-        XCTAssertTrue(json.contains("\"mood\":4"))
+        let store = FileTaskStore(url: url)
+        let create = CreateTaskTool(store: store, agentsProvider: { Agent.builtInAgents() })
+        let created = try await create.invoke(argumentsJSON: #"{"title":"Finish PR review","agent":"Claude","status":"incomplete","source":"inferred","activity_summary":"Left mid-review"}"#)
+        XCTAssertTrue(created.contains("ok\":true"))
+
+        let list = ListTasksTool(store: store)
+        let listed = try await list.invoke(argumentsJSON: #"{"limit":5}"#)
+        XCTAssertTrue(listed.contains("Finish PR review"))
+        XCTAssertTrue(listed.contains("incomplete"))
+
+        let open = await store.open(limit: 10)
+        XCTAssertEqual(open.count, 1)
+        let id = open[0].id.uuidString
+        let update = UpdateTaskTool(store: store)
+        let updated = try await update.invoke(argumentsJSON: #"{"id":"\#(id)","status":"done"}"#)
+        XCTAssertTrue(updated.contains("done"))
+        let remaining = await store.open(limit: 10)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testAgentActivitySummarizesSpecialistMemory() async throws {
+        let memURL = FileManager.default.temporaryDirectory.appendingPathComponent("mem-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: memURL) }
+        let memory = FileConversationMemory(url: memURL)
+        let maxId = Agent.SeedID.max
+        await memory.append(ConversationTurn(role: .user, text: "start push day", workspaceId: maxId))
+        await memory.append(ConversationTurn(role: .assistant, text: "logged bench press", workspaceId: maxId))
+        let tool = AgentActivityTool(memory: memory, agentsProvider: { Agent.builtInAgents() })
+        let json = try await tool.invoke(argumentsJSON: #"{"agent":"Max","limit":5}"#)
+        XCTAssertTrue(json.contains("\"ok\":true"))
+        XCTAssertTrue(json.contains("push day") || json.contains("bench"))
     }
 
     func testStudyGradeAdvancesDueDate() async throws {
@@ -238,6 +269,6 @@ final class AgentCapabilityPackTests: XCTestCase {
         let store = FileSkillStore(url: url)
         let all = await store.all()
         XCTAssertTrue(all.contains { $0.name == "Max rest 90s" })
-        XCTAssertTrue(all.contains { $0.name == "Sage box breathing" })
+        XCTAssertTrue(all.contains { $0.name == "Sage pickup review" })
     }
 }

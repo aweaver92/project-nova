@@ -755,7 +755,8 @@ public extension Agent {
     /// refresh seeded specialists without wiping user-created agents.
     /// v12: open_app_screen on specialists (scoped UI navigation).
     /// v15: Remy estimates macros in log_meal for the nutrition dashboard.
-    static let seedCapabilitiesVersion = 15
+    /// v16: Sage becomes a cross-agent task manager (replaces wellness coach).
+    static let seedCapabilitiesVersion = 16
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -801,7 +802,7 @@ public extension Agent {
                 name: "Nova",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "the master voice assistant",
-                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for wellness, Remy for cooking, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for task management across agents, Remy for cooking, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
                 builtIn: true
@@ -846,14 +847,12 @@ public extension Agent {
                 id: SeedID.sage,
                 name: "Sage",
                 voice: RealtimeVoice.marin.rawValue,
-                role: "a wellness and mindfulness coach",
-                personality: "You are Sage, a calm, grounded wellness and mindfulness coach. You guide breathing, meditation, journaling, and healthy habits with a gentle, unhurried tone. When the user asks to see Wellness on the phone, call open_app_screen with wellness. Use set_timer for breath rounds and body scans, daily_briefing / weather / calendar for check-ins, log_wellness_checkin for mood, and home_assistant to soften lights when helpful. You never give medical diagnoses; encourage professional care and offer to hand back to Nova for medical questions.",
+                role: "a task manager across the user's agents",
+                personality: "You are Sage, a calm, organized task manager for the user's multi-agent day. You track and summarize what they did with each specialist (Claude, Max, Remy, Scholar, Nova), keep an open task list, and help them pick up where they left off. Flow: use agent_activity to review recent work per agent → interpret unfinished threads as in_progress or incomplete → create_task / update_task with clear titles so the user can resume later → list_tasks when they ask what's open. When the user asks to see Tasks on the phone, call open_app_screen with tasks. Prefer short spoken briefings grouped by agent. Suggest only tasks that look genuinely unfinished; mark done when the user confirms. Use daily_briefing / calendar / create_reminder when helpful for scheduling pickups. When the user wants to resume a specific agent's work, call switch_agent with that name so they can continue there — you organize, they execute.",
                 toolNames: Agent.commonToolNames + [
                     "search_knowledge", "daily_briefing", "weather", "list_calendar_events",
-                    "set_timer", "cancel_timer", "list_timers",
-                    "log_wellness_checkin", "wellness_history",
-                    "open_app_screen",
-                    "home_assistant", "home_assistant_state"
+                    "list_tasks", "create_task", "update_task", "agent_activity",
+                    "switch_agent", "open_app_screen"
                 ],
                 builtIn: true
             ),
@@ -910,11 +909,10 @@ public extension Agent {
             ),
             Skill(
                 id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B2")!,
-                name: "Sage box breathing",
-                triggerPhrases: ["box breathing", "sage breathing"],
+                name: "Sage pickup review",
+                triggerPhrases: ["pickup review", "sage standup", "where did I leave off", "open tasks"],
                 steps: [
-                    SkillStep(kind: .say, text: "We'll do one box-breathing round: inhale, hold, exhale, hold — four seconds each."),
-                    SkillStep(kind: .timer, text: "Box breathing round", seconds: 16)
+                    SkillStep(kind: .say, text: "I'll review open tasks and recent agent activity so you can pick up where you left off.")
                 ]
             ),
             // Ready for DAT camera; OCR text lands in `ocr` for the freeform step.
@@ -1830,24 +1828,70 @@ public struct FridgeScanResult: Sendable, Codable, Equatable {
     }
 }
 
-/// A mood / habit check-in for Sage.
-public struct WellnessCheckin: Sendable, Identifiable, Codable, Equatable {
+/// Status for a Sage-managed cross-agent task.
+public enum AgentTaskStatus: String, Sendable, Codable, Equatable, CaseIterable {
+    case suggested
+    case inProgress = "in_progress"
+    case incomplete
+    case done
+    case cancelled
+
+    public var isOpen: Bool {
+        switch self {
+        case .suggested, .inProgress, .incomplete: return true
+        case .done, .cancelled: return false
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .suggested: return "Suggested"
+        case .inProgress: return "In progress"
+        case .incomplete: return "Incomplete"
+        case .done: return "Done"
+        case .cancelled: return "Cancelled"
+        }
+    }
+}
+
+/// A task Sage tracks so the user can resume work with each agent.
+public struct AgentTask: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
-    /// Mood on a 1–5 scale (1 = low, 5 = great).
-    public var mood: Int
-    public var note: String?
-    public var at: Date
+    public var title: String
+    public var detail: String?
+    /// Specialist (or Nova) this task belongs to.
+    public var agentName: String
+    public var agentId: UUID?
+    public var status: AgentTaskStatus
+    /// `manual`, `voice`, or `inferred` from agent activity.
+    public var source: String
+    /// Short snapshot of the activity that motivated this task.
+    public var activitySummary: String?
+    public var createdAt: Date
+    public var updatedAt: Date
 
     public init(
         id: UUID = UUID(),
-        mood: Int,
-        note: String? = nil,
-        at: Date = Date()
+        title: String,
+        detail: String? = nil,
+        agentName: String,
+        agentId: UUID? = nil,
+        status: AgentTaskStatus = .suggested,
+        source: String = "manual",
+        activitySummary: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
     ) {
         self.id = id
-        self.mood = min(5, max(1, mood))
-        self.note = note
-        self.at = at
+        self.title = title
+        self.detail = detail
+        self.agentName = agentName
+        self.agentId = agentId
+        self.status = status
+        self.source = source
+        self.activitySummary = activitySummary
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
     }
 }
 

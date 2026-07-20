@@ -459,11 +459,18 @@ public extension NutritionStoring {
     }
 }
 
-/// Sage's mood / habit check-ins.
-public protocol WellnessStoring: Sendable {
+/// Sage's cross-agent task list.
+public protocol AgentTaskStoring: Sendable {
+    func all() async -> [AgentTask]
+    /// Open tasks (suggested / in_progress / incomplete), newest first.
+    func open(limit: Int) async -> [AgentTask]
+    func forAgent(name: String?, status: AgentTaskStatus?, limit: Int) async -> [AgentTask]
     @discardableResult
-    func log(mood: Int, note: String?) async -> WellnessCheckin
-    func recent(limit: Int) async -> [WellnessCheckin]
+    func upsert(_ task: AgentTask) async -> AgentTask
+    @discardableResult
+    func updateStatus(id: UUID, status: AgentTaskStatus) async -> AgentTask?
+    func delete(id: UUID) async
+    /// Human-readable open-task summary for injecting into Sage's context.
     func summary(limit: Int) async -> String
 }
 

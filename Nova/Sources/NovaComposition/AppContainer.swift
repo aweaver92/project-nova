@@ -59,7 +59,7 @@ public final class AppContainer {
     public let agentsVM: AgentsViewModel
     public let codingVM: CodingViewModel
     public let trainingVM: TrainingViewModel
-    public let wellnessVM: SageWellnessViewModel
+    public let tasksVM: SageTasksViewModel
     public let kitchenVM: RemyKitchenViewModel
     public let studyVM: StudyViewModel
     public let settingsVM: SettingsViewModel
@@ -200,7 +200,7 @@ public final class AppContainer {
         let shoppingStore = FileShoppingStore()
         let mealPlanStore = FileMealPlanStore()
         let nutritionStore = FileNutritionStore()
-        let wellnessStore = FileWellnessStore()
+        let taskStore = FileTaskStore()
         let studyStore = FileStudyDeckStore()
         let timerService = LocalTimerService()
         let phoneRinger = LocalPhoneRinger(phoneNumber: Self.findMyPhoneNumber)
@@ -209,7 +209,7 @@ public final class AppContainer {
             plans: workoutPlanStore,
             timers: timerService
         )
-        self.wellnessVM = SageWellnessViewModel(store: wellnessStore, timers: timerService)
+        self.tasksVM = SageTasksViewModel(store: taskStore)
         self.studyVM = StudyViewModel(store: studyStore)
         let bridge = NovaBridgeClient(configProvider: bridgeConfig)
         self.bridge = bridge
@@ -385,9 +385,15 @@ public final class AppContainer {
             UpdateNutritionProfileTool(store: nutritionStore),
             LogMealTool(store: nutritionStore),
             RecentMealsTool(store: nutritionStore),
-            // Sage's wellness tools.
-            LogWellnessCheckinTool(store: wellnessStore),
-            WellnessHistoryTool(store: wellnessStore),
+            // Sage's task-manager tools.
+            ListTasksTool(store: taskStore),
+            CreateTaskTool(store: taskStore, agentsProvider: { await agentStore.all() }),
+            UpdateTaskTool(store: taskStore),
+            AgentActivityTool(
+                memory: memory,
+                digestStore: digestStore,
+                agentsProvider: { await agentStore.all() }
+            ),
             // Scholar's study tools.
             AddStudyCardTool(store: studyStore),
             ListStudyDecksTool(store: studyStore),
@@ -493,8 +499,8 @@ public final class AppContainer {
                     let s = await nutritionStore.profileSummary()
                     if !s.isEmpty { parts.append(s) }
                 }
-                if names.contains("wellness_history") {
-                    let s = await wellnessStore.summary(limit: 5)
+                if names.contains("list_tasks") {
+                    let s = await taskStore.summary(limit: 12)
                     if !s.isEmpty { parts.append(s) }
                 }
                 if names.contains("start_quiz") || names.contains("list_study_decks") {

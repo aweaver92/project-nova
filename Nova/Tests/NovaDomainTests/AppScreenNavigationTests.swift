@@ -33,6 +33,11 @@ final class AppScreenNavigationTests: XCTestCase {
 
         let claude = Set(AppScreenCatalog.owned(by: Agent.SeedID.claude).map(\.id))
         XCTAssertEqual(claude, ["coding"])
+
+        let sage = Set(AppScreenCatalog.owned(by: Agent.SeedID.sage).map(\.id))
+        XCTAssertEqual(sage, ["tasks"])
+        XCTAssertEqual(AppScreenCatalog.resolve("wellness")?.id, "tasks")
+        XCTAssertEqual(AppScreenCatalog.resolve("pickups")?.routeKey, "tasks")
     }
 
     func testSpecialistsAdvertiseOpenAppScreen() {

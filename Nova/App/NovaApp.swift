@@ -56,7 +56,7 @@ struct NovaApp: App {
                 agents: container.agentsVM,
                 coding: container.codingVM,
                 training: container.trainingVM,
-                wellness: container.wellnessVM,
+                tasks: container.tasksVM,
                 kitchen: container.kitchenVM,
                 study: container.studyVM,
                 settings: container.settingsVM,
