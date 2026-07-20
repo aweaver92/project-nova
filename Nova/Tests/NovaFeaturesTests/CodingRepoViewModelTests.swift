@@ -308,7 +308,8 @@ final class CodingRepoViewModelTests: XCTestCase {
 
         await vm.toggleFavoriteRepository("abcdef0123456789")
         XCTAssertFalse(vm.isFavoriteRepository("abcdef0123456789"))
-        XCTAssertEqual(await settings.codingFavoriteRepoIds(), [])
+        let cleared = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(cleared, [])
     }
 
     func testRefreshPrunesStaleFavoriteRepoIds() async {
@@ -320,7 +321,8 @@ final class CodingRepoViewModelTests: XCTestCase {
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
         XCTAssertEqual(vm.favoriteRepoIds, ["abcdef0123456789"])
-        XCTAssertEqual(await settings.codingFavoriteRepoIds(), ["abcdef0123456789"])
+        let pruned = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(pruned, ["abcdef0123456789"])
     }
 
     func testStopPreviewInvalidatesStaleAutoOpen() async {
