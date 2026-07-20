@@ -71,7 +71,9 @@ final class CodingRepoViewModelTests: XCTestCase {
     }
 
     func testSelectRepositoryDoesNotReuseAnotherReposPinnedSession() async {
-        let bridge = DirtyRepoBridge()
+        // Bridge must report the same selected repo as settings, or load()'s
+        // refreshRepositories() will overwrite and hide the per-repo pin.
+        let bridge = DirtyRepoBridge(selectedRepoId: "1111111111111111")
         let settings = MemorySettings(repoId: "1111111111111111", sessionId: "stale")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
@@ -298,8 +300,16 @@ final class CodingRepoViewModelTests: XCTestCase {
         let baselines = await bridge.baselineCreateCount
         XCTAssertEqual(baselines, 0)
         XCTAssertEqual(vm.promptHistory.first?.text, "/ask What does send() do?")
+        // retryLast restores raw `/ask` text then re-sends (draft clears like send()).
         await vm.retryLast()
-        XCTAssertEqual(vm.draft, "/ask What does send() do?")
+        XCTAssertTrue(vm.draft.isEmpty)
+        let commandsAfterRetry = await bridge.receivedCommands
+        XCTAssertEqual(commandsAfterRetry.count, 2)
+        XCTAssertTrue(commandsAfterRetry[1].contains("READ-ONLY Q&A"))
+        XCTAssertTrue(commandsAfterRetry[1].contains("What does send() do?"))
+        XCTAssertFalse(commandsAfterRetry[1].contains("/ask What"))
+        let baselinesAfterRetry = await bridge.baselineCreateCount
+        XCTAssertEqual(baselinesAfterRetry, 0)
     }
 
     func testPromptPinsComposeBridgeCommandButNotTranscript() async {
@@ -726,6 +736,7 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var runStatusCheckCount = 0
     private(set) var baselineCreateCount = 0
     private var reviewKept = false
+    private var selectedRepoId: String
     private let streamDelaySeconds: Double
     private let emitAfterCancel: Bool
     private let previewBecomesReadyAfterPolls: Int
@@ -742,7 +753,8 @@ private actor DirtyRepoBridge: AgentBridging {
         disconnectAfterStart: Bool = false,
         holdStreamUntilCancel: Bool = false,
         statusFailCount: Int = 0,
-        commitAndBuildShouldFail: Bool = false
+        commitAndBuildShouldFail: Bool = false,
+        selectedRepoId: String = "abcdef0123456789"
     ) {
         self.streamDelaySeconds = streamDelaySeconds
         self.emitAfterCancel = emitAfterCancel
@@ -751,19 +763,23 @@ private actor DirtyRepoBridge: AgentBridging {
         self.holdStreamUntilCancel = holdStreamUntilCancel
         self.statusFailCount = statusFailCount
         self.commitAndBuildShouldFail = commitAndBuildShouldFail
+        self.selectedRepoId = selectedRepoId
     }
 
     func isConfigured() async -> Bool { true }
 
     func listRepos() async -> BridgeResult {
-        BridgeResult(
+        let demoSelected = selectedRepoId == "abcdef0123456789"
+        let otherSelected = selectedRepoId == "1111111111111111"
+        return BridgeResult(
             ok: true,
-            payloadJSON: #"{"ok":true,"selectedRepoId":"abcdef0123456789","repos":[{"id":"abcdef0123456789","name":"demo","relativePath":"demo","rootLabel":"src","selected":true},{"id":"1111111111111111","name":"other","relativePath":"other","rootLabel":"src","selected":false}]}"#
+            payloadJSON: #"{"ok":true,"selectedRepoId":"\#(selectedRepoId)","repos":[{"id":"abcdef0123456789","name":"demo","relativePath":"demo","rootLabel":"src","selected":\#(demoSelected)},{"id":"1111111111111111","name":"other","relativePath":"other","rootLabel":"src","selected":\#(otherSelected)}]}"#
         )
     }
 
     func selectRepository(repoId: String) async -> BridgeResult {
-        BridgeResult(
+        selectedRepoId = repoId
+        return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"selectedRepoId":"\#(repoId)","repo":{"id":"\#(repoId)","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}}"#
         )
