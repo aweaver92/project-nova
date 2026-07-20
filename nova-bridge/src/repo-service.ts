@@ -401,6 +401,31 @@ function isInsideRoot(candidate: string, root: string): boolean {
   return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep);
 }
 
+/** Ensure gh/git stay resolvable when the bridge was started with a thin PATH. */
+function ensureWindowsToolsOnPath(pathEnv: string | undefined): string {
+  const parts = (pathEnv ?? "").split(";").filter(Boolean);
+  const extras = [
+    process.env.ProgramFiles
+      ? join(process.env.ProgramFiles, "GitHub CLI")
+      : null,
+    process.env.LOCALAPPDATA
+      ? join(process.env.LOCALAPPDATA, "GitHubCLI", "bin")
+      : null,
+    process.env.ProgramFiles
+      ? join(process.env.ProgramFiles, "Git", "bin")
+      : null,
+    process.env.ProgramFiles
+      ? join(process.env.ProgramFiles, "Git", "cmd")
+      : null,
+  ].filter((p): p is string => Boolean(p));
+  for (const extra of extras) {
+    if (!parts.some((p) => p.toLowerCase() === extra.toLowerCase())) {
+      parts.unshift(extra);
+    }
+  }
+  return parts.join(";");
+}
+
 function assertSafeRelPath(rel: string): void {
   if (!rel || rel.startsWith("-") || rel.includes("\0")) {
     throw new RepoError("invalid_path", "unsafe_path");
@@ -429,18 +454,25 @@ export async function runProcess(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxStdout = opts.maxStdout ?? MAX_STDOUT;
   // Keep a minimal env, but include the Windows profile vars `gh` needs to
-  // read its keyring login (APPDATA / LOCALAPPDATA). Without those, spawned
-  // `gh repo create` fails with "please run: gh auth login" even when the
-  // interactive shell is already authenticated.
+  // read its keyring login (APPDATA / LOCALAPPDATA) and the ProgramFiles*
+  // vars PowerShell scripts use to locate `gh.exe` / `git.exe`. Without
+  // ProgramFiles, run-ipa-ci.ps1's Find-Gh fails with "run 'gh auth login'"
+  // even when the interactive shell is already authenticated.
+  const pathWithTools = ensureWindowsToolsOnPath(process.env.PATH);
   const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
+    PATH: pathWithTools,
     SystemRoot: process.env.SystemRoot,
+    windir: process.env.windir ?? process.env.SystemRoot,
     USERPROFILE: process.env.USERPROFILE,
     HOME: process.env.HOME,
     USERNAME: process.env.USERNAME,
     USERDOMAIN: process.env.USERDOMAIN,
     APPDATA: process.env.APPDATA,
     LOCALAPPDATA: process.env.LOCALAPPDATA,
+    ProgramFiles: process.env.ProgramFiles,
+    ProgramW6432: process.env.ProgramW6432,
+    "ProgramFiles(x86)": process.env["ProgramFiles(x86)"],
+    ComSpec: process.env.ComSpec,
     LANG: process.env.LANG ?? "C",
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",

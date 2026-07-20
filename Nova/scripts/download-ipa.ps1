@@ -32,6 +32,9 @@ function Find-Gh {
             $(if ($cmd) { $cmd.Source })
             "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
             "$env:ProgramFiles\GitHub CLI\gh.exe"
+            # Hardcoded fallbacks — bridge spawn env may omit ProgramFiles.
+            "C:\Program Files\GitHub CLI\gh.exe"
+            "${env:ProgramW6432}\GitHub CLI\gh.exe"
         ) | Where-Object { $_ -and (Test-Path $_) }
     )
     if ($candidates.Count -eq 0) {
