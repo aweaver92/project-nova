@@ -100,7 +100,7 @@ public struct SettingsView: View {
                         Task { await settings.saveBridge() }
                     } label: {
                         HStack {
-                            Text("Save & test connection")
+                            Text("Save & run setup check")
                             if settings.bridgeChecking {
                                 Spacer()
                                 ProgressView()
@@ -125,23 +125,39 @@ public struct SettingsView: View {
                         Label("Save current as profile…", systemImage: "plus.circle")
                     }
                     .buttonStyle(.borderless)
-
-                    if let openai = settings.openaiConfigured {
-                        LabeledContent("Realtime mint") {
-                            Text(openai ? "Ready" : "Missing key")
-                                .foregroundStyle(openai ? .green : .red)
-                        }
-                    }
-                    if let cursor = settings.cursorConfigured {
-                        LabeledContent("Cursor") {
-                            Text(cursor ? "Ready" : "Missing key")
-                                .foregroundStyle(cursor ? .green : .orange)
-                        }
-                    }
                 } header: {
                     Text("Nova Bridge")
                 } footer: {
                     Text("Claude Code, Cursor, Realtime tokens, and repository clone/status/PR flow go through the bridge. Pick repositories in the Coding tab (opaque repo ids) — do not send absolute paths from the phone.")
+                }
+
+                Section {
+                    HStack {
+                        Text("Setup checklist")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(settings.bridgeSetupReadyCount)/\(settings.bridgeSetupSteps.count)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(settings.bridgeSetupSteps) { step in
+                        bridgeSetupRow(step)
+                    }
+                    if let next = settings.bridgeSetupNextAction {
+                        Text("Next: \(next)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    Button {
+                        Task { await settings.refreshBridgeHealth() }
+                    } label: {
+                        Label("Re-check bridge", systemImage: "stethoscope")
+                    }
+                    .disabled(settings.bridgeChecking || settings.bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } header: {
+                    Text("Bridge setup")
+                } footer: {
+                    Text("Work top to bottom until Coding tools respond. Missing Cursor/OpenAI keys are configured on the PC in nova-bridge/.env, not in the app.")
                 }
 
                 Section {
@@ -157,7 +173,7 @@ public struct SettingsView: View {
                 } header: {
                     Text("Coding")
                 } footer: {
-                    Text("When enabled, a newly started preview opens in Safari exactly once as soon as it becomes ready.")
+                    Text("When enabled, a newly started preview opens in Safari exactly once as soon as it becomes ready. Away from home, keep Tailscale connected so remote preview URLs (Tailscale IP or bridge proxy) open correctly.")
                 }
 
                 Section {
@@ -255,6 +271,42 @@ public struct SettingsView: View {
                 Text(editor.message)
             }
             .task { await settings.load() }
+        }
+    }
+
+    private func bridgeSetupRow(_ step: BridgeSetupStep) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: bridgeSetupSymbol(step.state))
+                .foregroundStyle(bridgeSetupColor(step.state))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(step.title)
+                    .font(.subheadline.weight(.medium))
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(step.title), \(step.state.rawValue)")
+        .accessibilityHint(step.detail)
+    }
+
+    private func bridgeSetupSymbol(_ state: BridgeSetupStep.State) -> String {
+        switch state {
+        case .ready: return "checkmark.circle.fill"
+        case .missing: return "xmark.circle.fill"
+        case .pending: return "circle.dotted"
+        }
+    }
+
+    private func bridgeSetupColor(_ state: BridgeSetupStep.State) -> Color {
+        switch state {
+        case .ready: return .green
+        case .missing: return .orange
+        case .pending: return .secondary
         }
     }
 

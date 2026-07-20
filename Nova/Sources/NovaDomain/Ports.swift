@@ -208,6 +208,9 @@ public protocol SettingsStoring: Sendable {
     /// Open the live preview URL in Safari when it becomes ready. Default off.
     func codingAutoOpenPreview() async -> Bool
     func setCodingAutoOpenPreview(_ enabled: Bool) async
+    /// Favorite bridge repository ids for the Coding repo picker.
+    func codingFavoriteRepoIds() async -> [String]
+    func setCodingFavoriteRepoIds(_ ids: [String]) async
     /// Generate follow-up suggestion chips (paid Responses call). Default on.
     func followUpSuggestionsEnabled() async -> Bool
     func setFollowUpSuggestionsEnabled(_ enabled: Bool) async
@@ -250,6 +253,8 @@ public extension SettingsStoring {
     func setCodingSelectedRepoId(_ value: String?) async {}
     func codingAutoOpenPreview() async -> Bool { false }
     func setCodingAutoOpenPreview(_ enabled: Bool) async {}
+    func codingFavoriteRepoIds() async -> [String] { [] }
+    func setCodingFavoriteRepoIds(_ ids: [String]) async {}
     func followUpSuggestionsEnabled() async -> Bool { false }
     func setFollowUpSuggestionsEnabled(_ enabled: Bool) async {}
     func webSearchEnabled() async -> Bool { false }
@@ -831,6 +836,13 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
     public let state: String
     public let port: Int
     public let url: String
+    /// Always the LAN IP URL when the bridge can detect one.
+    public let lanUrl: String?
+    /// "lan" | "remote" — how the preferred `url` should be reached.
+    public let access: String?
+    /// "tailscale" | "bridge-proxy" | "none"
+    public let remoteVia: String?
+    public let accessHint: String?
     public let error: String?
     public let lastOutput: String?
 
@@ -842,6 +854,10 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
         state: String,
         port: Int,
         url: String,
+        lanUrl: String? = nil,
+        access: String? = nil,
+        remoteVia: String? = nil,
+        accessHint: String? = nil,
         error: String? = nil,
         lastOutput: String? = nil
     ) {
@@ -852,12 +868,17 @@ public struct BridgePreviewInfo: Sendable, Equatable, Codable {
         self.state = state
         self.port = port
         self.url = url
+        self.lanUrl = lanUrl
+        self.access = access
+        self.remoteVia = remoteVia
+        self.accessHint = accessHint
         self.error = error
         self.lastOutput = lastOutput
     }
 
     public var isReady: Bool { state == "ready" }
     public var isPending: Bool { state == "installing" || state == "starting" }
+    public var isRemoteAccess: Bool { access == "remote" }
 }
 
 /// An image attached to a Coding prompt. Data is base64-encoded only at the

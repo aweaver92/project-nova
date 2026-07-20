@@ -14,6 +14,7 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
         static let codingWorkingDirectory = "nova.settings.codingWorkingDirectory"
         static let codingSelectedRepoId = "nova.settings.codingSelectedRepoId"
         static let codingAutoOpenPreview = "nova.settings.codingAutoOpenPreview"
+        static let codingFavoriteRepoIds = "nova.settings.codingFavoriteRepoIds"
         static let followUpSuggestionsEnabled = "nova.settings.followUpSuggestionsEnabled"
         static let webSearchEnabled = "nova.settings.webSearchEnabled"
         static let useLocalWakeWord = "nova.settings.useLocalWakeWord"
@@ -136,6 +137,21 @@ public actor UserDefaultsSettingsStore: SettingsStoring {
 
     public func setCodingAutoOpenPreview(_ enabled: Bool) async {
         defaults.set(enabled, forKey: Keys.codingAutoOpenPreview)
+    }
+
+    public func codingFavoriteRepoIds() async -> [String] {
+        defaults.stringArray(forKey: Keys.codingFavoriteRepoIds) ?? []
+    }
+
+    public func setCodingFavoriteRepoIds(_ ids: [String]) async {
+        let cleaned = ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if cleaned.isEmpty {
+            defaults.removeObject(forKey: Keys.codingFavoriteRepoIds)
+        } else {
+            defaults.set(cleaned, forKey: Keys.codingFavoriteRepoIds)
+        }
     }
 
     public func followUpSuggestionsEnabled() async -> Bool {

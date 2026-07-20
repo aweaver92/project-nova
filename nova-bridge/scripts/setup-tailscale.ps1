@@ -75,12 +75,36 @@ Write-Host ""
 Write-Host "Current serve config:"
 & $ts serve status 2>&1
 
+# Capture Tailscale IPv4 so remote "Preview in browser" can open
+# http://100.x.y.z:8790 without a separate Serve mapping per preview port.
+$tsIp = (& $ts ip -4 2>&1 | Select-Object -First 1).ToString().Trim()
+if ($tsIp -match '^100\.\d+\.\d+\.\d+$') {
+    $envFile = Join-Path $root ".env"
+    if (Test-Path $envFile) {
+        $envText = Get-Content $envFile -Raw
+        if ($envText -match '(?m)^\s*NOVA_TAILSCALE_IP\s*=') {
+            $envText = [regex]::Replace($envText, '(?m)^\s*NOVA_TAILSCALE_IP\s*=.*$', "NOVA_TAILSCALE_IP=$tsIp")
+        } else {
+            if (-not $envText.EndsWith("`n")) { $envText += "`n" }
+            $envText += "NOVA_TAILSCALE_IP=$tsIp`n"
+        }
+        Set-Content -Path $envFile -Value $envText -NoNewline
+        Write-Host "Wrote NOVA_TAILSCALE_IP=$tsIp to .env (restart the bridge to pick it up)."
+    }
+} else {
+    $tsIp = $null
+}
+
 if ($dnsName) {
     $url = "https://$dnsName"
     Write-Host ""
     Write-Host "======================================================================"
-    Write-Host " Bridge URL for the Nova app (Agents -> Claude - Nova Bridge -> URL):"
+    Write-Host " Bridge URL for the Nova app (Settings -> Nova Bridge -> URL):"
     Write-Host "   $url"
     Write-Host " Bridge token: the NOVA_BRIDGE_TOKEN value from nova-bridge\.env"
+    if ($tsIp) {
+        Write-Host " Tailscale IP (remote Safari previews): $tsIp"
+        Write-Host " Preview ports 8790-8799 stay peer-to-peer; Serve only covers the bridge."
+    }
     Write-Host "======================================================================"
 }

@@ -285,6 +285,44 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(opened.first?.absoluteString, "http://192.168.0.66:8790/src/page.html")
     }
 
+    func testFavoriteRepositoriesPersistAndFilterPicker() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        XCTAssertEqual(vm.repositories.count, 2)
+        XCTAssertTrue(vm.favoriteRepositories.isEmpty)
+        XCTAssertEqual(vm.filteredRepositories.count, 2)
+
+        await vm.toggleFavoriteRepository("abcdef0123456789")
+        XCTAssertTrue(vm.isFavoriteRepository("abcdef0123456789"))
+        XCTAssertEqual(vm.favoriteRepositories.map(\.id), ["abcdef0123456789"])
+        XCTAssertEqual(vm.filteredRepositories.map(\.id), ["1111111111111111"])
+        let persisted = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(persisted, ["abcdef0123456789"])
+
+        vm.repoSearchQuery = "oth"
+        XCTAssertEqual(vm.filteredRepositories.map(\.name), ["other"])
+        XCTAssertTrue(vm.favoriteRepositories.isEmpty) // favorite name does not match query
+
+        await vm.toggleFavoriteRepository("abcdef0123456789")
+        XCTAssertFalse(vm.isFavoriteRepository("abcdef0123456789"))
+        XCTAssertEqual(await settings.codingFavoriteRepoIds(), [])
+    }
+
+    func testRefreshPrunesStaleFavoriteRepoIds() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(
+            repoId: "abcdef0123456789",
+            favoriteRepoIds: ["abcdef0123456789", "deadbeefdeadbeef"]
+        )
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        XCTAssertEqual(vm.favoriteRepoIds, ["abcdef0123456789"])
+        XCTAssertEqual(await settings.codingFavoriteRepoIds(), ["abcdef0123456789"])
+    }
+
     func testStopPreviewInvalidatesStaleAutoOpen() async {
         let bridge = DirtyRepoBridge(previewBecomesReadyAfterPolls: 2)
         let settings = MemorySettings(repoId: "abcdef0123456789", autoOpenPreview: true)
@@ -399,8 +437,14 @@ private actor MemorySettings: SettingsStoring {
     private var sessionIdsByRepo: [String: String]
     private var unscopedSessionId: String?
     private var autoOpenPreview: Bool
+    private var favoriteRepoIds: [String]
 
-    init(repoId: String?, sessionId: String? = nil, autoOpenPreview: Bool = false) {
+    init(
+        repoId: String?,
+        sessionId: String? = nil,
+        autoOpenPreview: Bool = false,
+        favoriteRepoIds: [String] = []
+    ) {
         self.repoId = repoId
         if let repoId, let sessionId {
             self.sessionIdsByRepo = [repoId: sessionId]
@@ -410,6 +454,7 @@ private actor MemorySettings: SettingsStoring {
             self.unscopedSessionId = sessionId
         }
         self.autoOpenPreview = autoOpenPreview
+        self.favoriteRepoIds = favoriteRepoIds
     }
 
     func spokenFollowUps() async -> Bool { false }
@@ -434,6 +479,8 @@ private actor MemorySettings: SettingsStoring {
     }
     func codingAutoOpenPreview() async -> Bool { autoOpenPreview }
     func setCodingAutoOpenPreview(_ enabled: Bool) async { autoOpenPreview = enabled }
+    func codingFavoriteRepoIds() async -> [String] { favoriteRepoIds }
+    func setCodingFavoriteRepoIds(_ ids: [String]) async { favoriteRepoIds = ids }
 }
 
 private actor DirtyRepoBridge: AgentBridging {

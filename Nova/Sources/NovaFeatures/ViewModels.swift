@@ -677,6 +677,27 @@ public final class SkillsViewModel {
     }
 }
 
+/// One row in the Settings → Bridge setup checklist.
+public struct BridgeSetupStep: Identifiable, Equatable, Sendable {
+    public enum State: String, Sendable, Equatable {
+        case ready
+        case missing
+        case pending
+    }
+
+    public let id: String
+    public let title: String
+    public let detail: String
+    public let state: State
+
+    public init(id: String, title: String, detail: String, state: State) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.state = state
+    }
+}
+
 @MainActor
 @Observable
 public final class SettingsViewModel {
@@ -704,6 +725,11 @@ public final class SettingsViewModel {
     public private(set) var gitReady: Bool?
     public private(set) var ghReady: Bool?
     public private(set) var bridgeDefaultCwd: String?
+    public private(set) var repoRootCount: Int?
+    public private(set) var tokenConfiguredOnBridge: Bool?
+    public private(set) var previewRemoteReady: Bool?
+    public private(set) var tailscaleIp: String?
+    public private(set) var bridgeReachable = false
     /// When true, Realtime tokens come from the bridge (no baked-in OpenAI key).
     public var realtimeUsesBridge: Bool = true
 
@@ -724,6 +750,104 @@ public final class SettingsViewModel {
     /// True when Listen will fail because bridge Realtime minting lacks OPENAI_API_KEY.
     public var realtimeMintBlocked: Bool {
         realtimeUsesBridge && openaiConfigured == false
+    }
+
+    /// Guided checklist for first-run / reconnect bridge setup.
+    public var bridgeSetupSteps: [BridgeSetupStep] {
+        let urlSet = !bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let tokenSet = !bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return [
+            BridgeSetupStep(
+                id: "url",
+                title: "Bridge URL",
+                detail: urlSet ? bridgeBaseURL : "Enter http://host:8787 or your Tailscale https://….ts.net URL",
+                state: urlSet ? .ready : .missing
+            ),
+            BridgeSetupStep(
+                id: "token",
+                title: "Bridge token",
+                detail: tokenSet
+                    ? "Token saved on phone"
+                    : "Paste the same NOVA_BRIDGE_TOKEN from nova-bridge/.env",
+                state: tokenSet ? .ready : .missing
+            ),
+            BridgeSetupStep(
+                id: "reachable",
+                title: "Connection",
+                detail: bridgeReachable
+                    ? "Bridge reachable"
+                    : (urlSet ? bridgeStatus : "Save a URL, then test the connection"),
+                state: bridgeReachable ? .ready : (urlSet ? .missing : .pending)
+            ),
+            BridgeSetupStep(
+                id: "cursor",
+                title: "Cursor API key",
+                detail: cursorConfigured == true
+                    ? "Cursor ready"
+                    : "Set CURSOR_API_KEY on the bridge for Coding / push_to_cursor",
+                state: readinessState(cursorConfigured)
+            ),
+            BridgeSetupStep(
+                id: "openai",
+                title: "Realtime (OpenAI)",
+                detail: openaiConfigured == true
+                    ? "Realtime mint ready"
+                    : "Set OPENAI_API_KEY on the bridge for voice Listen",
+                state: readinessState(openaiConfigured)
+            ),
+            BridgeSetupStep(
+                id: "git",
+                title: "git",
+                detail: gitReady == true ? "git ready" : "Install Git and ensure it is on PATH",
+                state: readinessState(gitReady)
+            ),
+            BridgeSetupStep(
+                id: "gh",
+                title: "GitHub CLI",
+                detail: ghReady == true ? "gh ready" : "Install gh and run gh auth login for clone/PR",
+                state: readinessState(ghReady)
+            ),
+            BridgeSetupStep(
+                id: "roots",
+                title: "Repository roots",
+                detail: {
+                    if let count = repoRootCount {
+                        return count > 0
+                            ? "\(count) root\(count == 1 ? "" : "s") configured"
+                            : "Set NOVA_REPO_ROOTS in nova-bridge/.env"
+                    }
+                    return "Unknown until the bridge responds"
+                }(),
+                state: {
+                    guard let count = repoRootCount else { return BridgeSetupStep.State.pending }
+                    return count > 0 ? .ready : .missing
+                }()
+            ),
+            BridgeSetupStep(
+                id: "preview",
+                title: "Remote preview",
+                detail: previewRemoteReady == true
+                    ? "Tailscale IP \(tailscaleIp ?? "ready") — Safari previews work away from home"
+                    : "Optional: run scripts/setup-tailscale.ps1 so preview ports resolve remotely",
+                state: previewRemoteReady == true ? .ready : .pending
+            ),
+        ]
+    }
+
+    public var bridgeSetupNextAction: String? {
+        bridgeSetupSteps.first(where: { $0.state == .missing })?.detail
+    }
+
+    public var bridgeSetupReadyCount: Int {
+        bridgeSetupSteps.filter { $0.state == .ready }.count
+    }
+
+    private func readinessState(_ flag: Bool?) -> BridgeSetupStep.State {
+        switch flag {
+        case true: return .ready
+        case false: return .missing
+        case nil: return bridgeReachable ? .missing : .pending
+        }
     }
 
     public func load() async {
@@ -899,10 +1023,18 @@ public final class SettingsViewModel {
             bridgeStatus = "Saved. No URL set — enter your bridge URL (including http:// or https://)."
             openaiConfigured = nil
             cursorConfigured = nil
+            gitReady = nil
+            ghReady = nil
+            repoRootCount = nil
+            tokenConfiguredOnBridge = nil
+            previewRemoteReady = nil
+            tailscaleIp = nil
+            bridgeReachable = false
             return
         }
         guard trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") else {
             bridgeStatus = "Saved, but the URL is missing a scheme. Use http://host:8787 or https://host."
+            bridgeReachable = false
             return
         }
 
@@ -917,6 +1049,7 @@ public final class SettingsViewModel {
         let result = await bridge.health()
         if result.ok {
             applyHealthPayload(result.payloadJSON)
+            bridgeReachable = true
             var parts = ["Bridge reachable"]
             if let openaiConfigured {
                 parts.append(openaiConfigured ? "Realtime ready" : "Realtime unavailable (OPENAI_API_KEY missing on bridge)")
@@ -930,6 +1063,12 @@ public final class SettingsViewModel {
             if let ghReady {
                 parts.append(ghReady ? "gh ready" : "gh missing")
             }
+            if let repoRootCount {
+                parts.append(repoRootCount > 0 ? "\(repoRootCount) repo root\(repoRootCount == 1 ? "" : "s")" : "no repo roots")
+            }
+            if previewRemoteReady == true {
+                parts.append("remote preview ready")
+            }
             bridgeStatus = parts.joined(separator: " · ")
             return true
         } else if !(await store.bridgeBaseURL() ?? "").isEmpty {
@@ -938,6 +1077,12 @@ public final class SettingsViewModel {
             cursorConfigured = nil
             gitReady = nil
             ghReady = nil
+            repoRootCount = nil
+            tokenConfiguredOnBridge = nil
+            previewRemoteReady = nil
+            tailscaleIp = nil
+            bridgeReachable = false
+            bridgeDefaultCwd = nil
         }
         return false
     }
@@ -950,6 +1095,20 @@ public final class SettingsViewModel {
         gitReady = obj["gitReady"] as? Bool
         ghReady = obj["ghReady"] as? Bool
         bridgeDefaultCwd = obj["defaultCwd"] as? String
+        if let count = obj["repoRootCount"] as? Int {
+            repoRootCount = count
+        } else if let count = obj["rootCount"] as? Int {
+            repoRootCount = count
+        } else {
+            repoRootCount = nil
+        }
+        tokenConfiguredOnBridge = obj["tokenConfigured"] as? Bool
+        previewRemoteReady = obj["previewRemoteReady"] as? Bool
+        if let ip = obj["tailscaleIp"] as? String, !ip.isEmpty {
+            tailscaleIp = ip
+        } else {
+            tailscaleIp = nil
+        }
     }
 
     private static func summarize(_ payloadJSON: String) -> String {
@@ -1150,6 +1309,10 @@ public final class CodingViewModel {
     public private(set) var workingDirectory: String = ""
     public private(set) var selectedRepoId: String?
     public private(set) var repositories: [BridgeRepoSummary] = []
+    /// Favorited bridge repo ids (persisted locally on the phone).
+    public private(set) var favoriteRepoIds: [String] = []
+    /// Filters the Coding repo picker list.
+    public var repoSearchQuery: String = ""
     public private(set) var repoStatus: BridgeRepoStatus?
     public private(set) var repoDiff: BridgeRepoDiff?
     public private(set) var showDiff = false
@@ -1224,7 +1387,7 @@ public final class CodingViewModel {
     /// Watchdog poll interval (shortened in unit tests).
     var stallPollSeconds: TimeInterval = 5
     /// Delay between duplicate-safe status reconnect attempts (shortened in tests).
-    var reconnectRetrySeconds: TimeInterval = 60
+    var reconnectRetrySeconds: TimeInterval = 15
 
     public init(
         bridge: any AgentBridging,
@@ -1247,6 +1410,46 @@ public final class CodingViewModel {
             return selected.name
         }
         return selectedRepoId?.isEmpty == false ? "Repository" : "No repo"
+    }
+
+    public var favoriteRepositories: [BridgeRepoSummary] {
+        let favorites = Set(favoriteRepoIds)
+        return matchingRepositories.filter { favorites.contains($0.id) }
+    }
+
+    public var filteredRepositories: [BridgeRepoSummary] {
+        let favorites = Set(favoriteRepoIds)
+        // Keep favorites out of the main list when they already have their own section.
+        return matchingRepositories.filter { !favorites.contains($0.id) }
+    }
+
+    private var matchingRepositories: [BridgeRepoSummary] {
+        let query = repoSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return repositories }
+        return repositories.filter { repo in
+            repo.name.localizedCaseInsensitiveContains(query)
+                || repo.relativePath.localizedCaseInsensitiveContains(query)
+                || repo.rootLabel.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    public func isFavoriteRepository(_ repoId: String) -> Bool {
+        favoriteRepoIds.contains(repoId)
+    }
+
+    public func toggleFavoriteRepository(_ repoId: String) async {
+        let trimmed = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idx = favoriteRepoIds.firstIndex(of: trimmed) {
+            favoriteRepoIds.remove(at: idx)
+        } else {
+            favoriteRepoIds.insert(trimmed, at: 0)
+        }
+        await settings.setCodingFavoriteRepoIds(favoriteRepoIds)
+    }
+
+    public func noteStatus(_ message: String) {
+        statusMessage = message
     }
 
     public func addImage(
@@ -1292,6 +1495,7 @@ public final class CodingViewModel {
         workingDirectory = await settings.codingWorkingDirectory() ?? ""
         selectedRepoId = await settings.codingSelectedRepoId()
         autoOpenPreview = await settings.codingAutoOpenPreview()
+        favoriteRepoIds = await settings.codingFavoriteRepoIds()
         await refreshRepositories()
         await refreshSessions()
         await reloadPromptState()
@@ -1452,6 +1656,7 @@ public final class CodingViewModel {
     }
 
     public func refreshRepositories() async {
+        favoriteRepoIds = await settings.codingFavoriteRepoIds()
         let result = await bridge.listRepos()
         guard result.ok,
               let data = result.payloadJSON.data(using: .utf8),
@@ -1464,6 +1669,13 @@ public final class CodingViewModel {
             return
         }
         repositories = decoded.repos
+        // Drop favorites that no longer appear under bridge roots.
+        let known = Set(repositories.map(\.id))
+        let pruned = favoriteRepoIds.filter { known.contains($0) }
+        if pruned.count != favoriteRepoIds.count {
+            favoriteRepoIds = pruned
+            await settings.setCodingFavoriteRepoIds(pruned)
+        }
         if let selected = decoded.selectedRepoId, !selected.isEmpty {
             selectedRepoId = selected
             await settings.setCodingSelectedRepoId(selected)

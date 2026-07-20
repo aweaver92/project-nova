@@ -22,10 +22,11 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
 | `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
-| `GET`  | `/preview` | — | Active live previews (with phone-reachable URLs) |
+| `GET`  | `/preview` | — | Active live previews (`url`, `lanUrl`, `access`) |
 | `POST` | `/preview/start` | `{ "repoId": string }` | Serve the repo on a LAN port (static or `npm run dev`) |
 | `POST` | `/preview/stop` | `{ "repoId": string }` | Stop the repo's preview server |
-| `GET`  | `/health` | — | Liveness (no auth) |
+| `GET`  | `/preview-proxy/:repoId/*` | — | Unauthenticated reverse proxy for remote Safari (fallback) |
+| `GET`  | `/health` | — | Liveness + readiness flags (no auth) |
 
 ### Live preview (`/preview/*`)
 
@@ -115,6 +116,8 @@ npm run start   # or: npm run dev  (auto-reload)
 ```
 
 You should see `Nova Bridge listening on http://0.0.0.0:8787`.
+The bridge also advertises `_nova-bridge._tcp` over Bonjour/mDNS so Nova can
+follow DHCP address changes automatically after a router restart.
 
 Smoke-test locally:
 
@@ -127,9 +130,32 @@ curl -X POST localhost:8787/claude-code \
   -d '{"prompt":"list the files in this repo"}'
 ```
 
+### Same-LAN auto-detection (recommended at home)
+
+Run this once to allow the API and Bonjour through Windows Firewall on **Private**
+networks (it opens a UAC prompt):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\configure-lan-discovery.ps1
+```
+
+Make sure the current home network is marked **Private** in Windows Settings.
+When the app launches, it keeps a working saved URL; if that URL is unreachable,
+it auto-discovers the bridge on the current LAN and updates the IP while keeping
+the saved bearer token. Settings → Bridge → **Find bridge on local network** runs
+the same discovery manually. Bonjour is tried first; a bounded IPv4 scan remains
+as a fallback for routers that suppress multicast.
+
+Plain LAN HTTP is allowed only for local networking by the app's ATS settings.
+The bearer token is still required for every operational endpoint. Do not expose
+port 8787 to the public internet.
+
 ## 3. Expose it over HTTPS (Tailscale) — works from ANY network
 
-The iOS app blocks plain `http://` by default (App Transport Security), so give it an **HTTPS** URL. Tailscale is a private VPN overlay: once the bridge PC and your iPhone are on the same tailnet, the app reaches the bridge from **any network** (cellular, coffee-shop Wi-Fi, another house) — not just your LAN. It stays private to your devices — no public exposure.
+For access away from home, use an **HTTPS** URL. Tailscale is a private VPN overlay:
+once the bridge PC and your iPhone are on the same tailnet, the app reaches the
+bridge from cellular, coffee-shop Wi-Fi, or another house. It stays private to
+your devices.
 
 **One-time setup:**
 
@@ -159,13 +185,14 @@ this survives restarts alongside the `NovaBridge` scheduled task.
 
 > Prefer a quick throwaway public tunnel instead? `ngrok http 8787` also works and returns an `https://…ngrok…` URL. (Public — rely on the bearer token; Tailscale is preferred because it stays private.)
 
-> **Live preview caveat:** "Preview in browser" serves on LAN ports 8790–8799 and is only tunnelled on the same network. Coding/Cursor commands work from anywhere; browser previews still need same-LAN (or a separate tunnel per preview port).
+> **Live preview (remote):** When the phone talks to the bridge over Tailscale HTTPS, preview URLs prefer `http://{tailscale-ip}:8790…` (peer-to-peer on your tailnet — run `scripts\setup-tailscale.ps1` so `.env` gets `NOVA_TAILSCALE_IP`). If Tailscale IP detection fails, the bridge falls back to an unauthenticated `/preview-proxy/:repoId` path on the same HTTPS host (best for static sites; Vite HMR may still prefer same Wi‑Fi). The Coding UI shows access + a Copy URL control either way.
 
 ## 4. Point the app at it
 
-In Nova → **Agents** tab → **Claude — Nova Bridge**:
+In Nova → **Settings → Bridge**:
 
-- **URL:** the HTTPS URL from step 3 (e.g. `https://your-mac.tailnet-name.ts.net`)
+- On the same LAN, wait for auto-detection or tap **Find bridge on local network**
+- Away from home, set the Tailscale HTTPS URL (e.g. `https://your-pc.tailnet-name.ts.net`)
 - **Bridge token:** the same `NOVA_BRIDGE_TOKEN` from your `.env`
 - Tap **Save bridge settings**
 

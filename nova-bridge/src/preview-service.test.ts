@@ -6,8 +6,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import {
+  buildPreviewUrls,
   detectPreviewKind,
   devServerArgs,
+  isRemoteBridgeHost,
   PreviewService,
   previewUrl,
   safeStaticPath,
@@ -62,6 +64,43 @@ try {
   // --- previewUrl -----------------------------------------------------------
   assert(previewUrl("192.168.1.20:8787", 8790) === "http://192.168.1.20:8790/", "host from header");
   assert(previewUrl(undefined, 8790).startsWith("http://"), "fallback host");
+  assert(isRemoteBridgeHost("192.168.1.20:8787") === false, "LAN host not remote");
+  assert(isRemoteBridgeHost("pc.tailnet.ts.net") === true, "ts.net is remote");
+
+  const lanBundle = buildPreviewUrls({
+    requestHostHeader: "192.168.1.20:8787",
+    bridgeOrigin: "http://192.168.1.20:8787",
+    port: 8790,
+    repoId: "abcd",
+    tailscaleIp: null,
+  });
+  assert(lanBundle.access === "lan", "LAN access");
+  assert(lanBundle.url === "http://192.168.1.20:8790/", "LAN url from host");
+
+  const tsBundle = buildPreviewUrls({
+    requestHostHeader: "pc.tailnet.ts.net",
+    bridgeOrigin: "https://pc.tailnet.ts.net",
+    port: 8790,
+    repoId: "abcd",
+    relativePath: "index.html",
+    tailscaleIp: "100.64.1.2",
+  });
+  assert(tsBundle.access === "remote", "Tailscale access");
+  assert(tsBundle.remoteVia === "tailscale", "uses Tailscale IP");
+  assert(tsBundle.url === "http://100.64.1.2:8790/index.html", "Tailscale preview url");
+
+  const proxyBundle = buildPreviewUrls({
+    requestHostHeader: "pc.tailnet.ts.net",
+    bridgeOrigin: "https://pc.tailnet.ts.net",
+    port: 8790,
+    repoId: "cafe0123",
+    tailscaleIp: null,
+  });
+  assert(proxyBundle.remoteVia === "bridge-proxy", "proxy fallback");
+  assert(
+    proxyBundle.url === "https://pc.tailnet.ts.net/preview-proxy/cafe0123/",
+    "bridge proxy url",
+  );
 
   // --- static server round trip --------------------------------------------
   rmSync(join(tmp, "package.json")); // otherwise detect would pick "dev"

@@ -406,3 +406,135 @@ export function previewUrl(requestHostHeader: string | undefined, port: number):
   const host = (requestHostHeader ?? "").split(":")[0] || lanIPv4() || "127.0.0.1";
   return `http://${host}:${port}/`;
 }
+
+/** Hostname (no port) from a request Host header. */
+export function hostFromHeader(requestHostHeader: string | undefined): string {
+  return (requestHostHeader ?? "").split(":")[0]?.trim().toLowerCase() ?? "";
+}
+
+/** True for loopback / RFC1918 / .local hosts — same-LAN style reachability. */
+export function isPrivateOrLocalHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (!h || h === "localhost") return true;
+  if (h.endsWith(".local")) return true;
+  if (h === "127.0.0.1" || h === "::1") return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return false;
+}
+
+/**
+ * True when the phone is talking to the bridge through Tailscale/ngrok/etc.,
+ * so raw preview ports (8790+) are usually not reachable the same way.
+ */
+export function isRemoteBridgeHost(requestHostHeader: string | undefined): boolean {
+  const host = hostFromHeader(requestHostHeader);
+  if (!host) return false;
+  if (isPrivateOrLocalHost(host)) return false;
+  if (host.endsWith(".ts.net")) return true;
+  if (host.includes("ngrok") || host.includes("loca.lt") || host.includes("cloudflare")) {
+    return true;
+  }
+  // Non-private hostname (MagicDNS short name, public DNS, …).
+  return !/^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+/** Tailscale IPv4 for peer-to-peer preview URLs (Serve only covers the bridge port). */
+export function tailscaleIPv4(): string | null {
+  const fromEnv = (process.env.NOVA_TAILSCALE_IP ?? "").trim();
+  if (/^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(fromEnv)) return fromEnv;
+  try {
+    const bin = process.platform === "win32" ? "tailscale.exe" : "tailscale";
+    const result = spawnSync(bin, ["ip", "-4"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      shell: false,
+    });
+    const ip = (result.stdout ?? "").trim().split(/\s+/)[0] ?? "";
+    if (/^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) return ip;
+  } catch {
+    /* Tailscale not installed / not logged in */
+  }
+  return null;
+}
+
+export type PreviewAccess = "lan" | "remote";
+export type PreviewRemoteVia = "tailscale" | "bridge-proxy" | "none";
+
+export type PreviewUrlBundle = {
+  /** Best URL for the phone to open right now. */
+  url: string;
+  /** Always the LAN IP URL (handy when remote routing fails). */
+  lanUrl: string;
+  access: PreviewAccess;
+  remoteVia: PreviewRemoteVia;
+  /** Short hint for the phone UI when preview may need same Wi‑Fi. */
+  accessHint?: string;
+};
+
+function appendUrlPath(base: string, relativePath?: string): string {
+  if (!relativePath) return base.endsWith("/") ? base : `${base}/`;
+  const root = base.endsWith("/") ? base : `${base}/`;
+  return (
+    root +
+    relativePath
+      .split("/")
+      .filter(Boolean)
+      .map((part) => encodeURIComponent(part))
+      .join("/")
+  );
+}
+
+/**
+ * Build phone-reachable preview URLs.
+ *
+ * - Same LAN: direct `http://{bridge-host}:{previewPort}/…`
+ * - Remote (Tailscale Serve / tunnel): prefer `http://{tailscaleIP}:{port}/…`
+ *   (peer-to-peer on the tailnet; no Serve needed for preview ports). Fall back
+ *   to the bridge reverse proxy at `/preview-proxy/:repoId/…`.
+ */
+export function buildPreviewUrls(opts: {
+  requestHostHeader: string | undefined;
+  bridgeOrigin: string;
+  port: number;
+  repoId: string;
+  relativePath?: string;
+  tailscaleIp?: string | null;
+}): PreviewUrlBundle {
+  const lanHost = lanIPv4() || "127.0.0.1";
+  const lanUrl = appendUrlPath(`http://${lanHost}:${opts.port}/`, opts.relativePath);
+  const remote = isRemoteBridgeHost(opts.requestHostHeader);
+
+  if (!remote) {
+    return {
+      url: appendUrlPath(previewUrl(opts.requestHostHeader, opts.port), opts.relativePath),
+      lanUrl,
+      access: "lan",
+      remoteVia: "none",
+    };
+  }
+
+  const tsIp = opts.tailscaleIp === undefined ? tailscaleIPv4() : opts.tailscaleIp;
+  if (tsIp) {
+    return {
+      url: appendUrlPath(`http://${tsIp}:${opts.port}/`, opts.relativePath),
+      lanUrl,
+      access: "remote",
+      remoteVia: "tailscale",
+      accessHint:
+        "Preview uses your Tailscale IP. Keep Tailscale connected on the phone.",
+    };
+  }
+
+  const origin = opts.bridgeOrigin.replace(/\/$/, "");
+  const proxyBase = `${origin}/preview-proxy/${encodeURIComponent(opts.repoId)}/`;
+  return {
+    url: appendUrlPath(proxyBase, opts.relativePath),
+    lanUrl,
+    access: "remote",
+    remoteVia: "bridge-proxy",
+    accessHint:
+      "Remote preview is proxied through the bridge. Vite HMR may need same Wi‑Fi; copy the LAN URL when home.",
+  };
+}

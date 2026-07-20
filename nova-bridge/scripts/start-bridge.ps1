@@ -114,6 +114,17 @@ while ((Get-Date) -lt $deadline) {
     try {
         $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
         Write-Host "Healthy: $($health | ConvertTo-Json -Compress)"
+        $publicWiFi = Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.NetworkCategory -eq "Public" -and
+                ($_.InterfaceAlias -match "Wi-?Fi|Wireless")
+            } |
+            Select-Object -First 1
+        if ($publicWiFi) {
+            Write-Warning "Wi-Fi '$($publicWiFi.Name)' is Public; iPhone LAN discovery may be blocked."
+            Write-Host "For a trusted home network, set it to Private, then run:"
+            Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\configure-lan-discovery.ps1"
+        }
         exit 0
     } catch {
         # not up yet; keep polling

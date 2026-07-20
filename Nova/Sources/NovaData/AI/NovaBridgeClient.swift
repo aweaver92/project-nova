@@ -50,7 +50,7 @@ public actor NovaBridgeClient: AgentBridging {
     public init(
         configProvider: @escaping @Sendable () async -> (url: URL?, token: String?),
         session: URLSession = .shared,
-        reconnectRetrySeconds: TimeInterval = 60
+        reconnectRetrySeconds: TimeInterval = 15
     ) {
         self.configProvider = configProvider
         self.session = session

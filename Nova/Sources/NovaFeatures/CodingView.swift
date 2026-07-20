@@ -53,7 +53,11 @@ public struct CodingView: View {
         VStack(spacing: 0) {
             repoStatusCard
             Divider()
-            if coding.stallPhase == .stillWorking || coding.stallPhase == .looksStuck {
+            if coding.isRunning && coding.stallPhase != .looksStuck {
+                continuityBanner
+                Divider()
+            }
+            if coding.stallPhase == .looksStuck {
                 stallBanner
                 Divider()
             }
@@ -90,6 +94,9 @@ public struct CodingView: View {
                             .textCase(.uppercase)
                         if coding.isRunning, let started = coding.runStartedAt {
                             ElapsedTimeText(since: started)
+                        }
+                        if coding.isRunning, let last = coding.lastSSEActivityAt {
+                            LastEventAgeText(since: last)
                         }
                     }
                     Text(coding.selectedRepoName)
@@ -185,30 +192,69 @@ public struct CodingView: View {
     }
 
     @ViewBuilder
-    private var stallBanner: some View {
+    private var continuityBanner: some View {
         HStack(spacing: 10) {
-            Image(systemName: coding.stallPhase == .looksStuck ? "exclamationmark.triangle.fill" : "hourglass")
-                .foregroundStyle(coding.stallPhase == .looksStuck ? Color.orange : .secondary)
+            Image(systemName: coding.runStatus == "reconnecting"
+                  ? "arrow.triangle.2.circlepath"
+                  : "desktopcomputer")
+                .foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(coding.stallPhase == .looksStuck ? "Looks stuck" : "Still working…")
-                    .font(.caption.weight(.semibold))
-                Text(
-                    coding.stallPhase == .looksStuck
-                        ? "No agent activity for a while. You can restart the session and retry."
-                        : "The agent keeps working on your PC even if you lock the phone or leave this screen."
-                )
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                if coding.runStatus == "reconnecting" {
+                    Text("Reconnecting to PC…")
+                        .font(.caption.weight(.semibold))
+                    Text(coding.statusMessage.isEmpty
+                         ? "Checking the coding run that kept going on your PC."
+                         : coding.statusMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                } else if coding.stallPhase == .stillWorking {
+                    Text("Working on PC · quiet for a bit")
+                        .font(.caption.weight(.semibold))
+                    if let last = coding.lastSSEActivityAt {
+                        LastEventAgeText(since: last, prefix: "Last event ")
+                    } else {
+                        Text("The agent keeps working even if you lock the phone.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Working on PC")
+                        .font(.caption.weight(.semibold))
+                    if let last = coding.lastSSEActivityAt {
+                        LastEventAgeText(since: last, prefix: "Last event ")
+                    }
+                }
             }
             Spacer()
-            if coding.stallPhase == .looksStuck {
-                Button("Restart session") {
-                    Task { await coding.restartSession() }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    @ViewBuilder
+    private var stallBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Looks stuck")
+                    .font(.caption.weight(.semibold))
+                Text("No agent activity for a while. You can restart the session and retry.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if let last = coding.lastSSEActivityAt {
+                    LastEventAgeText(since: last, prefix: "Last event ")
                 }
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
             }
+            Spacer()
+            Button("Restart session") {
+                Task { await coding.restartSession() }
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -459,6 +505,18 @@ public struct CodingView: View {
                         }
                     }
                     Spacer()
+                    if preview.isReady {
+                        Button {
+                            #if canImport(UIKit)
+                            UIPasteboard.general.string = preview.url
+                            #endif
+                            coding.noteStatus("Preview URL copied")
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .font(.caption)
+                        .accessibilityLabel("Copy preview URL")
+                    }
                     Button("Change") {
                         showRepoFiles = true
                     }
@@ -467,6 +525,9 @@ public struct CodingView: View {
                         Task { await coding.stopPreview() }
                     }
                     .font(.caption)
+                }
+                if preview.isReady {
+                    previewAccessBanner(preview)
                 }
                 Label(
                     preview.path?.isEmpty == false ? (preview.path ?? "") : "Repository root",
@@ -1167,6 +1228,52 @@ public struct CodingView: View {
     }
     #endif
 
+    @ViewBuilder
+    private func previewAccessBanner(_ preview: BridgePreviewInfo) -> some View {
+        let isRemote = preview.isRemoteAccess
+        VStack(alignment: .leading, spacing: 4) {
+            Label(
+                isRemote
+                    ? (preview.remoteVia == "tailscale"
+                       ? "Remote preview via Tailscale"
+                       : "Remote preview (bridge proxy)")
+                    : "Same Wi‑Fi preview",
+                systemImage: isRemote ? "network" : "wifi"
+            )
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(isRemote ? Color.orange : Color.secondary)
+            if let hint = preview.accessHint, !hint.isEmpty {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if !isRemote {
+                Text("Safari opens a LAN port on the bridge PC. Away from home, use Tailscale on the phone.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if let lan = preview.lanUrl, isRemote, lan != preview.url {
+                HStack(spacing: 8) {
+                    Text(lan)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button("Copy LAN") {
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = lan
+                        #endif
+                        coding.noteStatus("LAN preview URL copied")
+                    }
+                    .font(.caption2)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
     private var repoPicker: some View {
         NavigationStack {
             List {
@@ -1180,36 +1287,33 @@ public struct CodingView: View {
                         showClone = true
                     }
                 }
+                if !coding.favoriteRepositories.isEmpty {
+                    Section("Favorites") {
+                        ForEach(coding.favoriteRepositories) { repo in
+                            repoPickerRow(repo)
+                        }
+                    }
+                }
                 Section("Allowlisted repositories") {
                     if coding.repositories.isEmpty {
-                        Text("No local repos under bridge roots yet.")
+                        Text("No local repos under bridge roots yet. Clone one, create a project, or add roots in nova-bridge `.env` (`NOVA_REPO_ROOTS`).")
                             .foregroundStyle(.secondary)
+                    } else if coding.filteredRepositories.isEmpty {
+                        if coding.repoSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("All matching repos are in Favorites.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No repositories match “\(coding.repoSearchQuery)”.")
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
-                        ForEach(coding.repositories) { repo in
-                            Button {
-                                Task {
-                                    await coding.selectRepository(repo.id)
-                                    showRepos = false
-                                }
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(repo.name)
-                                            .foregroundStyle(.primary)
-                                        Text("\(repo.rootLabel)/\(repo.relativePath)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if repo.id == coding.selectedRepoId {
-                                        Image(systemName: "checkmark.circle.fill")
-                                    }
-                                }
-                            }
+                        ForEach(coding.filteredRepositories) { repo in
+                            repoPickerRow(repo)
                         }
                     }
                 }
             }
+            .searchable(text: $coding.repoSearchQuery, prompt: "Search repos")
             .navigationTitle("Repositories")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1225,6 +1329,43 @@ public struct CodingView: View {
                 }
             }
             .task { await coding.refreshRepositories() }
+        }
+    }
+
+    private func repoPickerRow(_ repo: BridgeRepoSummary) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                Task {
+                    await coding.selectRepository(repo.id)
+                    showRepos = false
+                }
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(repo.name)
+                            .foregroundStyle(.primary)
+                        Text("\(repo.rootLabel)/\(repo.relativePath)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if repo.id == coding.selectedRepoId {
+                        Image(systemName: "checkmark.circle.fill")
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                Task { await coding.toggleFavoriteRepository(repo.id) }
+            } label: {
+                Image(systemName: coding.isFavoriteRepository(repo.id) ? "star.fill" : "star")
+                    .foregroundStyle(coding.isFavoriteRepository(repo.id) ? Color.yellow : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(
+                coding.isFavoriteRepository(repo.id) ? "Remove favorite" : "Add favorite"
+            )
         }
     }
 
@@ -1568,5 +1709,27 @@ private struct ElapsedTimeText: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// Compact “last event Ns ago” that ticks while a coding run is active.
+private struct LastEventAgeText: View {
+    let since: Date
+    var prefix: String = "· last "
+
+    var body: some View {
+        TimelineView(.periodic(from: since, by: 1)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(since)))
+            Text("\(prefix)\(Self.format(seconds)) ago")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private static func format(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        let rem = seconds % 60
+        return String(format: "%d:%02d", minutes, rem)
     }
 }

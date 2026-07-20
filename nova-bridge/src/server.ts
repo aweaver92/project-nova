@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync, realpathSync, promises as fs } from "node:fs";
+import { request as httpRequest } from "node:http";
 import path, { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,7 +14,12 @@ import {
   type CodingEvent,
 } from "./cursor-stream.js";
 import { bootstrapCursorRipgrep } from "./bootstrap-ripgrep.js";
-import { PreviewService, previewUrl } from "./preview-service.js";
+import { advertiseBridge, type BridgeAdvertisement } from "./bonjour-discovery.js";
+import {
+  buildPreviewUrls,
+  PreviewService,
+  tailscaleIPv4,
+} from "./preview-service.js";
 import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js";
 
 /**
@@ -68,6 +74,7 @@ loadEnv();
 const RIPGREP_PATH = bootstrapCursorRipgrep();
 
 const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST?.trim() || "0.0.0.0";
 const TOKEN = process.env.NOVA_BRIDGE_TOKEN ?? "";
 const CURSOR_API_KEY = process.env.CURSOR_API_KEY ?? "";
 const CURSOR_MODEL = process.env.CURSOR_MODEL ?? "composer-2.5";
@@ -156,6 +163,7 @@ function resolveQueryCwd(req: Request): string {
 // --- Health (no auth) -------------------------------------------------------
 app.get("/health", (_req, res) => {
   const ready = repos.readiness();
+  const tsIp = tailscaleIPv4();
   res.json({
     ok: true,
     service: "nova-bridge",
@@ -165,6 +173,10 @@ app.get("/health", (_req, res) => {
     ghReady: ready.ghReady,
     repoRootCount: ready.rootCount,
     selectedRepoId: repos.listRepos().selectedRepoId,
+    defaultCwd: DEFAULT_CWD,
+    tokenConfigured: TOKEN.length > 0,
+    tailscaleIp: tsIp,
+    previewRemoteReady: Boolean(tsIp),
   });
 });
 
@@ -392,12 +404,10 @@ app.post("/repos/:repoId/baselines/:baselineId/restore", requireAuth, async (req
 // --- Live preview -----------------------------------------------------------
 // Serves generated projects on LAN ports the phone's browser can open. Dev
 // servers (vite/next) start asynchronously; the app polls until state=ready.
+// When the phone reaches the bridge over Tailscale/HTTPS, URLs prefer the
+// Tailscale CGNAT IP (peer-to-peer) or fall back to /preview-proxy/:repoId.
 app.get("/preview", requireAuth, (req, res) => {
-  const host = req.get("host");
-  const list = previews.list().map((p) => ({
-    ...p,
-    url: previewTargetUrl(host, p.port, p.urlPath),
-  }));
+  const list = previews.list().map((p) => attachPreviewUrls(req, p));
   res.json({ ok: true, previews: list });
 });
 
@@ -427,32 +437,75 @@ app.post("/preview/start", requireAuth, async (req, res) => {
     );
     res.json({
       ok: true,
-      preview: {
-        ...info,
-        url: previewTargetUrl(req.get("host"), info.port, info.urlPath),
-      },
+      preview: attachPreviewUrls(req, info),
     });
   } catch (err) {
     sendRepoError(res, err);
   }
 });
 
-function previewTargetUrl(
-  host: string | undefined,
-  port: number,
-  relativePath?: string,
-): string {
-  const base = previewUrl(host, port);
-  if (!relativePath) return base;
-  return (
-    base +
-    relativePath
-      .split("/")
-      .filter(Boolean)
-      .map((part) => encodeURIComponent(part))
-      .join("/")
-  );
+function bridgeOriginFromRequest(req: Request): string {
+  const host = req.get("host") ?? "127.0.0.1";
+  const xf = (req.get("x-forwarded-proto") ?? "").split(",")[0]?.trim();
+  const proto =
+    xf ||
+    (host.toLowerCase().includes(".ts.net") || req.secure ? "https" : req.protocol) ||
+    "http";
+  return `${proto}://${host}`;
 }
+
+function attachPreviewUrls(
+  req: Request,
+  preview: { repoId: string; port: number; urlPath?: string },
+): Record<string, unknown> {
+  const urls = buildPreviewUrls({
+    requestHostHeader: req.get("host"),
+    bridgeOrigin: bridgeOriginFromRequest(req),
+    port: preview.port,
+    repoId: preview.repoId,
+    relativePath: preview.urlPath,
+  });
+  return { ...preview, ...urls };
+}
+
+/**
+ * Unauthenticated reverse proxy for remote Safari previews (same trust model as
+ * LAN preview ports: project content only, never bridge APIs).
+ */
+app.use("/preview-proxy/:repoId", (req, res) => {
+  const repoId = String(req.params.repoId ?? "").trim();
+  const preview = previews.get(repoId);
+  if (!preview || preview.state !== "ready") {
+    res.status(404).json({ ok: false, error: "preview_not_ready" });
+    return;
+  }
+  // Express strips the mount path; keep a leading slash for the upstream.
+  const upstreamPath = req.url && req.url !== "/" ? req.url : "/";
+  const proxyReq = httpRequest(
+    {
+      hostname: "127.0.0.1",
+      port: preview.port,
+      path: upstreamPath,
+      method: req.method,
+      headers: {
+        ...req.headers,
+        host: `127.0.0.1:${preview.port}`,
+      },
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    },
+  );
+  proxyReq.on("error", (err) => {
+    if (!res.headersSent) {
+      res.status(502).json({ ok: false, error: "preview_proxy_failed", detail: err.message });
+    } else {
+      res.end();
+    }
+  });
+  req.pipe(proxyReq);
+});
 
 app.post("/preview/stop", requireAuth, async (req, res) => {
   const repoId = String(req.body?.repoId ?? "").trim();
@@ -1422,9 +1475,12 @@ function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-app.listen(PORT, () => {
+let advertisement: BridgeAdvertisement | undefined;
+const server = app.listen(PORT, HOST, () => {
+  advertisement = advertiseBridge(PORT);
   const ready = repos.readiness();
-  console.log(`Nova Bridge listening on http://0.0.0.0:${PORT}`);
+  console.log(`Nova Bridge listening on http://${HOST}:${PORT}`);
+  console.log(`  LAN discovery:   _nova-bridge._tcp (Bonjour/mDNS)`);
   console.log(`  token set:       ${TOKEN ? "yes" : "NO (set NOVA_BRIDGE_TOKEN)"}`);
   console.log(`  cursor api key:  ${CURSOR_API_KEY ? "yes" : "no"}`);
   console.log(`  openai api key:  ${OPENAI_API_KEY ? "yes" : "no (realtime token endpoint disabled)"}`);
@@ -1434,3 +1490,13 @@ app.listen(PORT, () => {
   console.log(`  repo roots:      ${ready.rootCount}`);
   console.log(`  default cwd:     ${DEFAULT_CWD}`);
 });
+
+function shutdown(signal: string): void {
+  console.log(`${signal}: stopping Nova Bridge`);
+  advertisement?.stop();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5_000).unref();
+}
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));

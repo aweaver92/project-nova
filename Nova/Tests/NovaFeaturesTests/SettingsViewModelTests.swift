@@ -52,6 +52,25 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertTrue(remainingProfiles.isEmpty)
     }
 
+    func testHealthPopulatesBridgeSetupChecklist() async {
+        let store = SettingsStoreMock(
+            baseURL: "https://pc.ts.net",
+            token: "secret"
+        )
+        let viewModel = SettingsViewModel(store: store, bridge: HealthyBridgeMock())
+        await viewModel.load()
+
+        XCTAssertTrue(viewModel.bridgeReachable)
+        XCTAssertEqual(viewModel.repoRootCount, 2)
+        XCTAssertEqual(viewModel.tailscaleIp, "100.64.1.2")
+        XCTAssertEqual(viewModel.previewRemoteReady, true)
+        XCTAssertEqual(viewModel.bridgeDefaultCwd, #"C:\src"#)
+        let missing = viewModel.bridgeSetupSteps.filter { $0.state == .missing }
+        XCTAssertTrue(missing.isEmpty, "Expected full readiness, got missing: \(missing.map(\.id))")
+        XCTAssertNil(viewModel.bridgeSetupNextAction)
+        XCTAssertGreaterThanOrEqual(viewModel.bridgeSetupReadyCount, 8)
+    }
+
     func testLoadAutoDiscoversWhenSavedBridgeIsUnreachable() async throws {
         let store = SettingsStoreMock(
             baseURL: "http://192.168.1.20:8787",
@@ -87,7 +106,7 @@ private struct HealthyBridgeMock: AgentBridging {
     func health() async -> BridgeResult {
         BridgeResult(
             ok: true,
-            payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true}"#
+            payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true,"gitReady":true,"ghReady":true,"repoRootCount":2,"previewRemoteReady":true,"tailscaleIp":"100.64.1.2","defaultCwd":"C:\\src","tokenConfigured":true}"#
         )
     }
 }
