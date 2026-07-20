@@ -1422,6 +1422,8 @@ public final class CodingViewModel {
     private var queuedPrompts: [QueuedCodingPrompt] = []
     private var isProcessingPromptQueue = false
     private var isResumingCursorRun = false
+    /// True while a live coding SSE is intentionally kept open across background.
+    private var isHoldingBackgroundCodingConnection = false
     private var previewOpenGeneration = 0
     private var watchdogTask: Task<Void, Never>?
     var stallSoftSeconds: TimeInterval = 45
@@ -1597,8 +1599,9 @@ public final class CodingViewModel {
         await refreshRepoStatusAndDiff()
     }
 
-    /// Screen locked / app backgrounded: drop the SSE socket (it will die anyway),
-    /// keep the PC job id, and hold a soft audio keep-alive so polls can continue.
+    /// Screen locked / app backgrounded: keep the live SSE socket when possible,
+    /// persist the PC job id as a fallback, and hold a soft audio keep-alive so
+    /// iOS does not suspend networking mid-run.
     public func noteEnteredBackground() async {
         let pending = PendingCursorRunStore.load()
         let runId = activeRunId ?? pending?.runId
@@ -1610,21 +1613,13 @@ public final class CodingViewModel {
             persistPendingCursorRun(runId: runId)
             activeRunId = runId
         }
-        // Mark SSE stale so unlock resume never trusts a zombie in-flight execute.
-        lastSSEActivityAt = nil
+        // Do not cancel the coding SSE stream on background. URLSession background
+        // renewal + silent audio keep-alive can hold the connection; cancelling
+        // forced a reconnect loop and the "Backgrounded — reconnecting…" state.
+        isHoldingBackgroundCodingConnection = isRunning
         if isRunning {
-            runStatus = "reconnecting"
-            stallPhase = .stillWorking
-            statusMessage = "Screen off — PC keeps working. Holding the connection in the background…"
-            upsertActivity(
-                phase: "status",
-                text: "Backgrounded — reconnecting…",
-                detail: runId,
-                done: false
-            )
+            statusMessage = "Screen off — coding connection stays open; PC keeps working…"
         }
-        _ = await bridge.cancelActiveStream()
-        // Silent audio keep-alive is only needed once iOS would otherwise suspend us.
         ScreenPresence.setIdleTimerDisabled(true)
         BackgroundNetworkKeepAlive.shared.start(reason: "coding-background")
     }
@@ -1634,6 +1629,15 @@ public final class CodingViewModel {
         BackgroundNetworkKeepAlive.shared.stop(reason: "coding-foreground")
         updateCodingPresence()
         await resumePendingClaudeIfNeeded()
+
+        // Still running the same live SSE we kept open across background — leave it.
+        let heldLive = isHoldingBackgroundCodingConnection
+            && isRunning
+            && isProcessingPromptQueue
+            && runStatus == "running"
+        isHoldingBackgroundCodingConnection = false
+        if heldLive { return }
+
         for attempt in 0..<3 {
             await resumePendingCursorRunIfNeeded()
             if PendingCursorRunStore.load() == nil { return }
@@ -1652,13 +1656,12 @@ public final class CodingViewModel {
         let pending = PendingCursorRunStore.load()
         let runId = pending?.runId ?? activeRunId
 
-        // Only skip when the live SSE stream is still delivering events.
-        // A zombie execute after lock often still has isRunning + "running" with
-        // no SSE — that used to bail here and made automatic reconnect "always fail".
+        // Skip when the live SSE execute still owns the job. Fresh events OR an
+        // intentional background hold mean we must not cancel/reconnect.
         if isRunning,
            isProcessingPromptQueue,
            runStatus == "running",
-           hasFreshSSEActivity
+           hasFreshSSEActivity || isHoldingBackgroundCodingConnection
         {
             return
         }
@@ -1747,6 +1750,7 @@ public final class CodingViewModel {
         let active = forceActive ?? (isRunning || PendingCursorRunStore.load() != nil)
         ScreenPresence.setIdleTimerDisabled(active)
         if !active {
+            isHoldingBackgroundCodingConnection = false
             BackgroundNetworkKeepAlive.shared.stop(reason: "coding-idle")
         }
     }

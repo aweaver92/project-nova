@@ -462,17 +462,15 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isRunning)
     }
 
-    func testScreenOffHandoffThenUnlockRecoversWithoutResending() async {
+    func testBackgroundKeepsCodingStreamAliveWithoutDisconnect() async {
         PendingCursorRunStore.clear()
-        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true, statusFailCount: 1)
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.2)
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
-        vm.reconnectRetrySeconds = 0.01
-        vm.sseFreshnessSeconds = 0.05
         await vm.beginCodeViewSession()
 
         let sendTask = Task {
-            vm.draft = "keep editing after lock"
+            vm.draft = "keep editing in background"
             await vm.send()
         }
 
@@ -484,24 +482,63 @@ final class CodingRepoViewModelTests: XCTestCase {
             }
             try? await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertTrue(sawRun, "expected live run id before background handoff")
+        XCTAssertTrue(sawRun, "expected live run id before background")
 
         await vm.noteEnteredBackground()
-        XCTAssertEqual(vm.runStatus, "reconnecting")
+        XCTAssertEqual(vm.runStatus, "running", "background must not flip to reconnecting")
         XCTAssertEqual(PendingCursorRunStore.load()?.runId, "run-test")
+        let cancelledWhileBackgrounded = await bridge.cancelStreamCount
+        XCTAssertEqual(cancelledWhileBackgrounded, 0, "background must not cancel the coding SSE")
 
-        // Simulate unlock while a zombie execute still looks "running" with stale SSE.
-        // noteEnteredBackground already cleared freshness; resume must not early-return.
+        // Quiet SSE while held in background must not trigger unlock reconnect/cancel.
+        vm.sseFreshnessSeconds = 0.01
+        try? await Task.sleep(for: .milliseconds(30))
         await vm.handleBecameActive()
+        let cancelledAfterUnlock = await bridge.cancelStreamCount
+        XCTAssertEqual(cancelledAfterUnlock, 0, "unlock must leave a held live stream alone")
+
         await sendTask.value
 
         let commands = await bridge.receivedCommands
-        XCTAssertEqual(commands, ["keep editing after lock"], "unlock recovery must never resend")
+        XCTAssertEqual(commands, ["keep editing in background"], "must never resend")
+        XCTAssertEqual(vm.runStatus, "finished")
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testUnlockRecoversWhenStreamDiesWhileBackgrounded() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true, statusFailCount: 1)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "recover after socket drop"
+            await vm.send()
+        }
+
+        var sawRun = false
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" {
+                sawRun = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(sawRun, "expected live run id before background")
+
+        await vm.noteEnteredBackground()
+        XCTAssertEqual(vm.runStatus, "running")
+        // Simulate the OS dropping the SSE while we stay backgrounded.
+        _ = await bridge.cancelActiveStream()
+        await sendTask.value
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["recover after socket drop"], "drop recovery must never resend")
         XCTAssertEqual(vm.runStatus, "finished")
         XCTAssertFalse(vm.isRunning)
         XCTAssertNil(PendingCursorRunStore.load())
-        let cancelled = await bridge.cancelStreamCount
-        XCTAssertGreaterThanOrEqual(cancelled, 1)
     }
 
     func testTemplatesAndHistoryPersistPerRepo() async {

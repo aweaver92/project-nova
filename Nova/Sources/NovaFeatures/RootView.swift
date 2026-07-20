@@ -265,8 +265,8 @@ public struct RootView: View {
                         // `.inactive` (Control Center, app switcher, brief overlays)
                         // must not mark the session inactive — that caused connection
                         // loss when switching apps briefly.
-                        // Coding cancels the SSE socket, keeps the PC run id, and
-                        // holds a soft keep-alive so status polls can continue.
+                        // Coding keeps the live SSE socket, persists the PC run id,
+                        // and holds a soft keep-alive so the stream can stay open.
                         await conversation.noteEnteredBackground()
                         await coding.noteEnteredBackground()
                     case .inactive:
