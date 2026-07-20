@@ -71,7 +71,8 @@ targets:
           - com.meta.ar.wearable
         UIBackgroundModes:
           # `audio` keeps the mic/HFP session alive when the phone is locked or
-          # pocketed, so wake-word listening continues hands-free.
+          # pocketed (Listen), and allows Coding's silent keep-alive so bridge
+          # status polls can continue after screen-off.
           - audio
           - bluetooth-central
           # Meta DAT expects `bluetooth-peripheral` + `external-accessory` for the

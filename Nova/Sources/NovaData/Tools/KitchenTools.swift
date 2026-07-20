@@ -546,10 +546,10 @@ public struct UpdateNutritionProfileTool: Tool {
 
 public struct LogMealTool: Tool {
     public let name = "log_meal"
-    public let description = "Log a meal with an estimated calorie count and protein/carbs/fat in grams. Estimate the macros yourself from the description or recipe; omit any you truly can't estimate."
+    public let description = "Log a meal or snack with an estimated calorie count and protein/carbs/fat in grams. Pass meal_type as breakfast, lunch, dinner, or snack. Estimate the macros yourself from the description or recipe; omit any you truly can't estimate."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"description":{"type":"string"},"recipe_id":{"type":"string"},"calories":{"type":"number","description":"Estimated total kilocalories."},"protein_grams":{"type":"number"},"carbs_grams":{"type":"number"},"fat_grams":{"type":"number"}},"required":["description"],"additionalProperties":false}
+    {"type":"object","properties":{"description":{"type":"string"},"recipe_id":{"type":"string"},"meal_type":{"type":"string","description":"breakfast, lunch, dinner, or snack."},"calories":{"type":"number","description":"Estimated total kilocalories."},"protein_grams":{"type":"number"},"carbs_grams":{"type":"number"},"fat_grams":{"type":"number"}},"required":["description"],"additionalProperties":false}
     """
     private let store: any NutritionStoring
     public init(store: any NutritionStoring) { self.store = store }
@@ -558,6 +558,7 @@ public struct LogMealTool: Tool {
         struct Args: Decodable {
             let description: String
             let recipe_id: String?
+            let meal_type: String?
             let calories: Double?
             let protein_grams: Double?
             let carbs_grams: Double?
@@ -570,12 +571,14 @@ public struct LogMealTool: Tool {
             carbsGrams: args.carbs_grams,
             fatGrams: args.fat_grams
         )
+        let kind = MealLogKind.parse(args.meal_type) ?? .suggested()
         let entry = await store.logMeal(
             description: args.description,
             recipeId: args.recipe_id.flatMap(UUID.init(uuidString:)),
-            nutrition: nutrition.isEmpty ? nil : nutrition
+            nutrition: nutrition.isEmpty ? nil : nutrition,
+            kind: kind
         )
-        return #"{"ok":true,"id":"\#(entry.id.uuidString)"}"#
+        return #"{"ok":true,"id":"\#(entry.id.uuidString)","meal_type":"\#(entry.kind.rawValue)"}"#
     }
 }
 
@@ -597,6 +600,7 @@ public struct RecentMealsTool: Tool {
             var row: [String: Any] = [
                 "id": meal.id.uuidString,
                 "description": meal.description,
+                "meal_type": meal.kind.rawValue,
                 "at": ISO8601DateFormatter().string(from: meal.at)
             ]
             if let c = meal.calories { row["calories"] = c }

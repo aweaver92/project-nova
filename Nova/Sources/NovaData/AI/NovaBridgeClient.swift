@@ -706,14 +706,28 @@ public actor NovaBridgeClient: AgentBridging {
                 return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"no_response"}"#)
             }
             let payload = String(decoding: data, as: UTF8.self)
+            let trimmedPayload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
             let ok = (200..<300).contains(http.statusCode)
-            if payload.first == "{" || payload.first == "[" {
-                return BridgeResult(ok: ok, payloadJSON: payload)
+            if trimmedPayload.first == "{" || trimmedPayload.first == "[" {
+                return BridgeResult(ok: ok, payloadJSON: trimmedPayload)
+            }
+            // Express 404 HTML (e.g. stale bridge without a new route) used to
+            // surface only as opaque "non_json_response".
+            let hint: String
+            if http.statusCode == 404,
+               payload.localizedCaseInsensitiveContains("Cannot POST")
+                || payload.localizedCaseInsensitiveContains("Cannot GET") {
+                hint = "Bridge is missing this endpoint (HTTP 404). Restart nova-bridge so it loads the latest routes."
+            } else if trimmedPayload.isEmpty {
+                hint = "Bridge returned an empty body (HTTP \(http.statusCode))."
+            } else {
+                hint = "Bridge returned non-JSON (HTTP \(http.statusCode))."
             }
             let escaped = Self.escape(payload)
+            let escapedHint = Self.escape(hint)
             return BridgeResult(
                 ok: ok,
-                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)","error":"non_json_response"}"#
+                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)","error":"non_json_response","hint":"\#(escapedHint)"}"#
             )
         } catch {
             return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))

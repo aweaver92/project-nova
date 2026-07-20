@@ -4,10 +4,13 @@ import Foundation
 public struct MealPhotoEstimate: Sendable, Equatable {
     public var description: String
     public var nutrition: MealNutrition
+    /// Optional breakfast/lunch/dinner/snack guess from the model.
+    public var kind: MealLogKind?
 
-    public init(description: String, nutrition: MealNutrition) {
+    public init(description: String, nutrition: MealNutrition, kind: MealLogKind? = nil) {
         self.description = description
         self.nutrition = nutrition
+        self.kind = kind
     }
 }
 
@@ -24,9 +27,11 @@ public enum MealPhotoAnalysis {
     public static let analysisPrompt: String = """
         You are helping Remy, a personal chef, log a meal from a photo.
         Identify the food, estimate a reasonable serving size, and estimate calories and macros.
+        Also guess whether this is breakfast, lunch, dinner, or snack.
         Reply with ONLY valid JSON (no markdown) in this exact shape:
-        {"description":"Grilled chicken salad with vinaigrette","calories":420,"protein_grams":35,"carbs_grams":18,"fat_grams":22}
-        Use whole numbers. description must be a short meal name for the log UI. If the photo is not food, still return JSON with description explaining that and zeros for macros.
+        {"description":"Grilled chicken salad with vinaigrette","meal_type":"lunch","calories":420,"protein_grams":35,"carbs_grams":18,"fat_grams":22}
+        Use whole numbers. description must be a short meal name for the log UI. meal_type must be one of breakfast, lunch, dinner, snack.
+        If the photo is not food, still return JSON with description explaining that, meal_type snack, and zeros for macros.
         Do not narrate or speak — JSON only.
         """
 
@@ -57,7 +62,15 @@ public enum MealPhotoAnalysis {
         if nutrition.isEmpty {
             return .failure(MealPhotoAnalysisFailure("Meal photo analysis returned no macros."))
         }
-        return .success(MealPhotoEstimate(description: rawDescription, nutrition: nutrition))
+        let kind = MealLogKind.parse(string(in: root, keys: ["meal_type", "mealType", "kind", "type"]))
+        return .success(MealPhotoEstimate(description: rawDescription, nutrition: nutrition, kind: kind))
+    }
+
+    private static func string(in root: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = root[key] as? String { return value }
+        }
+        return nil
     }
 
     private static func number(in root: [String: Any], keys: [String]) -> Double? {

@@ -33,20 +33,39 @@ public actor FileNutritionStore: NutritionStoring {
 
     @discardableResult
     public func logMeal(description: String, recipeId: UUID?) -> MealLogEntry {
-        logMeal(description: description, recipeId: recipeId, nutrition: nil)
+        logMeal(description: description, recipeId: recipeId, nutrition: nil, kind: .suggested())
     }
 
     @discardableResult
     public func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) -> MealLogEntry {
+        logMeal(description: description, recipeId: recipeId, nutrition: nutrition, kind: .suggested())
+    }
+
+    @discardableResult
+    public func logMeal(
+        description: String,
+        recipeId: UUID?,
+        nutrition: MealNutrition?,
+        kind: MealLogKind
+    ) -> MealLogEntry {
         let entry = MealLogEntry(
             description: description,
             recipeId: recipeId,
+            kind: kind,
             calories: nutrition?.calories,
             proteinGrams: nutrition?.proteinGrams,
             carbsGrams: nutrition?.carbsGrams,
             fatGrams: nutrition?.fatGrams
         )
         state.meals.append(entry)
+        persist()
+        return entry
+    }
+
+    @discardableResult
+    public func updateMeal(_ entry: MealLogEntry) -> MealLogEntry? {
+        guard let index = state.meals.firstIndex(where: { $0.id == entry.id }) else { return nil }
+        state.meals[index] = entry
         persist()
         return entry
     }

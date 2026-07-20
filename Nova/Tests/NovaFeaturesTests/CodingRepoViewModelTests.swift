@@ -462,6 +462,48 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isRunning)
     }
 
+    func testScreenOffHandoffThenUnlockRecoversWithoutResending() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true, statusFailCount: 1)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        vm.sseFreshnessSeconds = 0.05
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "keep editing after lock"
+            await vm.send()
+        }
+
+        var sawRun = false
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" {
+                sawRun = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(sawRun, "expected live run id before background handoff")
+
+        await vm.noteEnteredBackground()
+        XCTAssertEqual(vm.runStatus, "reconnecting")
+        XCTAssertEqual(PendingCursorRunStore.load()?.runId, "run-test")
+
+        // Simulate unlock while a zombie execute still looks "running" with stale SSE.
+        // noteEnteredBackground already cleared freshness; resume must not early-return.
+        await vm.handleBecameActive()
+        await sendTask.value
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["keep editing after lock"], "unlock recovery must never resend")
+        XCTAssertEqual(vm.runStatus, "finished")
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertNil(PendingCursorRunStore.load())
+        let cancelled = await bridge.cancelStreamCount
+        XCTAssertGreaterThanOrEqual(cancelled, 1)
+    }
+
     func testTemplatesAndHistoryPersistPerRepo() async {
         let prompts = InMemoryCodingPromptStore()
         let bridge = DirtyRepoBridge()
@@ -562,6 +604,8 @@ private actor DirtyRepoBridge: AgentBridging {
     private let emitAfterCancel: Bool
     private let previewBecomesReadyAfterPolls: Int
     private let disconnectAfterStart: Bool
+    private let holdStreamUntilCancel: Bool
+    private let statusFailCount: Int
     private var previewPolls = 0
     private var cancelled = false
 
@@ -570,12 +614,16 @@ private actor DirtyRepoBridge: AgentBridging {
         emitAfterCancel: Bool = false,
         previewBecomesReadyAfterPolls: Int = 0,
         disconnectAfterStart: Bool = false,
+        holdStreamUntilCancel: Bool = false,
+        statusFailCount: Int = 0,
         commitAndBuildShouldFail: Bool = false
     ) {
         self.streamDelaySeconds = streamDelaySeconds
         self.emitAfterCancel = emitAfterCancel
         self.previewBecomesReadyAfterPolls = previewBecomesReadyAfterPolls
         self.disconnectAfterStart = disconnectAfterStart
+        self.holdStreamUntilCancel = holdStreamUntilCancel
+        self.statusFailCount = statusFailCount
         self.commitAndBuildShouldFail = commitAndBuildShouldFail
     }
 
@@ -719,7 +767,16 @@ private actor DirtyRepoBridge: AgentBridging {
 
     func cursorRunStatus(runId: String) async -> BridgeResult {
         runStatusCheckCount += 1
-        let status = runStatusCheckCount == 1 ? "running" : "finished"
+        if runStatusCheckCount <= statusFailCount {
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_unreachable"}"#
+            )
+        }
+        // With holdStreamUntilCancel, finish on the first successful check so
+        // unlock resume can complete quickly. Otherwise keep the old 2-check cadence.
+        let finishOnCheck = holdStreamUntilCancel ? (statusFailCount + 1) : 2
+        let status = runStatusCheckCount >= finishOnCheck ? "finished" : "running"
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"\#(runId)","status":"\#(status)","result":"ok"}"#
@@ -744,6 +801,15 @@ private actor DirtyRepoBridge: AgentBridging {
             sessionId: "agent-test",
             runId: "run-test"
         ))
+        if holdStreamUntilCancel {
+            while !cancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_connection_lost","sessionId":"agent-test","runId":"run-test","status":"running"}"#
+            )
+        }
         if disconnectAfterStart {
             return BridgeResult(
                 ok: false,

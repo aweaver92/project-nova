@@ -414,6 +414,17 @@ public protocol NutritionStoring: Sendable {
     /// implement the plain `logMeal` get a default that discards the macros.
     @discardableResult
     func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) async -> MealLogEntry
+    /// Log a meal with macros and breakfast/lunch/dinner/snack kind.
+    @discardableResult
+    func logMeal(
+        description: String,
+        recipeId: UUID?,
+        nutrition: MealNutrition?,
+        kind: MealLogKind
+    ) async -> MealLogEntry
+    /// Replace a previously logged meal. Returns nil if `entry.id` is unknown.
+    @discardableResult
+    func updateMeal(_ entry: MealLogEntry) async -> MealLogEntry?
     func recentMeals(limit: Int) async -> [MealLogEntry]
     func lastFridgeScan() async -> FridgeScanResult?
     func saveFridgeScan(_ result: FridgeScanResult) async
@@ -423,10 +434,28 @@ public protocol NutritionStoring: Sendable {
 
 public extension NutritionStoring {
     // Keeps existing conformers (mocks/fakes) source-compatible; the file-backed
-    // store overrides this to persist the macros.
+    // store overrides these to persist macros and kind.
     @discardableResult
     func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) async -> MealLogEntry {
-        await logMeal(description: description, recipeId: recipeId)
+        await logMeal(description: description, recipeId: recipeId, nutrition: nutrition, kind: .suggested())
+    }
+
+    @discardableResult
+    func logMeal(
+        description: String,
+        recipeId: UUID?,
+        nutrition: MealNutrition?,
+        kind: MealLogKind
+    ) async -> MealLogEntry {
+        _ = nutrition
+        _ = kind
+        return await logMeal(description: description, recipeId: recipeId)
+    }
+
+    @discardableResult
+    func updateMeal(_ entry: MealLogEntry) async -> MealLogEntry? {
+        _ = entry
+        return nil
     }
 }
 

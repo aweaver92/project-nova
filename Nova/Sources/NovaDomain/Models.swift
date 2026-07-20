@@ -1555,6 +1555,41 @@ public struct NutritionProfile: Sendable, Codable, Equatable {
     }
 }
 
+/// Breakfast / lunch / dinner / snack assignment for a logged food diary entry.
+public enum MealLogKind: String, Sendable, Codable, CaseIterable, Identifiable {
+    case breakfast
+    case lunch
+    case dinner
+    case snack
+
+    public var id: String { rawValue }
+
+    public var displayName: String { rawValue.capitalized }
+
+    /// Suggest a kind from the local clock (snack overnight; meals by typical windows).
+    public static func suggested(for date: Date = Date(), calendar: Calendar = .current) -> MealLogKind {
+        let hour = calendar.component(.hour, from: date)
+        switch hour {
+        case 5..<11: return .breakfast
+        case 11..<15: return .lunch
+        case 15..<17: return .snack
+        case 17..<22: return .dinner
+        default: return .snack
+        }
+    }
+
+    public static func parse(_ raw: String?) -> MealLogKind? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !trimmed.isEmpty else { return nil }
+        if let exact = MealLogKind(rawValue: trimmed) { return exact }
+        switch trimmed {
+        case "meal", "main", "main_meal", "main meal": return .dinner
+        case "brkfst", "bfast": return .breakfast
+        default: return nil
+        }
+    }
+}
+
 /// Estimated macros for a logged meal. Remy fills these in from the meal
 /// description or recipe; all fields are optional so a plain description still
 /// logs cleanly.
@@ -1586,17 +1621,25 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
     public var description: String
     public var at: Date
     public var recipeId: UUID?
+    /// Breakfast / lunch / dinner / snack for the diary entry.
+    public var kind: MealLogKind
     /// Remy's estimated calories for the meal, if known.
     public var calories: Double?
     public var proteinGrams: Double?
     public var carbsGrams: Double?
     public var fatGrams: Double?
 
+    private enum CodingKeys: String, CodingKey {
+        case id, description, at, recipeId, kind
+        case calories, proteinGrams, carbsGrams, fatGrams
+    }
+
     public init(
         id: UUID = UUID(),
         description: String,
         at: Date = Date(),
         recipeId: UUID? = nil,
+        kind: MealLogKind = .suggested(),
         calories: Double? = nil,
         proteinGrams: Double? = nil,
         carbsGrams: Double? = nil,
@@ -1606,14 +1649,126 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
         self.description = description
         self.at = at
         self.recipeId = recipeId
+        self.kind = kind
         self.calories = calories
         self.proteinGrams = proteinGrams
         self.carbsGrams = carbsGrams
         self.fatGrams = fatGrams
     }
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        description = try c.decode(String.self, forKey: .description)
+        at = try c.decode(Date.self, forKey: .at)
+        recipeId = try c.decodeIfPresent(UUID.self, forKey: .recipeId)
+        kind = try c.decodeIfPresent(MealLogKind.self, forKey: .kind) ?? .suggested(for: at)
+        calories = try c.decodeIfPresent(Double.self, forKey: .calories)
+        proteinGrams = try c.decodeIfPresent(Double.self, forKey: .proteinGrams)
+        carbsGrams = try c.decodeIfPresent(Double.self, forKey: .carbsGrams)
+        fatGrams = try c.decodeIfPresent(Double.self, forKey: .fatGrams)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(description, forKey: .description)
+        try c.encode(at, forKey: .at)
+        try c.encodeIfPresent(recipeId, forKey: .recipeId)
+        try c.encode(kind, forKey: .kind)
+        try c.encodeIfPresent(calories, forKey: .calories)
+        try c.encodeIfPresent(proteinGrams, forKey: .proteinGrams)
+        try c.encodeIfPresent(carbsGrams, forKey: .carbsGrams)
+        try c.encodeIfPresent(fatGrams, forKey: .fatGrams)
+    }
+
     public var nutrition: MealNutrition {
         MealNutrition(calories: calories, proteinGrams: proteinGrams, carbsGrams: carbsGrams, fatGrams: fatGrams)
+    }
+}
+
+/// Editable draft shown after a meal-photo scan (or when revisiting a saved log).
+public struct MealLogEditorState: Sendable, Identifiable, Equatable {
+    public var id: UUID
+    public var description: String
+    public var kind: MealLogKind
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+    public var at: Date
+    public var recipeId: UUID?
+    /// True when confirming a new scan / manual log; false when editing a saved entry.
+    public var isNew: Bool
+
+    public init(
+        id: UUID = UUID(),
+        description: String,
+        kind: MealLogKind = .suggested(),
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil,
+        at: Date = Date(),
+        recipeId: UUID? = nil,
+        isNew: Bool
+    ) {
+        self.id = id
+        self.description = description
+        self.kind = kind
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+        self.at = at
+        self.recipeId = recipeId
+        self.isNew = isNew
+    }
+
+    public init(estimate: MealPhotoEstimate, kind: MealLogKind = .suggested(), at: Date = Date()) {
+        self.init(
+            description: estimate.description,
+            kind: estimate.kind ?? kind,
+            calories: estimate.nutrition.calories,
+            proteinGrams: estimate.nutrition.proteinGrams,
+            carbsGrams: estimate.nutrition.carbsGrams,
+            fatGrams: estimate.nutrition.fatGrams,
+            at: at,
+            isNew: true
+        )
+    }
+
+    public init(entry: MealLogEntry) {
+        self.init(
+            id: entry.id,
+            description: entry.description,
+            kind: entry.kind,
+            calories: entry.calories,
+            proteinGrams: entry.proteinGrams,
+            carbsGrams: entry.carbsGrams,
+            fatGrams: entry.fatGrams,
+            at: entry.at,
+            recipeId: entry.recipeId,
+            isNew: false
+        )
+    }
+
+    public var nutrition: MealNutrition {
+        MealNutrition(calories: calories, proteinGrams: proteinGrams, carbsGrams: carbsGrams, fatGrams: fatGrams)
+    }
+
+    public func asEntry() -> MealLogEntry {
+        MealLogEntry(
+            id: id,
+            description: description,
+            at: at,
+            recipeId: recipeId,
+            kind: kind,
+            calories: calories,
+            proteinGrams: proteinGrams,
+            carbsGrams: carbsGrams,
+            fatGrams: fatGrams
+        )
     }
 }
 

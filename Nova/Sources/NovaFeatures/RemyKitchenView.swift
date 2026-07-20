@@ -86,6 +86,15 @@ public struct RemyKitchenView: View {
                 }
             )
         }
+        .sheet(item: $kitchen.mealLogEditor) { draft in
+            MealLogEditorSheet(
+                draft: draft,
+                onCancel: { kitchen.cancelMealLogEditor() },
+                onSave: { saved in
+                    Task { await kitchen.saveMealLogEditor(saved) }
+                }
+            )
+        }
     }
 
     private var kitchenList: some View {
@@ -424,7 +433,7 @@ public struct RemyKitchenView: View {
         }
 
         Section("Meal photo") {
-            Text("Estimate calories and macros from a plate photo — totals show up under Profile → Today.")
+            Text("Scan a plate to estimate calories and macros, then confirm meal type and details before saving. Totals show under Profile → Today.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -768,7 +777,7 @@ public struct RemyKitchenView: View {
                 Task { await kitchen.logMeal(text) }
             }
             .disabled(kitchen.isScanning)
-            Text("Or scan a meal photo under Scan.")
+            Text("Opens a details sheet so you can assign breakfast/lunch/dinner/snack and macros. Or scan a meal photo under Scan.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -776,17 +785,28 @@ public struct RemyKitchenView: View {
         if !kitchen.recentMeals.isEmpty {
             Section("Recent meals") {
                 ForEach(kitchen.recentMeals.prefix(12)) { meal in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(meal.description)
-                        HStack(spacing: 8) {
-                            Text(meal.at.formatted(date: .abbreviated, time: .shortened))
-                            if let macros = Self.macroLabel(meal) {
-                                Text(macros).foregroundStyle(Self.terracotta)
+                    Button {
+                        kitchen.editMeal(meal)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(meal.description)
+                                Spacer(minLength: 8)
+                                Text(meal.kind.displayName)
+                                    .font(.caption)
+                                    .foregroundStyle(Self.terracotta)
                             }
+                            HStack(spacing: 8) {
+                                Text(meal.at.formatted(date: .abbreviated, time: .shortened))
+                                if let macros = Self.macroLabel(meal) {
+                                    Text(macros).foregroundStyle(Self.terracotta)
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                     }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -1098,6 +1118,112 @@ private struct RecipeEditorSheet: View {
                 }
             }
         }
+    }
+}
+
+private struct MealLogEditorSheet: View {
+    var onCancel: () -> Void
+    var onSave: (MealLogEditorState) -> Void
+
+    @State private var description: String
+    @State private var kind: MealLogKind
+    @State private var caloriesText: String
+    @State private var proteinText: String
+    @State private var carbsText: String
+    @State private var fatText: String
+
+    private let draft: MealLogEditorState
+
+    init(
+        draft: MealLogEditorState,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (MealLogEditorState) -> Void
+    ) {
+        self.draft = draft
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _description = State(initialValue: draft.description)
+        _kind = State(initialValue: draft.kind)
+        _caloriesText = State(initialValue: Self.macroField(draft.calories))
+        _proteinText = State(initialValue: Self.macroField(draft.proteinGrams))
+        _carbsText = State(initialValue: Self.macroField(draft.carbsGrams))
+        _fatText = State(initialValue: Self.macroField(draft.fatGrams))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Type", selection: $kind) {
+                        ForEach(MealLogKind.allCases) { option in
+                            Text(option.displayName).tag(option)
+                        }
+                    }
+
+                    TextField("Description", text: $description, axis: .vertical)
+                        .lineLimit(2...4)
+                } header: {
+                    Text(draft.isNew ? "Confirm meal" : "Edit meal")
+                } footer: {
+                    Text(draft.isNew
+                         ? "Prefill is from the photo analysis — adjust anything before saving."
+                         : "Changes update your diary and today’s macro totals.")
+                }
+
+                Section("Nutrition") {
+                    macroField("Calories", text: $caloriesText, unit: "kcal")
+                    macroField("Protein", text: $proteinText, unit: "g")
+                    macroField("Carbs", text: $carbsText, unit: "g")
+                    macroField("Fat", text: $fatText, unit: "g")
+                }
+            }
+            .navigationTitle(draft.isNew ? "Log meal" : "Edit meal")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        var saved = draft
+                        saved.description = description
+                        saved.kind = kind
+                        saved.calories = Self.parseMacro(caloriesText)
+                        saved.proteinGrams = Self.parseMacro(proteinText)
+                        saved.carbsGrams = Self.parseMacro(carbsText)
+                        saved.fatGrams = Self.parseMacro(fatText)
+                        onSave(saved)
+                    }
+                    .disabled(description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func macroField(_ label: String, text: Binding<String>, unit: String) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField("—", text: text)
+                .keyboardType(.decimalPad)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 100)
+            Text(unit).foregroundStyle(.secondary)
+        }
+    }
+
+    private static func macroField(_ value: Double?) -> String {
+        guard let value else { return "" }
+        if value.rounded() == value { return String(Int(value)) }
+        return String(value)
+    }
+
+    private static func parseMacro(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return Double(trimmed)
     }
 }
 

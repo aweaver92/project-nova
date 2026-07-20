@@ -84,6 +84,8 @@ public final class RemyKitchenViewModel {
     public private(set) var lastScan: FridgeScanResult?
     public private(set) var isScanning = false
     public private(set) var statusMessage: String = ""
+    /// Prefill sheet after a meal-photo scan, or when editing a saved log.
+    public var mealLogEditor: MealLogEditorState?
     public var draftStaplesText: String = ""
     public var draftAllergensText: String = ""
     public var draftGoalsText: String = ""
@@ -718,11 +720,56 @@ public final class RemyKitchenViewModel {
     public func logMeal(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        _ = await nutrition.logMeal(description: trimmed, recipeId: nil)
+        mealLogEditor = MealLogEditorState(
+            description: trimmed,
+            kind: .suggested(),
+            isNew: true
+        )
+    }
+
+    /// Open the editor for a previously saved meal log entry.
+    public func editMeal(_ entry: MealLogEntry) {
+        mealLogEditor = MealLogEditorState(entry: entry)
+    }
+
+    public func cancelMealLogEditor() {
+        if mealLogEditor?.isNew == true {
+            statusMessage = "Meal not saved."
+        }
+        mealLogEditor = nil
+    }
+
+    /// Persist the editor draft — creates a new log or updates an existing one.
+    public func saveMealLogEditor(_ draft: MealLogEditorState) async {
+        let description = draft.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !description.isEmpty else {
+            statusMessage = "Add a short description before saving."
+            return
+        }
+        var cleaned = draft
+        cleaned.description = description
+        mealLogEditor = nil
+        if cleaned.isNew {
+            _ = await nutrition.logMeal(
+                description: cleaned.description,
+                recipeId: cleaned.recipeId,
+                nutrition: cleaned.nutrition.isEmpty ? nil : cleaned.nutrition,
+                kind: cleaned.kind
+            )
+            let cal = cleaned.calories.map { " · \(Int($0)) kcal" } ?? ""
+            statusMessage = "Logged \(cleaned.description) (\(cleaned.kind.displayName))\(cal)"
+        } else {
+            guard await nutrition.updateMeal(cleaned.asEntry()) != nil else {
+                statusMessage = "Couldn’t update that meal — it may have been removed."
+                await load()
+                return
+            }
+            statusMessage = "Updated \(cleaned.description)"
+        }
         await load()
     }
 
-    /// Analyze a meal photo for description + macros, then log it to today's totals.
+    /// Analyze a meal photo for description + macros, then open the confirm/edit sheet.
     public func logMealPhotoData(_ data: Data, mimeType: String = "image/jpeg") async {
         isScanning = true
         statusMessage = "Analyzing meal photo…"
@@ -743,7 +790,7 @@ public final class RemyKitchenViewModel {
         }
     }
 
-    /// Capture a meal still from the glasses camera, analyze macros, and log it.
+    /// Capture a meal still from the glasses camera, analyze macros, and open the confirm sheet.
     public func logMealWithGlasses() async {
         guard await isVisionReady(), let captureStill else {
             statusMessage = "Glasses vision isn’t ready — pick a phone photo instead."
@@ -764,14 +811,9 @@ public final class RemyKitchenViewModel {
         let answer = try await analyzeImage(frame, MealPhotoAnalysis.analysisPrompt)
         switch MealPhotoAnalysis.parseModelJSON(answer) {
         case .success(let estimate):
-            _ = await nutrition.logMeal(
-                description: estimate.description,
-                recipeId: nil,
-                nutrition: estimate.nutrition
-            )
-            await load()
+            mealLogEditor = MealLogEditorState(estimate: estimate)
             let cal = estimate.nutrition.calories.map { " · \(Int($0)) kcal" } ?? ""
-            statusMessage = "Logged \(estimate.description)\(cal)"
+            statusMessage = "Review \(estimate.description)\(cal)"
             selectedSection = .scan
         case .failure(let failure):
             statusMessage = failure.message

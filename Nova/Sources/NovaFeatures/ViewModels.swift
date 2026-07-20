@@ -1430,6 +1430,8 @@ public final class CodingViewModel {
     var stallPollSeconds: TimeInterval = 5
     /// Delay between duplicate-safe status reconnect attempts (shortened in tests).
     var reconnectRetrySeconds: TimeInterval = 15
+    /// SSE quieter than this is treated as dead (zombie execute must not block unlock resume).
+    var sseFreshnessSeconds: TimeInterval = 25
 
     public init(
         bridge: any AgentBridging,
@@ -1595,34 +1597,88 @@ public final class CodingViewModel {
         await refreshRepoStatusAndDiff()
     }
 
+    /// Screen locked / app backgrounded: drop the SSE socket (it will die anyway),
+    /// keep the PC job id, and hold a soft audio keep-alive so polls can continue.
+    public func noteEnteredBackground() async {
+        let pending = PendingCursorRunStore.load()
+        let runId = activeRunId ?? pending?.runId
+        guard isRunning || runId != nil else {
+            updateCodingPresence(forceActive: false)
+            return
+        }
+        if let runId, !runId.isEmpty {
+            persistPendingCursorRun(runId: runId)
+            activeRunId = runId
+        }
+        // Mark SSE stale so unlock resume never trusts a zombie in-flight execute.
+        lastSSEActivityAt = nil
+        if isRunning {
+            runStatus = "reconnecting"
+            stallPhase = .stillWorking
+            statusMessage = "Screen off — PC keeps working. Holding the connection in the background…"
+            upsertActivity(
+                phase: "status",
+                text: "Backgrounded — reconnecting…",
+                detail: runId,
+                done: false
+            )
+        }
+        _ = await bridge.cancelActiveStream()
+        // Silent audio keep-alive is only needed once iOS would otherwise suspend us.
+        ScreenPresence.setIdleTimerDisabled(true)
+        BackgroundNetworkKeepAlive.shared.start(reason: "coding-background")
+    }
+
+    /// Foreground / unlock: retry attach a few times so Wi‑Fi / VPN can settle.
+    public func handleBecameActive() async {
+        BackgroundNetworkKeepAlive.shared.stop(reason: "coding-foreground")
+        updateCodingPresence()
+        await resumePendingClaudeIfNeeded()
+        for attempt in 0..<3 {
+            await resumePendingCursorRunIfNeeded()
+            if PendingCursorRunStore.load() == nil { return }
+            // Recover owns a live poll loop — don't stack more resumes on top.
+            if isResumingCursorRun || runStatus == "reconnecting" { return }
+            let delayMs = 600 * (attempt + 1)
+            try? await Task.sleep(for: .milliseconds(delayMs))
+        }
+    }
+
     /// After unlock/foreground or re-entering Code view: poll a Cursor run that
     /// survived phone lock / SSE drop without replaying the prompt.
     public func resumePendingCursorRunIfNeeded() async {
-        // An in-flight execute() already owns recovery for its generation —
-        // except when it died mid-"reconnecting" after a lock (isRunning stuck).
         if isResumingCursorRun { return }
-        if isRunning, isProcessingPromptQueue, runStatus != "reconnecting" {
+
+        let pending = PendingCursorRunStore.load()
+        let runId = pending?.runId ?? activeRunId
+
+        // Only skip when the live SSE stream is still delivering events.
+        // A zombie execute after lock often still has isRunning + "running" with
+        // no SSE — that used to bail here and made automatic reconnect "always fail".
+        if isRunning,
+           isProcessingPromptQueue,
+           runStatus == "running",
+           hasFreshSSEActivity
+        {
             return
         }
 
-        guard let pending = PendingCursorRunStore.load() else { return }
-        let runId = pending.runId
-        guard !runId.isEmpty else {
-            PendingCursorRunStore.clear()
-            return
-        }
+        guard let runId, !runId.isEmpty else { return }
 
         isResumingCursorRun = true
         defer { isResumingCursorRun = false }
 
+        // Abort any dead execute/recover generation and cancel a hung SSE session.
+        _ = await bridge.cancelActiveStream()
+
         if !isCodeViewSessionActive {
             isCodeViewSessionActive = true
         }
-        if let sessionId = pending.sessionId, !sessionId.isEmpty {
+        if let sessionId = pending?.sessionId, !sessionId.isEmpty {
             pinnedSessionId = sessionId
             await settings.setCodingSessionId(sessionId)
         }
-        if let repoId = pending.repoId, !repoId.isEmpty, selectedRepoId != repoId {
+        if let repoId = pending?.repoId, !repoId.isEmpty, selectedRepoId != repoId {
             selectedRepoId = repoId
             await settings.setCodingSelectedRepoId(repoId)
         }
@@ -1633,7 +1689,7 @@ public final class CodingViewModel {
         activeRunId = runId
         runStatus = "reconnecting"
         stallPhase = .stillWorking
-        runStartedAt = runStartedAt ?? pending.startedAt
+        runStartedAt = runStartedAt ?? pending?.startedAt ?? Date()
         lastSSEActivityAt = Date()
         statusMessage = "Reconnecting to the coding run that kept going on your PC…"
         upsertActivity(
@@ -1642,6 +1698,7 @@ public final class CodingViewModel {
             detail: runId,
             done: false
         )
+        updateCodingPresence(forceActive: true)
         startWatchdog(generation: generation)
 
         guard let recovered = await recoverRunAfterDisconnect(
@@ -1649,6 +1706,7 @@ public final class CodingViewModel {
             generation: generation,
             pollImmediately: true
         ) else {
+            updateCodingPresence()
             return
         }
         guard generation == runGeneration else { return }
@@ -1659,6 +1717,7 @@ public final class CodingViewModel {
         stallPhase = .idle
         PendingCursorRunStore.clear(runId: runId)
         activeRunId = nil
+        updateCodingPresence(forceActive: false)
 
         if let sid = Self.string(recovered.payloadJSON, key: "sessionId"), !sid.isEmpty {
             pinnedSessionId = sid
@@ -1674,6 +1733,22 @@ public final class CodingViewModel {
         await refreshSessions()
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+    }
+
+    private var hasFreshSSEActivity: Bool {
+        guard let last = lastSSEActivityAt else { return false }
+        return Date().timeIntervalSince(last) < sseFreshnessSeconds
+    }
+
+    /// Keeps the screen awake while a coding run needs the process. Silent audio
+    /// keep-alive is started separately from `noteEnteredBackground` so foreground
+    /// Listen / glasses audio is not disrupted.
+    private func updateCodingPresence(forceActive: Bool? = nil) {
+        let active = forceActive ?? (isRunning || PendingCursorRunStore.load() != nil)
+        ScreenPresence.setIdleTimerDisabled(active)
+        if !active {
+            BackgroundNetworkKeepAlive.shared.stop(reason: "coding-idle")
+        }
     }
 
     private func persistPendingCursorRun(runId: String) {
@@ -2345,6 +2420,7 @@ public final class CodingViewModel {
         ]
         streamingAssistantId = nil
         streamingThinkingId = nil
+        updateCodingPresence(forceActive: true)
         startWatchdog(generation: generation)
 
         let repoId = prompt.repoId
@@ -2415,6 +2491,15 @@ public final class CodingViewModel {
                     await loadMessages(sessionId: sid)
                 }
             } else {
+                // Recover aborted (unlock resume took over, or process suspended).
+                // Only clear local run state when this generation still owns it.
+                if generation == runGeneration {
+                    stopWatchdog()
+                    isRunning = false
+                    runStartedAt = nil
+                    stallPhase = .idle
+                    updateCodingPresence(forceActive: false)
+                }
                 return
             }
         }
@@ -2426,6 +2511,7 @@ public final class CodingViewModel {
         streamingAssistantId = nil
         streamingThinkingId = nil
         PendingCursorRunStore.clear(runId: activeRunId)
+        updateCodingPresence(forceActive: false)
         if let sid = Self.string(result.payloadJSON, key: "sessionId"), !sid.isEmpty {
             pinnedSessionId = sid
             await settings.setCodingSessionId(sid)
@@ -2477,7 +2563,10 @@ public final class CodingViewModel {
                     detail: "Attempt \(attempt) · run \(runId)",
                     done: false
                 )
-                let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+                // Ramp up quickly after unlock (2s, 4s, …) instead of sitting on 15s
+                // while the bridge/VPN is still coming back.
+                let delay = min(reconnectRetrySeconds, max(0.01, Double(attempt) * 2.0))
+                let nanos = UInt64(delay * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
                 guard generation == runGeneration, isRunning else { return nil }
             } else {
@@ -2514,7 +2603,11 @@ public final class CodingViewModel {
                 persistPendingCursorRun(runId: runId)
             }
             if status == "running" {
-                runStatus = "running"
+                // Stay on "reconnecting" while status-polling. Flipping back to
+                // "running" made unlock resume think a live SSE execute still owned
+                // the job and skip recovery entirely.
+                runStatus = "reconnecting"
+                lastSSEActivityAt = nil
                 statusMessage = "Reconnected. The existing action is still running on your PC."
                 upsertActivity(
                     phase: "status",
@@ -2561,6 +2654,7 @@ public final class CodingViewModel {
         activeRunId = nil
         runStartedAt = nil
         stallPhase = .idle
+        updateCodingPresence(forceActive: false)
         for idx in activitySteps.indices where !activitySteps[idx].isDone {
             activitySteps[idx].isDone = true
         }

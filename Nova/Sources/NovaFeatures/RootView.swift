@@ -257,16 +257,16 @@ public struct RootView: View {
                     switch phase {
                     case .active:
                         await conversation.resumeAfterForeground()
-                        await coding.resumePendingClaudeIfNeeded()
-                        await coding.resumePendingCursorRunIfNeeded()
+                        await coding.handleBecameActive()
                     case .background:
                         // Only park Realtime reconnect when truly backgrounded.
                         // `.inactive` (Control Center, app switcher, brief overlays)
                         // must not mark the session inactive — that caused connection
                         // loss when switching apps briefly.
-                        // Coding keeps its own background task renewals; do not
-                        // cancel or pause bridge SSE/poll here.
+                        // Coding cancels the SSE socket, keeps the PC run id, and
+                        // holds a soft keep-alive so status polls can continue.
                         await conversation.noteEnteredBackground()
+                        await coding.noteEnteredBackground()
                     case .inactive:
                         break
                     @unknown default:

@@ -48,6 +48,66 @@ final class RemyKitchenViewModelTests: XCTestCase {
         XCTAssertEqual(saved.notes, "Updated by voice")
     }
 
+    func testMealPhotoOpensEditorInsteadOfAutoSaving() async {
+        let nutrition = KitchenNutritionStore()
+        let json = #"{"description":"Salmon bowl","meal_type":"lunch","calories":510,"protein_grams":42,"carbs_grams":48,"fat_grams":16}"#
+        let vm = RemyKitchenViewModel(
+            pantry: KitchenPantryStore(),
+            recipes: KitchenRecipeStore(),
+            shopping: KitchenShoppingStore(),
+            meals: KitchenMealPlanStore(),
+            nutrition: nutrition,
+            analyzeImage: { _, _ in json }
+        )
+
+        await vm.logMealPhotoData(Data([0xFF, 0xD8, 0xFF]), mimeType: "image/jpeg")
+
+        XCTAssertEqual(vm.mealLogEditor?.description, "Salmon bowl")
+        XCTAssertEqual(vm.mealLogEditor?.kind, .lunch)
+        XCTAssertEqual(vm.mealLogEditor?.calories, 510)
+        XCTAssertEqual(await nutrition.recentMeals(limit: 5).count, 0)
+
+        guard var draft = vm.mealLogEditor else {
+            return XCTFail("expected meal log editor")
+        }
+        draft.kind = .dinner
+        draft.calories = 480
+        await vm.saveMealLogEditor(draft)
+
+        XCTAssertNil(vm.mealLogEditor)
+        let meals = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(meals.count, 1)
+        XCTAssertEqual(meals[0].description, "Salmon bowl")
+        XCTAssertEqual(meals[0].kind, .dinner)
+        XCTAssertEqual(meals[0].calories, 480)
+    }
+
+    func testEditSavedMealUpdatesStore() async {
+        let nutrition = KitchenNutritionStore()
+        let vm = makeViewModel(nutrition: nutrition)
+        await vm.logMeal("Toast")
+        guard var draft = vm.mealLogEditor else {
+            return XCTFail("expected editor for manual log")
+        }
+        draft.kind = .breakfast
+        draft.calories = 200
+        await vm.saveMealLogEditor(draft)
+
+        let saved = await nutrition.recentMeals(limit: 1)[0]
+        vm.editMeal(saved)
+        guard var edited = vm.mealLogEditor else {
+            return XCTFail("expected editor for saved meal")
+        }
+        edited.description = "Avocado toast"
+        edited.kind = .snack
+        await vm.saveMealLogEditor(edited)
+
+        let meals = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(meals.count, 1)
+        XCTAssertEqual(meals[0].description, "Avocado toast")
+        XCTAssertEqual(meals[0].kind, .snack)
+    }
+
     private func makeViewModel(
         recipes: KitchenRecipeStore = KitchenRecipeStore(),
         nutrition: KitchenNutritionStore = KitchenNutritionStore(),
@@ -153,6 +213,7 @@ private actor KitchenMealPlanStore: MealPlanStoring {
 
 private actor KitchenNutritionStore: NutritionStoring {
     private var currentProfile = NutritionProfile()
+    private var meals: [MealLogEntry] = []
 
     func profile() -> NutritionProfile { currentProfile }
     func updateProfile(_ profile: NutritionProfile) -> NutritionProfile {
@@ -160,9 +221,37 @@ private actor KitchenNutritionStore: NutritionStoring {
         return profile
     }
     func logMeal(description: String, recipeId: UUID?) -> MealLogEntry {
-        MealLogEntry(description: description, recipeId: recipeId)
+        logMeal(description: description, recipeId: recipeId, nutrition: nil, kind: .suggested())
     }
-    func recentMeals(limit: Int) -> [MealLogEntry] { [] }
+    func logMeal(description: String, recipeId: UUID?, nutrition: MealNutrition?) -> MealLogEntry {
+        logMeal(description: description, recipeId: recipeId, nutrition: nutrition, kind: .suggested())
+    }
+    func logMeal(
+        description: String,
+        recipeId: UUID?,
+        nutrition: MealNutrition?,
+        kind: MealLogKind
+    ) -> MealLogEntry {
+        let entry = MealLogEntry(
+            description: description,
+            recipeId: recipeId,
+            kind: kind,
+            calories: nutrition?.calories,
+            proteinGrams: nutrition?.proteinGrams,
+            carbsGrams: nutrition?.carbsGrams,
+            fatGrams: nutrition?.fatGrams
+        )
+        meals.append(entry)
+        return entry
+    }
+    func updateMeal(_ entry: MealLogEntry) -> MealLogEntry? {
+        guard let index = meals.firstIndex(where: { $0.id == entry.id }) else { return nil }
+        meals[index] = entry
+        return entry
+    }
+    func recentMeals(limit: Int) -> [MealLogEntry] {
+        Array(meals.sorted { $0.at > $1.at }.prefix(max(0, limit)))
+    }
     func lastFridgeScan() -> FridgeScanResult? { nil }
     func saveFridgeScan(_ result: FridgeScanResult) {}
     func profileSummary() -> String { "" }

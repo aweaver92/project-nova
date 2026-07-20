@@ -13,6 +13,17 @@ final class MealPhotoAnalysisTests: XCTestCase {
             XCTAssertEqual(estimate.nutrition.proteinGrams, 42)
             XCTAssertEqual(estimate.nutrition.carbsGrams, 48)
             XCTAssertEqual(estimate.nutrition.fatGrams, 16)
+            XCTAssertNil(estimate.kind)
+        case .failure(let failure):
+            XCTFail(failure.message)
+        }
+    }
+
+    func testParseMealType() {
+        let text = #"{"description":"Oatmeal","meal_type":"breakfast","calories":300,"protein_grams":12,"carbs_grams":45,"fat_grams":8}"#
+        switch MealPhotoAnalysis.parseModelJSON(text) {
+        case .success(let estimate):
+            XCTAssertEqual(estimate.kind, .breakfast)
         case .failure(let failure):
             XCTFail(failure.message)
         }
@@ -66,6 +77,25 @@ final class MealPhotoAnalysisTests: XCTestCase {
 
     func testAnalysisPromptMentionsJSONShape() {
         XCTAssertTrue(MealPhotoAnalysis.analysisPrompt.contains("protein_grams"))
+        XCTAssertTrue(MealPhotoAnalysis.analysisPrompt.contains("meal_type"))
         XCTAssertTrue(MealPhotoAnalysis.analysisPrompt.contains("ONLY valid JSON"))
+    }
+
+    func testMealLogEntryDecodesMissingKind() throws {
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        let entry = MealLogEntry(
+            description: "Leftover pasta",
+            at: at,
+            kind: .dinner,
+            calories: 400
+        )
+        let encoded = try JSONEncoder().encode(entry)
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        root.removeValue(forKey: "kind")
+        let data = try JSONSerialization.data(withJSONObject: root)
+        let restored = try JSONDecoder().decode(MealLogEntry.self, from: data)
+        XCTAssertEqual(restored.description, "Leftover pasta")
+        XCTAssertEqual(restored.kind, MealLogKind.suggested(for: restored.at))
+        XCTAssertEqual(restored.calories, 400)
     }
 }

@@ -148,6 +148,30 @@ final class RemyKitchenTests: XCTestCase {
         _ = await nutrition.logMeal(description: "Rice bowl", recipeId: nil)
         let meals5 = await nutrition.recentMeals(limit: 5)
         XCTAssertEqual(meals5.count, 1)
+        XCTAssertEqual(meals5[0].kind, MealLogKind.suggested(for: meals5[0].at))
+
+        var edited = meals5[0]
+        edited.description = "Rice bowl with egg"
+        edited.kind = .lunch
+        edited.calories = 520
+        let updated = await nutrition.updateMeal(edited)
+        XCTAssertEqual(updated?.description, "Rice bowl with egg")
+        XCTAssertEqual(updated?.kind, .lunch)
+        XCTAssertEqual(updated?.calories, 520)
+        let afterEdit = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(afterEdit.count, 1)
+        XCTAssertEqual(afterEdit[0].description, "Rice bowl with egg")
+
+        _ = await nutrition.logMeal(
+            description: "Apple",
+            recipeId: nil,
+            nutrition: MealNutrition(calories: 95, proteinGrams: 0, carbsGrams: 25, fatGrams: 0),
+            kind: .snack
+        )
+        let withSnack = await nutrition.recentMeals(limit: 5)
+        XCTAssertEqual(withSnack.count, 2)
+        XCTAssertEqual(withSnack.first { $0.description == "Apple" }?.kind, .snack)
+
         let profileSummary = await nutrition.profileSummary()
         XCTAssertTrue(profileSummary.contains("Peanuts"))
     }
