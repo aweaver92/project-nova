@@ -96,6 +96,10 @@ public actor ConversationOrchestrator {
     private var skipFollowUpOnce = false
     // Serializes tool dispatch without blocking the provider event loop.
     private var toolTask: Task<Void, Never>?
+    /// True while a typed-chat turn runs without Listen (no mic / Listen UI).
+    private var textChatOnly = false
+    private var textChatBuffer = ""
+    private var textChatWait: CheckedContinuation<String, Error>?
     /// Bumped when a completed transcription is handled so speech-stopped
     /// fallbacks don't double-trigger a response.
     private var utteranceEpoch = 0
@@ -261,6 +265,120 @@ public actor ConversationOrchestrator {
         lastEngagement = .now
         listeningSuspended = false
         await ai.sendUserText(trimmed)
+    }
+
+    /// Typed chat that does **not** arm Listen or the mic. Opens a short-lived
+    /// text-only Realtime turn (tools + persona still apply), then disconnects.
+    /// When Listen is already streaming, forwards to `sendUserText` and returns
+    /// an empty string (reply arrives via transcript handlers).
+    public func sendTypedChatWithoutListen(_ text: String) async throws -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if streaming {
+            await sendUserText(trimmed)
+            return ""
+        }
+
+        return try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            // Event pump needed for tool calls; do not set isRunning / Listen.
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: true
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            textChatOnly = true
+            textChatBuffer = ""
+            lastUserText = trimmed
+            lastActivity = .now
+            await memory?.append(
+                ConversationTurn(role: .user, text: trimmed, workspaceId: await memoryScopeId())
+            )
+
+            do {
+                try await ai.connect(config: effective)
+                let answer = try await withThrowingTaskGroup(of: String.self) { group in
+                    group.addTask { [weak self] in
+                        guard let self else { throw CancellationError() }
+                        return try await self.awaitTextChatResult {
+                            await self.ai.sendUserText(trimmed)
+                        }
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(90))
+                        throw NovaError.aiProvider("Text chat timed out")
+                    }
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    return result
+                }
+                textChatOnly = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                }
+                return answer
+            } catch {
+                failTextChatWait(error)
+                textChatOnly = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                }
+                throw error
+            }
+        }
+    }
+
+    private func awaitTextChatResult(send: @escaping @Sendable () async -> Void) async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            textChatWait = cont
+            Task { await send() }
+        }
+    }
+
+    private func failTextChatWait(_ error: Error) {
+        if let wait = textChatWait {
+            textChatWait = nil
+            textChatBuffer = ""
+            wait.resume(throwing: error)
+        }
+    }
+
+    private func scheduleTextChatFinish() {
+        guard textChatOnly, textChatWait != nil else { return }
+        let pendingTools = toolTask
+        Task { [weak self] in
+            _ = await pendingTools?.value
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self else { return }
+            guard self.textChatOnly, let wait = self.textChatWait else { return }
+            // Another model response started after tools — wait for that one.
+            if self.assistantSpeaking { return }
+            self.textChatWait = nil
+            let answer = self.textChatBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.textChatBuffer = ""
+            wait.resume(returning: answer)
+        }
     }
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
@@ -477,13 +595,8 @@ public actor ConversationOrchestrator {
         await withLifecycle {
             if agents.isEmpty { await loadAgentRoster() }
             await performSwitchAgent(toId: id, greet: streaming)
-            // Recover a dead session: if we're running but neither streaming nor
-            // intentionally idle on the on-device wake word (detectionTask == nil),
-            // a prior reconnect likely failed and left the mic/transcripts dead.
-            // Re-establish so tapping an agent always brings the session back.
-            if isRunning, !streaming, detectionTask == nil {
-                await restoreSessionUnlocked()
-            }
+            // Do not auto-reopen Realtime from the Agents tab. Listen is only
+            // armed manually on the Assistant tab.
         }
     }
 
@@ -683,12 +796,14 @@ public actor ConversationOrchestrator {
             return
         }
 
-        // Local wake-word standby or half-torn session: reopen cloud.
-        do {
-            try await reopenRealtime()
-        } catch {
-            NovaLog.session.error(
-                "Foreground reopen failed: \(String(describing: error), privacy: .public)"
+        // Local wake-word standby: do not auto-reopen Realtime on unlock.
+        // Listen must be started again from the Assistant tab.
+        if !streaming {
+            publishListenHealth(
+                phase: isRunning && detectionTask != nil ? .awaitingWakeWord : .idle,
+                detail: isRunning && detectionTask != nil
+                    ? "Say \"Nova\" is disabled — tap Listen to reconnect."
+                    : "Listen stopped — tap Listen on Assistant to start."
             )
         }
     }
@@ -708,7 +823,11 @@ public actor ConversationOrchestrator {
     /// Compose the effective session config for the active agent: persona voice +
     /// front-loaded instructions + durable/recent memory + workspace context +
     /// tool allowlist. `gen` is used to bail out if the stream is superseded.
-    private func buildEffectiveConfig(base config: AISessionConfig, gen: Int) async throws -> AISessionConfig {
+    private func buildEffectiveConfig(
+        base config: AISessionConfig,
+        gen: Int,
+        requireSession: Bool = true
+    ) async throws -> AISessionConfig {
         var effective = config
         // Active-agent persona + voice: the persona is front-loaded ahead of the
         // base rules, and the voice determines who the user hears.
@@ -722,7 +841,9 @@ public actor ConversationOrchestrator {
         }
         if let profileProvider {
             let facts = await profileProvider()
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !facts.isEmpty {
                 effective.instructions += "\n\nWhat you know about the user:\n\(facts)"
             }
@@ -730,11 +851,15 @@ public actor ConversationOrchestrator {
         // Memory is scoped per-agent (so each specialist has its own window);
         // the master falls back to the active workspace.
         let scopeId = await memoryScopeId()
-        guard gen == streamGeneration, isRunning else { throw CancellationError() }
+        if requireSession {
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+        }
         // Durable long-term digest first (older, compacted context)…
         if let digestStore {
             let digest = await digestStore.digest(workspaceId: scopeId)
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !digest.isEmpty {
                 effective.instructions += "\n\nLong-term memory for this context:\n\(digest)"
             }
@@ -742,7 +867,9 @@ public actor ConversationOrchestrator {
         // …then the recent rolling window.
         if let memory {
             let summary = await memory.summary(workspaceId: scopeId)
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
             }
@@ -750,7 +877,9 @@ public actor ConversationOrchestrator {
         // Active workspace context + available skills catalog.
         if let contextProvider {
             let ctx = await contextProvider()
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -758,7 +887,9 @@ public actor ConversationOrchestrator {
         // Agent-specific extra context (e.g. the trainer's recent workouts).
         if let agent = activeAgent, let agentContextProvider {
             let ctx = await agentContextProvider(agent)
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -766,7 +897,17 @@ public actor ConversationOrchestrator {
         // Advertise available tools, scoped to the active agent's allowlist.
         if let toolRouter {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
-            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
+        }
+        // Typed chat without Listen: prefer plain prose over spoken-glass style.
+        if config.textOutputOnly {
+            effective.instructions += """
+
+
+            You are answering a typed chat message (not voice). Reply in clear written prose. Do not narrate that you are an audio assistant.
+            """
         }
         return effective
     }
@@ -1126,6 +1267,8 @@ public actor ConversationOrchestrator {
         inputRoute: String? = nil,
         detail: String
     ) {
+        // Typed chat without Listen must not flip the Assistant Listen UI.
+        guard !textChatOnly else { return }
         var next = listenHealth
         next.phase = phase
         next.micLevel = micLevel ?? next.micLevel
@@ -1262,8 +1405,14 @@ public actor ConversationOrchestrator {
             await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
             outputTranscript += delta
-            onTranscript?(delta, .assistant)
+            if textChatOnly {
+                textChatBuffer += delta
+            } else {
+                onTranscript?(delta, .assistant)
+            }
         case .outputAudio(let pcm24):
+            // Text-only typed chat must never play TTS through the glasses.
+            guard !textChatOnly else { break }
             lastOutputAudioAt = .now
             let t0 = ContinuousClock.Instant.now
             // Play the assistant voice at its native 24 kHz. Downsampling to 8 kHz
@@ -1275,7 +1424,11 @@ public actor ConversationOrchestrator {
         case .responseStarted:
             assistantSpeaking = true
             lastOutputAudioAt = .now
-            outputTranscript = ""
+            if !textChatOnly {
+                outputTranscript = ""
+            } else if textChatBuffer.isEmpty {
+                outputTranscript = ""
+            }
         case .responseEnded:
             assistantSpeaking = false
             // If a "Nova, stop" just landed, this is the cancelled response
@@ -1299,7 +1452,11 @@ public actor ConversationOrchestrator {
                 await memory?.append(ConversationTurn(role: .user, text: inputTranscript, workspaceId: wsid))
                 inputTranscript = ""
             }
-            await requestFollowUps()
+            if textChatOnly {
+                scheduleTextChatFinish()
+            } else {
+                await requestFollowUps()
+            }
             onMetricsTick?()
         case .speechStarted:
             cloudVadSpeechEvents += 1
@@ -1553,8 +1710,8 @@ public actor ConversationOrchestrator {
         NovaLog.session.info("Stop command: speech halted; wake word required to resume")
     }
 
-    /// "Close Connection": drop the cloud Realtime session and arm on-device
-    /// wake-word listening. Tap Listen or say "Nova" to reopen.
+    /// "Close Connection": drop the cloud Realtime session fully. Listen must be
+    /// re-enabled manually from the Assistant tab (no wake-word auto-reopen).
     private func handleCloseConnection() async {
         await ai.interrupt()
         await egress.flush()
@@ -1563,35 +1720,17 @@ public actor ConversationOrchestrator {
         onTranscript?("Connection closed.", .system)
         await withLifecycle {
             await teardownStreaming()
-            if let listener = wakeWordListener, isRunning {
-                sessionConfig.useLocalWakeWord = true
-                do {
-                    try await beginLocalListening(listener)
-                    publishListenHealth(
-                        phase: .awaitingWakeWord,
-                        detail: "Connection closed — say \"Nova\" or tap Listen to reconnect."
-                    )
-                    NovaLog.session.info("Close Connection: Realtime closed; local wake word armed")
-                } catch {
-                    NovaLog.session.error("Close Connection: wake listener failed: \(String(describing: error), privacy: .public)")
-                    isRunning = false
-                    eventTask?.cancel()
-                    eventTask = nil
-                    publishListenHealth(
-                        phase: .idle,
-                        detail: "Connection closed. Tap Listen to start again."
-                    )
-                }
-            } else {
-                isRunning = false
-                eventTask?.cancel()
-                eventTask = nil
-                publishListenHealth(
-                    phase: .idle,
-                    detail: "Connection closed. Tap Listen to start again."
-                )
-                NovaLog.session.info("Close Connection: Realtime closed (no local wake listener)")
-            }
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            isRunning = false
+            eventTask?.cancel()
+            eventTask = nil
+            publishListenHealth(
+                phase: .idle,
+                detail: "Connection closed. Tap Listen to start again."
+            )
+            NovaLog.session.info("Close Connection: Realtime closed; Listen off until manual Start")
         }
     }
 

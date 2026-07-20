@@ -38,12 +38,37 @@ final class CodingRepoViewModelTests: XCTestCase {
         let settings = MemorySettings(repoId: "abcdef0123456789")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         vm.confirmPublish = { _, _ in false }
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
 
         await vm.load()
         await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
         let calls = await bridge.commitAndBuildCallCount
         XCTAssertEqual(calls, 1)
         XCTAssertTrue(vm.statusMessage.contains("Nova/App/NovaApp.ipa"))
+        XCTAssertEqual(notified?.0, true)
+        XCTAssertTrue(notified?.1.contains("Nova/App/NovaApp.ipa") == true)
+        XCTAssertFalse(vm.isCommitAndBuilding)
+        XCTAssertNil(vm.commitAndBuildStartedAt)
+    }
+
+    func testCommitAndBuildFailureNotifies() async {
+        let bridge = DirtyRepoBridge()
+        bridge.commitAndBuildShouldFail = true
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
+
+        await vm.load()
+        await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
+        XCTAssertEqual(notified?.0, false)
+        XCTAssertNotNil(notified?.1)
+        XCTAssertFalse(vm.isCommitAndBuilding)
     }
 
     func testSelectRepositoryDoesNotReuseAnotherReposPinnedSession() async {
@@ -523,6 +548,7 @@ private actor MemorySettings: SettingsStoring {
 private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var commitAndBuildCallCount = 0
+    var commitAndBuildShouldFail = false
     private(set) var receivedImageCount = 0
     private(set) var receivedCommands: [String] = []
     private(set) var receivedSessionIds: [String?] = []
@@ -663,6 +689,9 @@ private actor DirtyRepoBridge: AgentBridging {
 
     func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
         commitAndBuildCallCount += 1
+        if commitAndBuildShouldFail {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"ci_failed","detail":"GitHub Actions IPA job failed"}"#)
+        }
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#

@@ -259,23 +259,22 @@ public struct RootView: View {
                         await conversation.resumeAfterForeground()
                         await coding.resumePendingClaudeIfNeeded()
                         await coding.resumePendingCursorRunIfNeeded()
-                    case .background, .inactive:
+                    case .background:
+                        // Only park Realtime reconnect when truly backgrounded.
+                        // `.inactive` (Control Center, app switcher, brief overlays)
+                        // must not mark the session inactive — that caused connection
+                        // loss when switching apps briefly.
+                        // Coding keeps its own background task renewals; do not
+                        // cancel or pause bridge SSE/poll here.
                         await conversation.noteEnteredBackground()
+                    case .inactive:
+                        break
                     @unknown default:
                         break
                     }
                 }
             }
         }
-    }
-
-    private func startListeningIfReady() async {
-        guard !conversation.isRunning else { return }
-        if settings.realtimeMintBlocked {
-            showRealtimeWarning = true
-            return
-        }
-        await conversation.start()
     }
 
     // MARK: - Assistant sections
@@ -476,7 +475,9 @@ public struct RootView: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(recording.isRecording ? .red : .accentColor)
+                .disabled(!conversation.isRunning && !recording.isRecording)
                 .accessibilityLabel(recording.isRecording ? "Stop voice recording" : "Begin voice recording")
+                .accessibilityHint("Requires Listen to be on")
             }
             .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
 
@@ -572,8 +573,8 @@ public struct RootView: View {
         } footer: {
             Text(
                 conversation.isRunning
-                    ? "Sends to the active agent over the live session — useful when the mic path is broken."
-                    : "Send opens the agent session automatically, then delivers your message."
+                    ? "Sends to the active agent over the live voice session."
+                    : "Works without Listen — typed chat does not turn on the mic."
             )
         }
     }

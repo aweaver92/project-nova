@@ -48,6 +48,9 @@ public struct AISessionConfig: Sendable, Equatable {
     public var toolDefinitions: [ToolDefinition]
     /// Phrases (after the wake word) that route to the vision path.
     public var visionTriggerPhrases: [String]
+    /// When true, Realtime opens with text-only output (no TTS). Used for silent
+    /// Kitchen photo analysis so meal/fridge vision never arms spoken Listen.
+    public var textOutputOnly: Bool
 
     public init(
         instructions: String = """
@@ -79,7 +82,8 @@ public struct AISessionConfig: Sendable, Equatable {
         useLocalWakeWord: Bool = false,
         streamIdleTimeout: Duration = .seconds(20),
         toolDefinitions: [ToolDefinition] = [],
-        visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
+        visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases,
+        textOutputOnly: Bool = false
     ) {
         self.instructions = instructions
         self.voice = voice
@@ -93,6 +97,7 @@ public struct AISessionConfig: Sendable, Equatable {
         self.streamIdleTimeout = streamIdleTimeout
         self.toolDefinitions = toolDefinitions
         self.visionTriggerPhrases = visionTriggerPhrases
+        self.textOutputOnly = textOutputOnly
     }
 }
 
@@ -761,6 +766,19 @@ public extension Agent {
         public static let sage = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
         public static let remy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A5")!
         public static let scholar = UUID(uuidString: "00000000-0000-0000-0000-0000000000A6")!
+    }
+
+    /// SF Symbol reflecting this agent's specialty (list rows, CTAs).
+    public var systemImage: String {
+        switch id {
+        case SeedID.nova: return "crown.fill"
+        case SeedID.claude: return "chevron.left.forwardslash.chevron.right"
+        case SeedID.max: return "figure.strengthtraining.traditional"
+        case SeedID.sage: return "leaf"
+        case SeedID.remy: return "fork.knife"
+        case SeedID.scholar: return "text.book.closed"
+        default: return isMaster ? "crown.fill" : "person.wave.2.fill"
+        }
     }
 
     /// Common tools most specialists should be able to reach.

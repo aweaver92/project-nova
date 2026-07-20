@@ -128,12 +128,18 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         // GA Realtime session shape: session.type, output_modalities, and audio
         // config nested under audio.input / audio.output (24 kHz PCM both ways).
+        // Kitchen silent vision uses text-only so meal/fridge analysis never TTS.
+        let modalities: [String] = config.textOutputOnly ? ["text"] : ["audio"]
         var sessionDict: [String: Any] = [
             "type": "realtime",
             "model": model,
-            "output_modalities": ["audio"],
-            "instructions": config.instructions,
-            "audio": [
+            "output_modalities": modalities,
+            "instructions": config.instructions
+        ]
+        if config.textOutputOnly {
+            // No mic / VAD / TTS — one-shot image→text for Kitchen photo logging.
+        } else {
+            sessionDict["audio"] = [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
                     "noise_reduction": ["type": "near_field"],
@@ -158,7 +164,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                     "voice": config.voice
                 ] as [String: Any]
             ] as [String: Any]
-        ]
+        }
 
         // Advertise tools so the model can emit function calls the orchestrator
         // dispatches through ToolRouter.
@@ -353,6 +359,12 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func analyze(image: CapturedFrame, prompt: String) async throws -> String {
+        try await analyze(image: image, prompt: prompt, speak: true)
+    }
+
+    /// Vision turn. When `speak` is false, request text-only output so Kitchen
+    /// photo logging never plays TTS through the glasses.
+    public func analyze(image: CapturedFrame, prompt: String, speak: Bool) async throws -> String {
         // Downscale/recompress before base64 so the WebSocket payload (and the
         // model's decode time) stays small — this is the dominant, tunable slice
         // of end-to-end vision latency. base64 also inflates bytes ~33%.
@@ -383,7 +395,16 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             ]
         ])
         ttfaMark = .now
-        try await sendJSON(["type": "response.create"])
+        if speak {
+            try await sendJSON(["type": "response.create"])
+        } else {
+            try await sendJSON([
+                "type": "response.create",
+                "response": [
+                    "output_modalities": ["text"]
+                ]
+            ])
+        }
         // Await the correlated transcript while the receive loop still streams
         // `.outputTranscript` events for live UI. Cap wait so a stuck socket cannot
         // hang the vision path forever.
@@ -425,7 +446,7 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     /// Returns the original bytes unchanged when UIKit isn't available or the
     /// image is already small enough. Longest side is capped so upload + model
     /// decode stay fast without hurting recognition quality.
-    static func prepareForUpload(_ frame: CapturedFrame, maxDimension: CGFloat = 768, quality: CGFloat = 0.5) -> (Data, String) {
+    public static func prepareForUpload(_ frame: CapturedFrame, maxDimension: CGFloat = 768, quality: CGFloat = 0.5) -> (Data, String) {
         #if canImport(UIKit)
         guard let image = UIImage(data: frame.imageData) else { return (frame.imageData, frame.mimeType) }
         let longest = max(image.size.width, image.size.height)
@@ -660,7 +681,8 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 }
                 eventsContinuation?.yield(.outputAudio(pcm16_24k: pcm))
             }
-        case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+        case "response.audio_transcript.delta", "response.output_audio_transcript.delta",
+             "response.output_text.delta", "response.text.delta":
             if let delta = json["delta"] as? String {
                 if analyzeWait != nil { analyzeBuffer += delta }
                 eventsContinuation?.yield(.outputTranscript(delta: delta))

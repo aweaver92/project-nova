@@ -54,6 +54,10 @@ public struct CodingView: View {
         VStack(spacing: 0) {
             repoStatusCard
             Divider()
+            if coding.isCommitAndBuilding {
+                commitAndBuildBanner
+                Divider()
+            }
             if coding.isRunning && coding.stallPhase != .looksStuck {
                 continuityBanner
                 Divider()
@@ -83,17 +87,21 @@ public struct CodingView: View {
             }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text(coding.shortSessionId)
+                    Text(coding.isCommitAndBuilding ? "Commit & Build" : coding.shortSessionId)
                         .font(.caption.monospaced().weight(.semibold))
                     HStack(spacing: 5) {
                         Circle()
-                            .fill(statusColor)
+                            .fill(coding.isCommitAndBuilding ? Color.orange : statusColor)
                             .frame(width: 6, height: 6)
-                        Text(coding.runStatus)
+                        Text(coding.isCommitAndBuilding
+                             ? (coding.commitAndBuildPhaseLabel.isEmpty ? "building" : coding.commitAndBuildPhaseLabel)
+                             : coding.runStatus)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .textCase(.uppercase)
-                        if coding.isRunning, let started = coding.runStartedAt {
+                            .lineLimit(1)
+                        if coding.isCommitAndBuilding, let started = coding.commitAndBuildStartedAt {
+                            ElapsedTimeText(since: started)
+                        } else if coding.isRunning, let started = coding.runStartedAt {
                             ElapsedTimeText(since: started)
                         }
                         if coding.isRunning, let last = coding.lastSSEActivityAt {
@@ -214,6 +222,38 @@ public struct CodingView: View {
 
         Cancel if you are not ready to publish these changes.
         """
+    }
+
+    @ViewBuilder
+    private var commitAndBuildBanner: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(coding.commitAndBuildPhaseLabel.isEmpty
+                     ? "Commit and Build in progress"
+                     : coding.commitAndBuildPhaseLabel)
+                    .font(.caption.weight(.semibold))
+                if let started = coding.commitAndBuildStartedAt {
+                    HStack(spacing: 4) {
+                        Text("Elapsed")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        ElapsedTimeText(since: started)
+                    }
+                }
+                Text(coding.statusMessage.isEmpty
+                     ? "Commit, push, then GitHub Actions IPA build. Safe to lock the phone."
+                     : coding.statusMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
     }
 
     @ViewBuilder
@@ -413,15 +453,32 @@ public struct CodingView: View {
                 }
             }
 
-            if let built = coding.lastCommitAndBuildResult {
+            if let built = coding.lastCommitAndBuildResult, !coding.isCommitAndBuilding {
                 Text(built.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             if coding.isCommitAndBuilding {
-                ProgressView("Building IPA…")
-                    .font(.caption)
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(coding.commitAndBuildPhaseLabel.isEmpty
+                             ? "Commit and Build running…"
+                             : coding.commitAndBuildPhaseLabel)
+                            .font(.caption.weight(.semibold))
+                        if let started = coding.commitAndBuildStartedAt {
+                            HStack(spacing: 4) {
+                                Text("Elapsed")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                ElapsedTimeText(since: started)
+                            }
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
             }
 
             if !coding.statusMessage.isEmpty {

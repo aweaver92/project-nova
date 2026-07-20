@@ -196,11 +196,11 @@ public final class ConversationViewModel {
                 return
             }
             var config = AISessionConfig()
-            // Explicit Listen / typed chat must open Realtime immediately.
+            // Explicit Listen must open Realtime immediately.
             // "Local wake word first" is for idle always-on mode only — if we
             // honor it here, start() returns after on-device mic setup and the
             // UI stays stuck on "Connecting… Starting Realtime…" with no cloud
-            // session (and text chat cannot send).
+            // session.
             config.useLocalWakeWord = false
             config.requireWakeWord = false
             // Show Stop + diagnostics while connect is in flight.
@@ -235,21 +235,31 @@ public final class ConversationViewModel {
         await sendTypedMessage(text)
     }
 
-    /// Typed chat with the active agent. Starts Listen automatically when needed
-    /// so text works even when the mic path is broken.
+    /// Typed chat with the active agent. Independent of Listen: when voice is
+    /// off, opens a short text-only turn (no mic / Listen UI). When Listen is
+    /// already on, injects into the live Realtime session.
     public func sendTypedMessage(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if !isRunning {
-            await start()
-            guard isRunning else { return }
-        }
         // Realtime does not echo typed `input_text` as STT deltas — show it locally.
         // Force a new bubble so a typed turn never concatenates onto partial STT.
         suggestions = []
         transcript.append(ConversationTranscriptLine(role: .user, text: trimmed))
         currentTranscriptRole = .user
-        await orchestrator.sendUserText(trimmed)
+
+        if isRunning {
+            await orchestrator.sendUserText(trimmed)
+        } else {
+            do {
+                let reply = try await orchestrator.sendTypedChatWithoutListen(trimmed)
+                let cleaned = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    appendTranscript(cleaned, role: .assistant)
+                }
+            } catch {
+                errorMessage = String(describing: error)
+            }
+        }
         refreshLatency()
     }
 
@@ -424,6 +434,7 @@ public final class RecordingViewModel {
     private let store: any RecordingStoring
     // Ensures the mic pipeline is live so a recording started from the button
     // actually captures audio even if the conversation isn't already running.
+    // Must NOT arm Assistant Listen — that is manual from the Assistant tab only.
     private let ensureAudioActive: @Sendable () async -> Void
     private var directoryURL: URL?
     private var tasks: [Task<Void, Never>] = []
@@ -1346,6 +1357,10 @@ public final class CodingViewModel {
     public private(set) var isCreatingProject = false
     public private(set) var isPublishing = false
     public private(set) var isCommitAndBuilding = false
+    /// Wall-clock start of the in-flight Commit and Build job.
+    public private(set) var commitAndBuildStartedAt: Date?
+    /// Human phase label while Commit and Build is active.
+    public private(set) var commitAndBuildPhaseLabel: String = ""
     /// Live preview server for the selected repo ("Preview in browser").
     public private(set) var activePreview: BridgePreviewInfo?
     public private(set) var isStartingPreview = false
@@ -1394,6 +1409,8 @@ public final class CodingViewModel {
     public var confirmPublish: ((String, String) async -> Bool)?
     /// Opens URLs (Safari) — injected from AppContainer.
     public var openURL: ((URL) async -> Bool)?
+    /// Local push when Commit and Build finishes (success or failure).
+    public var notifyCommitAndBuildResult: (@Sendable (_ success: Bool, _ detail: String) async -> Void)?
 
     private let bridge: any AgentBridging
     private let settings: any SettingsStoring
@@ -2084,19 +2101,51 @@ public final class CodingViewModel {
             }
         }
         isCommitAndBuilding = true
-        statusMessage = "Committing, pushing, and building IPA…"
-        defer { isCommitAndBuilding = false }
+        commitAndBuildStartedAt = Date()
+        commitAndBuildPhaseLabel = "Committing & pushing…"
+        statusMessage = "Commit and Build started — commit, push, then GitHub Actions IPA (~10–25 min)."
+        defer {
+            isCommitAndBuilding = false
+            commitAndBuildStartedAt = nil
+            commitAndBuildPhaseLabel = ""
+        }
+
+        // Keep the phone awake across the long bridge round-trip (CI often 10–25 min).
+        let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.commit-and-build"))
+        defer { Task { await BackgroundTask.end(bgBox.handle) } }
+        let heartbeat = Task { @MainActor [weak self] in
+            var tick = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled, let self else { break }
+                bgBox.handle = BackgroundTask.renew(bgBox.handle, name: "nova.commit-and-build")
+                tick += 1
+                // After the first minute, most wall time is CI — update the label.
+                if tick >= 4, self.isCommitAndBuilding {
+                    self.commitAndBuildPhaseLabel = "Building IPA on GitHub Actions…"
+                    self.statusMessage = "Waiting on GitHub Actions IPA job (often 10–25 min). You can lock the phone."
+                }
+            }
+        }
+        defer { heartbeat.cancel() }
+
         let request = BridgeCommitAndBuildRequest(
             statusToken: nil,
             commitMessage: "Nova: commit and build IPA"
         )
         let result = await bridge.commitAndBuildIpa(request: request)
+        heartbeat.cancel()
         guard result.ok, let built = Self.decodeCommitAndBuildResult(result.payloadJSON) else {
-            statusMessage = Self.summarize(result.payloadJSON)
+            let summary = Self.summarize(result.payloadJSON)
+            statusMessage = summary
+            commitAndBuildPhaseLabel = "Failed"
+            await notifyCommitAndBuildResult?(false, summary)
             return
         }
         lastCommitAndBuildResult = built
         statusMessage = built.detail
+        commitAndBuildPhaseLabel = "Succeeded"
+        await notifyCommitAndBuildResult?(true, built.detail)
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
     }
@@ -2409,10 +2458,15 @@ public final class CodingViewModel {
         generation: Int,
         pollImmediately: Bool = false
     ) async -> BridgeResult? {
+        // Keep polling while locked — renew the background window each attempt.
+        let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.cursor-recover"))
+        defer { Task { await BackgroundTask.end(bgBox.handle) } }
+
         var attempt = 0
         var delayBeforePoll = !pollImmediately
         while generation == runGeneration, isRunning {
             attempt += 1
+            bgBox.handle = await BackgroundTask.renew(bgBox.handle, name: "nova.cursor-recover")
             runStatus = "reconnecting"
             stallPhase = .stillWorking
             if delayBeforePoll {

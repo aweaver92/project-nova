@@ -555,6 +555,9 @@ public final class AppContainer {
             return false
             #endif
         }
+        codingVM.notifyCommitAndBuildResult = { success, detail in
+            await LocalCommitBuildNotifier.notify(success: success, detail: detail)
+        }
         self.codingVM = codingVM
         self.kitchenVM = RemyKitchenViewModel(
             pantry: pantryStore,
@@ -563,16 +566,14 @@ public final class AppContainer {
             meals: mealPlanStore,
             nutrition: nutritionStore,
             timers: timerService,
-            analyzeImage: { [orchestrator] frame, prompt in
-                // Fridge / meal photo analysis needs an open Realtime socket.
-                // Listen may only arm on-device wake word, so reopen if idle.
-                if await !orchestrator.isStreaming {
-                    if await !orchestrator.isSessionActive {
-                        try await orchestrator.start()
-                    }
-                    try await orchestrator.reopenRealtime()
+            analyzeImage: { [tokenService, useFakeAI] frame, prompt in
+                // Kitchen photo/fridge analysis must NEVER arm Assistant Listen
+                // or speak through Realtime. Silent vision only.
+                if useFakeAI {
+                    return #"{"description":"Test meal","calories":400,"protein_grams":30,"carbs_grams":20,"fat_grams":15,"items":[]}"#
                 }
-                return try await orchestrator.askAboutFrame(frame, prompt: prompt)
+                return try await OpenAIImageAnalyzer(tokenService: tokenService)
+                    .analyze(frame: frame, prompt: prompt)
             },
             captureStill: { [capture] in
                 try await capture.captureStill()
@@ -593,7 +594,10 @@ public final class AppContainer {
         self.recordingVM = RecordingViewModel(
             recorder: recorder,
             store: recordingStore,
-            ensureAudioActive: { try? await orchestrator.start() }
+            ensureAudioActive: {
+                // Do not arm Assistant Listen here. Recording tees the mic only
+                // when Listen is already open; otherwise the recorder starts idle.
+            }
         )
         self.videoRecordingVM = VideoRecordingViewModel(recorder: videoRecorder, store: videoStore)
 

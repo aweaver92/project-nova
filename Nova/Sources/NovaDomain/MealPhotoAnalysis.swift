@@ -26,7 +26,8 @@ public enum MealPhotoAnalysis {
         Identify the food, estimate a reasonable serving size, and estimate calories and macros.
         Reply with ONLY valid JSON (no markdown) in this exact shape:
         {"description":"Grilled chicken salad with vinaigrette","calories":420,"protein_grams":35,"carbs_grams":18,"fat_grams":22}
-        Use whole numbers. description must be a short spoken-friendly meal name. If the photo is not food, still return JSON with description explaining that and zeros for macros.
+        Use whole numbers. description must be a short meal name for the log UI. If the photo is not food, still return JSON with description explaining that and zeros for macros.
+        Do not narrate or speak — JSON only.
         """
 
     /// Parse model output into a meal estimate. Fails if JSON is missing or description is empty.

@@ -350,7 +350,7 @@ public final class RemyKitchenViewModel {
         if ns.domain.contains("NovaError") {
             switch ns.code {
             case 3:
-                return "Voice isn’t connected — open Assistant, tap Listen, then try again."
+                return "AI connection failed — check Settings / Nova Bridge, then try again."
             case 4:
                 return "Credentials problem — check Settings / API keys."
             case 5:
@@ -361,7 +361,7 @@ public final class RemyKitchenViewModel {
         }
         let localized = error.localizedDescription
         if localized.contains("NovaCore.NovaError") || localized.contains("NovaError error") {
-            return "Something went wrong (error \(ns.code)). Open Assistant → Listen, then retry."
+            return "Something went wrong (error \(ns.code)). Check Settings / Bridge, then retry."
         }
         return localized
     }

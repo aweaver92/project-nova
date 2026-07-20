@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(UIKit)
-import UIKit
-#endif
 
 /// Persists an in-flight Claude Code job so unlock/foreground can reattach
 /// without spawning a second process on the bridge.
@@ -46,47 +43,5 @@ enum PendingClaudeJobStore {
             return
         }
         defaults.removeObject(forKey: key)
-    }
-}
-
-/// Short iOS background execution window for bridge start / poll / SSE ticks.
-enum BackgroundTask {
-    struct Handle: @unchecked Sendable {
-        #if canImport(UIKit)
-        let rawValue: Int
-        var id: UIBackgroundTaskIdentifier { UIBackgroundTaskIdentifier(rawValue: rawValue) }
-        #else
-        let rawValue: Int
-        #endif
-    }
-
-    @MainActor
-    static func begin(name: String) -> Handle {
-        #if canImport(UIKit)
-        var id = UIBackgroundTaskIdentifier.invalid
-        id = UIApplication.shared.beginBackgroundTask(withName: name) {
-            UIApplication.shared.endBackgroundTask(id)
-        }
-        return Handle(rawValue: id.rawValue)
-        #else
-        return Handle(rawValue: -1)
-        #endif
-    }
-
-    /// End the previous window and open a fresh one so long polls stay alive.
-    @MainActor
-    static func renew(_ handle: Handle, name: String) -> Handle {
-        end(handle)
-        return begin(name: name)
-    }
-
-    @MainActor
-    static func end(_ handle: Handle) {
-        #if canImport(UIKit)
-        let id = handle.id
-        if id != .invalid {
-            UIApplication.shared.endBackgroundTask(id)
-        }
-        #endif
     }
 }

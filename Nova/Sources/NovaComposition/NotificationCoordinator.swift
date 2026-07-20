@@ -31,6 +31,7 @@ public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDe
         if id.hasPrefix(LocalTimerService.identifierPrefix) {
             Task { await announceTimer(notification) }
         }
+        // Commit-and-build / other alerts: banner + sound is enough.
         completionHandler([.banner, .sound])
     }
 

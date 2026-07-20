@@ -300,8 +300,18 @@ public actor NovaBridgeClient: AgentBridging {
         config.waitsForConnectivity = false
         config.httpAdditionalHeaders = ["Accept": "text/event-stream", "Cache-Control": "no-cache"]
 
-        let bg = await BackgroundTask.begin(name: "nova.cursor-run")
-        defer { Task { await BackgroundTask.end(bg) } }
+        // Keep renewing the iOS background window for the whole SSE lifetime so
+        // Coding stays alive while the phone is locked (same pattern as Claude poll).
+        let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.cursor-run"))
+        defer { Task { await BackgroundTask.end(bgBox.handle) } }
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { break }
+                bgBox.handle = BackgroundTask.renew(bgBox.handle, name: "nova.cursor-run")
+            }
+        }
+        defer { heartbeat.cancel() }
 
         let pump = SSEURLSessionPump()
         let streamSession = URLSession(configuration: config, delegate: pump, delegateQueue: nil)

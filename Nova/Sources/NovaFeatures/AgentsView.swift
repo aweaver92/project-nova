@@ -273,7 +273,7 @@ private struct AgentRow: View {
     var body: some View {
         Button(action: activate) {
             HStack(spacing: 10) {
-                Image(systemName: agent.isMaster ? "crown.fill" : "person.wave.2.fill")
+                Image(systemName: agent.systemImage)
                     .foregroundStyle(isActive ? Color.accentColor : .secondary)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
