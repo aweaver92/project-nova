@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 import NovaDomain
 import NovaLiveActivity
 import Observation
@@ -313,7 +314,7 @@ public final class RemyKitchenViewModel {
             let frame = CapturedFrame(imageData: data, mimeType: mimeType, width: width, height: height)
             try await runScan(on: frame)
         } catch {
-            statusMessage = "Scan failed: \(error.localizedDescription)"
+            statusMessage = "Scan failed: \(Self.userFacingMessage(from: error))"
         }
     }
 
@@ -329,8 +330,20 @@ public final class RemyKitchenViewModel {
             let frame = try await captureStill()
             try await runScan(on: frame)
         } catch {
-            statusMessage = "Glasses scan failed: \(error.localizedDescription)"
+            statusMessage = "Glasses scan failed: \(Self.userFacingMessage(from: error))"
         }
+    }
+
+    /// Prefer `NovaError` tips over Foundation’s opaque `NovaError error N` text.
+    private static func userFacingMessage(from error: Error) -> String {
+        if let nova = error as? NovaError, let tip = nova.errorDescription, !tip.isEmpty {
+            return tip
+        }
+        let localized = error.localizedDescription
+        if localized.contains("NovaCore.NovaError") || localized.contains("NovaError error") {
+            return String(describing: error)
+        }
+        return localized
     }
 
     private func runScan(on frame: CapturedFrame) async throws {
@@ -706,7 +719,7 @@ public final class RemyKitchenViewModel {
             let frame = CapturedFrame(imageData: data, mimeType: mimeType, width: width, height: height)
             try await runMealPhotoLog(on: frame)
         } catch {
-            statusMessage = "Meal photo failed: \(error.localizedDescription)"
+            statusMessage = "Meal photo failed: \(Self.userFacingMessage(from: error))"
         }
     }
 
@@ -723,7 +736,7 @@ public final class RemyKitchenViewModel {
             let frame = try await captureStill()
             try await runMealPhotoLog(on: frame)
         } catch {
-            statusMessage = "Glasses meal log failed: \(error.localizedDescription)"
+            statusMessage = "Glasses meal log failed: \(Self.userFacingMessage(from: error))"
         }
     }
 
