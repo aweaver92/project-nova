@@ -938,8 +938,8 @@ public struct CodingView: View {
                     .font(.headline)
                 Text(
                     coding.selectedRepoId == nil
-                        ? "Pick a repository above, then describe what you want built or fixed."
-                        : "Describe what you want built or fixed, or try one of these."
+                        ? "Pick a repository above, then describe what you want built or fixed — type here or ask Claude by voice. Prefix with /ask for a question with no coding updates."
+                        : "Type a prompt here, or speak to Claude. Start with /ask to get an answer without coding updates."
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -1008,10 +1008,24 @@ public struct CodingView: View {
         case .user:
             HStack {
                 Spacer(minLength: 40)
-                Text(item.text)
-                    .padding(10)
-                    .background(Color.accentColor.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        if item.isAskOnly {
+                            Label("Ask", systemImage: "questionmark.bubble.fill")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        if item.isFromVoice {
+                            Label("Spoken", systemImage: "mic.fill")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(item.text)
+                        .padding(10)
+                        .background(Color.accentColor.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
             }
             .padding(.horizontal)
         case .assistant:
@@ -1253,7 +1267,7 @@ public struct CodingView: View {
                 }
                 #endif
 
-                TextField("Prompt Claude about code or an image…", text: $coding.draft, axis: .vertical)
+                TextField("Prompt… or /ask a question", text: $coding.draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
                 Button {
@@ -1637,19 +1651,43 @@ public struct CodingView: View {
                 } else {
                     ForEach(coding.promptHistory) { entry in
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(entry.text)
-                                .font(.subheadline)
-                                .lineLimit(4)
-                            Text(entry.sentAt.formatted(date: .abbreviated, time: .shortened))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            HStack {
-                                Button("Edit") {
+                            Button {
+                                showPromptHistory = false
+                                Task { await coding.openHistoryEntry(entry) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(entry.text)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.primary)
+                                        .multilineTextAlignment(.leading)
+                                        .lineLimit(4)
+                                    HStack(spacing: 8) {
+                                        Text(entry.sentAt.formatted(date: .abbreviated, time: .shortened))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        if entry.hasReviewableTranscript {
+                                            Text("Tap to review")
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Text("No saved chat yet")
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            HStack(spacing: 16) {
+                                Button("Edit in composer") {
                                     coding.editHistoryEntry(entry)
                                     showPromptHistory = false
                                 }
                                 .font(.caption.weight(.semibold))
-                                Button("Run") {
+                                Button("Run again") {
                                     showPromptHistory = false
                                     Task { await coding.runHistoryEntry(entry) }
                                 }

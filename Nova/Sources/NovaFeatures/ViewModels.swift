@@ -1175,6 +1175,10 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
     public var isExpanded: Bool
     /// For tool rows: false while the tool is still running.
     public var isDone: Bool
+    /// True when the prompt arrived via Claude voice (`push_to_cursor`).
+    public var isFromVoice: Bool
+    /// True when the user sent `/ask …` (read-only Q&A, no coding updates).
+    public var isAskOnly: Bool
 
     public init(
         id: UUID = UUID(),
@@ -1183,7 +1187,9 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         detail: String? = nil,
         diff: String? = nil,
         isExpanded: Bool = false,
-        isDone: Bool = true
+        isDone: Bool = true,
+        isFromVoice: Bool = false,
+        isAskOnly: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -1192,6 +1198,8 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         self.diff = diff
         self.isExpanded = isExpanded
         self.isDone = isDone
+        self.isFromVoice = isFromVoice
+        self.isAskOnly = isAskOnly
     }
 
     /// SF Symbol for tool rows, keyed off the tool name prefix ("edit · path").
@@ -1263,6 +1271,17 @@ public actor InMemoryCodingPromptStore: CodingPromptStoring {
         repos[repoId] = state
     }
 
+    public func updateHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async {
+        var state = await state(repoId: repoId)
+        if let idx = state.history.firstIndex(where: { $0.id == entry.id }) {
+            state.history[idx] = entry
+        } else {
+            state.history.insert(entry, at: 0)
+            if state.history.count > 50 { state.history = Array(state.history.prefix(50)) }
+        }
+        repos[repoId] = state
+    }
+
     public func clearHistory(repoId: String) async {
         var state = await state(repoId: repoId)
         state.history = []
@@ -1325,12 +1344,23 @@ public struct CodingSessionInfo: Identifiable, Equatable, Sendable {
     }
 }
 
+private enum CodingPromptSource: Sendable {
+    case typed
+    case voice
+}
+
 private struct QueuedCodingPrompt {
     let userText: String
     let bridgeCommand: String
     let images: [CodingImageAttachment]
     let repoId: String?
     let workingDirectory: String
+    let source: CodingPromptSource
+    let isAskOnly: Bool
+    /// Original draft including `/ask` so retries preserve ask mode.
+    let rawUserText: String
+    /// Voice tool callers wait on this for a push_to_cursor-shaped JSON payload.
+    let completion: CheckedContinuation<String, Never>?
 }
 
 @MainActor
@@ -1556,6 +1586,7 @@ public final class CodingViewModel {
     /// Re-entering Code view while a session is already active (navigate away,
     /// lock/unlock) must NOT reset the chat or bump `runGeneration` — that was
     /// aborting in-flight Cursor runs and looking like a disconnect.
+    /// Spoken `push_to_cursor` prompts reuse the same session pin and transcript.
     public func beginCodeViewSession() async {
         if isCodeViewSessionActive {
             if isRunning || activeRunId != nil || PendingCursorRunStore.load() != nil {
@@ -1574,8 +1605,27 @@ public final class CodingViewModel {
             return
         }
         isCodeViewSessionActive = true
-        await startNewSession()
-        statusMessage = "Session started — send a prompt to begin the chat."
+        // Restore the shared voice/Coding pin so spoken work appears here.
+        if let pinned = await settings.codingSessionId(),
+           !pinned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            let trimmed = pinned.trimmingCharacters(in: .whitespacesAndNewlines)
+            pinnedSessionId = trimmed
+            await loadMessages(sessionId: trimmed)
+            statusMessage = items.isEmpty
+                ? "Session restored — type here or keep talking to Claude."
+                : "Session restored."
+            return
+        }
+        items = []
+        pinnedSessionId = nil
+        activeRunId = nil
+        isRunning = false
+        runStartedAt = nil
+        runStatus = "idle"
+        stallPhase = .idle
+        lastSSEActivityAt = nil
+        statusMessage = "Session started — type here or ask Claude by voice."
     }
 
     /// After unlock/foreground: reattach to a Claude Code job the bridge kept running.
@@ -2371,19 +2421,23 @@ public final class CodingViewModel {
         let command = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !command.isEmpty || !pendingImages.isEmpty else { return }
         let images = pendingImages
-        let userText = command.isEmpty
+        let rawUserText = command.isEmpty
             ? "Analyze the attached image. Identify the visible error and recommend the next debugging steps."
             : command
-        let bridgeCommand = CodingPromptComposer.command(userText: userText, pins: pinnedPaths)
+        let composition = CodingPromptComposer.compose(userText: rawUserText, pins: pinnedPaths)
         draft = ""
         pendingImages = []
         queuedPrompts.append(
             QueuedCodingPrompt(
-                userText: userText,
-                bridgeCommand: bridgeCommand,
+                userText: composition.displayText,
+                bridgeCommand: composition.bridgeCommand,
                 images: images,
                 repoId: selectedRepoId,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                source: .typed,
+                isAskOnly: composition.isAskOnly,
+                rawUserText: rawUserText,
+                completion: nil
             )
         )
         queuedPromptCount = queuedPrompts.count
@@ -2393,6 +2447,95 @@ public final class CodingViewModel {
             return
         }
 
+        await drainPromptQueue()
+    }
+
+    /// Voice `push_to_cursor` entry point — same SSE queue as typed prompts so
+    /// spoken coding requests appear live in Coding view.
+    public func enqueueFromVoice(
+        command: String,
+        sessionId: String? = nil,
+        repoId: String? = nil
+    ) async -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return #"{"ok":false,"error":"missing_command"}"#
+        }
+
+        if let repoId {
+            let wanted = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !wanted.isEmpty, wanted != selectedRepoId {
+                let result = await bridge.selectRepository(repoId: wanted)
+                guard result.ok else {
+                    return result.payloadJSON
+                }
+                selectedRepoId = wanted
+                await settings.setCodingSelectedRepoId(wanted)
+                let explicitSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if explicitSession.isEmpty {
+                    pinnedSessionId = nil
+                    await settings.setCodingSessionId(nil)
+                    items = []
+                } else {
+                    pinnedSessionId = explicitSession
+                    await settings.setCodingSessionId(explicitSession)
+                    items = []
+                }
+                await refreshRepositories()
+            }
+        }
+
+        if !isCodeViewSessionActive {
+            isCodeViewSessionActive = true
+        }
+
+        let explicit = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let explicit, !explicit.isEmpty {
+            if pinnedSessionId != explicit {
+                pinnedSessionId = explicit
+                await settings.setCodingSessionId(explicit)
+                if items.isEmpty {
+                    await loadMessages(sessionId: explicit)
+                }
+            }
+        } else if pinnedSessionId == nil,
+                  let existing = await settings.codingSessionId(),
+                  !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            let pin = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+            pinnedSessionId = pin
+            if items.isEmpty {
+                await loadMessages(sessionId: pin)
+            }
+        }
+
+        let composition = CodingPromptComposer.compose(userText: trimmed, pins: pinnedPaths)
+        return await withCheckedContinuation { continuation in
+            queuedPrompts.append(
+                QueuedCodingPrompt(
+                    userText: composition.displayText,
+                    bridgeCommand: composition.bridgeCommand,
+                    images: [],
+                    repoId: selectedRepoId,
+                    workingDirectory: workingDirectory,
+                    source: .voice,
+                    isAskOnly: composition.isAskOnly,
+                    rawUserText: trimmed,
+                    completion: continuation
+                )
+            )
+            queuedPromptCount = queuedPrompts.count
+            if isProcessingPromptQueue {
+                statusMessage = "Voice prompt queued · \(queuedPromptCount) waiting"
+                return
+            }
+            Task { @MainActor [weak self] in
+                await self?.drainPromptQueue()
+            }
+        }
+    }
+
+    private func drainPromptQueue() async {
         isProcessingPromptQueue = true
         defer { isProcessingPromptQueue = false }
         while isCodeViewSessionActive, !queuedPrompts.isEmpty {
@@ -2408,21 +2551,42 @@ public final class CodingViewModel {
         let imageSuffix = images.isEmpty
             ? ""
             : "\n📎 \(images.count) image\(images.count == 1 ? "" : "s")"
-        // Transcript keeps the original user text so retries never duplicate pins.
-        items.append(CodingTranscriptItem(kind: .user, text: userText + imageSuffix))
-        lastSentCommand = userText
+        // Transcript shows display text ( `/ask` stripped); retries use rawUserText.
+        items.append(
+            CodingTranscriptItem(
+                kind: .user,
+                text: userText + imageSuffix,
+                isFromVoice: prompt.source == .voice,
+                isAskOnly: prompt.isAskOnly
+            )
+        )
+        lastSentCommand = prompt.rawUserText
         lastSentImages = images
         runGeneration += 1
         let generation = runGeneration
         isRunning = true
         runStatus = "running"
         stallPhase = .running
-        statusMessage = ""
+        if prompt.isAskOnly {
+            statusMessage = "Ask mode — answering without coding updates…"
+        } else if prompt.source == .voice {
+            statusMessage = "Spoken prompt — running in Coding…"
+        } else {
+            statusMessage = ""
+        }
         activeRunId = nil
         runStartedAt = Date()
         lastSSEActivityAt = Date()
+        let connectingLabel: String
+        if prompt.isAskOnly {
+            connectingLabel = "Ask → Cursor…"
+        } else if prompt.source == .voice {
+            connectingLabel = "Voice → Cursor…"
+        } else {
+            connectingLabel = "Connecting to bridge…"
+        }
         activitySteps = [
-            CodingActivityStep(phase: "status", text: "Connecting to bridge…", isDone: false)
+            CodingActivityStep(phase: "status", text: connectingLabel, isDone: false)
         ]
         streamingAssistantId = nil
         streamingThinkingId = nil
@@ -2431,25 +2595,32 @@ public final class CodingViewModel {
 
         let repoId = prompt.repoId
         let cwd = prompt.workingDirectory
+        var historyEntry: CodingPromptHistoryEntry?
+        let transcriptStartIndex = items.count - 1
 
         if let repoId, !repoId.isEmpty {
-            await prompts.appendHistory(
-                CodingPromptHistoryEntry(text: userText),
-                repoId: repoId
+            let entry = CodingPromptHistoryEntry(
+                text: prompt.rawUserText,
+                imageCount: images.count
             )
+            historyEntry = entry
+            await prompts.appendHistory(entry, repoId: repoId)
             await reloadPromptState()
-            let baselineResult = await bridge.createBaseline(repoId: repoId)
-            if baselineResult.ok,
-               let data = baselineResult.payloadJSON.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let baselineId = obj["baselineId"] as? String,
-               !baselineId.isEmpty
-            {
-                activeBaselineId = baselineId
-                agentReview = nil
-                expandedReviewPath = nil
-            } else if !baselineResult.ok {
-                statusMessage = Self.summarize(baselineResult.payloadJSON)
+            // Ask mode is read-only — skip baselines so we don't imply an edit review.
+            if !prompt.isAskOnly {
+                let baselineResult = await bridge.createBaseline(repoId: repoId)
+                if baselineResult.ok,
+                   let data = baselineResult.payloadJSON.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let baselineId = obj["baselineId"] as? String,
+                   !baselineId.isEmpty
+                {
+                    activeBaselineId = baselineId
+                    agentReview = nil
+                    expandedReviewPath = nil
+                } else if !baselineResult.ok {
+                    statusMessage = Self.summarize(baselineResult.payloadJSON)
+                }
             }
         }
 
@@ -2476,7 +2647,15 @@ public final class CodingViewModel {
         eventContinuation.finish()
         await applyTask.value
 
-        guard generation == runGeneration else { return }
+        guard generation == runGeneration else {
+            await persistHistoryTranscript(
+                entry: historyEntry,
+                repoId: repoId,
+                startIndex: transcriptStartIndex
+            )
+            completeVoicePrompt(prompt, payload: #"{"ok":false,"error":"cancelled","status":"cancelled"}"#)
+            return
+        }
         if !result.ok,
            Self.string(result.payloadJSON, key: "status")?.lowercased() == "running",
            let runId = (activeRunId ?? Self.string(result.payloadJSON, key: "runId")),
@@ -2506,10 +2685,33 @@ public final class CodingViewModel {
                     stallPhase = .idle
                     updateCodingPresence(forceActive: false)
                 }
+                await persistHistoryTranscript(
+                    entry: historyEntry,
+                    repoId: repoId,
+                    startIndex: transcriptStartIndex
+                )
+                completeVoicePrompt(
+                    prompt,
+                    payload: voicePayload(
+                        ok: false,
+                        sessionId: pinnedSessionId,
+                        status: "running",
+                        resultText: "Coding run still in progress on the PC.",
+                        fallback: result.payloadJSON
+                    )
+                )
                 return
             }
         }
-        guard generation == runGeneration else { return }
+        guard generation == runGeneration else {
+            await persistHistoryTranscript(
+                entry: historyEntry,
+                repoId: repoId,
+                startIndex: transcriptStartIndex
+            )
+            completeVoicePrompt(prompt, payload: #"{"ok":false,"error":"cancelled","status":"cancelled"}"#)
+            return
+        }
         stopWatchdog()
         isRunning = false
         runStartedAt = nil
@@ -2540,7 +2742,68 @@ public final class CodingViewModel {
         }
         await refreshSessions()
         await refreshRepoStatusAndDiff()
-        await refreshAgentReview()
+        if !prompt.isAskOnly {
+            await refreshAgentReview()
+        }
+
+        await persistHistoryTranscript(
+            entry: historyEntry,
+            repoId: repoId,
+            startIndex: transcriptStartIndex
+        )
+
+        let assistantText = items.last(where: { $0.kind == .assistant })?.text ?? ""
+        completeVoicePrompt(
+            prompt,
+            payload: voicePayload(
+                ok: result.ok,
+                sessionId: pinnedSessionId,
+                status: runStatus,
+                resultText: assistantText,
+                fallback: result.payloadJSON
+            )
+        )
+    }
+
+    private func persistHistoryTranscript(
+        entry: CodingPromptHistoryEntry?,
+        repoId: String?,
+        startIndex: Int
+    ) async {
+        guard let repoId, !repoId.isEmpty, var entry else { return }
+        let end = items.count
+        let start = max(0, min(startIndex, end))
+        entry.sessionId = pinnedSessionId
+        entry.transcript = items[start..<end].map(Self.storedTurn(from:))
+        await prompts.updateHistory(entry, repoId: repoId)
+        await reloadPromptState()
+    }
+
+    private func completeVoicePrompt(_ prompt: QueuedCodingPrompt, payload: String) {
+        prompt.completion?.resume(returning: payload)
+    }
+
+    private func voicePayload(
+        ok: Bool,
+        sessionId: String?,
+        status: String,
+        resultText: String,
+        fallback: String
+    ) -> String {
+        var obj: [String: Any] = [
+            "ok": ok,
+            "status": status,
+            "result": resultText,
+        ]
+        if let sessionId, !sessionId.isEmpty {
+            obj["sessionId"] = sessionId
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: obj),
+           let json = String(data: data, encoding: .utf8)
+        {
+            return json
+        }
+        return fallback
     }
 
     /// Poll the existing run after its SSE transport disappears.
@@ -2640,6 +2903,12 @@ public final class CodingViewModel {
     }
 
     private func clearQueuedPrompts() {
+        for prompt in queuedPrompts {
+            completeVoicePrompt(
+                prompt,
+                payload: #"{"ok":false,"error":"cancelled","status":"cancelled"}"#
+            )
+        }
         queuedPrompts.removeAll()
         queuedPromptCount = 0
     }
@@ -2725,13 +2994,72 @@ public final class CodingViewModel {
         await reloadPromptState()
     }
 
+    public func openHistoryEntry(_ entry: CodingPromptHistoryEntry) async {
+        guard isCodeViewSessionActive else {
+            statusMessage = "Reopen Code view to review a recent prompt."
+            return
+        }
+        if isRunning {
+            statusMessage = "Wait for the current run to finish before opening Recent."
+            return
+        }
+
+        if entry.hasReviewableTranscript {
+            items = entry.transcript.compactMap(Self.transcriptItem(from:))
+            if let sid = entry.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sid.isEmpty
+            {
+                pinnedSessionId = sid
+                await settings.setCodingSessionId(sid)
+            }
+            statusMessage = "Restored conversation from Recent — review only (not re-sent)."
+            return
+        }
+
+        if let sid = entry.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sid.isEmpty
+        {
+            await attach(sessionId: sid)
+            if !items.isEmpty {
+                statusMessage = "Restored Cursor session from Recent."
+                return
+            }
+        }
+
+        draft = entry.text
+        statusMessage = "No saved transcript for this prompt — text loaded into the composer."
+    }
+
+    public func editHistoryEntry(_ entry: CodingPromptHistoryEntry) {
+        draft = entry.text
+    }
+
+    /// Re-send a recent prompt (explicit; Open is the default Recent action).
     public func runHistoryEntry(_ entry: CodingPromptHistoryEntry) async {
         draft = entry.text
         await send()
     }
 
-    public func editHistoryEntry(_ entry: CodingPromptHistoryEntry) {
-        draft = entry.text
+    private static func storedTurn(from item: CodingTranscriptItem) -> CodingStoredTurn {
+        CodingStoredTurn(
+            role: item.kind.rawValue,
+            text: item.text,
+            detail: item.detail,
+            isFromVoice: item.isFromVoice,
+            isAskOnly: item.isAskOnly
+        )
+    }
+
+    private static func transcriptItem(from turn: CodingStoredTurn) -> CodingTranscriptItem? {
+        guard let kind = CodingTranscriptItem.Kind(rawValue: turn.role) else { return nil }
+        guard !turn.text.isEmpty || kind == .user || kind == .assistant else { return nil }
+        return CodingTranscriptItem(
+            kind: kind,
+            text: turn.text,
+            detail: turn.detail,
+            isFromVoice: turn.isFromVoice,
+            isAskOnly: turn.isAskOnly
+        )
     }
 
     public func pinPath(_ path: String, isDirectory: Bool) async {

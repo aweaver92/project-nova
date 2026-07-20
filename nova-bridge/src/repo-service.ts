@@ -463,16 +463,25 @@ export async function runProcess(
     PATH: pathWithTools,
     SystemRoot: process.env.SystemRoot,
     windir: process.env.windir ?? process.env.SystemRoot,
+    SystemDrive: process.env.SystemDrive,
     USERPROFILE: process.env.USERPROFILE,
     HOME: process.env.HOME,
+    HOMEDRIVE: process.env.HOMEDRIVE,
+    HOMEPATH: process.env.HOMEPATH,
     USERNAME: process.env.USERNAME,
     USERDOMAIN: process.env.USERDOMAIN,
     APPDATA: process.env.APPDATA,
     LOCALAPPDATA: process.env.LOCALAPPDATA,
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
     ProgramFiles: process.env.ProgramFiles,
     ProgramW6432: process.env.ProgramW6432,
     "ProgramFiles(x86)": process.env["ProgramFiles(x86)"],
     ComSpec: process.env.ComSpec,
+    // Without PATHEXT (.EXE;.CMD;...), PowerShell cannot launch gh/git and
+    // $LASTEXITCODE stays $null — which `-ne 0` treats as failure.
+    PATHEXT: process.env.PATHEXT,
+    OS: process.env.OS,
     LANG: process.env.LANG ?? "C",
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",
@@ -486,6 +495,10 @@ export async function runProcess(
   // Strip credential helpers that might prompt; keep GH token auth via gh itself.
   delete env.GIT_ASKPASS;
   delete env.SSH_ASKPASS;
+  // Node spawn rejects / stringifies undefined env values poorly on Windows.
+  for (const key of Object.keys(env)) {
+    if (env[key] === undefined || env[key] === null) delete env[key];
+  }
 
   return new Promise((resolvePromise, rejectPromise) => {
     let stdout = "";

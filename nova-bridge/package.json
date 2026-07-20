@@ -14,6 +14,8 @@
     "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-service.ps1",
     "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-bridge.ps1",
     "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-bridge.ps1",
+    "watchdog:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-bridge-watchdog.ps1",
+    "watchdog:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-watchdog.ps1",
     "typecheck": "tsc --noEmit",
     "test:stream": "tsx src/cursor-stream.test.ts",
     "test:repos": "tsx src/repo-service.test.ts",

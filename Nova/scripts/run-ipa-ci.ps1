@@ -56,9 +56,12 @@ $git = Join-Path $gitBin "git.exe"
 if (-not (Test-Path $git)) { $git = "git" }
 
 # Fail early with a clear message when the bridge spawn can't use keyring auth.
-$authOut = & $gh auth status 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw "gh is not authenticated in this environment. Run 'gh auth login' on the PC, or set GH_TOKEN for the bridge. Detail: $(($authOut | Out-String).Trim())"
+# Capture exit code immediately — under a thin env without PATHEXT, native
+# commands may not run and $LASTEXITCODE stays $null ($null -ne 0 is $true).
+$authOut = & $gh auth status 2>&1 | Out-String
+$authCode = $LASTEXITCODE
+if ($null -eq $authCode -or $authCode -ne 0) {
+    throw "gh is not authenticated in this environment (exit=$authCode). Run 'gh auth login' on the PC, or set GH_TOKEN for the bridge. Detail: $($authOut.Trim())"
 }
 
 Push-Location $RepoRoot
@@ -107,15 +110,15 @@ try {
     $dispatchErr = $null
     $dispatched = $false
     for ($attempt = 1; $attempt -le 6; $attempt++) {
-        $dispatchOut = & $gh workflow run CI --ref $Ref 2>&1
+        $dispatchOut = & $gh workflow run CI --ref $Ref 2>&1 | Out-String
         $dispatchCode = $LASTEXITCODE
-        if ($dispatchCode -eq 0) {
+        if ($null -ne $dispatchCode -and $dispatchCode -eq 0) {
             $dispatched = $true
-            if ($dispatchOut) { Write-Host ($dispatchOut | Out-String).TrimEnd() }
+            if ($dispatchOut.Trim()) { Write-Host $dispatchOut.TrimEnd() }
             break
         }
-        $dispatchErr = (($dispatchOut | Out-String).Trim())
-        if (-not $dispatchErr) { $dispatchErr = "(no gh output, exit $dispatchCode)" }
+        $dispatchErr = $dispatchOut.Trim()
+        if (-not $dispatchErr) { $dispatchErr = "(no gh output, exit=$dispatchCode)" }
         Write-Warning "gh workflow run attempt $attempt/6 failed: $dispatchErr"
         Start-Sleep -Seconds ([Math]::Min(20, 2 * $attempt))
     }

@@ -35,18 +35,28 @@ public struct RunClaudeCodeTool: Tool {
 /// Push a command into an active Cursor session on the user's dev machine.
 /// When `session_id` is omitted, uses the Coding-tab pinned session; after a
 /// successful send, pins the returned session id so the Coding tab can preview it.
+/// When `runThroughCodingUI` is set (app wiring), the prompt runs through the
+/// Coding view SSE queue so spoken requests appear in the transcript.
 public struct PushToCursorTool: Tool {
     public let name = "push_to_cursor"
-    public let description = "Send a command or prompt to the user's active Cursor session in the selected repository. Prefer omitting session_id so the pinned Coding-tab session is used."
+    public let description = "Send a command or prompt to the user's active Cursor session in the selected repository. Prefer omitting session_id so the pinned Coding-tab session is used. Spoken prompts appear live in the Coding tab."
     public let requiresConfirmation = true
     public let parametersJSON = """
     {"type":"object","properties":{"command":{"type":"string","description":"The command or prompt to send to Cursor."},"session_id":{"type":"string","description":"Optional id of a specific Cursor session (from list_cursor_sessions). Omit to use the pinned Coding-tab session."},"repo_id":{"type":"string","description":"Optional opaque repository id from list_repos. Defaults to the Coding-tab selection."}},"required":["command"],"additionalProperties":false}
     """
     private let bridge: any AgentBridging
     private let settings: any SettingsStoring
-    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+    /// Optional Coding-tab runner: (command, sessionId?, repoId?) → JSON payload.
+    private let runThroughCodingUI: (@Sendable (String, String?, String?) async -> String)?
+
+    public init(
+        bridge: any AgentBridging,
+        settings: any SettingsStoring,
+        runThroughCodingUI: (@Sendable (String, String?, String?) async -> String)? = nil
+    ) {
         self.bridge = bridge
         self.settings = settings
+        self.runThroughCodingUI = runThroughCodingUI
     }
 
     public func invoke(argumentsJSON: String) async throws -> String {
@@ -59,19 +69,27 @@ public struct PushToCursorTool: Tool {
         let sessionId = (explicit?.isEmpty == false)
             ? explicit
             : (repoId == selected ? pinned : nil)
-        let result = await bridge.pushToCursor(
-            command: args.command,
-            sessionId: sessionId,
-            workingDirectory: nil,
-            repoId: repoId
-        )
+
+        let payload: String
+        if let runThroughCodingUI {
+            payload = await runThroughCodingUI(args.command, sessionId, repoId)
+        } else {
+            let result = await bridge.pushToCursor(
+                command: args.command,
+                sessionId: sessionId,
+                workingDirectory: nil,
+                repoId: repoId
+            )
+            payload = result.payloadJSON
+        }
+
         if repoId == selected,
-           let returned = Self.sessionId(from: result.payloadJSON),
+           let returned = Self.sessionId(from: payload),
            !returned.isEmpty
         {
             await settings.setCodingSessionId(returned)
         }
-        return result.payloadJSON
+        return payload
     }
 
     private static func sessionId(from payloadJSON: String) -> String? {

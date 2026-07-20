@@ -962,6 +962,32 @@ final class CodingPromptComposerTests: XCTestCase {
         XCTAssertTrue(composed.contains("- src/components (directory)"))
         XCTAssertTrue(composed.hasSuffix("Add a button"))
     }
+
+    func testAskPrefixIsReadOnlyAndStripsPrefix() {
+        let ask = CodingPromptComposer.compose(
+            userText: "  /ask What does CodingViewModel.send do?  ",
+            pins: []
+        )
+        XCTAssertTrue(ask.isAskOnly)
+        XCTAssertEqual(ask.displayText, "What does CodingViewModel.send do?")
+        XCTAssertTrue(ask.bridgeCommand.contains("READ-ONLY Q&A"))
+        XCTAssertTrue(ask.bridgeCommand.contains("Do not create, edit, delete"))
+        XCTAssertTrue(ask.bridgeCommand.contains("What does CodingViewModel.send do?"))
+        XCTAssertFalse(ask.bridgeCommand.hasPrefix("/ask"))
+
+        let withPins = CodingPromptComposer.compose(
+            userText: "/ASK explain this",
+            pins: [CodingContextPin(path: "ViewModels.swift", kind: "file")]
+        )
+        XCTAssertTrue(withPins.isAskOnly)
+        XCTAssertTrue(withPins.bridgeCommand.contains("Focus on these paths"))
+        XCTAssertTrue(withPins.bridgeCommand.contains("explain this"))
+
+        XCTAssertNil(CodingPromptComposer.askQuestion(from: "fix the bug"))
+        XCTAssertNil(CodingPromptComposer.askQuestion(from: "/askfoo"))
+        XCTAssertEqual(CodingPromptComposer.askQuestion(from: "/ask"), "")
+        XCTAssertFalse(CodingPromptComposer.compose(userText: "fix /ask later", pins: []).isAskOnly)
+    }
 }
 
 final class WorkoutPlanProgressTests: XCTestCase {

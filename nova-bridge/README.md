@@ -119,6 +119,19 @@ You should see `Nova Bridge listening on http://0.0.0.0:8787`.
 The bridge also advertises `_nova-bridge._tcp` over Bonjour/mDNS so Nova can
 follow DHCP address changes automatically after a router restart.
 
+### Keep it alive (PC watchdog)
+
+If the bridge process dies (PC sleep, crash, closed terminal), a small watchdog
+polls `/health` every 30s and restarts it:
+
+```powershell
+npm run watchdog:install    # logon task + start now
+# npm run watchdog:uninstall
+```
+
+Logs land in `nova-bridge/logs/watchdog.log`. This is PC-side only — the phone
+cannot start a fully stopped bridge by itself.
+
 Smoke-test locally:
 
 ```bash
@@ -197,9 +210,12 @@ In Nova → **Settings → Bridge**:
 - Tap **Save bridge settings**
 
 Then open the **Coding** tab (visible while Claude is the active agent) to attach a
-Cursor session by id, type prompts, and watch the live SSE preview. Or say
+Cursor session by id, type prompts, and watch the live SSE preview. Prefix a prompt
+with `/ask` for a read-only question (no coding updates). Open **Recent** and tap a
+prompt to restore that prompt’s saved chat for review (use **Run again** only when you
+want to re-send). Or say
 *"Nova, let me talk to Claude"* and give it a coding task — voice `push_to_cursor`
-uses the same pinned session id as the Coding tab.
+runs through the same Coding transcript and pinned session as typed prompts.
 
 (Config precedence in the app: in-app Settings → `NOVA_BRIDGE_URL` / `NOVA_BRIDGE_TOKEN`
 env → `NovaBridgeBaseURL` / `NovaBridgeToken` in `Secrets.xcconfig`.)

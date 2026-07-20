@@ -81,6 +81,21 @@ public actor FileCodingPromptStore: CodingPromptStoring {
         persist()
     }
 
+    public func updateHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async {
+        let key = normalizeRepoId(repoId)
+        var state = await state(repoId: key)
+        if let idx = state.history.firstIndex(where: { $0.id == entry.id }) {
+            state.history[idx] = entry
+        } else {
+            state.history.insert(entry, at: 0)
+            if state.history.count > Self.maxHistory {
+                state.history = Array(state.history.prefix(Self.maxHistory))
+            }
+        }
+        bag.repos[key] = state
+        persist()
+    }
+
     public func clearHistory(repoId: String) async {
         let key = normalizeRepoId(repoId)
         var state = await state(repoId: key)

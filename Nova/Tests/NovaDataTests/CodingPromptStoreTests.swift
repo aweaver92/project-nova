@@ -18,7 +18,14 @@ final class CodingPromptStoreTests: XCTestCase {
             repoId: repoId
         )
         await store.appendHistory(
-            CodingPromptHistoryEntry(text: "Add dark mode"),
+            CodingPromptHistoryEntry(
+                text: "Add dark mode",
+                sessionId: "agent-1",
+                transcript: [
+                    CodingStoredTurn(role: "user", text: "Add dark mode"),
+                    CodingStoredTurn(role: "assistant", text: "Done."),
+                ]
+            ),
             repoId: repoId
         )
         await store.setPinnedPaths(
@@ -33,6 +40,9 @@ final class CodingPromptStoreTests: XCTestCase {
         let state = await reloaded.state(repoId: repoId)
         XCTAssertEqual(state.templates.first?.title, "Fix tests")
         XCTAssertEqual(state.history.first?.text, "Add dark mode")
+        XCTAssertEqual(state.history.first?.sessionId, "agent-1")
+        XCTAssertEqual(state.history.first?.transcript.count, 2)
+        XCTAssertEqual(state.history.first?.transcript.last?.text, "Done.")
         XCTAssertEqual(state.pinnedPaths.map(\.path), ["src", "README.md"])
 
         let other = await reloaded.state(repoId: "1111111111111111")
@@ -67,6 +77,12 @@ final class CodingPromptStoreTests: XCTestCase {
         let history = await store.state(repoId: repoId)
         XCTAssertEqual(history.history.count, 50)
         XCTAssertEqual(history.history.first?.text, "prompt 54")
+
+        var updated = history.history[0]
+        updated.transcript = [CodingStoredTurn(role: "user", text: updated.text)]
+        await store.updateHistory(updated, repoId: repoId)
+        let afterUpdate = await store.state(repoId: repoId)
+        XCTAssertEqual(afterUpdate.history.first?.transcript.count, 1)
 
         for i in 0..<25 {
             await store.upsertTemplate(

@@ -815,23 +815,65 @@ public struct CodingPromptTemplate: Identifiable, Sendable, Equatable, Codable {
     }
 }
 
+public struct CodingStoredTurn: Sendable, Equatable, Codable {
+    public var role: String
+    public var text: String
+    public var detail: String?
+    public var isFromVoice: Bool
+    public var isAskOnly: Bool
+
+    public init(
+        role: String,
+        text: String,
+        detail: String? = nil,
+        isFromVoice: Bool = false,
+        isAskOnly: Bool = false
+    ) {
+        self.role = role
+        self.text = text
+        self.detail = detail
+        self.isFromVoice = isFromVoice
+        self.isAskOnly = isAskOnly
+    }
+}
+
 public struct CodingPromptHistoryEntry: Identifiable, Sendable, Equatable, Codable {
     public let id: UUID
     public var text: String
     public var sentAt: Date
     public var imageCount: Int
+    /// Cursor session that handled this prompt (when known).
+    public var sessionId: String?
+    /// Local snapshot of the prompt + responses for offline review.
+    public var transcript: [CodingStoredTurn]
 
     public init(
         id: UUID = UUID(),
         text: String,
         sentAt: Date = Date(),
-        imageCount: Int = 0
+        imageCount: Int = 0,
+        sessionId: String? = nil,
+        transcript: [CodingStoredTurn] = []
     ) {
         self.id = id
         self.text = text
         self.sentAt = sentAt
         self.imageCount = imageCount
+        self.sessionId = sessionId
+        self.transcript = transcript
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        text = try c.decode(String.self, forKey: .text)
+        sentAt = try c.decode(Date.self, forKey: .sentAt)
+        imageCount = try c.decodeIfPresent(Int.self, forKey: .imageCount) ?? 0
+        sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+        transcript = try c.decodeIfPresent([CodingStoredTurn].self, forKey: .transcript) ?? []
+    }
+
+    public var hasReviewableTranscript: Bool { !transcript.isEmpty }
 }
 
 public struct CodingContextPin: Identifiable, Sendable, Equatable, Codable {
@@ -868,16 +910,72 @@ public struct CodingRepoPromptState: Sendable, Equatable, Codable {
 }
 
 /// Prefixes pinned repo-relative paths onto a Coding prompt without mutating history text.
+/// Prompts that begin with `/ask` become read-only Q&A (no file edits or mutating commands).
 public enum CodingPromptComposer {
-    public static func command(userText: String, pins: [CodingContextPin]) -> String {
+    public struct Composition: Sendable, Equatable {
+        /// Text shown in the Coding transcript ( `/ask` prefix stripped when present).
+        public let displayText: String
+        /// Prompt sent to the Cursor agent (includes ask-mode guardrails when needed).
+        public let bridgeCommand: String
+        /// True when the user prefixed the prompt with `/ask`.
+        public let isAskOnly: Bool
+
+        public init(displayText: String, bridgeCommand: String, isAskOnly: Bool) {
+            self.displayText = displayText
+            self.bridgeCommand = bridgeCommand
+            self.isAskOnly = isAskOnly
+        }
+    }
+
+    public static func compose(userText: String, pins: [CodingContextPin]) -> Composition {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pins.isEmpty else { return trimmed }
+        if let question = askQuestion(from: trimmed) {
+            let body = question.isEmpty
+                ? "Answer the user's question about this repository."
+                : question
+            let focused = focusedBody(body, pins: pins)
+            let bridgeCommand = """
+            READ-ONLY Q&A — answer the question only. Do not make any coding updates.
+            Do not create, edit, delete, rename, or move files.
+            Do not run shell commands that change the working tree, install packages, commit, push, or start long-running servers.
+            You may read files and search the codebase to answer accurately. Reply in clear prose.
+
+            \(focused)
+            """
+            return Composition(displayText: body, bridgeCommand: bridgeCommand, isAskOnly: true)
+        }
+        let bridgeCommand = focusedBody(trimmed, pins: pins)
+        return Composition(displayText: trimmed, bridgeCommand: bridgeCommand, isAskOnly: false)
+    }
+
+    /// Builds the bridge prompt (pins + ask-mode wrapping). Prefer `compose` when you need flags.
+    public static func command(userText: String, pins: [CodingContextPin]) -> String {
+        compose(userText: userText, pins: pins).bridgeCommand
+    }
+
+    /// Returns the question text when `userText` starts with `/ask` (case-insensitive), else nil.
+    public static func askQuestion(from userText: String) -> String? {
+        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 4 else { return nil }
+        let prefix = trimmed.prefix(4)
+        guard prefix.lowercased() == "/ask" else { return nil }
+        let rest = trimmed.dropFirst(4)
+        if rest.isEmpty { return "" }
+        guard let first = rest.first, first.isWhitespace || first.isNewline else {
+            // "/askfoo" is not ask mode
+            return nil
+        }
+        return rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func focusedBody(_ body: String, pins: [CodingContextPin]) -> String {
+        guard !pins.isEmpty else { return body }
         var lines = ["Focus on these paths (repo-relative):"]
         for pin in pins.prefix(3) {
             lines.append("- \(pin.path) (\(pin.isDirectory ? "directory" : "file"))")
         }
         lines.append("")
-        lines.append(trimmed)
+        lines.append(body)
         return lines.joined(separator: "\n")
     }
 }
@@ -888,6 +986,7 @@ public protocol CodingPromptStoring: Sendable {
     func upsertTemplate(_ template: CodingPromptTemplate, repoId: String) async
     func deleteTemplate(id: UUID, repoId: String) async
     func appendHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async
+    func updateHistory(_ entry: CodingPromptHistoryEntry, repoId: String) async
     func clearHistory(repoId: String) async
 }
 

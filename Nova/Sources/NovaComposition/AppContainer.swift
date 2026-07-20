@@ -273,9 +273,10 @@ public final class AppContainer {
         // base URL + token are provided (env or Info.plist).
         let ha = HomeAssistantConfig.load()
         // Bound after the orchestrator exists so voice can call switch_agent /
-        // open_app_screen.
+        // open_app_screen. Coding voice sink binds after CodingViewModel exists.
         let switchAgentSink = SwitchAgentSink()
         let openAppScreenSink = OpenAppScreenSink()
+        let codingVoiceSink = CodingVoiceSink(bridge: bridge, settings: settingsStore)
         let appNavigation = AppNavigationBridge()
         self.appNavigation = appNavigation
         var tools: [any Tool] = [
@@ -343,7 +344,17 @@ public final class AppContainer {
             RepoDiffTool(bridge: bridge, settings: settingsStore),
             PublishRepoTool(bridge: bridge, settings: settingsStore),
             RunClaudeCodeTool(bridge: bridge, settings: settingsStore),
-            PushToCursorTool(bridge: bridge, settings: settingsStore),
+            PushToCursorTool(
+                bridge: bridge,
+                settings: settingsStore,
+                runThroughCodingUI: { command, sessionId, repoId in
+                    await codingVoiceSink.run(
+                        command: command,
+                        sessionId: sessionId,
+                        repoId: repoId
+                    )
+                }
+            ),
             ListCursorSessionsTool(bridge: bridge, settings: settingsStore),
             GetCursorSessionHistoryTool(bridge: bridge, settings: settingsStore),
             // Max's workout + plan tools.
@@ -564,6 +575,7 @@ public final class AppContainer {
         codingVM.notifyCommitAndBuildResult = { success, detail in
             await LocalCommitBuildNotifier.notify(success: success, detail: detail)
         }
+        codingVoiceSink.bind(codingVM)
         self.codingVM = codingVM
         self.kitchenVM = RemyKitchenViewModel(
             pantry: pantryStore,
@@ -630,6 +642,59 @@ struct FrameCaptureBandwidthBridge: MetaDATBandwidthBridge {
     let capture: MetaDATFrameCapture
     func holdVideoForAudio(_ hold: Bool) async {
         await capture.setAudioPriorityHold(hold)
+    }
+}
+
+/// Late-binds voice `push_to_cursor` → CodingViewModel SSE queue so spoken
+/// prompts appear in the Coding transcript. Falls back to blocking bridge
+/// `/cursor/command` until Coding is ready.
+private final class CodingVoiceSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var coding: CodingViewModel?
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+
+    init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    func bind(_ coding: CodingViewModel) {
+        lock.lock()
+        self.coding = coding
+        lock.unlock()
+    }
+
+    func run(command: String, sessionId: String?, repoId: String?) async -> String {
+        lock.lock()
+        let codingVM = coding
+        lock.unlock()
+        if let codingVM {
+            return await codingVM.enqueueFromVoice(
+                command: command,
+                sessionId: sessionId,
+                repoId: repoId
+            )
+        }
+        let result = await bridge.pushToCursor(
+            command: command,
+            sessionId: sessionId,
+            workingDirectory: nil,
+            repoId: repoId
+        )
+        if let returned = Self.sessionId(from: result.payloadJSON), !returned.isEmpty {
+            await settings.setCodingSessionId(returned)
+        }
+        return result.payloadJSON
+    }
+
+    private static func sessionId(from payloadJSON: String) -> String? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["sessionId"] as? String
+        else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

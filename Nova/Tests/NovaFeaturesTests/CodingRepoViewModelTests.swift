@@ -75,10 +75,11 @@ final class CodingRepoViewModelTests: XCTestCase {
         let settings = MemorySettings(repoId: "1111111111111111", sessionId: "stale")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
-        // Code view sessions start fresh — persisted pins are not auto-restored.
+        // Pins are restored when Code view opens (shared with voice).
         XCTAssertNil(vm.pinnedSessionId)
 
         await vm.beginCodeViewSession()
+        XCTAssertEqual(vm.pinnedSessionId, "stale")
         await vm.attach(sessionId: "stale")
         XCTAssertEqual(vm.pinnedSessionId, "stale")
 
@@ -89,16 +90,34 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertNil(sessionAfter)
     }
 
-    func testBeginCodeViewSessionClearsPriorPin() async {
+    func testBeginCodeViewSessionRestoresPriorPin() async {
         let bridge = DirtyRepoBridge()
         let settings = MemorySettings(repoId: "abcdef0123456789", sessionId: "old-agent")
         let vm = CodingViewModel(bridge: bridge, settings: settings)
         await vm.load()
         await vm.beginCodeViewSession()
-        XCTAssertNil(vm.pinnedSessionId)
-        let cleared = await settings.codingSessionId()
-        XCTAssertNil(cleared)
-        XCTAssertTrue(vm.items.isEmpty)
+        XCTAssertEqual(vm.pinnedSessionId, "old-agent")
+        let kept = await settings.codingSessionId()
+        XCTAssertEqual(kept, "old-agent")
+    }
+
+    func testEnqueueFromVoiceAppearsInTranscriptAndPinsSession() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        let payload = await vm.enqueueFromVoice(command: "spoken fix the bug")
+        XCTAssertTrue(payload.contains("agent-test"))
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        XCTAssertEqual(vm.items.first?.kind, .user)
+        XCTAssertEqual(vm.items.first?.text, "spoken fix the bug")
+        XCTAssertEqual(vm.items.first?.isFromVoice, true)
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["spoken fix the bug"])
+        let pinned = await settings.codingSessionId()
+        XCTAssertEqual(pinned, "agent-test")
     }
 
     func testReenteringCodeViewPreservesActiveSessionAndRun() async {
@@ -257,6 +276,30 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(vm.activePreview?.url, "http://192.168.0.66:8790/src/page.html")
         let target = await bridge.receivedPreviewPath
         XCTAssertEqual(target, "src/page.html")
+    }
+
+    func testAskPromptIsReadOnlyInBridgeCommandAndTranscript() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "/ask What does send() do?"
+        await vm.send()
+
+        XCTAssertEqual(vm.items.first?.text, "What does send() do?")
+        XCTAssertEqual(vm.items.first?.isAskOnly, true)
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands.count, 1)
+        XCTAssertTrue(commands[0].contains("READ-ONLY Q&A"))
+        XCTAssertTrue(commands[0].contains("What does send() do?"))
+        XCTAssertFalse(commands[0].contains("/ask What"))
+        let baselines = await bridge.baselineCreateCount
+        XCTAssertEqual(baselines, 0)
+        XCTAssertEqual(vm.promptHistory.first?.text, "/ask What does send() do?")
+        await vm.retryLast()
+        XCTAssertEqual(vm.draft, "/ask What does send() do?")
     }
 
     func testPromptPinsComposeBridgeCommandButNotTranscript() async {
@@ -572,6 +615,49 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(vm.savedTemplates.first?.title, "Dark mode")
         XCTAssertEqual(vm.promptHistory.first?.text, "history prompt")
     }
+
+    func testOpenHistoryEntryRestoresTranscriptWithoutResending() async {
+        let prompts = InMemoryCodingPromptStore()
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first reviewable prompt"
+        await vm.send()
+        XCTAssertTrue(vm.promptHistory.first?.hasReviewableTranscript == true)
+        XCTAssertEqual(vm.promptHistory.first?.sessionId, "agent-test")
+        let saved = try XCTUnwrap(vm.promptHistory.first)
+
+        vm.draft = "second prompt clears the live transcript"
+        await vm.send()
+        XCTAssertTrue(vm.items.contains(where: { $0.text == "second prompt clears the live transcript" }))
+
+        let commandsBeforeOpen = await bridge.receivedCommands
+        await vm.openHistoryEntry(saved)
+        let commandsAfterOpen = await bridge.receivedCommands
+        XCTAssertEqual(commandsBeforeOpen, commandsAfterOpen, "opening Recent must not re-send")
+        XCTAssertEqual(vm.items.first?.text, "first reviewable prompt")
+        XCTAssertTrue(vm.items.contains(where: { $0.kind == .assistant }))
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        XCTAssertTrue(vm.statusMessage.contains("Restored conversation"))
+    }
+
+    func testOpenHistoryEntryWithoutTranscriptLoadsComposer() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        let legacy = CodingPromptHistoryEntry(text: "old prompt without transcript")
+        await vm.openHistoryEntry(legacy)
+        XCTAssertEqual(vm.draft, "old prompt without transcript")
+        XCTAssertTrue(vm.statusMessage.contains("No saved transcript"))
+        let commands = await bridge.receivedCommands
+        XCTAssertTrue(commands.isEmpty)
+    }
 }
 
 private actor MemorySettings: SettingsStoring {
@@ -638,6 +724,7 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var lastPublishPaths: [String] = []
     private(set) var cancelStreamCount = 0
     private(set) var runStatusCheckCount = 0
+    private(set) var baselineCreateCount = 0
     private var reviewKept = false
     private let streamDelaySeconds: Double
     private let emitAfterCancel: Bool
@@ -735,7 +822,8 @@ private actor DirtyRepoBridge: AgentBridging {
     }
 
     func createBaseline(repoId: String) async -> BridgeResult {
-        BridgeResult(
+        baselineCreateCount += 1
+        return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"baselineId":"base-\#(repoId)","repoId":"\#(repoId)"}"#
         )
@@ -871,6 +959,10 @@ private actor DirtyRepoBridge: AgentBridging {
                 payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"cancelled"}"#
             )
         }
+        await onEvent(CodingStreamEvent(
+            type: "assistant_delta",
+            text: "assistant reply for \(command.prefix(40))"
+        ))
         await onEvent(CodingStreamEvent(type: "done", status: "finished", sessionId: "agent-test", runId: "run-test"))
         return BridgeResult(
             ok: true,

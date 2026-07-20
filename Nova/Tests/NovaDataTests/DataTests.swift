@@ -648,6 +648,27 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertEqual(updated, "returned-99")
     }
 
+    func testPushToCursorPrefersCodingUIRunnerWhenWired() async throws {
+        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1", codingSelectedRepoId: "abcdef0123456789")
+        let bridge = PinCapturingBridge()
+        let tool = PushToCursorTool(
+            bridge: bridge,
+            settings: settings,
+            runThroughCodingUI: { command, sessionId, repoId in
+                XCTAssertEqual(command, "spoken task")
+                XCTAssertEqual(sessionId, "pinned-1")
+                XCTAssertEqual(repoId, "abcdef0123456789")
+                return #"{"ok":true,"sessionId":"voice-agent-1","status":"finished","result":"done"}"#
+            }
+        )
+        let payload = try await tool.invoke(argumentsJSON: #"{"command":"spoken task"}"#)
+        XCTAssertTrue(payload.contains("voice-agent-1"))
+        let used = await bridge.lastSessionId
+        XCTAssertNil(used) // bridge push skipped when Coding UI runner is wired
+        let updated = await settings.codingSessionId()
+        XCTAssertEqual(updated, "voice-agent-1")
+    }
+
     func testCursorHistoryToolUsesPinnedSessionAndSelectedRepository() async throws {
         let settings = FakeCodingSettingsStore(
             codingSessionId: "pinned-history",
