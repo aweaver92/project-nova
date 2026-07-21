@@ -63,6 +63,13 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
                     lastWateredAt: next.lastWateredAt,
                     isOutdoor: next.isOutdoor ?? plants[idx].isOutdoor,
                     frostSensitive: next.frostSensitive ?? plants[idx].frostSensitive,
+                    suggestedActions: next.suggestedActions.isEmpty
+                        ? plants[idx].suggestedActions
+                        : next.suggestedActions,
+                    seasonalNotes: next.seasonalNotes.isEmpty
+                        ? plants[idx].seasonalNotes
+                        : next.seasonalNotes,
+                    healthStatus: next.healthStatus ?? plants[idx].healthStatus,
                     createdAt: plants[idx].createdAt,
                     updatedAt: next.updatedAt
                 )

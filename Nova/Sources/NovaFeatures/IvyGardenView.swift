@@ -5,9 +5,6 @@ import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
-#if canImport(AVFoundation)
-import AVFoundation
-#endif
 
 /// Ivy's garden workspace: gallery, identify, Garden Walk, and seasonal planning.
 public struct IvyGardenView: View {
@@ -101,7 +98,7 @@ public struct IvyGardenView: View {
             Button("Cancel", role: .cancel) {}
         }
         .sheet(item: $editing) { plant in
-            PlantEditorSheet(plant: plant) { name, species, location, notes, outdoor, frost in
+            PlantEditorSheet(plant: plant) { name, species, location, notes, outdoor, frost, actions, seasonal, health in
                 Task {
                     await garden.updateNotes(
                         plant,
@@ -110,7 +107,10 @@ public struct IvyGardenView: View {
                         location: location,
                         careNotes: notes,
                         isOutdoor: outdoor,
-                        frostSensitive: frost
+                        frostSensitive: frost,
+                        suggestedActions: actions,
+                        seasonalNotes: seasonal,
+                        healthStatus: health
                     )
                     editing = nil
                 }
@@ -126,8 +126,9 @@ public struct IvyGardenView: View {
         .onChange(of: identifyPickerItem) { _, item in
             guard let item else { return }
             Task {
-                if let data = await loadPhotoJPEG(from: item) {
-                    await garden.identify(imageData: data, save: true)
+                if let frames = await loadMediaFrames(from: item), !frames.isEmpty {
+                    // Identify uses one representative frame (middle keyframe for video).
+                    await garden.identify(imageData: frames[frames.count / 2], save: true)
                 } else {
                     garden.notePhotoLoadFailed()
                 }
@@ -139,8 +140,10 @@ public struct IvyGardenView: View {
             Task {
                 var datas: [Data] = []
                 for item in items.prefix(12) {
-                    if let data = await loadPhotoJPEG(from: item) {
-                        datas.append(data)
+                    if datas.count >= 12 { break }
+                    if let framesFromItem = await loadMediaFrames(from: item) {
+                        let remaining = 12 - datas.count
+                        datas.append(contentsOf: framesFromItem.prefix(remaining))
                     }
                 }
                 if datas.isEmpty {
@@ -157,7 +160,7 @@ public struct IvyGardenView: View {
                 var frames: [Data] = []
                 for item in items.prefix(12) {
                     if frames.count >= 12 { break }
-                    if let framesFromItem = await loadWalkFrames(from: item) {
+                    if let framesFromItem = await loadMediaFrames(from: item) {
                         let remaining = 12 - frames.count
                         frames.append(contentsOf: framesFromItem.prefix(remaining))
                     }
@@ -165,7 +168,7 @@ public struct IvyGardenView: View {
                 if frames.isEmpty {
                     garden.notePhotoLoadFailed()
                 } else {
-                    await garden.startGardenWalk(imageDatas: frames, speak: true)
+                    await garden.catalogFrames(frames, speak: true)
                 }
                 walkPickerItems = []
             }
@@ -183,7 +186,7 @@ public struct IvyGardenView: View {
                     systemImage: "figure.walk"
                 )
             }
-            .disabled(garden.isBusy || garden.isWalking)
+            .disabled(garden.isBusy || garden.isWalking || garden.isCataloging)
 
             PhotosPicker(
                 selection: $walkPickerItems,
@@ -191,73 +194,155 @@ public struct IvyGardenView: View {
                 matching: .any(of: [.images, .videos])
             ) {
                 Label(
-                    garden.isWalking ? "Analyzing photos…" : "Choose photos for Garden Walk",
+                    garden.isCataloging
+                        ? "Cataloging plants…"
+                        : "Catalog plants from photos or video",
                     systemImage: "photo.on.rectangle.angled"
                 )
             }
-            .disabled(garden.isBusy || garden.isWalking)
+            .disabled(garden.isBusy || garden.isWalking || garden.isCataloging)
 
-            if let walk = garden.lastWalk {
-                VStack(alignment: .leading, spacing: 6) {
-                    if let score = walk.healthScore {
-                        Text("Health · \(score)")
-                            .font(.caption.weight(.semibold))
-                    }
-                    if !walk.overview.isEmpty {
-                        Text(walk.overview)
-                            .font(.caption)
-                    }
-                    if !walk.mistakes.isEmpty {
-                        Text("Mistakes")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.top, 2)
-                        ForEach(walk.mistakes, id: \.self) { item in
-                            Text("• \(item)").font(.caption2)
-                        }
-                    }
-                    if !walk.maintenance.isEmpty {
-                        Text("Maintenance")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.top, 2)
-                        ForEach(walk.maintenance, id: \.self) { item in
-                            Text("• \(item)").font(.caption2)
-                        }
-                    }
-                    ForEach(walk.findings) { finding in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(finding.severity): \(finding.title)")
-                                .font(.caption.weight(.semibold))
-                            if !finding.detail.isEmpty {
-                                Text(finding.detail).font(.caption2)
-                            }
-                        }
-                        .padding(.top, 2)
-                    }
-                }
-                .textSelection(.enabled)
-                .contextMenu {
-                    ShareLink(item: walk.shareText) {
-                        Label("Share…", systemImage: "square.and.arrow.up")
-                    }
-                    Button {
-                        Task { await garden.saveLastWalkToLibrary() }
-                    } label: {
-                        Label("Save to Library", systemImage: "books.vertical")
-                    }
-                    Button {
-                        #if canImport(UIKit)
-                        UIPasteboard.general.string = walk.shareText
-                        #endif
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
-                }
+            if let catalog = garden.lastCatalog {
+                catalogOverviewBlock(catalog)
+            } else if let walk = garden.lastWalk {
+                walkOverviewBlock(walk, shareText: walk.shareText)
             }
         } header: {
-            Text("Garden Walk")
+            Text("Garden Overview")
         } footer: {
-            Text("Pick up to 12 photos (or a video) for Ivy to analyze together, or walk with glasses. Press and hold the analysis to share or save it to Library.")
+            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Glasses Walk is a quicker coaching look. Press and hold the overview to share or save it to Library.")
                 .font(.caption2)
+        }
+    }
+
+    @ViewBuilder
+    private func catalogOverviewBlock(_ catalog: GardenCatalogResult) -> some View {
+        let walk = catalog.overview
+        VStack(alignment: .leading, spacing: 8) {
+            walkOverviewContent(walk)
+            if !catalog.profiles.isEmpty {
+                Text("Cataloged plants · \(catalog.profiles.count)")
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 4)
+                ForEach(catalog.profiles) { profile in
+                    Button {
+                        if let id = profile.savedPlantId ?? profile.matchedPlantId,
+                           let plant = garden.plants.first(where: { $0.id == id }) {
+                            editing = plant
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(profile.name)
+                                    .font(.caption.weight(.semibold))
+                                if let health = profile.health, !health.isEmpty {
+                                    Text(health)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if let species = profile.species, !species.isEmpty {
+                                Text(species)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let action = profile.suggestedActions.first {
+                                Text("→ \(action)")
+                                    .font(.caption2)
+                            }
+                            if !profile.seasonalNotes.isEmpty {
+                                Text(profile.seasonalNotes)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .contextMenu {
+            ShareLink(item: catalog.shareText) {
+                Label("Share…", systemImage: "square.and.arrow.up")
+            }
+            Button {
+                Task { await garden.saveLastWalkToLibrary() }
+            } label: {
+                Label("Save to Library", systemImage: "books.vertical")
+            }
+            Button {
+                #if canImport(UIKit)
+                UIPasteboard.general.string = catalog.shareText
+                #endif
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func walkOverviewBlock(_ walk: GardenWalkResult, shareText: String) -> some View {
+        walkOverviewContent(walk)
+            .textSelection(.enabled)
+            .contextMenu {
+                ShareLink(item: shareText) {
+                    Label("Share…", systemImage: "square.and.arrow.up")
+                }
+                Button {
+                    Task { await garden.saveLastWalkToLibrary() }
+                } label: {
+                    Label("Save to Library", systemImage: "books.vertical")
+                }
+                Button {
+                    #if canImport(UIKit)
+                    UIPasteboard.general.string = shareText
+                    #endif
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func walkOverviewContent(_ walk: GardenWalkResult) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let score = walk.healthScore {
+                Text("Health · \(score)")
+                    .font(.caption.weight(.semibold))
+            }
+            if !walk.overview.isEmpty {
+                Text(walk.overview)
+                    .font(.caption)
+            }
+            if !walk.mistakes.isEmpty {
+                Text("Watch-outs")
+                    .font(.caption2.weight(.semibold))
+                    .padding(.top, 2)
+                ForEach(walk.mistakes, id: \.self) { item in
+                    Text("• \(item)").font(.caption2)
+                }
+            }
+            if !walk.maintenance.isEmpty {
+                Text("Priority actions")
+                    .font(.caption2.weight(.semibold))
+                    .padding(.top, 2)
+                ForEach(walk.maintenance, id: \.self) { item in
+                    Text("• \(item)").font(.caption2)
+                }
+            }
+            ForEach(walk.findings) { finding in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(finding.severity): \(finding.title)")
+                        .font(.caption.weight(.semibold))
+                    if !finding.detail.isEmpty {
+                        Text(finding.detail).font(.caption2)
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
     }
 
@@ -267,17 +352,17 @@ public struct IvyGardenView: View {
             PhotosPicker(
                 selection: $galleryPickerItems,
                 maxSelectionCount: 12,
-                matching: .images
+                matching: .any(of: [.images, .videos])
             ) {
                 Label(
-                    garden.isBusy ? "Adding photos…" : "Add photos to gallery",
+                    garden.isBusy ? "Adding…" : "Add photos or video to gallery",
                     systemImage: "plus.circle"
                 )
             }
             .disabled(garden.isBusy)
 
             if garden.plants.isEmpty {
-                Text("No plants yet. Add photos here, or use Identify / Garden Walk.")
+                Text("No plants yet. Add photos or a video here, or catalog from Garden Overview / Media → Send to Ivy.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -321,7 +406,7 @@ public struct IvyGardenView: View {
         } footer: {
             Text(isGalleryEditing
                  ? "Tap a plant to remove it. Tap Done when finished."
-                 : "Add photos to build Ivy’s library. Tap a plant to edit; long-press to water or delete. Use Edit to remove several quickly.")
+                 : "Add photos or a video to build Ivy’s library. Tap a plant to edit; long-press to water or delete. Use Edit to remove several quickly.")
                 .font(.caption2)
         }
     }
@@ -329,9 +414,12 @@ public struct IvyGardenView: View {
     @ViewBuilder
     private var identifySection: some View {
         Section {
-            PhotosPicker(selection: $identifyPickerItem, matching: .images) {
+            PhotosPicker(
+                selection: $identifyPickerItem,
+                matching: .any(of: [.images, .videos])
+            ) {
                 Label(
-                    garden.isBusy ? "Identifying…" : "Upload plant photo",
+                    garden.isBusy ? "Identifying…" : "Upload plant photo or video",
                     systemImage: "photo.on.rectangle"
                 )
             }
@@ -366,7 +454,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Identify")
         } footer: {
-            Text("Photos and glasses stills are matched against your garden library when possible.")
+            Text("Photos, videos (sampled as keyframes), and glasses stills are matched against your garden library when possible.")
                 .font(.caption2)
         }
     }
@@ -463,52 +551,24 @@ public struct IvyGardenView: View {
         return nil
     }
 
-    private func loadWalkFrames(from item: PhotosPickerItem) async -> [Data]? {
-        let isMovie = item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) })
+    /// Load a still as one JPEG, or sample keyframes from a movie.
+    private func loadMediaFrames(from item: PhotosPickerItem) async -> [Data]? {
+        let isMovie = item.supportedContentTypes.contains(where: {
+            $0.conforms(to: .movie) || $0.conforms(to: .video) || $0.conforms(to: .mpeg4Movie) || $0.conforms(to: .quickTimeMovie)
+        })
         if !isMovie, let jpeg = await loadPhotoJPEG(from: item) {
             return [jpeg]
         }
-        #if canImport(AVFoundation) && canImport(UIKit)
-        if let movie = try? await item.loadTransferable(type: WalkMovieTransfer.self) {
-            let frames = await extractKeyFrames(from: movie.url, count: 3)
+        if let movie = try? await item.loadTransferable(type: GardenMovieTransfer.self) {
+            defer { try? FileManager.default.removeItem(at: movie.url) }
+            let frames = await VideoKeyframeSampler.jpegKeyFramesAdaptive(from: movie.url, catalog: true)
             return frames.isEmpty ? nil : frames
         }
-        #endif
         if let jpeg = await loadPhotoJPEG(from: item) {
             return [jpeg]
         }
         return nil
     }
-
-    #if canImport(AVFoundation) && canImport(UIKit)
-    private func extractKeyFrames(from url: URL, count: Int) async -> [Data] {
-        let asset = AVURLAsset(url: url)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 1280, height: 1280)
-        let duration: Double
-        do {
-            let cm = try await asset.load(.duration)
-            duration = CMTimeGetSeconds(cm)
-        } catch {
-            return []
-        }
-        guard duration.isFinite, duration > 0 else { return [] }
-        var frames: [Data] = []
-        let steps = max(count, 1)
-        for i in 0..<steps {
-            let t = duration * (Double(i) + 0.5) / Double(steps)
-            let time = CMTime(seconds: t, preferredTimescale: 600)
-            if let cg = try? generator.copyCGImage(at: time, actualTime: nil) {
-                let image = UIImage(cgImage: cg)
-                if let data = image.jpegData(compressionQuality: 0.7) {
-                    frames.append(data)
-                }
-            }
-        }
-        return frames
-    }
-    #endif
 }
 
 #if canImport(UIKit)
@@ -528,23 +588,35 @@ private struct GardenImageTransfer: Transferable {
 }
 #endif
 
-#if canImport(AVFoundation)
-private struct WalkMovieTransfer: Transferable {
+private struct GardenMovieTransfer: Transferable {
     let url: URL
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(contentType: .movie) { movie in
             SentTransferredFile(movie.url)
         } importing: { received in
-            let temp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("nova-garden-walk-\(UUID().uuidString).mov")
-            try? FileManager.default.removeItem(at: temp)
-            try FileManager.default.copyItem(at: received.file, to: temp)
-            return WalkMovieTransfer(url: temp)
+            try Self.importMovie(from: received.file)
+        }
+        FileRepresentation(contentType: .mpeg4Movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            try Self.importMovie(from: received.file)
+        }
+        FileRepresentation(contentType: .quickTimeMovie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            try Self.importMovie(from: received.file)
         }
     }
+
+    private static func importMovie(from file: URL) throws -> GardenMovieTransfer {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nova-garden-media-\(UUID().uuidString).mov")
+        try? FileManager.default.removeItem(at: temp)
+        try FileManager.default.copyItem(at: file, to: temp)
+        return GardenMovieTransfer(url: temp)
+    }
 }
-#endif
 
 private struct PlantThumbnail: View {
     let url: URL?
@@ -591,7 +663,7 @@ private struct PlantThumbnail: View {
 
 private struct PlantEditorSheet: View {
     let plant: PlantSighting
-    let onSave: (String, String, String, String, Bool, Bool) -> Void
+    let onSave: (String, String, String, String, Bool, Bool, [String], String, String?) -> Void
     let onDelete: () -> Void
     let onCancel: () -> Void
 
@@ -601,11 +673,14 @@ private struct PlantEditorSheet: View {
     @State private var careNotes: String
     @State private var isOutdoor: Bool
     @State private var frostSensitive: Bool
+    @State private var suggestedActionsText: String
+    @State private var seasonalNotes: String
+    @State private var healthStatus: String
     @State private var confirmDelete = false
 
     init(
         plant: PlantSighting,
-        onSave: @escaping (String, String, String, String, Bool, Bool) -> Void,
+        onSave: @escaping (String, String, String, String, Bool, Bool, [String], String, String?) -> Void,
         onDelete: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -619,6 +694,9 @@ private struct PlantEditorSheet: View {
         _careNotes = State(initialValue: plant.careNotes)
         _isOutdoor = State(initialValue: plant.isOutdoor ?? GardenPlanningDiff.isLikelyOutdoor(plant))
         _frostSensitive = State(initialValue: plant.frostSensitive ?? GardenPlanningDiff.isFrostSensitive(plant))
+        _suggestedActionsText = State(initialValue: plant.suggestedActions.joined(separator: "\n"))
+        _seasonalNotes = State(initialValue: plant.seasonalNotes)
+        _healthStatus = State(initialValue: plant.healthStatus ?? "")
     }
 
     var body: some View {
@@ -627,7 +705,12 @@ private struct PlantEditorSheet: View {
                 TextField("Name", text: $name)
                 TextField("Species", text: $species)
                 TextField("Location", text: $location)
+                TextField("Health", text: $healthStatus, prompt: Text("ok / needs_water / stressed"))
                 TextField("Care notes", text: $careNotes, axis: .vertical)
+                    .lineLimit(3...8)
+                TextField("Suggested actions (one per line)", text: $suggestedActionsText, axis: .vertical)
+                    .lineLimit(3...8)
+                TextField("Seasonal notes", text: $seasonalNotes, axis: .vertical)
                     .lineLimit(3...8)
                 Toggle("Outdoor plant", isOn: $isOutdoor)
                 Toggle("Bring inside before frost", isOn: $frostSensitive)
@@ -646,7 +729,22 @@ private struct PlantEditorSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        onSave(name, species, location, careNotes, isOutdoor, frostSensitive)
+                        let actions = suggestedActionsText
+                            .split(whereSeparator: \.isNewline)
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        let health = healthStatus.trimmingCharacters(in: .whitespacesAndNewlines)
+                        onSave(
+                            name,
+                            species,
+                            location,
+                            careNotes,
+                            isOutdoor,
+                            frostSensitive,
+                            actions,
+                            seasonalNotes,
+                            health.isEmpty ? nil : health
+                        )
                     }
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }

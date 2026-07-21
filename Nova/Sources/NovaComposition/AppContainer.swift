@@ -580,8 +580,11 @@ public final class AppContainer {
             store: plantStore,
             analyzeImage: { [tokenService, useFakeAI] frame, prompt in
                 if useFakeAI {
-                    if prompt.contains("Garden Walk") {
+                    if prompt.contains("Garden Overview") || prompt.contains("Garden Walk") {
                         return #"{"overview":"Garden looks fair with a few thirsty pots.","health_score":"fair","findings":[{"severity":"watch","title":"Dry soil","detail":"Top soil looks dry on visible pots.","matched_library":""}],"maintenance":["Water dry pots this evening"],"mistakes":["Leaving tender plants out overnight near frost"]}"#
+                    }
+                    if prompt.contains("catalog a garden") {
+                        return #"{"plants":[{"name":"Test Monstera","species":"Monstera deliciosa","matched_library":"","confidence":0.9,"health":"ok","care_tips":"Bright indirect light; water when top soil is dry.","suggested_actions":["Wipe dusty leaves","Check for spider mites"],"seasonal_info":"Keep indoors; avoid cold drafts in winter.","is_outdoor":false,"frost_sensitive":true},{"name":"Cherry tomato","species":"Solanum lycopersicum","confidence":0.85,"health":"needs_water","care_tips":"Full sun and even moisture.","suggested_actions":["Water deeply today","Stake fruiting stems"],"seasonal_info":"Plant after last frost; harvest mid–late summer.","is_outdoor":true,"frost_sensitive":true}],"frame_notes":"fake catalog"}"#
                     }
                     return #"{"plants":[{"name":"Test Monstera","species":"Monstera deliciosa","matched_library":"","confidence":0.9,"care_tips":"Bright indirect light; water when top soil is dry.","health":"ok"}],"notes":"fake"}"#
                 }

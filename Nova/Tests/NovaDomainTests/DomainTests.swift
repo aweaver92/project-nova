@@ -1017,6 +1017,44 @@ final class CodingPromptComposerTests: XCTestCase {
         XCTAssertEqual(CodingPromptComposer.askQuestion(from: "/ask"), "")
         XCTAssertFalse(CodingPromptComposer.compose(userText: "fix /ask later", pins: []).isAskOnly)
     }
+
+    func testModePickerAskPlanDebugWrapping() {
+        let ask = CodingPromptComposer.compose(
+            userText: "What opens CodingView?",
+            pins: [],
+            mode: .ask
+        )
+        XCTAssertEqual(ask.mode, .ask)
+        XCTAssertTrue(ask.isAskOnly)
+        XCTAssertTrue(ask.bridgeCommand.contains("READ-ONLY Q&A"))
+
+        let plan = CodingPromptComposer.compose(
+            userText: "Add offline sync",
+            pins: [],
+            mode: .plan
+        )
+        XCTAssertEqual(plan.mode, .plan)
+        XCTAssertTrue(plan.bridgeCommand.contains("PLAN MODE"))
+        XCTAssertEqual(CodingAgentMode.plan.bridgeMode, "plan")
+
+        let debug = CodingPromptComposer.compose(
+            userText: "Crash on launch",
+            pins: [],
+            mode: .debug
+        )
+        XCTAssertEqual(debug.mode, .debug)
+        XCTAssertTrue(debug.bridgeCommand.contains("DEBUG MODE"))
+        XCTAssertNil(CodingAgentMode.debug.bridgeMode)
+
+        // Slash /ask wins over Agent picker.
+        let forced = CodingPromptComposer.compose(
+            userText: "/ask where is send()?",
+            pins: [],
+            mode: .agent
+        )
+        XCTAssertEqual(forced.mode, .ask)
+        XCTAssertTrue(forced.isAskOnly)
+    }
 }
 
 final class WorkoutPlanProgressTests: XCTestCase {

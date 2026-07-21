@@ -56,6 +56,19 @@ final class GardenWalkAndPlanningDiffTests: XCTestCase {
         XCTAssertFalse(springPlant.isEmpty)
     }
 
+    func testPlanningIncludesSuggestedActionsFromProfile() {
+        let plant = PlantSighting(
+            fileName: "t.jpg",
+            name: "Tomato",
+            suggestedActions: ["Water deeply", "Stake stems"],
+            seasonalNotes: "After last frost"
+        )
+        let plan = GardenPlanningDiff.buildPlan(library: [plant], climate: nil)
+        let suggested = plan.filter { $0.title.contains("Water deeply") }
+        XCTAssertEqual(suggested.count, 1)
+        XCTAssertEqual(suggested.first?.plantId, plant.id)
+    }
+
     func testGardenWalkShareTextIncludesSections() {
         let result = GardenWalkResult(
             overview: "Beds look thirsty.",

@@ -52,6 +52,7 @@ final class AppScreenNavigationTests: XCTestCase {
         XCTAssertEqual(AppScreenCatalog.resolve("plant_scan")?.kitchenSection, "identify")
         XCTAssertEqual(AppScreenCatalog.resolve("scan plant")?.ownerAgentId, Agent.SeedID.ivy)
         XCTAssertEqual(AppScreenCatalog.resolve("garden_walk")?.routeKey, "garden")
+        XCTAssertNil(AppScreenCatalog.resolve("garden_walk")?.kitchenSection)
         XCTAssertEqual(AppScreenCatalog.resolve("garden_plan")?.kitchenSection, "planning")
     }
 

@@ -151,6 +151,23 @@ public enum GardenPlanningDiff {
             }
         }
 
+        // Suggested actions from video catalog / identify profiles.
+        let seasonNow = GardenSeason.current(on: now, calendar: calendar)
+        for plant in library {
+            guard let action = plant.suggestedActions.first else { continue }
+            items.append(GardenPlanItem(
+                season: seasonNow,
+                kind: .maintenance,
+                title: "\(plant.name): \(action)",
+                detail: plant.seasonalNotes.isEmpty
+                    ? (plant.careNotes.isEmpty ? "From Ivy’s plant profile." : plant.careNotes)
+                    : plant.seasonalNotes,
+                windowLabel: "Suggested now",
+                plantId: plant.id,
+                plantName: plant.name
+            ))
+        }
+
         if library.isEmpty {
             items.append(GardenPlanItem(
                 season: GardenSeason.current(on: now, calendar: calendar),

@@ -114,7 +114,13 @@ public struct RootView: View {
                 .tabItem { Label("Library", systemImage: "books.vertical") }
                 .tag(RootTab.library)
 
-            MediaView(recording: recording, video: video)
+            MediaView(recording: recording, video: video) { url in
+                Task {
+                    agents.requestRoute(.garden)
+                    selectedTab = .agents
+                    await garden.catalogVideo(at: url, speak: true)
+                }
+            }
                 .tabItem { Label("Media", systemImage: "photo.on.rectangle") }
                 .tag(RootTab.media)
         }

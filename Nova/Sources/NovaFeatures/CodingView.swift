@@ -1084,7 +1084,11 @@ public struct CodingView: View {
                 Spacer(minLength: 40)
                 VStack(alignment: .trailing, spacing: 4) {
                     HStack(spacing: 8) {
-                        if item.isAskOnly {
+                        if item.agentMode != .agent {
+                            Label(item.agentMode.title, systemImage: item.agentMode.systemImage)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        } else if item.isAskOnly {
                             Label("Ask", systemImage: "questionmark.bubble.fill")
                                 .font(.caption2.weight(.semibold))
                                 .foregroundStyle(.secondary)
@@ -1324,6 +1328,33 @@ public struct CodingView: View {
             #endif
 
             HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                    ForEach(CodingAgentMode.allCases) { mode in
+                        Button {
+                            coding.selectedAgentMode = mode
+                        } label: {
+                            if mode == coding.selectedAgentMode {
+                                Label(mode.title, systemImage: "checkmark")
+                            } else {
+                                Label(mode.title, systemImage: mode.systemImage)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: coding.selectedAgentMode.systemImage)
+                        Text(coding.selectedAgentMode.title)
+                            .font(.caption.weight(.semibold))
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                }
+                .accessibilityLabel("Coding mode, \(coding.selectedAgentMode.title). \(coding.selectedAgentMode.subtitle)")
+                .accessibilityValue(coding.selectedAgentMode.title)
+
                 #if canImport(UIKit)
                 PhotosPicker(
                     selection: $selectedPhotoItems,
@@ -1341,7 +1372,7 @@ public struct CodingView: View {
                 }
                 #endif
 
-                TextField("Prompt… or /ask a question", text: $coding.draft, axis: .vertical)
+                TextField(composerPlaceholder, text: $coding.draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
                 Button {
@@ -1360,6 +1391,15 @@ public struct CodingView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private var composerPlaceholder: String {
+        switch coding.selectedAgentMode {
+        case .agent: return "Prompt… or /ask a question"
+        case .plan: return "Describe what to plan…"
+        case .ask: return "Ask about this repo…"
+        case .debug: return "Describe the bug or paste an error…"
+        }
     }
 
     #if canImport(UIKit)
@@ -1483,8 +1523,13 @@ public struct CodingView: View {
                 }
                 Section("Allowlisted repositories") {
                     if coding.repositories.isEmpty {
-                        Text("No local repos under bridge roots yet. Clone one, create a project, or add roots in nova-bridge `.env` (`NOVA_REPO_ROOTS`).")
-                            .foregroundStyle(.secondary)
+                        if !coding.statusMessage.isEmpty {
+                            Text(coding.statusMessage)
+                                .foregroundStyle(.red)
+                        } else {
+                            Text("No local repos under bridge roots yet. Clone one, create a project, or add roots in nova-bridge `.env` (`NOVA_REPO_ROOTS`).")
+                                .foregroundStyle(.secondary)
+                        }
                     } else if coding.filteredRepositories.isEmpty {
                         if coding.repoSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             Text("All matching repos are in Favorites.")
@@ -1564,8 +1609,31 @@ public struct CodingView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
+                        .submitLabel(.go)
+                        .onSubmit {
+                            Task { await runCloneFromSheet() }
+                        }
                 } footer: {
-                    Text("Uses the bridge PC’s existing GitHub CLI authentication. Only https://github.com/owner/repo URLs are accepted.")
+                    Text("Uses the bridge PC’s existing GitHub CLI authentication. Only https://github.com/owner/repo URLs are accepted. If this repo is already on the PC, pick it from Repositories instead of cloning again.")
+                }
+
+                if coding.isRefreshingRepo {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Cloning…")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else if !coding.statusMessage.isEmpty,
+                          !coding.statusMessage.hasPrefix("Selected "),
+                          !coding.statusMessage.hasPrefix("Cloned ")
+                {
+                    Section {
+                        Text(coding.statusMessage)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
                 }
             }
             .navigationTitle("Clone repo")
@@ -1576,16 +1644,18 @@ public struct CodingView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Clone") {
-                        Task {
-                            await coding.cloneRepository()
-                            if coding.selectedRepoId != nil {
-                                showClone = false
-                            }
-                        }
+                        Task { await runCloneFromSheet() }
                     }
                     .disabled(coding.cloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || coding.isRefreshingRepo)
                 }
             }
+        }
+    }
+
+    private func runCloneFromSheet() async {
+        let ok = await coding.cloneRepository()
+        if ok {
+            showClone = false
         }
     }
 

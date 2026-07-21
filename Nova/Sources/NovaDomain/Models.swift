@@ -585,6 +585,12 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
     public var isOutdoor: Bool?
     /// When true (or inferred), bring indoors before first frost.
     public var frostSensitive: Bool?
+    /// Concrete next steps from video catalog / identify (water, prune, move, etc.).
+    public var suggestedActions: [String]
+    /// Seasonal coaching (plant-out, frost, dormancy) for this specimen.
+    public var seasonalNotes: String
+    /// Latest observed health label (ok / needs_water / stressed / unknown).
+    public var healthStatus: String?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -600,6 +606,9 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
         lastWateredAt: Date? = nil,
         isOutdoor: Bool? = nil,
         frostSensitive: Bool? = nil,
+        suggestedActions: [String] = [],
+        seasonalNotes: String = "",
+        healthStatus: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -614,8 +623,38 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
         self.lastWateredAt = lastWateredAt
         self.isOutdoor = isOutdoor
         self.frostSensitive = frostSensitive
+        self.suggestedActions = suggestedActions
+        self.seasonalNotes = seasonalNotes
+        self.healthStatus = healthStatus
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, fileName, name, species, location, careNotes, text, caption
+        case lastWateredAt, isOutdoor, frostSensitive
+        case suggestedActions, seasonalNotes, healthStatus
+        case createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        fileName = try c.decode(String.self, forKey: .fileName)
+        name = try c.decode(String.self, forKey: .name)
+        species = try c.decodeIfPresent(String.self, forKey: .species)
+        location = try c.decodeIfPresent(String.self, forKey: .location)
+        careNotes = try c.decodeIfPresent(String.self, forKey: .careNotes) ?? ""
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        caption = try c.decodeIfPresent(String.self, forKey: .caption) ?? ""
+        lastWateredAt = try c.decodeIfPresent(Date.self, forKey: .lastWateredAt)
+        isOutdoor = try c.decodeIfPresent(Bool.self, forKey: .isOutdoor)
+        frostSensitive = try c.decodeIfPresent(Bool.self, forKey: .frostSensitive)
+        suggestedActions = try c.decodeIfPresent([String].self, forKey: .suggestedActions) ?? []
+        seasonalNotes = try c.decodeIfPresent(String.self, forKey: .seasonalNotes) ?? ""
+        healthStatus = try c.decodeIfPresent(String.self, forKey: .healthStatus)
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 }
 
@@ -804,6 +843,123 @@ public struct GardenWalkResult: Sendable, Equatable, Codable {
                 if !finding.detail.isEmpty { line += " — \(finding.detail)" }
                 lines.append(line)
             }
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// One plant drafted from a video/frame catalog pass (before or after library save).
+public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
+    public let id: UUID
+    public var name: String
+    public var species: String?
+    public var matchedLibraryName: String?
+    public var matchedPlantId: UUID?
+    public var confidence: Double?
+    public var careTips: String
+    public var health: String?
+    public var suggestedActions: [String]
+    public var seasonalNotes: String
+    public var isOutdoor: Bool?
+    public var frostSensitive: Bool?
+    /// Best source frame JPEG used when saving a new library entry.
+    public var imageData: Data?
+    /// Library id after catalog save/merge.
+    public var savedPlantId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        species: String? = nil,
+        matchedLibraryName: String? = nil,
+        matchedPlantId: UUID? = nil,
+        confidence: Double? = nil,
+        careTips: String = "",
+        health: String? = nil,
+        suggestedActions: [String] = [],
+        seasonalNotes: String = "",
+        isOutdoor: Bool? = nil,
+        frostSensitive: Bool? = nil,
+        imageData: Data? = nil,
+        savedPlantId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.species = species
+        self.matchedLibraryName = matchedLibraryName
+        self.matchedPlantId = matchedPlantId
+        self.confidence = confidence
+        self.careTips = careTips
+        self.health = health
+        self.suggestedActions = suggestedActions
+        self.seasonalNotes = seasonalNotes
+        self.isOutdoor = isOutdoor
+        self.frostSensitive = frostSensitive
+        self.imageData = imageData
+        self.savedPlantId = savedPlantId
+    }
+
+    /// Stable merge key: prefer species, else common name.
+    public var mergeKey: String {
+        let speciesKey = (species ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !speciesKey.isEmpty { return "sp:\(speciesKey)" }
+        return "name:\(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+    }
+}
+
+/// Result of cataloging every distinct plant found in a shared garden video.
+public struct GardenCatalogResult: Sendable, Equatable, Codable {
+    public var overview: GardenWalkResult
+    public var profiles: [CatalogPlantDraft]
+    public var catalogedAt: Date
+
+    public init(
+        overview: GardenWalkResult = GardenWalkResult(),
+        profiles: [CatalogPlantDraft] = [],
+        catalogedAt: Date = Date()
+    ) {
+        self.overview = overview
+        self.profiles = profiles
+        self.catalogedAt = catalogedAt
+    }
+
+    public var shareText: String {
+        var lines: [String] = ["Garden Overview — Ivy"]
+        if let health = overview.healthScore, !health.isEmpty {
+            lines.append("Health: \(health)")
+        }
+        if !overview.overview.isEmpty {
+            lines.append("")
+            lines.append(overview.overview)
+        }
+        if !profiles.isEmpty {
+            lines.append("")
+            lines.append("Cataloged plants (\(profiles.count))")
+            for profile in profiles {
+                var head = "• \(profile.name)"
+                if let species = profile.species, !species.isEmpty { head += " (\(species))" }
+                if let health = profile.health, !health.isEmpty { head += " — \(health)" }
+                lines.append(head)
+                if !profile.careTips.isEmpty {
+                    lines.append("  Care: \(profile.careTips)")
+                }
+                for action in profile.suggestedActions.prefix(4) {
+                    lines.append("  → \(action)")
+                }
+                if !profile.seasonalNotes.isEmpty {
+                    lines.append("  Season: \(profile.seasonalNotes)")
+                }
+            }
+        }
+        if !overview.maintenance.isEmpty {
+            lines.append("")
+            lines.append("Priority actions")
+            for item in overview.maintenance { lines.append("• \(item)") }
+        }
+        if !overview.mistakes.isEmpty {
+            lines.append("")
+            lines.append("Watch-outs")
+            for item in overview.mistakes { lines.append("• \(item)") }
         }
         return lines.joined(separator: "\n")
     }

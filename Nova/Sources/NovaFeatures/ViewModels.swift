@@ -1165,8 +1165,21 @@ public final class SettingsViewModel {
             if previewRemoteReady == true {
                 parts.append("remote preview ready")
             }
+            // `/health` is unauthenticated — probe `/repos` so a wrong token
+            // doesn't look "healthy" while Coding shows an empty repo list.
+            let reposResult = await bridge.listRepos()
+            if reposResult.ok {
+                parts.append("token accepted")
+            } else {
+                let reason = Self.summarize(reposResult.payloadJSON)
+                parts.append(
+                    bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "token missing on phone (required for repos)"
+                        : "token rejected (\(reason)) — paste NOVA_BRIDGE_TOKEN from nova-bridge/.env"
+                )
+            }
             bridgeStatus = parts.joined(separator: " · ")
-            return true
+            return reposResult.ok
         } else if !(await store.bridgeBaseURL() ?? "").isEmpty {
             bridgeStatus = "Couldn't reach the bridge: \(Self.summarize(result.payloadJSON))"
             openaiConfigured = nil
@@ -1239,8 +1252,10 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
     public var isDone: Bool
     /// True when the prompt arrived via Claude voice (`push_to_cursor`).
     public var isFromVoice: Bool
-    /// True when the user sent `/ask …` (read-only Q&A, no coding updates).
+    /// True when the user sent `/ask …` or selected Ask mode (read-only Q&A).
     public var isAskOnly: Bool
+    /// Cursor-style mode used for this prompt (Agent / Plan / Ask / Debug).
+    public var agentMode: CodingAgentMode
 
     public init(
         id: UUID = UUID(),
@@ -1251,7 +1266,8 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         isExpanded: Bool = false,
         isDone: Bool = true,
         isFromVoice: Bool = false,
-        isAskOnly: Bool = false
+        isAskOnly: Bool = false,
+        agentMode: CodingAgentMode = .agent
     ) {
         self.id = id
         self.kind = kind
@@ -1262,6 +1278,7 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         self.isDone = isDone
         self.isFromVoice = isFromVoice
         self.isAskOnly = isAskOnly
+        self.agentMode = agentMode
     }
 
     /// SF Symbol for tool rows, keyed off the tool name prefix ("edit · path").
@@ -1419,6 +1436,7 @@ private struct QueuedCodingPrompt {
     let workingDirectory: String
     let source: CodingPromptSource
     let isAskOnly: Bool
+    let mode: CodingAgentMode
     /// Original draft including `/ask` so retries preserve ask mode.
     let rawUserText: String
     /// Voice tool callers wait on this for a push_to_cursor-shaped JSON payload.
@@ -1487,6 +1505,12 @@ public final class CodingViewModel {
     public private(set) var stallPhase: CodingStallPhase = .idle
     public var draft: String = ""
     public private(set) var pendingImages: [CodingImageAttachment] = []
+    /// Cursor-style Agent / Plan / Ask / Debug picker (composer mode).
+    public var selectedAgentMode: CodingAgentMode = CodingViewModel.loadSavedAgentMode() {
+        didSet {
+            UserDefaults.standard.set(selectedAgentMode.rawValue, forKey: Self.agentModeDefaultsKey)
+        }
+    }
     private var lastSentCommand: String = ""
     private var lastSentImages: [CodingImageAttachment] = []
     public var cloneURL: String = ""
@@ -1537,6 +1561,15 @@ public final class CodingViewModel {
         self.bridge = bridge
         self.settings = settings
         self.prompts = prompts
+    }
+
+    private static let agentModeDefaultsKey = "nova.coding.agentMode"
+
+    private static func loadSavedAgentMode() -> CodingAgentMode {
+        guard let raw = UserDefaults.standard.string(forKey: agentModeDefaultsKey),
+              let mode = CodingAgentMode(rawValue: raw)
+        else { return .agent }
+        return mode
     }
 
     public var shortSessionId: String {
@@ -1904,7 +1937,14 @@ public final class CodingViewModel {
         else {
             repositories = []
             if !result.ok {
-                statusMessage = Self.summarize(result.payloadJSON)
+                let summary = Self.summarize(result.payloadJSON)
+                if summary.localizedCaseInsensitiveContains("unauthorized") {
+                    statusMessage = "Bridge token rejected — paste the same NOVA_BRIDGE_TOKEN from nova-bridge/.env (or the old phone), then Save & run setup check."
+                } else {
+                    statusMessage = summary
+                }
+            } else {
+                statusMessage = "Bridge returned repos, but this app build could not parse the list. Update the IPA."
             }
             return
         }
@@ -1957,9 +1997,11 @@ public final class CodingViewModel {
         statusMessage = "Selected \(selectedRepoName). Send a prompt to continue this session."
     }
 
-    public func cloneRepository() async {
+    /// Returns `true` when the bridge accepted the clone (or selected an existing checkout of that URL).
+    @discardableResult
+    public func cloneRepository() async -> Bool {
         let url = cloneURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !url.isEmpty else { return }
+        guard !url.isEmpty else { return false }
         isRefreshingRepo = true
         defer { isRefreshingRepo = false }
         let result = await bridge.cloneRepository(url: url, rootLabel: nil)
@@ -1969,7 +2011,7 @@ public final class CodingViewModel {
               let repo = obj.repo
         else {
             statusMessage = Self.summarize(result.payloadJSON)
-            return
+            return false
         }
         cloneURL = ""
         selectedRepoId = repo.id
@@ -1978,6 +2020,7 @@ public final class CodingViewModel {
         await refreshRepositories()
         await refreshRepoStatusAndDiff()
         statusMessage = "Cloned \(repo.name)."
+        return true
     }
 
     public func createPublicWebProject() async {
@@ -2499,7 +2542,11 @@ public final class CodingViewModel {
         let rawUserText = command.isEmpty
             ? "Analyze the attached image. Identify the visible error and recommend the next debugging steps."
             : command
-        let composition = CodingPromptComposer.compose(userText: rawUserText, pins: pinnedPaths)
+        let composition = CodingPromptComposer.compose(
+            userText: rawUserText,
+            pins: pinnedPaths,
+            mode: selectedAgentMode
+        )
         draft = ""
         pendingImages = []
         queuedPrompts.append(
@@ -2511,6 +2558,7 @@ public final class CodingViewModel {
                 workingDirectory: workingDirectory,
                 source: .typed,
                 isAskOnly: composition.isAskOnly,
+                mode: composition.mode,
                 rawUserText: rawUserText,
                 completion: nil
             )
@@ -2584,7 +2632,11 @@ public final class CodingViewModel {
             }
         }
 
-        let composition = CodingPromptComposer.compose(userText: trimmed, pins: pinnedPaths)
+        let composition = CodingPromptComposer.compose(
+            userText: trimmed,
+            pins: pinnedPaths,
+            mode: selectedAgentMode
+        )
         return await withCheckedContinuation { continuation in
             queuedPrompts.append(
                 QueuedCodingPrompt(
@@ -2595,6 +2647,7 @@ public final class CodingViewModel {
                     workingDirectory: workingDirectory,
                     source: .voice,
                     isAskOnly: composition.isAskOnly,
+                    mode: composition.mode,
                     rawUserText: trimmed,
                     completion: continuation
                 )
@@ -2632,7 +2685,8 @@ public final class CodingViewModel {
                 kind: .user,
                 text: userText + imageSuffix,
                 isFromVoice: prompt.source == .voice,
-                isAskOnly: prompt.isAskOnly
+                isAskOnly: prompt.isAskOnly,
+                agentMode: prompt.mode
             )
         )
         lastSentCommand = prompt.rawUserText
@@ -2642,23 +2696,30 @@ public final class CodingViewModel {
         isRunning = true
         runStatus = "running"
         stallPhase = .running
-        if prompt.isAskOnly {
+        switch prompt.mode {
+        case .ask:
             statusMessage = "Ask mode — answering without coding updates…"
-        } else if prompt.source == .voice {
-            statusMessage = "Spoken prompt — running in Coding…"
-        } else {
-            statusMessage = ""
+        case .plan:
+            statusMessage = "Plan mode — designing an approach…"
+        case .debug:
+            statusMessage = "Debug mode — investigating with evidence…"
+        case .agent:
+            if prompt.source == .voice {
+                statusMessage = "Spoken prompt — running in Coding…"
+            } else {
+                statusMessage = ""
+            }
         }
         activeRunId = nil
         runStartedAt = Date()
         lastSSEActivityAt = Date()
         let connectingLabel: String
-        if prompt.isAskOnly {
-            connectingLabel = "Ask → Cursor…"
-        } else if prompt.source == .voice {
-            connectingLabel = "Voice → Cursor…"
-        } else {
-            connectingLabel = "Connecting to bridge…"
+        switch prompt.mode {
+        case .ask: connectingLabel = "Ask → Cursor…"
+        case .plan: connectingLabel = "Plan → Cursor…"
+        case .debug: connectingLabel = "Debug → Cursor…"
+        case .agent:
+            connectingLabel = prompt.source == .voice ? "Voice → Cursor…" : "Connecting to bridge…"
         }
         activitySteps = [
             CodingActivityStep(phase: "status", text: connectingLabel, isDone: false)
@@ -2681,8 +2742,8 @@ public final class CodingViewModel {
             historyEntry = entry
             await prompts.appendHistory(entry, repoId: repoId)
             await reloadPromptState()
-            // Ask mode is read-only — skip baselines so we don't imply an edit review.
-            if !prompt.isAskOnly {
+            // Ask/Plan are non-edit oriented — skip baselines so we don't imply an edit review.
+            if !prompt.mode.skipsEditBaseline {
                 let baselineResult = await bridge.createBaseline(repoId: repoId)
                 if baselineResult.ok,
                    let data = baselineResult.payloadJSON.data(using: .utf8),
@@ -2715,7 +2776,8 @@ public final class CodingViewModel {
             images: images,
             sessionId: pinnedSessionId,
             workingDirectory: repoId == nil ? cwd : nil,
-            repoId: repoId
+            repoId: repoId,
+            mode: prompt.mode.bridgeMode
         ) { event in
             eventContinuation.yield(event)
         }
@@ -2817,7 +2879,7 @@ public final class CodingViewModel {
         }
         await refreshSessions()
         await refreshRepoStatusAndDiff()
-        if !prompt.isAskOnly {
+        if !prompt.mode.skipsEditBaseline {
             await refreshAgentReview()
         }
 

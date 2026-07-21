@@ -247,7 +247,7 @@ public struct IdentifyPlantTool: Tool {
 
 public struct GardenWalkTool: Tool {
     public let name = "garden_walk"
-    public let description = "Capture a short glasses live look of the garden, analyze health/maintenance/mistakes grounded in the plant library, and return a coaching overview. Prefer this when the user wants a Garden Walk or proactive garden check."
+    public let description = "Capture a short glasses live look of the garden, analyze health/maintenance/mistakes grounded in the plant library, and return a coaching overview. Prefer this when the user wants a Garden Walk or proactive garden check. For a phone video, tell them to open Garden (upload) or Media → Send to Ivy."
     public let requiresConfirmation = false
     public let parametersJSON = #"{"type":"object","properties":{"duration_seconds":{"type":"number"}},"additionalProperties":false}"#
 
@@ -275,7 +275,7 @@ public struct GardenWalkTool: Tool {
         let duration = min(max(args.duration_seconds ?? 10, 4), 20)
 
         guard await isVisionReady() else {
-            return #"{"ok":false,"error":"vision_not_ready","hint":"Open Garden and tap Garden Walk, or register glasses first."}"#
+            return #"{"ok":false,"error":"vision_not_ready","hint":"Open Garden and tap Garden Walk, upload a garden video/photo, or send a Media video to Ivy. Register glasses for a live walk."}"#
         }
 
         let stream = try await frameCapture.startLiveLook(fps: 2)

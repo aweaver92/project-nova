@@ -913,27 +913,94 @@ public struct CodingRepoPromptState: Sendable, Equatable, Codable {
     }
 }
 
+/// Cursor-style Coding session mode (mirrors the IDE mode picker).
+public enum CodingAgentMode: String, CaseIterable, Identifiable, Sendable, Codable, Hashable {
+    case agent
+    case plan
+    case ask
+    case debug
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .agent: return "Agent"
+        case .plan: return "Plan"
+        case .ask: return "Ask"
+        case .debug: return "Debug"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .agent: return "hammer.fill"
+        case .plan: return "point.topleft.down.to.point.bottomright.curvepath"
+        case .ask: return "questionmark.bubble.fill"
+        case .debug: return "ant.fill"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .agent: return "Build and edit code"
+        case .plan: return "Design an approach first"
+        case .ask: return "Read-only Q&A"
+        case .debug: return "Investigate bugs with evidence"
+        }
+    }
+
+    /// Value forwarded to nova-bridge / Cursor SDK (`agent` | `plan` only).
+    public var bridgeMode: String? {
+        switch self {
+        case .agent: return "agent"
+        case .plan: return "plan"
+        case .ask, .debug: return nil
+        }
+    }
+
+    public var isAskOnly: Bool { self == .ask }
+    public var skipsEditBaseline: Bool { self == .ask || self == .plan }
+}
+
 /// Prefixes pinned repo-relative paths onto a Coding prompt without mutating history text.
 /// Prompts that begin with `/ask` become read-only Q&A (no file edits or mutating commands).
+/// The Coding mode picker can also force Ask / Plan / Debug wrapping without a slash command.
 public enum CodingPromptComposer {
     public struct Composition: Sendable, Equatable {
         /// Text shown in the Coding transcript ( `/ask` prefix stripped when present).
         public let displayText: String
         /// Prompt sent to the Cursor agent (includes ask-mode guardrails when needed).
         public let bridgeCommand: String
-        /// True when the user prefixed the prompt with `/ask`.
+        /// True when the user prefixed the prompt with `/ask` or selected Ask mode.
         public let isAskOnly: Bool
+        /// Effective mode after combining the picker with `/ask`.
+        public let mode: CodingAgentMode
 
-        public init(displayText: String, bridgeCommand: String, isAskOnly: Bool) {
+        public init(
+            displayText: String,
+            bridgeCommand: String,
+            isAskOnly: Bool,
+            mode: CodingAgentMode = .agent
+        ) {
             self.displayText = displayText
             self.bridgeCommand = bridgeCommand
             self.isAskOnly = isAskOnly
+            self.mode = mode
         }
     }
 
-    public static func compose(userText: String, pins: [CodingContextPin]) -> Composition {
+    public static func compose(
+        userText: String,
+        pins: [CodingContextPin],
+        mode: CodingAgentMode = .agent
+    ) -> Composition {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let question = askQuestion(from: trimmed) {
+        let explicitAsk = askQuestion(from: trimmed)
+        let effectiveMode: CodingAgentMode = explicitAsk != nil ? .ask : mode
+
+        switch effectiveMode {
+        case .ask:
+            let question = (explicitAsk ?? trimmed)
             let body = question.isEmpty
                 ? "Answer the user's question about this repository."
                 : question
@@ -946,15 +1013,64 @@ public enum CodingPromptComposer {
 
             \(focused)
             """
-            return Composition(displayText: body, bridgeCommand: bridgeCommand, isAskOnly: true)
+            return Composition(
+                displayText: body,
+                bridgeCommand: bridgeCommand,
+                isAskOnly: true,
+                mode: .ask
+            )
+        case .plan:
+            let body = trimmed.isEmpty ? "Propose a plan for the next change in this repository." : trimmed
+            let focused = focusedBody(body, pins: pins)
+            let bridgeCommand = """
+            PLAN MODE — design the approach before coding.
+            Produce a clear plan with trade-offs, file touch list, and risks.
+            Prefer not to edit files yet unless the user explicitly asked you to implement immediately.
+
+            \(focused)
+            """
+            return Composition(
+                displayText: body,
+                bridgeCommand: bridgeCommand,
+                isAskOnly: false,
+                mode: .plan
+            )
+        case .debug:
+            let body = trimmed.isEmpty
+                ? "Investigate the attached evidence and identify the root cause."
+                : trimmed
+            let focused = focusedBody(body, pins: pins)
+            let bridgeCommand = """
+            DEBUG MODE — investigate with evidence.
+            Reproduce or reason from logs, stack traces, failing tests, and the attached screenshots.
+            State the likely root cause, the smallest fix, and how to verify. Prefer targeted edits over broad refactors.
+
+            \(focused)
+            """
+            return Composition(
+                displayText: body,
+                bridgeCommand: bridgeCommand,
+                isAskOnly: false,
+                mode: .debug
+            )
+        case .agent:
+            let bridgeCommand = focusedBody(trimmed, pins: pins)
+            return Composition(
+                displayText: trimmed,
+                bridgeCommand: bridgeCommand,
+                isAskOnly: false,
+                mode: .agent
+            )
         }
-        let bridgeCommand = focusedBody(trimmed, pins: pins)
-        return Composition(displayText: trimmed, bridgeCommand: bridgeCommand, isAskOnly: false)
     }
 
     /// Builds the bridge prompt (pins + ask-mode wrapping). Prefer `compose` when you need flags.
-    public static func command(userText: String, pins: [CodingContextPin]) -> String {
-        compose(userText: userText, pins: pins).bridgeCommand
+    public static func command(
+        userText: String,
+        pins: [CodingContextPin],
+        mode: CodingAgentMode = .agent
+    ) -> String {
+        compose(userText: userText, pins: pins, mode: mode).bridgeCommand
     }
 
     /// Returns the question text when `userText` starts with `/ask` (case-insensitive), else nil.
@@ -1211,6 +1327,15 @@ public protocol AgentBridging: Sendable {
         repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        mode: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult
     /// Read the state of an existing run without sending its prompt again.
     func cursorRunStatus(runId: String) async -> BridgeResult
     func cancelCursorRun(runId: String) async -> BridgeResult
@@ -1317,6 +1442,25 @@ public extension AgentBridging {
         sessionId: String?,
         workingDirectory: String?,
         repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            images: images,
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: repoId,
+            mode: nil,
+            onEvent: onEvent
+        )
+    }
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        mode: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
         await streamCursorRun(

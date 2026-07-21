@@ -914,8 +914,11 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
     sendRepoError(res, err);
     return;
   }
-  try {
+    try {
     const { Agent } = await import("@cursor/sdk");
+    const modeRaw = String(req.body?.mode ?? "").trim().toLowerCase();
+    const cursorMode =
+      modeRaw === "plan" || modeRaw === "agent" ? modeRaw : undefined;
     const agent = sessionId
       ? await Agent.resume(sessionId, {
           apiKey: CURSOR_API_KEY,
@@ -928,7 +931,10 @@ app.post("/cursor/command", requireAuth, async (req, res) => {
           local: { cwd },
         });
     try {
-      const run = await agent.send(command, { model: { id: CURSOR_MODEL } });
+      const run = await agent.send(command, {
+        model: { id: CURSOR_MODEL },
+        ...(cursorMode ? { mode: cursorMode } : {}),
+      });
       const result = await run.wait();
       res.json({
         ok: result.status === "finished",
@@ -1138,11 +1144,15 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
 
     const message =
       images.length > 0 ? { text: command, images } : command;
-    console.log(`[cursor/runs] sending prompt (${command.length} chars, ${images.length} images)`);
+    const modeRaw = String(req.body?.mode ?? "").trim().toLowerCase();
+    const cursorMode =
+      modeRaw === "plan" || modeRaw === "agent" ? modeRaw : undefined;
+    console.log(`[cursor/runs] sending prompt (${command.length} chars, ${images.length} images${cursorMode ? `, mode=${cursorMode}` : ""})`);
     const run = await withTimeout(
       "agent_send",
       agent.send(message, {
         model: { id: CURSOR_MODEL },
+        ...(cursorMode ? { mode: cursorMode } : {}),
         onDelta: ({ update }) => {
           emit(normalizeInteractionUpdate(update));
         },

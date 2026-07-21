@@ -173,7 +173,8 @@ public enum AppScreenCatalog: Sendable {
             ownerAgentId: Agent.SeedID.ivy,
             ownerName: "Ivy",
             routeKey: "garden",
-            kitchenSection: "identify",
+            // Walk UI sits above the Gallery/Identify/Planning segments.
+            kitchenSection: nil,
             title: "Garden Walk"
         ),
         AppScreenTarget(

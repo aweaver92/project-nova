@@ -25,6 +25,7 @@ public final class IvyGardenViewModel {
     public private(set) var plants: [PlantSighting] = []
     public private(set) var lastIdentify: PlantIdentifyResult?
     public private(set) var lastWalk: GardenWalkResult?
+    public private(set) var lastCatalog: GardenCatalogResult?
     public private(set) var planItems: [GardenPlanItem] = []
     public private(set) var climate: GardenClimateSnapshot?
     public var climateCityDraft: String = ""
@@ -32,6 +33,7 @@ public final class IvyGardenViewModel {
     public private(set) var errorMessage: String?
     public private(set) var isBusy = false
     public private(set) var isWalking = false
+    public private(set) var isCataloging = false
     public private(set) var directoryURL: URL?
     public private(set) var librarySaveMessage: String?
 
@@ -87,8 +89,18 @@ public final class IvyGardenViewModel {
     }
 
     public func saveLastWalkToLibrary() async {
+        if let catalog = lastCatalog {
+            guard let saveLibraryNote else {
+                librarySaveMessage = "Library notes unavailable."
+                return
+            }
+            await saveLibraryNote(catalog.shareText)
+            librarySaveMessage = "Saved Garden Overview to Library notes"
+            statusMessage = librarySaveMessage ?? statusMessage
+            return
+        }
         guard let walk = lastWalk else {
-            librarySaveMessage = "No Garden Walk to save yet."
+            librarySaveMessage = "No Garden Overview to save yet."
             return
         }
         guard let saveLibraryNote else {
@@ -101,7 +113,7 @@ public final class IvyGardenViewModel {
     }
 
     public func notePhotoLoadFailed() {
-        errorMessage = "Could not read one or more photos — try JPEG/HEIC stills from Photos."
+        errorMessage = "Could not read that media — try JPEG/HEIC photos or an MP4/MOV video from Photos."
     }
 
     public func planItems(for season: GardenSeason) -> [GardenPlanItem] {
@@ -131,11 +143,11 @@ public final class IvyGardenViewModel {
         statusMessage = "Removed \(plant.name)"
     }
 
-    /// Import one or more photos into the gallery (identify + save each).
+    /// Import one or more photos / video keyframes into the gallery (identify + save each).
     public func importPhotosToGallery(_ imageDatas: [Data]) async {
         let datas = Array(imageDatas.filter { !$0.isEmpty }.prefix(12))
         guard !datas.isEmpty else {
-            errorMessage = "Could not read those photos — try again."
+            errorMessage = "Could not read that media — try again."
             return
         }
         isBusy = true
@@ -143,7 +155,7 @@ public final class IvyGardenViewModel {
         defer { isBusy = false }
         var saved = 0
         for (index, data) in datas.enumerated() {
-            statusMessage = "Adding photo \(index + 1) of \(datas.count)…"
+            statusMessage = "Adding frame \(index + 1) of \(datas.count)…"
             let frame = CapturedFrame(imageData: data, width: 0, height: 0)
             let countBefore = await store.all().count
             await runIdentify(frame: frame, save: true, location: nil, switchToGallery: false)
@@ -168,8 +180,203 @@ public final class IvyGardenViewModel {
         await load()
         if saved > 0 { errorMessage = nil }
         statusMessage = saved == 0
-            ? "No plants saved from those photos"
-            : "Added \(saved) photo\(saved == 1 ? "" : "s") to gallery (\(plants.count) total)"
+            ? "No plants saved from that media"
+            : "Added \(saved) frame\(saved == 1 ? "" : "s") to gallery (\(plants.count) total)"
+    }
+
+    /// Full plant catalog from a local movie (Media → Send to Ivy or Garden upload).
+    /// Identifies every distinct plant, saves/merges profiles, and builds a Garden Overview.
+    public func catalogVideo(at url: URL, speak: Bool = true) async {
+        statusMessage = "Sampling video for plant catalog…"
+        errorMessage = nil
+        let frames = await VideoKeyframeSampler.jpegKeyFramesAdaptive(from: url, catalog: true)
+        guard !frames.isEmpty else {
+            errorMessage = "Could not read that video — try an MP4/MOV from Photos or Media."
+            return
+        }
+        await catalogFrames(frames, speak: speak)
+    }
+
+    /// Catalog every distinct plant across stills / video keyframes into the Gallery.
+    public func catalogFrames(_ imageDatas: [Data], speak: Bool = true) async {
+        let datas = Array(imageDatas.filter { !$0.isEmpty }.prefix(12))
+        guard !datas.isEmpty else {
+            errorMessage = "Add a photo or video to catalog plants."
+            return
+        }
+        isCataloging = true
+        isBusy = true
+        errorMessage = nil
+        defer {
+            isCataloging = false
+            isBusy = false
+        }
+
+        var library = await store.all()
+        let framePrompt = GardenVideoCatalogDiff.framePrompt(library: library)
+        var frameDrafts: [CatalogPlantDraft] = []
+        for (index, data) in datas.enumerated() {
+            statusMessage = "Cataloging frame \(index + 1) of \(datas.count)…"
+            let frame = CapturedFrame(imageData: data, width: 0, height: 0)
+            do {
+                let answer = try await analyzeImage(frame, framePrompt)
+                let parsed = GardenVideoCatalogDiff.parseFrameJSON(
+                    answer,
+                    library: library,
+                    imageData: data
+                )
+                frameDrafts.append(contentsOf: parsed)
+            } catch {
+                continue
+            }
+        }
+
+        var merged = GardenVideoCatalogDiff.mergeDrafts(frameDrafts)
+        guard !merged.isEmpty else {
+            errorMessage = "No plants found to catalog in that media."
+            statusMessage = "Catalog empty"
+            return
+        }
+
+        statusMessage = "Saving \(merged.count) plant profile\(merged.count == 1 ? "" : "s")…"
+        for i in merged.indices {
+            merged[i] = await persistCatalogDraft(merged[i], library: &library)
+        }
+
+        await load()
+        library = plants
+
+        statusMessage = "Writing Garden Overview…"
+        var overview = GardenVideoCatalogDiff.fallbackOverview(from: merged)
+        let overviewPrompt = GardenVideoCatalogDiff.overviewPrompt(profiles: merged, climate: climate)
+        // Text-only overview: reuse first frame as a vision carrier when needed,
+        // but prefer a dedicated analyze call with the first catalog frame so
+        // multimodal models still get garden context.
+        if let firstData = merged.compactMap(\.imageData).first ?? datas.first {
+            let frame = CapturedFrame(imageData: firstData, width: 0, height: 0)
+            if let answer = try? await analyzeImage(frame, overviewPrompt) {
+                let parsed = GardenVideoCatalogDiff.parseOverviewJSON(answer, library: library)
+                if !parsed.overview.isEmpty || parsed.healthScore != nil {
+                    overview = parsed
+                }
+            }
+        }
+
+        let result = GardenCatalogResult(overview: overview, profiles: merged)
+        lastCatalog = result
+        lastWalk = overview
+        rebuildPlan()
+        statusMessage = "Cataloged \(merged.count) plant\(merged.count == 1 ? "" : "s") · overview ready"
+        errorMessage = nil
+
+        guard speak else { return }
+        let briefing = GardenVideoCatalogDiff.speakPrompt(result: result)
+        await holdVideoForAudio?(true)
+        do {
+            statusMessage = "Ivy speaking Garden Overview…"
+            if let speakBriefing {
+                try await speakBriefing(briefing)
+                statusMessage = "Catalog briefing finished"
+                errorMessage = nil
+            }
+            await holdVideoForAudio?(false)
+        } catch {
+            await holdVideoForAudio?(false)
+            statusMessage = "Cataloged \(merged.count) plants (text only)"
+            errorMessage = "Audio briefing skipped: \(error.localizedDescription)"
+        }
+    }
+
+    /// Garden Walk from a local movie — prefers full catalog + overview for videos.
+    public func startGardenWalkFromVideo(at url: URL, speak: Bool = true) async {
+        await catalogVideo(at: url, speak: speak)
+    }
+
+    private func persistCatalogDraft(
+        _ draft: CatalogPlantDraft,
+        library: inout [PlantSighting]
+    ) async -> CatalogPlantDraft {
+        var next = draft
+        if let matchId = draft.matchedPlantId,
+           var existing = library.first(where: { $0.id == matchId })
+        {
+            existing.name = draft.name
+            if let species = draft.species, !species.isEmpty { existing.species = species }
+            if !draft.careTips.isEmpty { existing.careNotes = draft.careTips }
+            if !draft.suggestedActions.isEmpty { existing.suggestedActions = draft.suggestedActions }
+            if !draft.seasonalNotes.isEmpty { existing.seasonalNotes = draft.seasonalNotes }
+            if let health = draft.health, !health.isEmpty {
+                existing.healthStatus = health
+                existing.caption = health
+            }
+            if let outdoor = draft.isOutdoor { existing.isOutdoor = outdoor }
+            if let frost = draft.frostSensitive { existing.frostSensitive = frost }
+            let saved = await store.upsert(existing)
+            if let idx = library.firstIndex(where: { $0.id == saved.id }) {
+                library[idx] = saved
+            }
+            next.savedPlantId = saved.id
+            next.matchedPlantId = saved.id
+            next.matchedLibraryName = saved.name
+            next.imageData = nil
+            return next
+        }
+
+        // Species/name match without id.
+        if let existing = library.first(where: { plant in
+            if let species = draft.species, let ps = plant.species,
+               !species.isEmpty,
+               ps.localizedCaseInsensitiveCompare(species) == .orderedSame {
+                return true
+            }
+            return plant.name.localizedCaseInsensitiveCompare(draft.name) == .orderedSame
+        }) {
+            var updated = existing
+            if let species = draft.species, !species.isEmpty { updated.species = species }
+            if !draft.careTips.isEmpty { updated.careNotes = draft.careTips }
+            if !draft.suggestedActions.isEmpty { updated.suggestedActions = draft.suggestedActions }
+            if !draft.seasonalNotes.isEmpty { updated.seasonalNotes = draft.seasonalNotes }
+            if let health = draft.health, !health.isEmpty {
+                updated.healthStatus = health
+                updated.caption = health
+            }
+            if let outdoor = draft.isOutdoor { updated.isOutdoor = outdoor }
+            if let frost = draft.frostSensitive { updated.frostSensitive = frost }
+            let saved = await store.upsert(updated)
+            if let idx = library.firstIndex(where: { $0.id == saved.id }) {
+                library[idx] = saved
+            }
+            next.savedPlantId = saved.id
+            next.matchedPlantId = saved.id
+            next.matchedLibraryName = saved.name
+            next.imageData = nil
+            return next
+        }
+
+        let imageData = draft.imageData ?? Data()
+        let ocr = await recognizeText?(imageData) ?? ""
+        var saved = await store.save(
+            imageData: imageData,
+            name: draft.name,
+            species: draft.species,
+            location: nil,
+            careNotes: draft.careTips,
+            text: ocr,
+            caption: draft.health ?? "Cataloged from video"
+        )
+        saved.suggestedActions = draft.suggestedActions
+        saved.seasonalNotes = draft.seasonalNotes
+        saved.healthStatus = draft.health
+        saved.isOutdoor = draft.isOutdoor
+        saved.frostSensitive = draft.frostSensitive
+        saved = await store.upsert(saved)
+        library.append(saved)
+        next.savedPlantId = saved.id
+        next.matchedPlantId = saved.id
+        next.matchedLibraryName = saved.name
+        // Drop bulky JPEG from in-memory result after save.
+        next.imageData = nil
+        return next
     }
 
     public func clearLibrary() async {
@@ -192,7 +399,10 @@ public final class IvyGardenViewModel {
         location: String,
         careNotes: String,
         isOutdoor: Bool,
-        frostSensitive: Bool
+        frostSensitive: Bool,
+        suggestedActions: [String] = [],
+        seasonalNotes: String = "",
+        healthStatus: String? = nil
     ) async {
         var next = plant
         next.name = name
@@ -201,6 +411,11 @@ public final class IvyGardenViewModel {
         next.careNotes = careNotes
         next.isOutdoor = isOutdoor
         next.frostSensitive = frostSensitive
+        next.suggestedActions = suggestedActions
+        next.seasonalNotes = seasonalNotes
+        next.healthStatus = healthStatus?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
+            ? nil
+            : healthStatus
         _ = await store.upsert(next)
         await load()
     }
@@ -242,7 +457,7 @@ public final class IvyGardenViewModel {
 
     public func identifyWithGlasses(save: Bool = true) async {
         guard await isVisionReady(), let captureStill else {
-            errorMessage = "Glasses camera not ready — register Meta glasses or upload a photo."
+            errorMessage = "Glasses camera not ready — register Meta glasses or upload a plant photo/video."
             return
         }
         isBusy = true

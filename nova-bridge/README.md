@@ -18,7 +18,7 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/realtime/token` | `{ "model"?: string }` | Mint a short-lived OpenAI Realtime secret → `{ "value", "expires_at" }` |
 | `POST` | `/claude-code` | `{ "prompt": string, "cwd"?: string }` | Run Claude Code headlessly |
 | `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Blocking Cursor send (legacy; Coding tab prefers `/cursor/runs`) |
-| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string, "images"?: [{ "data", "mimeType", "width"?, "height"? }] }` | **SSE** stream of a Cursor run, with optional base64 screenshots |
+| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string, "mode"?: "agent"|"plan", "images"?: [{ "data", "mimeType", "width"?, "height"? }] }` | **SSE** stream of a Cursor run, with optional base64 screenshots and Cursor conversation mode |
 | `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
 | `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
