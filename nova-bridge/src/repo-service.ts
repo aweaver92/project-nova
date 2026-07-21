@@ -1682,8 +1682,7 @@ export class RepoService {
     );
     if (build.code !== 0 || !existsSync(ipaPath)) {
       const combined = `${build.stderr}\n${build.stdout}`.trim();
-      // Prefer the tail — PowerShell / gh often put the real failure last.
-      const detail = (combined.slice(-500) || "IPA build failed").trim();
+      const detail = summarizeIpaBuildFailure(combined);
       throw new RepoError("ipa_build_failed", detail, 502);
     }
 
@@ -1833,6 +1832,31 @@ export class RepoService {
 export function extractPrUrl(text: string): string | null {
   const m = text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/);
   return m?.[0] ?? null;
+}
+
+/** Prefer Swift/xcodebuild errors over Node/action deprecation noise in IPA logs. */
+export function summarizeIpaBuildFailure(combined: string): string {
+  const lines = combined.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const noise =
+    /Node\.js 20|actions\/checkout|actions\/setup-node|github\.blog\/changelog|DEPRECATED/i;
+  const compile = lines.filter(
+    (l) => /\berror:/i.test(l) && !noise.test(l),
+  );
+  if (compile.length > 0) {
+    return compile
+      .slice(-6)
+      .map((l) => l.replace(/^.*?error:\s*/i, "error: "))
+      .join(" | ")
+      .slice(-500);
+  }
+  const actionable = lines.filter(
+    (l) =>
+      /did not succeed|Failed:|ipa_build|Run \d+/i.test(l) && !noise.test(l),
+  );
+  if (actionable.length > 0) {
+    return actionable.slice(-4).join(" | ").slice(-500);
+  }
+  return (combined.slice(-500) || "IPA build failed").trim();
 }
 
 export function timingSafeTokenEqual(provided: string, expected: string): boolean {

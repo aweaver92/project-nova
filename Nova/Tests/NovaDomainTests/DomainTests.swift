@@ -705,17 +705,26 @@ final class WakeWordTests: XCTestCase {
         let orch = makeOrchestrator(provider: provider)
         let frame = CapturedFrame(imageData: Data([0xFF, 0xD8, 0xFF, 0xD9]), width: 1, height: 1)
 
-        XCTAssertFalse(await orch.isStreaming)
-        XCTAssertFalse(await orch.isSessionActive)
+        let streamingBefore = await orch.isStreaming
+        let sessionBefore = await orch.isSessionActive
+        XCTAssertFalse(streamingBefore)
+        XCTAssertFalse(sessionBefore)
 
         let answer = try await orch.askAboutFrame(frame, prompt: "What am I looking at?")
         XCTAssertEqual(answer, "ok")
-        XCTAssertEqual(await provider.connectCount, 1)
-        XCTAssertEqual(await provider.analyzeCount, 1)
-        XCTAssertEqual(await provider.disconnectCount, 1)
-        XCTAssertFalse(await provider.lastTextOutputOnly, "What's this? must request spoken audio output")
-        XCTAssertFalse(await orch.isSessionActive, "Listen must stay off")
-        XCTAssertFalse(await orch.isStreaming)
+
+        let connectCount = await provider.connectCount
+        let analyzeCount = await provider.analyzeCount
+        let disconnectCount = await provider.disconnectCount
+        let textOnly = await provider.lastTextOutputOnly
+        let sessionAfter = await orch.isSessionActive
+        let streamingAfter = await orch.isStreaming
+        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(analyzeCount, 1)
+        XCTAssertEqual(disconnectCount, 1)
+        XCTAssertFalse(textOnly, "What's this? must request spoken audio output")
+        XCTAssertFalse(sessionAfter, "Listen must stay off")
+        XCTAssertFalse(streamingAfter)
     }
 
     private func makeOrchestrator(

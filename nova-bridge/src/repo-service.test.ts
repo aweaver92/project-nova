@@ -22,6 +22,7 @@ import {
   RepoService,
   sanitizeBranchSlug,
   scaffoldWebProject,
+  summarizeIpaBuildFailure,
   timingSafeTokenEqual,
   validateGitHubHttpsUrl,
   validateProjectName,
@@ -124,6 +125,22 @@ section("extractPrUrl / timingSafeTokenEqual");
   assert.equal(timingSafeTokenEqual("abc", "abc"), true);
   assert.equal(timingSafeTokenEqual("abc", "abd"), false);
   assert.equal(timingSafeTokenEqual("ab", "abc"), false);
+}
+
+section("summarizeIpaBuildFailure prefers Swift errors");
+{
+  const noisy = [
+    "Node.js 20 actions are deprecated",
+    "actions/checkout@v4",
+    "actions/setup-node@v4",
+    "For more information see: https://github.blog/changelog/2025-...",
+    "DomainTests.swift:708:35: error: actor-isolated property 'isStreaming'",
+    "DomainTests.swift:709:35: error: actor-isolated property 'isSessionActive'",
+    "##[error]Process completed with exit code 65.",
+  ].join("\n");
+  const summary = summarizeIpaBuildFailure(noisy);
+  assert.match(summary, /isStreaming|isSessionActive/);
+  assert.doesNotMatch(summary, /checkout@v4|setup-node@v4/);
 }
 
 section("path containment rejects symlink escape");
