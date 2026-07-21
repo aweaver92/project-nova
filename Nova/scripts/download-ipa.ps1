@@ -106,7 +106,12 @@ try {
     if ($Wait) {
         Write-Host "Waiting for run $RunId to finish..."
         & $gh run watch $RunId --exit-status
-        if ($LASTEXITCODE -ne 0) { throw "Run $RunId did not succeed (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            $failedJobs = & $gh run view $RunId --json jobs --jq '.jobs[] | select(.conclusion=="failure") | "\(.name) (ID \(.databaseId))"' 2>$null
+            $failedJobs = ("$failedJobs" -replace "`r", "").Trim()
+            if (-not $failedJobs) { $failedJobs = "(see Actions run $RunId)" }
+            throw "Run $RunId did not succeed. Failed: $failedJobs"
+        }
     }
 
     $runMeta = & $gh run view $RunId --json headSha,createdAt,event,headBranch,url,conclusion | ConvertFrom-Json
