@@ -603,8 +603,83 @@ public actor NovaBridgeClient: AgentBridging {
         if let commitMessage = request.commitMessage, !commitMessage.isEmpty {
             body["commitMessage"] = commitMessage
         }
-        // macOS IPA CI often takes 10–25 minutes; leave headroom for download.
-        return await post(path: "nova/commit-and-build", body: body, timeout: 50 * 60)
+        body["asyncPoll"] = true
+        // Commit+push only — CI waits in a background bridge job. Holding one
+        // HTTP request for 10–25 min is what produced "Lost connection mid-run".
+        let started = await post(path: "nova/commit-and-build", body: body, timeout: 180)
+        guard started.ok else { return started }
+        guard let jobId = Self.stringField(started.payloadJSON, "jobId"), !jobId.isEmpty else {
+            return started
+        }
+        let status = Self.stringField(started.payloadJSON, "buildStatus")?.lowercased() ?? ""
+        if status == "completed" || status == "failed" {
+            return Self.terminalCommitAndBuildResult(started)
+        }
+
+        let deadline = Date().addingTimeInterval(50 * 60)
+        var consecutiveTransportFailures = 0
+        while Date() < deadline {
+            try? await Task.sleep(for: .seconds(8))
+            let poll = await send(
+                path: "nova/commit-and-build/\(jobId)",
+                method: "GET",
+                body: nil,
+                timeout: 45
+            )
+            if !poll.ok {
+                // Wi‑Fi blips during a long CI wait are expected — keep polling.
+                if Self.isTransientBridgeTransport(poll.payloadJSON) {
+                    consecutiveTransportFailures += 1
+                    if consecutiveTransportFailures >= 20 {
+                        return poll
+                    }
+                    continue
+                }
+                return poll
+            }
+            consecutiveTransportFailures = 0
+            let buildStatus = Self.stringField(poll.payloadJSON, "buildStatus")?.lowercased() ?? ""
+            if buildStatus == "completed" || buildStatus == "failed" {
+                return Self.terminalCommitAndBuildResult(poll)
+            }
+        }
+        return BridgeResult(
+            ok: false,
+            payloadJSON: #"{"ok":false,"error":"ipa_build_timeout","hint":"GitHub Actions IPA is still running on the PC bridge — check Actions, or retry Commit and Build later."}"#
+        )
+    }
+
+    /// Map a finished job payload: `buildStatus=failed` becomes ok:false for the UI.
+    private static func terminalCommitAndBuildResult(_ result: BridgeResult) -> BridgeResult {
+        let status = stringField(result.payloadJSON, "buildStatus")?.lowercased() ?? ""
+        if status == "failed" {
+            let detail = stringField(result.payloadJSON, "detail")
+                ?? "ipa_build_failed"
+            let escaped = escape(detail)
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"ipa_build_failed","detail":"\#(escaped)","hint":"\#(escaped)"}"#
+            )
+        }
+        return result
+    }
+
+    private static func isTransientBridgeTransport(_ payloadJSON: String) -> Bool {
+        let lower = payloadJSON.lowercased()
+        return lower.contains("bridge_connection_lost")
+            || lower.contains("bridge_unreachable")
+            || lower.contains("bridge_timeout")
+            || lower.contains("networkconnectionlost")
+            || lower.contains("notconnectedtointernet")
+    }
+
+    private static func stringField(_ payloadJSON: String, _ key: String) -> String? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if let value = obj[key] as? String { return value }
+        if let value = obj[key] as? NSNumber { return value.stringValue }
+        return nil
     }
 
     public func createBaseline(repoId: String) async -> BridgeResult {

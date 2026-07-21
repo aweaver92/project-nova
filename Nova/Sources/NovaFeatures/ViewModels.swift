@@ -2343,13 +2343,13 @@ public final class CodingViewModel {
         commitAndBuildStartedAt = Date()
         commitAndBuildPhaseLabel = "Committing & pushing…"
         lastCommitAndBuildFailure = nil
-        statusMessage = "Commit and Build started — commit, push, then GitHub Actions IPA (~10–25 min)."
+        statusMessage = "Commit and Build started — short commit/push, then the phone polls CI (you can lock the phone)."
         defer {
             isCommitAndBuilding = false
             commitAndBuildStartedAt = nil
         }
 
-        // Keep the phone awake across the long bridge round-trip (CI often 10–25 min).
+        // Keep the phone awake across commit/push + polling (CI often 10–25 min).
         let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.commit-and-build"))
         defer { Task { await BackgroundTask.end(bgBox.handle) } }
         let heartbeat = Task { @MainActor [weak self] in
@@ -2362,7 +2362,7 @@ public final class CodingViewModel {
                 // After the first minute, most wall time is CI — update the label.
                 if tick >= 4, self.isCommitAndBuilding {
                     self.commitAndBuildPhaseLabel = "Building IPA on GitHub Actions…"
-                    self.statusMessage = "Waiting on GitHub Actions IPA job (often 10–25 min). You can lock the phone."
+                    self.statusMessage = "Polling GitHub Actions via bridge (often 10–25 min). Brief Wi‑Fi drops are OK."
                 }
             }
         }
@@ -2413,6 +2413,7 @@ public final class CodingViewModel {
               let detail = obj["detail"] as? String
         else { return nil }
         return BridgeCommitAndBuildResult(
+            jobId: obj["jobId"] as? String,
             repoId: repoId,
             branch: branch,
             commitSha: commitSha,

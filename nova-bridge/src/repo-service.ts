@@ -145,9 +145,17 @@ export type CommitAndBuildRequest = {
   /** Optional; when set must match the Nova checkout status token. */
   statusToken?: string;
   commitMessage?: string;
+  /**
+   * When true, return after commit+push with `buildStatus: "building"` and a
+   * `jobId` for polling. New phone clients set this so they do not hold one
+   * HTTP socket open for the full 10–25 min CI wait.
+   */
+  asyncPoll?: boolean;
 };
 
 export type CommitAndBuildResult = {
+  /** Background job id — phone polls GET /nova/commit-and-build/:jobId. */
+  jobId: string;
   repoId: string;
   branch: string;
   commitSha: string;
@@ -158,11 +166,17 @@ export type CommitAndBuildResult = {
   /** Relative path from the Nova repo root. */
   ipaRelativePath: string;
   workflowRunId: string | null;
-  buildStatus: "completed" | "failed";
+  buildStatus: "building" | "completed" | "failed";
   detail: string;
 };
 
+type IpaBuildJob = CommitAndBuildResult & {
+  errorCode?: string;
+  updatedAt: number;
+};
+
 const IPA_BUILD_TIMEOUT_MS = 45 * 60_000;
+const IPA_JOB_TTL_MS = 2 * 60 * 60_000;
 
 export const WEB_PROJECT_TEMPLATES = [
   "static",
@@ -555,6 +569,8 @@ export class RepoService {
   private readonly activeBaseline = new Map<string, string>();
   private discoverCache: { at: number; repos: RepoSummary[] } | null = null;
   private static readonly DISCOVER_CACHE_MS = 5_000;
+  /** In-memory IPA commit-and-build jobs (survive phone HTTP disconnects). */
+  private readonly ipaJobs = new Map<string, IpaBuildJob>();
 
   constructor(opts?: {
     rootsEnv?: string;
@@ -1547,13 +1563,15 @@ export class RepoService {
   }
 
   /**
-   * Commit every dirty path on the current branch, push to origin, then run the
-   * GitHub Actions IPA job and download `Nova/App/NovaApp.ipa` (SideStore path).
-   * Always targets the Meta GPT / Nova source checkout — not an arbitrary repo.
+   * Commit every dirty path on the current branch, push to origin, then start
+   * the GitHub Actions IPA job in the background. Returns immediately with a
+   * `jobId` so the phone can poll instead of holding one HTTP socket for 10–25 min
+   * (iOS/Wi‑Fi routinely drops that long request as "Lost connection mid-run").
    */
   async commitAndBuildIpa(req: CommitAndBuildRequest): Promise<CommitAndBuildResult> {
     const nova = this.resolveNovaRepo();
     this.requireGh(); // fail fast — run-ipa-ci.ps1 needs authenticated gh
+    this.pruneIpaJobs();
 
     const pushed = await this.withLock(nova.id, async () => {
       const git = this.requireGit();
@@ -1650,7 +1668,6 @@ export class RepoService {
       };
     });
 
-    // IPA CI is long-running — do not hold the repo lock while waiting.
     const ipaRelativePath = "Nova/App/NovaApp.ipa";
     const ipaPath = join(pushed.repoPath, "Nova", "App", "NovaApp.ipa");
     const scriptPath = join(pushed.repoPath, "Nova", "scripts", "run-ipa-ci.ps1");
@@ -1662,35 +1679,9 @@ export class RepoService {
       );
     }
 
-    const ps = process.platform === "win32" ? "powershell.exe" : "pwsh";
-    const build = await runProcess(
-      ps,
-      [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        scriptPath,
-        "-Ref",
-        pushed.branch,
-      ],
-      {
-        cwd: join(pushed.repoPath, "Nova"),
-        timeoutMs: IPA_BUILD_TIMEOUT_MS,
-        maxStdout: 1_000_000,
-      },
-    );
-    if (build.code !== 0 || !existsSync(ipaPath)) {
-      const combined = `${build.stderr}\n${build.stdout}`.trim();
-      const detail = summarizeIpaBuildFailure(combined);
-      throw new RepoError("ipa_build_failed", detail, 502);
-    }
-
-    const runMatch = (build.stdout + "\n" + build.stderr).match(
-      /Run\s+(\d+)\s+started/i,
-    );
-
-    return {
+    const jobId = `ipa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const initial: IpaBuildJob = {
+      jobId,
       repoId: pushed.repoId,
       branch: pushed.branch,
       commitSha: pushed.commitSha,
@@ -1698,10 +1689,132 @@ export class RepoService {
       pushed: pushed.pushed,
       ipaPath,
       ipaRelativePath,
-      workflowRunId: runMatch?.[1] ?? null,
-      buildStatus: "completed",
-      detail: `IPA ready at Nova/App/NovaApp.ipa (${pushed.commitSha.slice(0, 7)} on ${pushed.branch})`,
+      workflowRunId: null,
+      buildStatus: "building",
+      detail: `Pushed ${pushed.commitSha.slice(0, 7)} on ${pushed.branch}. Waiting on GitHub Actions IPA (often 10–25 min)…`,
+      updatedAt: Date.now(),
     };
+    this.ipaJobs.set(jobId, initial);
+
+    // Fire-and-forget: do not hold the HTTP request open for the macOS CI wait.
+    void this.runIpaCiJob(jobId, {
+      repoPath: pushed.repoPath,
+      branch: pushed.branch,
+      commitSha: pushed.commitSha,
+      scriptPath,
+      ipaPath,
+      ipaRelativePath,
+    });
+
+    if (req.asyncPoll === true) {
+      return { ...initial };
+    }
+
+    // Legacy phone clients hold the POST open until CI finishes.
+    return this.waitForIpaJob(jobId);
+  }
+
+  /** Poll status for a background Commit-and-Build IPA job. */
+  getCommitAndBuildJob(jobId: string): CommitAndBuildResult {
+    this.pruneIpaJobs();
+    const id = (jobId ?? "").trim();
+    const job = this.ipaJobs.get(id);
+    if (!job) {
+      throw new RepoError("ipa_job_not_found", "unknown_or_expired_job", 404);
+    }
+    const { errorCode: _errorCode, updatedAt: _updatedAt, ...publicResult } = job;
+    return publicResult;
+  }
+
+  private async waitForIpaJob(jobId: string): Promise<CommitAndBuildResult> {
+    const deadline = Date.now() + IPA_BUILD_TIMEOUT_MS + 60_000;
+    while (Date.now() < deadline) {
+      const job = this.getCommitAndBuildJob(jobId);
+      if (job.buildStatus === "completed") return job;
+      if (job.buildStatus === "failed") {
+        throw new RepoError("ipa_build_failed", job.detail, 502);
+      }
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+    throw new RepoError("ipa_build_timeout", "timed_out_waiting_for_ipa_job", 504);
+  }
+
+  private pruneIpaJobs(): void {
+    const cutoff = Date.now() - IPA_JOB_TTL_MS;
+    for (const [id, job] of this.ipaJobs) {
+      if (job.updatedAt < cutoff) this.ipaJobs.delete(id);
+    }
+  }
+
+  private async runIpaCiJob(
+    jobId: string,
+    opts: {
+      repoPath: string;
+      branch: string;
+      commitSha: string;
+      scriptPath: string;
+      ipaPath: string;
+      ipaRelativePath: string;
+    },
+  ): Promise<void> {
+    const ps = process.platform === "win32" ? "powershell.exe" : "pwsh";
+    try {
+      const build = await runProcess(
+        ps,
+        [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          opts.scriptPath,
+          "-Ref",
+          opts.branch,
+        ],
+        {
+          cwd: join(opts.repoPath, "Nova"),
+          timeoutMs: IPA_BUILD_TIMEOUT_MS,
+          maxStdout: 1_000_000,
+        },
+      );
+      const existing = this.ipaJobs.get(jobId);
+      if (!existing) return;
+
+      if (build.code !== 0 || !existsSync(opts.ipaPath)) {
+        const combined = `${build.stderr}\n${build.stdout}`.trim();
+        const detail = summarizeIpaBuildFailure(combined);
+        this.ipaJobs.set(jobId, {
+          ...existing,
+          buildStatus: "failed",
+          detail,
+          errorCode: "ipa_build_failed",
+          updatedAt: Date.now(),
+        });
+        return;
+      }
+
+      const runMatch = (build.stdout + "\n" + build.stderr).match(
+        /Run\s+(\d+)\s+started/i,
+      );
+      this.ipaJobs.set(jobId, {
+        ...existing,
+        workflowRunId: runMatch?.[1] ?? null,
+        buildStatus: "completed",
+        detail: `IPA ready at Nova/App/NovaApp.ipa (${opts.commitSha.slice(0, 7)} on ${opts.branch})`,
+        updatedAt: Date.now(),
+      });
+    } catch (err) {
+      const existing = this.ipaJobs.get(jobId);
+      if (!existing) return;
+      const message =
+        err instanceof Error ? err.message.slice(0, 400) : "ipa_build_failed";
+      this.ipaJobs.set(jobId, {
+        ...existing,
+        buildStatus: "failed",
+        detail: message,
+        errorCode: "ipa_build_failed",
+        updatedAt: Date.now(),
+      });
+    }
   }
 
   async createPublicWebProject(

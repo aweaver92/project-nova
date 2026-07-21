@@ -27,6 +27,8 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/preview/stop` | `{ "repoId": string }` | Stop the repo's preview server |
 | `GET`  | `/preview-proxy/:repoId/*` | — | Unauthenticated reverse proxy for remote Safari (fallback) |
 | `GET`  | `/health` | — | Liveness + readiness flags (no auth) |
+| `POST` | `/nova/commit-and-build` | `{ "statusToken"?: string, "commitMessage"?: string, "asyncPoll"?: boolean }` | Commit+push Nova checkout. With `asyncPoll: true`, returns `{ jobId, buildStatus: "building" }` immediately; otherwise waits for IPA (legacy). |
+| `GET`  | `/nova/commit-and-build/:jobId` | — | Poll IPA job until `buildStatus` is `completed` or `failed` |
 
 ### Live preview (`/preview/*`)
 

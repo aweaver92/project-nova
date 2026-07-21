@@ -38,7 +38,8 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /repos/:repoId/status | /diff | /files?path=
  *   POST /self-code/search | /self-code/read       → read-only Nova grounding
  *   POST /repos/:repoId/publish
- *   POST /nova/commit-and-build        → commit+push Nova checkout, build IPA
+ *   POST /nova/commit-and-build        → commit+push Nova checkout, start IPA job (returns jobId)
+ *   GET  /nova/commit-and-build/:jobId → poll IPA job until completed/failed
  *   POST /repos/:repoId/baselines                 → create pre-run snapshot
  *   GET  /repos/:repoId/baselines/:id/review      → agent-only file diffs
  *   POST /repos/:repoId/baselines/:id/keep        { paths }
@@ -343,7 +344,19 @@ app.post("/nova/commit-and-build", requireAuth, async (req, res) => {
         typeof req.body?.statusToken === "string" ? req.body.statusToken : undefined,
       commitMessage:
         typeof req.body?.commitMessage === "string" ? req.body.commitMessage : undefined,
+      asyncPoll: req.body?.asyncPoll === true,
     });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+app.get("/nova/commit-and-build/:jobId", requireAuth, async (req, res) => {
+  try {
+    const result = repos.getCommitAndBuildJob(String(req.params.jobId ?? ""));
+    // Always 200 with buildStatus so the phone can poll through Wi‑Fi blips
+    // without treating a finished failure as a transport error.
     res.json({ ok: true, ...result });
   } catch (err) {
     sendRepoError(res, err);

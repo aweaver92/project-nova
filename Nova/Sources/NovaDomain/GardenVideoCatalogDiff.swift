@@ -403,9 +403,14 @@ public enum GardenVideoCatalogDiff {
         guard !tokens.isEmpty else { return nil }
         var best: (PlantSighting, Double)?
         for plant in library {
-            let score = tokenOverlapScore(tokens, nameTokens(plant.name))
-            let compatible = nameTokensCompatible(tokens, nameTokens(plant.name), requireStrongToken: true)
-            guard compatible, score >= 0.6 else { continue }
+            let other = nameTokens(plant.name)
+            guard nameTokensCompatible(tokens, other, requireStrongToken: true) else { continue }
+            // Prefer higher Jaccard, but allow subset matches whose score is < 0.6
+            // (e.g. "Tomato" ⊂ "Cherry Tomato" → 0.5).
+            let score = max(
+                tokenOverlapScore(tokens, other),
+                tokens.isSubset(of: other) || other.isSubset(of: tokens) ? 0.75 : 0
+            )
             if best == nil || score > best!.1 {
                 best = (plant, score)
             }

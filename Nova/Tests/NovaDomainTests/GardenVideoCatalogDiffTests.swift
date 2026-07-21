@@ -175,7 +175,13 @@ final class GardenVideoCatalogDiffTests: XCTestCase {
 
     func testSanitizeOverviewDropsInventedPlants() {
         let catalog = [
-            CatalogPlantDraft(name: "Basil", confidence: 0.9, health: "stressed")
+            CatalogPlantDraft(
+                name: "Basil",
+                confidence: 0.9,
+                careTips: "Wilting",
+                health: "stressed",
+                suggestedActions: ["Water now"]
+            )
         ]
         let raw = GardenWalkResult(
             overview: "Garden needs water.",

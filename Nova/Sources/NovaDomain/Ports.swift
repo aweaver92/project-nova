@@ -707,6 +707,7 @@ public struct BridgeCommitAndBuildRequest: Sendable, Equatable, Codable {
 }
 
 public struct BridgeCommitAndBuildResult: Sendable, Equatable, Codable {
+    public let jobId: String?
     public let repoId: String
     public let branch: String
     public let commitSha: String
@@ -719,6 +720,7 @@ public struct BridgeCommitAndBuildResult: Sendable, Equatable, Codable {
     public let detail: String
 
     public init(
+        jobId: String? = nil,
         repoId: String,
         branch: String,
         commitSha: String,
@@ -730,6 +732,7 @@ public struct BridgeCommitAndBuildResult: Sendable, Equatable, Codable {
         buildStatus: String,
         detail: String
     ) {
+        self.jobId = jobId
         self.repoId = repoId
         self.branch = branch
         self.commitSha = commitSha

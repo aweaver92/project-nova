@@ -886,7 +886,7 @@ private actor DirtyRepoBridge: AgentBridging {
         }
         return BridgeResult(
             ok: true,
-            payloadJSON: #"{"ok":true,"repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
+            payloadJSON: #"{"ok":true,"jobId":"ipa-test","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
         )
     }
 
