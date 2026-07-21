@@ -32,7 +32,7 @@ function Find-Gh {
             $(if ($cmd) { $cmd.Source })
             "$env:LOCALAPPDATA\GitHubCLI\bin\gh.exe"
             "$env:ProgramFiles\GitHub CLI\gh.exe"
-            # Hardcoded fallbacks — bridge spawn env may omit ProgramFiles.
+            # Hardcoded fallbacks - bridge spawn env may omit ProgramFiles.
             "C:\Program Files\GitHub CLI\gh.exe"
             "${env:ProgramW6432}\GitHub CLI\gh.exe"
         ) | Where-Object { $_ -and (Test-Path $_) }
@@ -111,24 +111,23 @@ try {
             $failedJobs = ("$failedJobs" -replace "`r", "").Trim()
             if (-not $failedJobs) { $failedJobs = "(see Actions run $RunId)" }
 
-            # Surface real compile/test errors — gh often dumps Node/action
+            # Surface real compile/test errors - gh often dumps Node/action
             # deprecation noise at the end, which is useless on the phone.
             $logFailed = & $gh run view $RunId --log-failed 2>$null | Out-String
-            $errorLines = @(
-                ($logFailed -split "`r?`n") |
-                    Where-Object {
-                        $_ -match '(^|\s)error:' -and
-                        $_ -notmatch 'Node\.js 20|actions/checkout|actions/setup-node|github\.blog/changelog'
-                    } |
-                    ForEach-Object {
-                        ($_ -replace '.*?error:\s*', 'error: ').Trim()
-                    } |
-                    Select-Object -Last 6
-            )
-            $detail = if ($errorLines.Count -gt 0) {
-                ($errorLines -join " | ")
+            $errorLines = @()
+            foreach ($line in ($logFailed -split "`r?`n")) {
+                if ($line -notmatch '(^|\s)error:') { continue }
+                if ($line -match 'Node\.js 20|actions/checkout|actions/setup-node|github\.blog/changelog') { continue }
+                $cleaned = ($line -replace '.*?error:\s*', 'error: ').Trim()
+                if ($cleaned) { $errorLines += $cleaned }
+            }
+            if ($errorLines.Count -gt 6) {
+                $errorLines = $errorLines[($errorLines.Count - 6)..($errorLines.Count - 1)]
+            }
+            if ($errorLines.Count -gt 0) {
+                $detail = $errorLines -join " | "
             } else {
-                "no compile errors extracted — open Actions run $RunId"
+                $detail = "no compile errors extracted - open Actions run $RunId"
             }
             throw "Run $RunId did not succeed. Failed: $failedJobs. $detail"
         }
