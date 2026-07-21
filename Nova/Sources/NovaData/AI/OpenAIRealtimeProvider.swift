@@ -369,7 +369,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         // model's decode time) stays small — this is the dominant, tunable slice
         // of end-to-end vision latency. base64 also inflates bytes ~33%.
         let t0 = Date()
-        let (data, mime) = Self.prepareForUpload(image)
+        // Prefer higher-fidelity stills for one-shot vision (plants, meals, etc.).
+        // Streaming chat frames can keep the smaller realtime defaults elsewhere.
+        let (data, mime) = Self.prepareForUpload(image, maxDimension: 1536, quality: 0.82)
         let b64 = data.base64EncodedString()
         let encodeMs = Int(Date().timeIntervalSince(t0) * 1000)
         NovaLog.vision.info(

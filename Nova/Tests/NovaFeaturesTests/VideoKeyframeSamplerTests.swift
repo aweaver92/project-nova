@@ -13,4 +13,12 @@ final class VideoKeyframeSamplerTests: XCTestCase {
         XCTAssertEqual(VideoKeyframeSampler.suggestedFrameCount(durationSeconds: 60, catalog: true), 12)
         XCTAssertEqual(VideoKeyframeSampler.suggestedFrameCount(durationSeconds: 20, catalog: true), 5)
     }
+
+    func testDedupeFramesKeepsDistinctAndCaps() {
+        let a = Data(repeating: 1, count: 200)
+        let b = Data(repeating: 2, count: 200)
+        let nearA = Data(repeating: 1, count: 200)
+        let kept = VideoKeyframeSampler.dedupeFrames([a, nearA, b], maxKeep: 2)
+        XCTAssertEqual(kept.count, 2)
+    }
 }

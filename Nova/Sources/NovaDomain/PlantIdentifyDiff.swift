@@ -6,7 +6,7 @@ public enum PlantIdentifyDiff {
     public static func analysisPrompt(library: [PlantSighting]) -> String {
         let known: String
         if library.isEmpty {
-            known = "(none yet — identify freely and suggest care tips)"
+            known = "(none yet — only name plants you can identify with high confidence)"
         } else {
             known = library.prefix(40).map { plant in
                 var line = "- \(plant.name)"
@@ -19,9 +19,16 @@ public enum PlantIdentifyDiff {
             }.joined(separator: "\n")
         }
         return """
-        You are helping Ivy, a personal botanist. Look at this plant photo.
-        Prefer matching plants from the user's garden library when they look the same; \
-        otherwise identify the species as best you can and give practical care tips.
+        You are helping Ivy, a personal botanist. Look at this plant photo with HIGH PRECISION.
+        Rules:
+        - Prefer matching the user's garden library when the same specimen appears.
+        - matched_library MUST be an exact library name from the list below, or "".
+        - Only name plants that are clearly identifiable in the photo.
+        - Do NOT invent plants for empty lawn, driveway, boats, fences, or distant scenery.
+        - Do NOT use vague names (Unknown Vine, General Garden Plants, Mixed Flowers, Plant).
+        - Do NOT invent a Latin binomial when unsure — omit species instead.
+        - If unsure, return {"plants":[]} rather than guessing among similar annuals.
+        - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
         Reply with ONLY valid JSON (no markdown) in this shape:
         {"plants":[{"name":"Monstera","species":"Monstera deliciosa","matched_library":"Monstera","confidence":0.0,"care_tips":"…","health":"ok|needs_water|stressed|unknown"}],"notes":"optional"}
         User's plant library:
@@ -50,32 +57,81 @@ public enum PlantIdentifyDiff {
             guard let name = dict["name"] as? String else { return nil }
             let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !cleaned.isEmpty else { return nil }
-            let species = dict["species"] as? String
-            let matchedName = dict["matched_library"] as? String
-            let confidence = dict["confidence"] as? Double
-            let care = (dict["care_tips"] as? String) ?? ""
-            let health = dict["health"] as? String
-            var matchedId: UUID?
-            if let matchedName, !matchedName.isEmpty {
-                matchedId = library.first {
-                    $0.name.localizedCaseInsensitiveCompare(matchedName) == .orderedSame
-                }?.id
+            let speciesRaw = dict["species"] as? String
+            let species: String?
+            if let speciesRaw {
+                let trimmedSpecies = speciesRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedSpecies.isEmpty || GardenVideoCatalogDiff.isVaguePlantName(trimmedSpecies) {
+                    species = nil
+                } else if trimmedSpecies.split(whereSeparator: \.isWhitespace).count >= 2,
+                          !GardenVideoCatalogDiff.looksLikeBinomial(trimmedSpecies) {
+                    species = nil
+                } else {
+                    species = trimmedSpecies
+                }
+            } else {
+                species = nil
             }
-            if matchedId == nil {
-                matchedId = library.first {
-                    $0.name.localizedCaseInsensitiveCompare(cleaned) == .orderedSame
-                }?.id
-            }
+            let matchedHint = dict["matched_library"] as? String
+            let match = GardenVideoCatalogDiff.resolveLibraryMatch(
+                name: cleaned,
+                species: species,
+                matchedLibraryHint: matchedHint,
+                library: library
+            )
             return PlantIdentifyHit(
                 name: cleaned,
                 species: species,
-                matchedLibraryName: matchedName,
-                matchedPlantId: matchedId,
-                confidence: confidence,
-                careTips: care,
-                health: health
+                matchedLibraryName: match?.name ?? matchedHint,
+                matchedPlantId: match?.id,
+                confidence: GardenVideoCatalogDiff.parseConfidence(dict["confidence"]),
+                careTips: (dict["care_tips"] as? String) ?? "",
+                health: dict["health"] as? String
             )
         }
-        return PlantIdentifyResult(plants: plants, notes: notes)
+        return PlantIdentifyResult(plants: filterReliableHits(plants), notes: notes)
+    }
+
+    /// Drop vague / low-confidence IDs before showing or saving.
+    public static func filterReliableHits(_ hits: [PlantIdentifyHit]) -> [PlantIdentifyHit] {
+        hits.filter(isReliableHit)
+    }
+
+    public static func isReliableHit(_ hit: PlantIdentifyHit) -> Bool {
+        guard !GardenVideoCatalogDiff.isVaguePlantName(hit.name) else { return false }
+        if let species = hit.species {
+            if GardenVideoCatalogDiff.isVaguePlantName(species) { return false }
+            let parts = species.split(whereSeparator: \.isWhitespace)
+            if parts.count >= 2, !GardenVideoCatalogDiff.looksLikeBinomial(species) {
+                return false
+            }
+        }
+        switch hit.confidence {
+        case .none:
+            if hit.matchedPlantId != nil { return true }
+            return GardenVideoCatalogDiff.looksLikeBinomial(hit.species ?? "")
+        case .some(let confidence):
+            if hit.matchedPlantId != nil {
+                return confidence >= 0.45
+            }
+            return confidence >= GardenVideoCatalogDiff.minimumConfidence
+        }
+    }
+
+    /// Persist identify result: update a library match or create a confident new plant.
+    public static func shouldPersist(_ hit: PlantIdentifyHit) -> Bool {
+        guard isReliableHit(hit) else { return false }
+        if hit.matchedPlantId != nil { return true }
+        return shouldSaveAsNew(hit)
+    }
+
+    /// Whether a hit is strong enough to create a brand-new gallery entry.
+    public static func shouldSaveAsNew(_ hit: PlantIdentifyHit) -> Bool {
+        guard hit.matchedPlantId == nil else { return false }
+        guard isReliableHit(hit) else { return false }
+        let confidence = hit.confidence ?? 0
+        if confidence >= GardenVideoCatalogDiff.singleObservationConfidence { return true }
+        let binomial = GardenVideoCatalogDiff.looksLikeBinomial(hit.species ?? "")
+        return binomial && confidence >= GardenVideoCatalogDiff.minimumConfidenceForNewPlant
     }
 }

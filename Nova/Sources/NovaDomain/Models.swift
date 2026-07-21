@@ -866,6 +866,14 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
     public var imageData: Data?
     /// Library id after catalog save/merge.
     public var savedPlantId: UUID?
+    /// How many frames contributed to this merged profile (not persisted).
+    public var observationCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, species, matchedLibraryName, matchedPlantId, confidence
+        case careTips, health, suggestedActions, seasonalNotes, isOutdoor, frostSensitive
+        case imageData, savedPlantId
+    }
 
     public init(
         id: UUID = UUID(),
@@ -881,7 +889,8 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
         isOutdoor: Bool? = nil,
         frostSensitive: Bool? = nil,
         imageData: Data? = nil,
-        savedPlantId: UUID? = nil
+        savedPlantId: UUID? = nil,
+        observationCount: Int = 1
     ) {
         self.id = id
         self.name = name
@@ -897,10 +906,14 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
         self.frostSensitive = frostSensitive
         self.imageData = imageData
         self.savedPlantId = savedPlantId
+        self.observationCount = max(1, observationCount)
     }
 
-    /// Stable merge key: prefer species, else common name.
+    /// Stable merge key: prefer library id, else species, else common name.
     public var mergeKey: String {
+        if let matchedPlantId {
+            return "id:\(matchedPlantId.uuidString.lowercased())"
+        }
         let speciesKey = (species ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !speciesKey.isEmpty { return "sp:\(speciesKey)" }
         return "name:\(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"

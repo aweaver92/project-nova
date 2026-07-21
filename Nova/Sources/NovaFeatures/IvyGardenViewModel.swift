@@ -143,45 +143,10 @@ public final class IvyGardenViewModel {
         statusMessage = "Removed \(plant.name)"
     }
 
-    /// Import one or more photos / video keyframes into the gallery (identify + save each).
+    /// Import photos / video keyframes into the gallery via catalog (merge + confidence filters).
     public func importPhotosToGallery(_ imageDatas: [Data]) async {
-        let datas = Array(imageDatas.filter { !$0.isEmpty }.prefix(12))
-        guard !datas.isEmpty else {
-            errorMessage = "Could not read that media — try again."
-            return
-        }
-        isBusy = true
-        errorMessage = nil
-        defer { isBusy = false }
-        var saved = 0
-        for (index, data) in datas.enumerated() {
-            statusMessage = "Adding frame \(index + 1) of \(datas.count)…"
-            let frame = CapturedFrame(imageData: data, width: 0, height: 0)
-            let countBefore = await store.all().count
-            await runIdentify(frame: frame, save: true, location: nil, switchToGallery: false)
-            var countAfter = await store.all().count
-            if countAfter <= countBefore {
-                // Vision failed — still keep the photo in the gallery.
-                _ = await store.save(
-                    imageData: data,
-                    name: "Plant",
-                    species: nil,
-                    location: nil,
-                    careNotes: "",
-                    text: await recognizeText?(data) ?? "",
-                    caption: "Added from Photos — rename in Gallery"
-                )
-                countAfter = await store.all().count
-                errorMessage = nil
-            }
-            if countAfter > countBefore { saved += 1 }
-        }
         section = .gallery
-        await load()
-        if saved > 0 { errorMessage = nil }
-        statusMessage = saved == 0
-            ? "No plants saved from that media"
-            : "Added \(saved) frame\(saved == 1 ? "" : "s") to gallery (\(plants.count) total)"
+        await catalogFrames(imageDatas, speak: false)
     }
 
     /// Full plant catalog from a local movie (Media → Send to Ivy or Garden upload).
@@ -233,14 +198,23 @@ public final class IvyGardenViewModel {
 
         var merged = GardenVideoCatalogDiff.mergeDrafts(frameDrafts)
         guard !merged.isEmpty else {
-            errorMessage = "No plants found to catalog in that media."
+            errorMessage = "No confident plant IDs in that media — try a closer photo of leaves/flowers."
             statusMessage = "Catalog empty"
             return
         }
 
         statusMessage = "Saving \(merged.count) plant profile\(merged.count == 1 ? "" : "s")…"
-        for i in merged.indices {
-            merged[i] = await persistCatalogDraft(merged[i], library: &library)
+        var persisted: [CatalogPlantDraft] = []
+        for draft in merged {
+            if let saved = await persistCatalogDraft(draft, library: &library) {
+                persisted.append(saved)
+            }
+        }
+        merged = persisted
+        guard !merged.isEmpty else {
+            errorMessage = "Plants looked uncertain — nothing new was saved. Try closer shots of distinct plants."
+            statusMessage = "Catalog skipped weak IDs"
+            return
         }
 
         await load()
@@ -249,15 +223,15 @@ public final class IvyGardenViewModel {
         statusMessage = "Writing Garden Overview…"
         var overview = GardenVideoCatalogDiff.fallbackOverview(from: merged)
         let overviewPrompt = GardenVideoCatalogDiff.overviewPrompt(profiles: merged, climate: climate)
-        // Text-only overview: reuse first frame as a vision carrier when needed,
-        // but prefer a dedicated analyze call with the first catalog frame so
-        // multimodal models still get garden context.
+        // Prefer grounded catalog text; optionally enrich prose from vision while
+        // stripping any findings that invent plants outside the catalog.
         if let firstData = merged.compactMap(\.imageData).first ?? datas.first {
             let frame = CapturedFrame(imageData: firstData, width: 0, height: 0)
             if let answer = try? await analyzeImage(frame, overviewPrompt) {
                 let parsed = GardenVideoCatalogDiff.parseOverviewJSON(answer, library: library)
-                if !parsed.overview.isEmpty || parsed.healthScore != nil {
-                    overview = parsed
+                let sanitized = GardenVideoCatalogDiff.sanitizeOverview(parsed, catalog: merged)
+                if !sanitized.overview.isEmpty {
+                    overview = sanitized
                 }
             }
         }
@@ -292,16 +266,27 @@ public final class IvyGardenViewModel {
         await catalogVideo(at: url, speak: speak)
     }
 
+    /// Updates a matched library plant, or creates a new one when confidence is high enough.
+    /// Returns nil when the draft is too weak to create a new gallery row.
     private func persistCatalogDraft(
         _ draft: CatalogPlantDraft,
         library: inout [PlantSighting]
-    ) async -> CatalogPlantDraft {
+    ) async -> CatalogPlantDraft? {
         var next = draft
         if let matchId = draft.matchedPlantId,
            var existing = library.first(where: { $0.id == matchId })
         {
-            existing.name = draft.name
-            if let species = draft.species, !species.isEmpty { existing.species = species }
+            // Preserve the gardener's display name unless the model agrees closely.
+            if GardenVideoCatalogDiff.namesLikelySame(existing.name, draft.name),
+               (draft.confidence ?? 0) >= 0.9 {
+                existing.name = draft.name
+            }
+            if let species = draft.species, !species.isEmpty {
+                if existing.species == nil || existing.species?.isEmpty == true
+                    || (draft.confidence ?? 0) >= 0.8 {
+                    existing.species = species
+                }
+            }
             if !draft.careTips.isEmpty { existing.careNotes = draft.careTips }
             if !draft.suggestedActions.isEmpty { existing.suggestedActions = draft.suggestedActions }
             if !draft.seasonalNotes.isEmpty { existing.seasonalNotes = draft.seasonalNotes }
@@ -318,6 +303,7 @@ public final class IvyGardenViewModel {
             next.savedPlantId = saved.id
             next.matchedPlantId = saved.id
             next.matchedLibraryName = saved.name
+            next.name = saved.name
             next.imageData = nil
             return next
         }
@@ -327,12 +313,23 @@ public final class IvyGardenViewModel {
             if let species = draft.species, let ps = plant.species,
                !species.isEmpty,
                ps.localizedCaseInsensitiveCompare(species) == .orderedSame {
-                return true
+                // Only collapse onto a unique species hit.
+                let sameSpecies = library.filter {
+                    ($0.species ?? "").localizedCaseInsensitiveCompare(species) == .orderedSame
+                }
+                return sameSpecies.count == 1
+                    || GardenVideoCatalogDiff.namesLikelySame(plant.name, draft.name)
             }
             return plant.name.localizedCaseInsensitiveCompare(draft.name) == .orderedSame
+                || GardenVideoCatalogDiff.namesLikelySame(plant.name, draft.name)
         }) {
             var updated = existing
-            if let species = draft.species, !species.isEmpty { updated.species = species }
+            if let species = draft.species, !species.isEmpty {
+                if updated.species == nil || updated.species?.isEmpty == true
+                    || (draft.confidence ?? 0) >= 0.8 {
+                    updated.species = species
+                }
+            }
             if !draft.careTips.isEmpty { updated.careNotes = draft.careTips }
             if !draft.suggestedActions.isEmpty { updated.suggestedActions = draft.suggestedActions }
             if !draft.seasonalNotes.isEmpty { updated.seasonalNotes = draft.seasonalNotes }
@@ -349,8 +346,13 @@ public final class IvyGardenViewModel {
             next.savedPlantId = saved.id
             next.matchedPlantId = saved.id
             next.matchedLibraryName = saved.name
+            next.name = saved.name
             next.imageData = nil
             return next
+        }
+
+        guard GardenVideoCatalogDiff.shouldCreateNewPlant(draft) else {
+            return nil
         }
 
         let imageData = draft.imageData ?? Data()
@@ -620,38 +622,54 @@ public final class IvyGardenViewModel {
         do {
             let answer = try await analyzeImage(frame, prompt)
             var result = PlantIdentifyDiff.parseModelJSON(answer, library: library)
-            if save, let top = result.plants.first {
+            if save, let top = result.plants.first, PlantIdentifyDiff.shouldPersist(top) {
                 let ocrText = await recognizeText?(frame.imageData) ?? ""
-                let plant = await store.save(
-                    imageData: frame.imageData,
-                    name: top.name,
-                    species: top.species,
-                    location: location,
-                    careNotes: top.careTips,
-                    text: ocrText,
-                    caption: top.health ?? ""
-                )
-                if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                    result.plants[idx].matchedPlantId = plant.id
-                    result.plants[idx].matchedLibraryName = plant.name
+                if let matchId = top.matchedPlantId,
+                   var existing = library.first(where: { $0.id == matchId }) {
+                    if let species = top.species, !species.isEmpty {
+                        if existing.species == nil || existing.species?.isEmpty == true
+                            || (top.confidence ?? 0) >= 0.8 {
+                            existing.species = species
+                        }
+                    }
+                    if !top.careTips.isEmpty { existing.careNotes = top.careTips }
+                    if let health = top.health, !health.isEmpty {
+                        existing.healthStatus = health
+                        existing.caption = health
+                    }
+                    if let location, !location.isEmpty { existing.location = location }
+                    let plant = await store.upsert(existing)
+                    if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
+                        result.plants[idx].matchedPlantId = plant.id
+                        result.plants[idx].matchedLibraryName = plant.name
+                    }
+                    statusMessage = "Updated \(plant.name) in garden library"
+                } else if PlantIdentifyDiff.shouldSaveAsNew(top) {
+                    let plant = await store.save(
+                        imageData: frame.imageData,
+                        name: top.name,
+                        species: top.species,
+                        location: location,
+                        careNotes: top.careTips,
+                        text: ocrText,
+                        caption: top.health ?? ""
+                    )
+                    if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
+                        result.plants[idx].matchedPlantId = plant.id
+                        result.plants[idx].matchedLibraryName = plant.name
+                    }
+                    statusMessage = "Saved \(plant.name) to garden library"
+                } else {
+                    statusMessage = "Skipped weak ID (\(top.name)) — try a closer photo"
                 }
-                statusMessage = "Saved \(plant.name) to garden library"
             } else if let top = result.plants.first {
-                statusMessage = "Identified \(top.name)"
-            } else if save {
-                // Still keep the photo in the gallery even when ID is uncertain.
-                let plant = await store.save(
-                    imageData: frame.imageData,
-                    name: "Plant",
-                    species: nil,
-                    location: location,
-                    careNotes: "",
-                    text: await recognizeText?(frame.imageData) ?? "",
-                    caption: "Unidentified — rename in Gallery"
-                )
-                statusMessage = "Saved photo as \(plant.name) — tap to rename"
+                statusMessage = save
+                    ? "Skipped weak ID (\(top.name)) — try a closer photo"
+                    : "Identified \(top.name)"
             } else {
-                statusMessage = "No plant identified"
+                statusMessage = save
+                    ? "No confident plant ID — photo not saved"
+                    : "No plant identified"
             }
             lastIdentify = result
             if switchToGallery { section = .gallery }

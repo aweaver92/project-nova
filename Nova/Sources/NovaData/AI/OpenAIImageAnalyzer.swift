@@ -51,7 +51,11 @@ public struct OpenAIImageAnalyzer: Sendable {
         prompt: String,
         apiKey: String
     ) async throws -> String {
-        let (data, mime) = OpenAIRealtimeProvider.prepareForUpload(frame)
+        let (data, mime) = OpenAIRealtimeProvider.prepareForUpload(
+            frame,
+            maxDimension: 1536,
+            quality: 0.82
+        )
         let b64 = data.base64EncodedString()
 
         var request = URLRequest(url: endpoint)

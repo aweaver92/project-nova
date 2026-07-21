@@ -199,20 +199,44 @@ public struct IdentifyPlantTool: Tool {
         var result = PlantIdentifyDiff.parseModelJSON(answer, library: library)
 
         var savedId: String?
-        if args.save == true, let top = result.plants.first {
-            let plant = await store.save(
-                imageData: frame.imageData,
-                name: top.name,
-                species: top.species,
-                location: args.location,
-                careNotes: top.careTips,
-                text: "",
-                caption: top.health ?? ""
-            )
-            savedId = plant.id.uuidString
-            if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                result.plants[idx].matchedPlantId = plant.id
-                result.plants[idx].matchedLibraryName = plant.name
+        if args.save == true, let top = result.plants.first, PlantIdentifyDiff.shouldPersist(top) {
+            if let matchId = top.matchedPlantId,
+               var existing = library.first(where: { $0.id == matchId }) {
+                if let species = top.species, !species.isEmpty {
+                    if existing.species == nil || existing.species?.isEmpty == true
+                        || (top.confidence ?? 0) >= 0.8 {
+                        existing.species = species
+                    }
+                }
+                if !top.careTips.isEmpty { existing.careNotes = top.careTips }
+                if let health = top.health, !health.isEmpty {
+                    existing.healthStatus = health
+                    existing.caption = health
+                }
+                if let location = args.location, !location.isEmpty {
+                    existing.location = location
+                }
+                let plant = await store.upsert(existing)
+                savedId = plant.id.uuidString
+                if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
+                    result.plants[idx].matchedPlantId = plant.id
+                    result.plants[idx].matchedLibraryName = plant.name
+                }
+            } else if PlantIdentifyDiff.shouldSaveAsNew(top) {
+                let plant = await store.save(
+                    imageData: frame.imageData,
+                    name: top.name,
+                    species: top.species,
+                    location: args.location,
+                    careNotes: top.careTips,
+                    text: "",
+                    caption: top.health ?? ""
+                )
+                savedId = plant.id.uuidString
+                if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
+                    result.plants[idx].matchedPlantId = plant.id
+                    result.plants[idx].matchedLibraryName = plant.name
+                }
             }
         }
 

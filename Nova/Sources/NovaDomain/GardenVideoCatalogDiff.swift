@@ -3,10 +3,17 @@ import Foundation
 /// Pure helpers for Ivy's video plant catalog: enumerate every distinct plant,
 /// build profiles (actions + seasonal notes), and synthesize a Garden Overview.
 public enum GardenVideoCatalogDiff {
+    /// Minimum model confidence to keep a draft (precision over recall).
+    public static let minimumConfidence: Double = 0.62
+    /// Higher bar to create a brand-new library entry with no library match.
+    public static let minimumConfidenceForNewPlant: Double = 0.72
+    /// Single-frame new plants need this unless they also have a solid binomial.
+    public static let singleObservationConfidence: Double = 0.85
+
     public static func framePrompt(library: [PlantSighting]) -> String {
         let known: String
         if library.isEmpty {
-            known = "(none yet — identify every visible plant freely)"
+            known = "(none yet — only name plants you can identify with high confidence)"
         } else {
             known = library.prefix(40).map { plant in
                 var line = "- \(plant.name)"
@@ -18,12 +25,19 @@ public enum GardenVideoCatalogDiff {
             }.joined(separator: "\n")
         }
         return """
-        You are helping Ivy catalog a garden from this video frame.
-        List EVERY distinct plant visible (different species or clearly separate specimens \
-        with different names). Do not stop at one plant. Match the user's library when the \
-        same plant appears; otherwise identify species as best you can.
-        For each plant include practical care tips, 1–4 concrete suggested actions, and \
-        seasonal guidance (plant-out, frost, dormancy, prune windows).
+        You are helping Ivy catalog a garden from this video frame with HIGH PRECISION.
+        Rules:
+        - Only list plants that are clearly visible and identifiable in THIS frame.
+        - Prefer matching the user's library when the same specimen appears.
+        - matched_library MUST be an exact library name from the list below, or "".
+        - Do NOT invent plants for empty lawn, driveway, boats, fences, or distant scenery.
+        - Do NOT use vague names (Unknown Vine, General Garden Plants, Mixed Flowers, Plant).
+        - Do NOT invent a Latin binomial when unsure — omit species instead.
+        - In a mixed bed, list only distinct, clearly identifiable types — never guess among similar annuals.
+        - Prefer one primary plant when the frame is a close-up of a single specimen.
+        - If nothing is confidently identifiable, return {"plants":[]}.
+        - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
+        For each kept plant include care tips, 1–4 concrete actions, and seasonal guidance.
         Reply with ONLY valid JSON (no markdown):
         {"plants":[{"name":"Tomato","species":"Solanum lycopersicum","matched_library":"",\
         "confidence":0.0,"health":"ok|needs_water|stressed|unknown","care_tips":"…",\
@@ -65,7 +79,8 @@ public enum GardenVideoCatalogDiff {
         return """
         You are Ivy writing a Garden Overview after cataloging plants from a garden video.
         Synthesize how the garden is doing overall, priority actions, and mistakes to avoid. \
-        Ground every claim in the catalog below — do not invent plants.
+        Ground every claim in the catalog below — do not invent plants or rename them. \
+        Finding titles must use exact catalog plant names when referring to a plant.
         Reply with ONLY valid JSON (no markdown):
         {"overview":"2-5 sentences","health_score":"excellent|good|fair|poor|unknown",\
         "findings":[{"severity":"info|watch|urgent","title":"…","detail":"…","matched_library":""}],\
@@ -96,46 +111,166 @@ public enum GardenVideoCatalogDiff {
     ) -> [CatalogPlantDraft] {
         guard let root = extractJSONObject(text) else { return [] }
         let raw = root["plants"] as? [[String: Any]] ?? []
-        return raw.compactMap { dict in
+        let drafts: [CatalogPlantDraft] = raw.compactMap { dict in
             guard let name = dict["name"] as? String else { return nil }
             let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !cleaned.isEmpty else { return nil }
-            let species = dict["species"] as? String
-            let matchedName = dict["matched_library"] as? String
-            var matchedId: UUID?
-            if let matchedName, !matchedName.isEmpty {
-                matchedId = library.first {
-                    $0.name.localizedCaseInsensitiveCompare(matchedName) == .orderedSame
-                }?.id
-            }
-            if matchedId == nil {
-                matchedId = library.first {
-                    $0.name.localizedCaseInsensitiveCompare(cleaned) == .orderedSame
-                }?.id
-            }
-            if matchedId == nil, let species, !species.isEmpty {
-                matchedId = library.first {
-                    ($0.species ?? "").localizedCaseInsensitiveCompare(species) == .orderedSame
-                }?.id
-            }
+            let speciesRaw = dict["species"] as? String
+            let species = normalizedSpecies(speciesRaw)
+            let matchedHint = dict["matched_library"] as? String
+            let match = resolveLibraryMatch(
+                name: cleaned,
+                species: species,
+                matchedLibraryHint: matchedHint,
+                library: library
+            )
             let actions = (dict["suggested_actions"] as? [String])?
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty } ?? []
             return CatalogPlantDraft(
                 name: cleaned,
                 species: species,
-                matchedLibraryName: matchedName,
-                matchedPlantId: matchedId,
-                confidence: dict["confidence"] as? Double,
+                matchedLibraryName: match?.name ?? matchedHint,
+                matchedPlantId: match?.id,
+                confidence: parseConfidence(dict["confidence"]),
                 careTips: (dict["care_tips"] as? String) ?? "",
                 health: dict["health"] as? String,
                 suggestedActions: actions,
                 seasonalNotes: (dict["seasonal_info"] as? String) ?? "",
                 isOutdoor: dict["is_outdoor"] as? Bool,
                 frostSensitive: dict["frost_sensitive"] as? Bool,
-                imageData: imageData
+                imageData: imageData,
+                observationCount: 1
             )
         }
+        return filterReliableDrafts(drafts)
+    }
+
+    /// Drop vague / low-confidence IDs before merge or save.
+    public static func filterReliableDrafts(_ drafts: [CatalogPlantDraft]) -> [CatalogPlantDraft] {
+        drafts.filter(isReliableDraft)
+    }
+
+    public static func isReliableDraft(_ draft: CatalogPlantDraft) -> Bool {
+        guard !isVaguePlantName(draft.name) else { return false }
+        if let species = draft.species {
+            if isVaguePlantName(species) { return false }
+            // Reject fake binomials like "Mixed plants".
+            let parts = species.split(whereSeparator: \.isWhitespace)
+            if parts.count >= 2, !looksLikeBinomial(species) { return false }
+        }
+
+        switch draft.confidence {
+        case .none:
+            // Missing confidence: allow library hits; otherwise require a real binomial.
+            if draft.matchedPlantId != nil { return true }
+            return looksLikeBinomial(draft.species ?? "")
+        case .some(let confidence):
+            if draft.matchedPlantId != nil {
+                return confidence >= 0.45
+            }
+            return confidence >= minimumConfidence
+        }
+    }
+
+    public static func isVaguePlantName(_ raw: String) -> Bool {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !name.isEmpty else { return true }
+        let bannedExact: Set<String> = [
+            "plant", "plants", "flower", "flowers", "vine", "vines", "bush", "shrub",
+            "tree", "grass", "weeds", "weed", "foliage", "vegetation", "greenery",
+            "unknown", "unidentified", "various", "mixed", "assorted", "misc", "other"
+        ]
+        if bannedExact.contains(name) { return true }
+        let bannedPhrases = [
+            "unknown ", "unidentified ", "general garden", "garden plant", "mixed flower",
+            "various plant", "assorted plant", "mystery plant", "unknown vine",
+            "flowering plant", "ornamental plant", "landscape plant"
+        ]
+        return bannedPhrases.contains(where: { name.contains($0) })
+    }
+
+    /// Genus + specific epithet that looks like a real binomial (not a vague phrase).
+    public static func looksLikeBinomial(_ raw: String) -> Bool {
+        let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard parts.count >= 2 else { return false }
+        let genus = parts[0]
+        let epithet = parts[1]
+        guard genus.count >= 3, epithet.count >= 3 else { return false }
+        guard let first = genus.first, first.isUppercase else { return false }
+        guard genus.dropFirst().allSatisfy({ $0.isLowercase || $0 == "-" }) else { return false }
+        let epithetOK = epithet.allSatisfy { $0.isLetter || $0 == "-" }
+        guard epithetOK else { return false }
+        if isVaguePlantName(genus) || isVaguePlantName(epithet) { return false }
+        return true
+    }
+
+    /// Whether a draft is strong enough to create a brand-new gallery entry.
+    public static func shouldCreateNewPlant(_ draft: CatalogPlantDraft) -> Bool {
+        if draft.matchedPlantId != nil { return false }
+        guard isReliableDraft(draft) else { return false }
+        let confidence = draft.confidence ?? 0
+        let binomial = looksLikeBinomial(draft.species ?? "")
+        let observations = max(1, draft.observationCount)
+
+        // Cross-frame agreement: same ID seen twice at normal confidence is enough.
+        if observations >= 2, confidence >= minimumConfidence { return true }
+        // Single clear close-up: require high confidence.
+        if confidence >= singleObservationConfidence { return true }
+        if confidence >= minimumConfidenceForNewPlant, binomial { return true }
+        return false
+    }
+
+    /// Exact → species → fuzzy library resolution (shared by catalog + identify).
+    public static func resolveLibraryMatch(
+        name: String,
+        species: String?,
+        matchedLibraryHint: String?,
+        library: [PlantSighting]
+    ) -> (id: UUID, name: String)? {
+        if let hint = matchedLibraryHint?.trimmingCharacters(in: .whitespacesAndNewlines), !hint.isEmpty {
+            if let plant = library.first(where: {
+                $0.name.localizedCaseInsensitiveCompare(hint) == .orderedSame
+            }) {
+                return (plant.id, plant.name)
+            }
+        }
+        if let plant = library.first(where: {
+            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }) {
+            return (plant.id, plant.name)
+        }
+
+        let speciesKey = (species ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !speciesKey.isEmpty {
+            let speciesHits = library.filter {
+                ($0.species ?? "").localizedCaseInsensitiveCompare(speciesKey) == .orderedSame
+            }
+            if speciesHits.count == 1, let only = speciesHits.first {
+                return (only.id, only.name)
+            }
+            if speciesHits.count > 1 {
+                if let best = bestFuzzyLibraryMatch(name: name, among: speciesHits) {
+                    return best
+                }
+            }
+        }
+
+        return bestFuzzyLibraryMatch(name: name, among: library)
+    }
+
+    public static func parseConfidence(_ value: Any?) -> Double? {
+        guard let value else { return nil }
+        if let d = value as? Double { return d }
+        if let i = value as? Int { return Double(i) }
+        if let n = value as? NSNumber { return n.doubleValue }
+        if let s = value as? String,
+           let parsed = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return parsed
+        }
+        return nil
     }
 
     public static func parseOverviewJSON(
@@ -145,21 +280,50 @@ public enum GardenVideoCatalogDiff {
         GardenWalkDiff.parseModelJSON(text, library: library)
     }
 
+    /// Drop overview findings that invent plants outside the catalog.
+    public static func sanitizeOverview(
+        _ result: GardenWalkResult,
+        catalog: [CatalogPlantDraft]
+    ) -> GardenWalkResult {
+        let catalogNames = catalog.map(\.name)
+        let catalogLower = Set(catalogNames.map { $0.lowercased() })
+        var next = result
+        next.findings = result.findings.filter { finding in
+            let title = finding.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty, !isVaguePlantName(title) else { return false }
+            if catalogLower.contains(title.lowercased()) { return true }
+            if let matched = finding.matchedPlantName,
+               catalogLower.contains(matched.lowercased()) {
+                return true
+            }
+            // Garden-wide notes: allow if they mention a catalog plant.
+            return catalogNames.contains { title.localizedCaseInsensitiveContains($0) }
+        }
+        // Prefer catalog-derived maintenance when the model invents plant-specific chores.
+        if next.maintenance.isEmpty {
+            next.maintenance = fallbackOverview(from: catalog).maintenance
+        }
+        return next
+    }
+
     /// Merge drafts from many frames into one profile per distinct plant.
     public static func mergeDrafts(_ drafts: [CatalogPlantDraft]) -> [CatalogPlantDraft] {
+        let reliable = filterReliableDrafts(drafts)
         var order: [String] = []
-        var byKey: [String: CatalogPlantDraft] = [:]
-        for draft in drafts {
-            let key = draft.mergeKey
+        var groups: [String: [CatalogPlantDraft]] = [:]
+        for draft in reliable {
+            let key = canonicalMergeKey(for: draft, existingKeys: order, groups: groups)
             guard !key.hasSuffix(":") else { continue }
-            if var existing = byKey[key] {
-                byKey[key] = mergePair(existing: &existing, incoming: draft)
-            } else {
+            if groups[key] == nil {
                 order.append(key)
-                byKey[key] = draft
+                groups[key] = [draft]
+            } else {
+                groups[key]?.append(draft)
             }
         }
-        return order.compactMap { byKey[$0] }
+        return order.compactMap { key in
+            resolveConsensus(groups[key] ?? [])
+        }
     }
 
     public static func fallbackOverview(from profiles: [CatalogPlantDraft]) -> GardenWalkResult {
@@ -211,60 +375,224 @@ public enum GardenVideoCatalogDiff {
         )
     }
 
+    /// Whether two display names likely refer to the same plant (shared by persist).
+    public static func namesLikelySame(_ a: String, _ b: String) -> Bool {
+        let left = a.trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = b.trimmingCharacters(in: .whitespacesAndNewlines)
+        if left.localizedCaseInsensitiveCompare(right) == .orderedSame { return true }
+        return nameTokensCompatible(nameTokens(left), nameTokens(right), requireStrongToken: true)
+    }
+
     // MARK: - Private
 
-    private static func mergePair(
-        existing: inout CatalogPlantDraft,
-        incoming: CatalogPlantDraft
-    ) -> CatalogPlantDraft {
-        let existingConf = existing.confidence ?? 0
-        let incomingConf = incoming.confidence ?? 0
-        if incomingConf > existingConf {
-            existing.name = incoming.name
-            if let species = incoming.species, !species.isEmpty { existing.species = species }
-            existing.confidence = incoming.confidence
-            if let image = incoming.imageData, !image.isEmpty { existing.imageData = image }
-        } else if (existing.imageData == nil || existing.imageData?.isEmpty == true),
-                  let image = incoming.imageData, !image.isEmpty {
-            existing.imageData = image
+    private static func normalizedSpecies(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isVaguePlantName(trimmed) else { return nil }
+        if trimmed.split(whereSeparator: \.isWhitespace).count >= 2, !looksLikeBinomial(trimmed) {
+            return nil
         }
-        if existing.careTips.count < incoming.careTips.count {
-            existing.careTips = incoming.careTips
+        return trimmed
+    }
+
+    private static func bestFuzzyLibraryMatch(
+        name: String,
+        among library: [PlantSighting]
+    ) -> (id: UUID, name: String)? {
+        let tokens = nameTokens(name)
+        guard !tokens.isEmpty else { return nil }
+        var best: (PlantSighting, Double)?
+        for plant in library {
+            let score = tokenOverlapScore(tokens, nameTokens(plant.name))
+            let compatible = nameTokensCompatible(tokens, nameTokens(plant.name), requireStrongToken: true)
+            guard compatible, score >= 0.6 else { continue }
+            if best == nil || score > best!.1 {
+                best = (plant, score)
+            }
         }
-        if existing.seasonalNotes.count < incoming.seasonalNotes.count {
-            existing.seasonalNotes = incoming.seasonalNotes
+        guard let best else { return nil }
+        return (best.0.id, best.0.name)
+    }
+
+    /// Prefer library id; only merge by species when names also agree; fuzzy names carefully.
+    private static func canonicalMergeKey(
+        for draft: CatalogPlantDraft,
+        existingKeys: [String],
+        groups: [String: [CatalogPlantDraft]]
+    ) -> String {
+        if let id = draft.matchedPlantId {
+            return "id:\(id.uuidString.lowercased())"
         }
-        if existing.health == nil || existing.health?.isEmpty == true {
-            existing.health = incoming.health
-        } else if let incomingHealth = incoming.health {
-            // Prefer more concerning status.
-            let rank: (String) -> Int = { raw in
-                switch raw.lowercased() {
-                case "stressed", "poor": return 3
-                case "needs_water", "fair": return 2
-                case "ok", "good", "excellent": return 1
-                default: return 0
+
+        let tokens = nameTokens(draft.name)
+        // Match an existing name cluster when tokens strongly agree.
+        for key in existingKeys where key.hasPrefix("name:") {
+            let other = String(key.dropFirst("name:".count))
+            if nameTokensCompatible(tokens, nameTokens(other), requireStrongToken: true) {
+                return key
+            }
+        }
+        // Species merge only when an existing draft of that species has a compatible name.
+        let speciesKey = (draft.species ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !speciesKey.isEmpty {
+            let sp = "sp:\(speciesKey)"
+            if existingKeys.contains(sp), let existing = groups[sp]?.first {
+                if nameTokensCompatible(tokens, nameTokens(existing.name), requireStrongToken: false)
+                    || namesLikelySame(draft.name, existing.name)
+                {
+                    return sp
+                }
+                // Same species but different common names → keep separate specimens.
+                return "name:\(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            }
+            // First time we see this species: use species key only if name is empty of tokens? Prefer name key.
+            // Use species key so later compatible frames can join.
+            return sp
+        }
+
+        return "name:\(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+    }
+
+    private static func resolveConsensus(_ drafts: [CatalogPlantDraft]) -> CatalogPlantDraft? {
+        guard !drafts.isEmpty else { return nil }
+
+        // Vote on names / species by confidence weight.
+        var nameVotes: [String: Double] = [:]
+        var speciesVotes: [String: Double] = [:]
+        for draft in drafts {
+            let weight = max(0.01, draft.confidence ?? minimumConfidence)
+            let nameKey = draft.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            nameVotes[nameKey, default: 0] += weight
+            if let species = draft.species?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !species.isEmpty,
+               looksLikeBinomial(species) || species.split(whereSeparator: \.isWhitespace).count == 1 {
+                speciesVotes[species.lowercased(), default: 0] += weight
+            }
+        }
+
+        let rankedNames = nameVotes.sorted { $0.value > $1.value }
+        // Competing common names with no clear winner → drop the cluster (guessing).
+        if rankedNames.count >= 2 {
+            let top = rankedNames[0].value
+            let second = rankedNames[1].value
+            let hasLibrary = drafts.contains { $0.matchedPlantId != nil }
+            if !hasLibrary, second >= top * 0.75, !namesLikelySame(rankedNames[0].key, rankedNames[1].key) {
+                return nil
+            }
+        }
+
+        let winnerNameKey = rankedNames.first?.key
+        let winnerDraft = drafts
+            .filter {
+                $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == winnerNameKey
+            }
+            .max(by: { ($0.confidence ?? 0) < ($1.confidence ?? 0) })
+            ?? drafts.max(by: { ($0.confidence ?? 0) < ($1.confidence ?? 0) })!
+
+        var merged = winnerDraft
+        merged.observationCount = drafts.count
+
+        let rankedSpecies = speciesVotes.sorted { $0.value > $1.value }
+        if rankedSpecies.count >= 2 {
+            let top = rankedSpecies[0].value
+            let second = rankedSpecies[1].value
+            if second >= top * 0.75 {
+                // Ambiguous species — keep name but clear conflicting binomial.
+                merged.species = nil
+            } else if let best = drafts.first(where: {
+                ($0.species ?? "").lowercased() == rankedSpecies[0].key
+            })?.species {
+                merged.species = best
+            }
+        } else if let only = rankedSpecies.first,
+                  let best = drafts.first(where: { ($0.species ?? "").lowercased() == only.key })?.species {
+            merged.species = best
+        }
+
+        // Enrich care / health / actions from other frames without flipping identity.
+        for draft in drafts where draft.id != winnerDraft.id {
+            if merged.careTips.count < draft.careTips.count {
+                merged.careTips = draft.careTips
+            }
+            if merged.seasonalNotes.count < draft.seasonalNotes.count {
+                merged.seasonalNotes = draft.seasonalNotes
+            }
+            if merged.health == nil || merged.health?.isEmpty == true {
+                merged.health = draft.health
+            } else if let incomingHealth = draft.health {
+                let rank: (String) -> Int = { raw in
+                    switch raw.lowercased() {
+                    case "stressed", "poor": return 3
+                    case "needs_water", "fair": return 2
+                    case "ok", "good", "excellent": return 1
+                    default: return 0
+                    }
+                }
+                if rank(incomingHealth) > rank(merged.health ?? "") {
+                    merged.health = incomingHealth
                 }
             }
-            if rank(incomingHealth) > rank(existing.health ?? "") {
-                existing.health = incomingHealth
+            var actionSeen = Set(merged.suggestedActions.map { $0.lowercased() })
+            for action in draft.suggestedActions {
+                if actionSeen.insert(action.lowercased()).inserted {
+                    merged.suggestedActions.append(action)
+                }
+            }
+            if draft.isOutdoor == true { merged.isOutdoor = true }
+            else if merged.isOutdoor == nil { merged.isOutdoor = draft.isOutdoor }
+            if draft.frostSensitive == true { merged.frostSensitive = true }
+            else if merged.frostSensitive == nil { merged.frostSensitive = draft.frostSensitive }
+            if merged.matchedPlantId == nil { merged.matchedPlantId = draft.matchedPlantId }
+            if merged.matchedLibraryName == nil || merged.matchedLibraryName?.isEmpty == true {
+                merged.matchedLibraryName = draft.matchedLibraryName
+            }
+            if (merged.imageData == nil || merged.imageData?.isEmpty == true),
+               let image = draft.imageData, !image.isEmpty {
+                merged.imageData = image
+            } else if (draft.confidence ?? 0) > (merged.confidence ?? 0),
+                      let image = draft.imageData, !image.isEmpty {
+                merged.imageData = image
+            }
+            if let conf = draft.confidence, conf > (merged.confidence ?? 0) {
+                merged.confidence = conf
             }
         }
-        var actionSeen = Set(existing.suggestedActions.map { $0.lowercased() })
-        for action in incoming.suggestedActions {
-            if actionSeen.insert(action.lowercased()).inserted {
-                existing.suggestedActions.append(action)
-            }
+        merged.observationCount = drafts.count
+        return merged
+    }
+
+    private static func nameTokens(_ name: String) -> Set<String> {
+        let stop: Set<String> = ["the", "a", "an", "and", "or", "of", "plant", "flower"]
+        return Set(
+            name.lowercased()
+                .split { !$0.isLetter }
+                .map(String.init)
+                .filter { $0.count > 2 && !stop.contains($0) }
+        )
+    }
+
+    private static func tokenOverlapScore(_ a: Set<String>, _ b: Set<String>) -> Double {
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        let inter = a.intersection(b).count
+        let union = a.union(b).count
+        return union == 0 ? 0 : Double(inter) / Double(union)
+    }
+
+    /// Subset/overlap merge, but require a strong shared token (≥5 letters) to avoid
+    /// Rose ↔ Rose Mallow style false friends unless species already agreed elsewhere.
+    private static func nameTokensCompatible(
+        _ a: Set<String>,
+        _ b: Set<String>,
+        requireStrongToken: Bool
+    ) -> Bool {
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        let inter = a.intersection(b)
+        guard !inter.isEmpty else { return false }
+        if requireStrongToken {
+            guard inter.contains(where: { $0.count >= 5 }) else { return false }
         }
-        if incoming.isOutdoor == true { existing.isOutdoor = true }
-        else if existing.isOutdoor == nil { existing.isOutdoor = incoming.isOutdoor }
-        if incoming.frostSensitive == true { existing.frostSensitive = true }
-        else if existing.frostSensitive == nil { existing.frostSensitive = incoming.frostSensitive }
-        if existing.matchedPlantId == nil { existing.matchedPlantId = incoming.matchedPlantId }
-        if existing.matchedLibraryName == nil || existing.matchedLibraryName?.isEmpty == true {
-            existing.matchedLibraryName = incoming.matchedLibraryName
-        }
-        return existing
+        if a.isSubset(of: b) || b.isSubset(of: a) { return true }
+        return tokenOverlapScore(a, b) >= 0.6
     }
 
     private static func extractJSONObject(_ text: String) -> [String: Any]? {

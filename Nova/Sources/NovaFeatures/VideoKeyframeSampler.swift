@@ -10,12 +10,12 @@ import UIKit
 /// Identify (and similar vision paths that only accept image frames).
 public enum VideoKeyframeSampler {
     /// Returns up to `count` JPEG frames spaced through the movie, or `[]` if
-    /// the asset cannot be read / has no duration.
+    /// the asset cannot be read / has no duration. Near-duplicate frames are dropped.
     public static func jpegKeyFrames(
         from url: URL,
         count: Int = 3,
         maxDimension: CGFloat = 1280,
-        compressionQuality: CGFloat = 0.7
+        compressionQuality: CGFloat = 0.78
     ) async -> [Data] {
         #if canImport(AVFoundation) && canImport(UIKit)
         let asset = AVURLAsset(url: url)
@@ -30,10 +30,12 @@ public enum VideoKeyframeSampler {
             return []
         }
         guard duration.isFinite, duration > 0 else { return [] }
-        var frames: [Data] = []
+        // Oversample slightly, then dedupe near-identical stills.
         let steps = max(count, 1)
-        for i in 0..<steps {
-            let t = duration * (Double(i) + 0.5) / Double(steps)
+        let sampleCount = min(steps * 2, max(steps, 24))
+        var frames: [Data] = []
+        for i in 0..<sampleCount {
+            let t = duration * (Double(i) + 0.5) / Double(sampleCount)
             let time = CMTime(seconds: t, preferredTimescale: 600)
             if let cg = try? generator.copyCGImage(at: time, actualTime: nil) {
                 let image = UIImage(cgImage: cg)
@@ -42,7 +44,7 @@ public enum VideoKeyframeSampler {
                 }
             }
         }
-        return frames
+        return dedupeFrames(frames, maxKeep: steps)
         #else
         return []
         #endif
@@ -68,10 +70,92 @@ public enum VideoKeyframeSampler {
         }
         return await jpegKeyFrames(
             from: url,
-            count: suggestedFrameCount(durationSeconds: duration, catalog: catalog)
+            count: suggestedFrameCount(durationSeconds: duration, catalog: catalog),
+            maxDimension: catalog ? 1536 : 1280,
+            compressionQuality: catalog ? 0.82 : 0.78
         )
         #else
         return await jpegKeyFrames(from: url, count: catalog ? 6 : 3)
         #endif
+    }
+
+    /// Drops near-duplicate JPEGs using a tiny grayscale fingerprint.
+    public static func dedupeFrames(_ frames: [Data], maxKeep: Int) -> [Data] {
+        guard maxKeep > 0, !frames.isEmpty else { return [] }
+        var kept: [Data] = []
+        var fingerprints: [[UInt8]] = []
+        for frame in frames {
+            guard let fp = fingerprint(frame) else {
+                if kept.count < maxKeep { kept.append(frame) }
+                continue
+            }
+            let isDup = fingerprints.contains { existing in
+                meanAbsoluteDifference(existing, fp) < 12
+            }
+            if isDup { continue }
+            fingerprints.append(fp)
+            kept.append(frame)
+            if kept.count >= maxKeep { break }
+        }
+        // If dedupe was too aggressive, fall back to evenly spaced originals.
+        if kept.count < min(maxKeep, frames.count), frames.count >= maxKeep {
+            var evenly: [Data] = []
+            for i in 0..<maxKeep {
+                let idx = Int((Double(i) + 0.5) / Double(maxKeep) * Double(frames.count))
+                evenly.append(frames[min(idx, frames.count - 1)])
+            }
+            return evenly
+        }
+        return kept
+    }
+
+    // MARK: - Private
+
+    private static func fingerprint(_ data: Data) -> [UInt8]? {
+        #if canImport(UIKit)
+        guard let image = UIImage(data: data) else { return nil }
+        let size = CGSize(width: 8, height: 8)
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let small = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        guard let cg = small.cgImage else { return nil }
+        guard let provider = cg.dataProvider, let cfData = provider.data else { return nil }
+        let ptr = CFDataGetBytePtr(cfData)
+        let length = CFDataGetLength(cfData)
+        let bpp = max(cg.bitsPerPixel / 8, 1)
+        var values: [UInt8] = []
+        values.reserveCapacity(64)
+        var i = 0
+        while values.count < 64, i + 2 < length {
+            let r = Int(ptr[i])
+            let g = Int(ptr[i + 1])
+            let b = Int(ptr[i + 2])
+            values.append(UInt8((r + g + b) / 3))
+            i += bpp
+        }
+        return values.count == 64 ? values : nil
+        #else
+        // Non-UIKit: coarse byte sample.
+        guard data.count > 64 else { return nil }
+        var values: [UInt8] = []
+        let step = max(data.count / 64, 1)
+        for i in 0..<64 {
+            values.append(data[data.index(data.startIndex, offsetBy: min(i * step, data.count - 1))])
+        }
+        return values
+        #endif
+    }
+
+    private static func meanAbsoluteDifference(_ a: [UInt8], _ b: [UInt8]) -> Double {
+        let n = min(a.count, b.count)
+        guard n > 0 else { return Double.greatestFiniteMagnitude }
+        var sum = 0
+        for i in 0..<n {
+            sum += abs(Int(a[i]) - Int(b[i]))
+        }
+        return Double(sum) / Double(n)
     }
 }

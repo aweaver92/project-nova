@@ -127,8 +127,12 @@ public struct IvyGardenView: View {
             guard let item else { return }
             Task {
                 if let frames = await loadMediaFrames(from: item), !frames.isEmpty {
-                    // Identify uses one representative frame (middle keyframe for video).
-                    await garden.identify(imageData: frames[frames.count / 2], save: true)
+                    if frames.count > 1 {
+                        // Multi-frame (video): catalog + consensus instead of one middle still.
+                        await garden.catalogFrames(frames, speak: false)
+                    } else {
+                        await garden.identify(imageData: frames[0], save: true)
+                    }
                 } else {
                     garden.notePhotoLoadFailed()
                 }
@@ -149,7 +153,9 @@ public struct IvyGardenView: View {
                 if datas.isEmpty {
                     garden.notePhotoLoadFailed()
                 } else {
-                    await garden.importPhotosToGallery(datas)
+                    // Catalog merges frames and filters weak IDs — avoids one bed becoming
+                    // Zinnia / Coleus / Celosia / Rose Mallow as separate gallery rows.
+                    await garden.catalogFrames(datas, speak: false)
                 }
                 galleryPickerItems = []
             }
