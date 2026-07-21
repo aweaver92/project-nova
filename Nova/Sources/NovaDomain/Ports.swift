@@ -1444,13 +1444,12 @@ public extension AgentBridging {
         repoId: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
+        // Leaf default for mocks that only implement the non-image overload.
         await streamCursorRun(
             command: command,
-            images: images,
             sessionId: sessionId,
             workingDirectory: workingDirectory,
             repoId: repoId,
-            mode: nil,
             onEvent: onEvent
         )
     }
@@ -1463,8 +1462,10 @@ public extension AgentBridging {
         mode: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
+        // Preserve images; older conformers ignore Cursor mode.
         await streamCursorRun(
             command: command,
+            images: images,
             sessionId: sessionId,
             workingDirectory: workingDirectory,
             repoId: repoId,
