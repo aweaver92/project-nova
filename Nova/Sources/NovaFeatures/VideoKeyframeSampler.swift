@@ -113,40 +113,31 @@ public enum VideoKeyframeSampler {
 
     private static func fingerprint(_ data: Data) -> [UInt8]? {
         #if canImport(UIKit)
-        guard let image = UIImage(data: data) else { return nil }
-        let size = CGSize(width: 8, height: 8)
-        let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 1
-        let renderer = UIGraphicsImageRenderer(size: size, format: format)
-        let small = renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: size))
+        if let image = UIImage(data: data) {
+            let size = CGSize(width: 8, height: 8)
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = 1
+            let small = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                image.draw(in: CGRect(origin: .zero, size: size))
+            }
+            if let tiny = small.jpegData(compressionQuality: 0.5) {
+                return coarseByteFingerprint(tiny)
+            }
         }
-        guard let cg = small.cgImage else { return nil }
-        guard let provider = cg.dataProvider, let cfData = provider.data else { return nil }
-        let ptr = CFDataGetBytePtr(cfData)
-        let length = CFDataGetLength(cfData)
-        let bpp = max(cg.bitsPerPixel / 8, 1)
-        var values: [UInt8] = []
-        values.reserveCapacity(64)
-        var i = 0
-        while values.count < 64, i + 2 < length {
-            let r = Int(ptr[i])
-            let g = Int(ptr[i + 1])
-            let b = Int(ptr[i + 2])
-            values.append(UInt8((r + g + b) / 3))
-            i += bpp
-        }
-        return values.count == 64 ? values : nil
-        #else
-        // Non-UIKit: coarse byte sample.
+        #endif
+        return coarseByteFingerprint(data)
+    }
+
+    private static func coarseByteFingerprint(_ data: Data) -> [UInt8]? {
         guard data.count > 64 else { return nil }
         var values: [UInt8] = []
+        values.reserveCapacity(64)
         let step = max(data.count / 64, 1)
         for i in 0..<64 {
-            values.append(data[data.index(data.startIndex, offsetBy: min(i * step, data.count - 1))])
+            let offset = min(i * step, data.count - 1)
+            values.append(data[data.index(data.startIndex, offsetBy: offset)])
         }
         return values
-        #endif
     }
 
     private static func meanAbsoluteDifference(_ a: [UInt8], _ b: [UInt8]) -> Double {
