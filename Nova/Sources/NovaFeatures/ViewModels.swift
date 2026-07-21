@@ -3590,6 +3590,23 @@ public final class AgentsViewModel {
     /// Available OpenAI Realtime voices for the picker.
     public var voices: [RealtimeVoice] { RealtimeVoice.allCases }
 
+    /// Agent display names currently using this voice id (sorted).
+    public func agentNames(usingVoice voice: String) -> [String] {
+        agents
+            .filter { $0.voice == voice }
+            .map(\.name)
+            .sorted()
+    }
+
+    /// Picker label: voice name plus which agents already use it.
+    public func voicePickerLabel(for voice: RealtimeVoice) -> String {
+        let assigned = agentNames(usingVoice: voice.rawValue)
+        if assigned.isEmpty {
+            return voice.displayName
+        }
+        return "\(voice.displayName) · \(assigned.joined(separator: ", "))"
+    }
+
     public var isClaudeActive: Bool {
         activeAgent?.id == Agent.SeedID.claude
     }
@@ -3631,6 +3648,16 @@ public final class AgentsViewModel {
     public func activate(_ agent: Agent) async {
         await orchestrator.setActiveAgentFromUI(agent.id)
         await load()
+    }
+
+    /// Change the active agent's default Realtime voice and reapply if listening.
+    public func setActiveVoice(_ voice: String) async {
+        let trimmed = voice.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var agent = activeAgent else { return }
+        guard agent.voice != trimmed else { return }
+        agent.voice = trimmed
+        await save(agent)
+        await activate(agent)
     }
 
     @discardableResult

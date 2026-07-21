@@ -14,9 +14,11 @@ public struct IvyGardenView: View {
     @Bindable var garden: IvyGardenViewModel
     var embedded: Bool = false
     @State private var identifyPickerItem: PhotosPickerItem?
+    @State private var galleryPickerItems: [PhotosPickerItem] = []
     @State private var walkPickerItems: [PhotosPickerItem] = []
     @State private var confirmClear = false
     @State private var editing: PlantSighting?
+    @State private var isGalleryEditing = false
 
     public init(garden: IvyGardenViewModel, embedded: Bool = false) {
         self.garden = garden
@@ -74,11 +76,23 @@ public struct IvyGardenView: View {
         .navigationTitle("Garden")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if garden.section == .gallery, !garden.plants.isEmpty {
+            if garden.section == .gallery {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Clear", role: .destructive) { confirmClear = true }
+                    if !garden.plants.isEmpty {
+                        Button(isGalleryEditing ? "Done" : "Edit") {
+                            isGalleryEditing.toggle()
+                        }
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if !garden.plants.isEmpty {
+                        Button("Clear", role: .destructive) { confirmClear = true }
+                    }
                 }
             }
+        }
+        .onChange(of: garden.section) { _, section in
+            if section != .gallery { isGalleryEditing = false }
         }
         .confirmationDialog("Clear plant library?", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("Clear all plants", role: .destructive) {
@@ -100,6 +114,11 @@ public struct IvyGardenView: View {
                     )
                     editing = nil
                 }
+            } onDelete: {
+                Task {
+                    await garden.delete(plant)
+                    editing = nil
+                }
             } onCancel: {
                 editing = nil
             }
@@ -107,22 +126,47 @@ public struct IvyGardenView: View {
         .onChange(of: identifyPickerItem) { _, item in
             guard let item else { return }
             Task {
-                if let data = try? await item.loadTransferable(type: Data.self) {
+                if let data = await loadPhotoJPEG(from: item) {
                     await garden.identify(imageData: data, save: true)
+                } else {
+                    garden.notePhotoLoadFailed()
                 }
                 identifyPickerItem = nil
+            }
+        }
+        .onChange(of: galleryPickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task {
+                var datas: [Data] = []
+                for item in items.prefix(12) {
+                    if let data = await loadPhotoJPEG(from: item) {
+                        datas.append(data)
+                    }
+                }
+                if datas.isEmpty {
+                    garden.notePhotoLoadFailed()
+                } else {
+                    await garden.importPhotosToGallery(datas)
+                }
+                galleryPickerItems = []
             }
         }
         .onChange(of: walkPickerItems) { _, items in
             guard !items.isEmpty else { return }
             Task {
                 var frames: [Data] = []
-                for item in items.prefix(6) {
-                    if let framesFromVideo = await loadWalkFrames(from: item) {
-                        frames.append(contentsOf: framesFromVideo)
+                for item in items.prefix(12) {
+                    if frames.count >= 12 { break }
+                    if let framesFromItem = await loadWalkFrames(from: item) {
+                        let remaining = 12 - frames.count
+                        frames.append(contentsOf: framesFromItem.prefix(remaining))
                     }
                 }
-                await garden.startGardenWalk(imageDatas: frames, speak: true)
+                if frames.isEmpty {
+                    garden.notePhotoLoadFailed()
+                } else {
+                    await garden.startGardenWalk(imageDatas: frames, speak: true)
+                }
                 walkPickerItems = []
             }
         }
@@ -135,7 +179,7 @@ public struct IvyGardenView: View {
                 Task { await garden.startGardenWalkWithGlasses(speak: true) }
             } label: {
                 Label(
-                    garden.isWalking ? "Walking…" : "Garden Walk",
+                    garden.isWalking ? "Walking…" : "Garden Walk (glasses)",
                     systemImage: "figure.walk"
                 )
             }
@@ -143,10 +187,13 @@ public struct IvyGardenView: View {
 
             PhotosPicker(
                 selection: $walkPickerItems,
-                maxSelectionCount: 6,
+                maxSelectionCount: 12,
                 matching: .any(of: [.images, .videos])
             ) {
-                Label("Upload walk photos/video", systemImage: "video.badge.plus")
+                Label(
+                    garden.isWalking ? "Analyzing photos…" : "Choose photos for Garden Walk",
+                    systemImage: "photo.on.rectangle.angled"
+                )
             }
             .disabled(garden.isBusy || garden.isWalking)
 
@@ -209,7 +256,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Garden Walk")
         } footer: {
-            Text("Ivy watches a live glasses feed or your upload, then speaks an overview — including mistakes you did not ask about. Press and hold the analysis to share or save it to Library.")
+            Text("Pick up to 12 photos (or a video) for Ivy to analyze together, or walk with glasses. Press and hold the analysis to share or save it to Library.")
                 .font(.caption2)
         }
     }
@@ -217,19 +264,45 @@ public struct IvyGardenView: View {
     @ViewBuilder
     private var gallerySection: some View {
         Section {
+            PhotosPicker(
+                selection: $galleryPickerItems,
+                maxSelectionCount: 12,
+                matching: .images
+            ) {
+                Label(
+                    garden.isBusy ? "Adding photos…" : "Add photos to gallery",
+                    systemImage: "plus.circle"
+                )
+            }
+            .disabled(garden.isBusy)
+
             if garden.plants.isEmpty {
-                Text("No plants yet. Identify from a photo or glasses to build Ivy’s library.")
+                Text("No plants yet. Add photos here, or use Identify / Garden Walk.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 8)], spacing: 8) {
                     ForEach(garden.plants) { plant in
-                        Button {
-                            editing = plant
-                        } label: {
-                            PlantThumbnail(url: garden.imageURL(for: plant), title: plant.name)
+                        ZStack(alignment: .topTrailing) {
+                            Button {
+                                if isGalleryEditing {
+                                    Task { await garden.delete(plant) }
+                                } else {
+                                    editing = plant
+                                }
+                            } label: {
+                                PlantThumbnail(url: garden.imageURL(for: plant), title: plant.name)
+                            }
+                            .buttonStyle(.plain)
+
+                            if isGalleryEditing {
+                                Image(systemName: "minus.circle.fill")
+                                    .symbolRenderingMode(.palette)
+                                    .foregroundStyle(.white, .red)
+                                    .padding(4)
+                                    .accessibilityLabel("Remove \(plant.name)")
+                            }
                         }
-                        .buttonStyle(.plain)
                         .contextMenu {
                             Button("Edit") { editing = plant }
                             Button("Log watering") {
@@ -244,9 +317,11 @@ public struct IvyGardenView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
             }
         } header: {
-            Text("Library · \(garden.plantCount)")
+            Text("Gallery · \(garden.plantCount)")
         } footer: {
-            Text("Long-press a plant to water, edit, or delete. Mark outdoor / frost-sensitive for Planning.")
+            Text(isGalleryEditing
+                 ? "Tap a plant to remove it. Tap Done when finished."
+                 : "Add photos to build Ivy’s library. Tap a plant to edit; long-press to water or delete. Use Edit to remove several quickly.")
                 .font(.caption2)
         }
     }
@@ -368,20 +443,39 @@ public struct IvyGardenView: View {
         }
     }
 
-    private func loadWalkFrames(from item: PhotosPickerItem) async -> [Data]? {
+    /// Load a still as JPEG. `Data` transferable often fails for HEIC in Photos.
+    private func loadPhotoJPEG(from item: PhotosPickerItem) async -> Data? {
+        #if canImport(UIKit)
+        if let data = try? await item.loadTransferable(type: Data.self),
+           let image = UIImage(data: data),
+           let jpeg = image.jpegData(compressionQuality: 0.82)
+        {
+            return jpeg
+        }
+        if let data = try? await item.loadTransferable(type: GardenImageTransfer.self) {
+            return data.jpeg
+        }
+        #else
         if let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty {
-            // Heuristic: smallish payloads are stills; large may still be images.
-            if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) == false {
-                return [data]
-            }
+            return data
+        }
+        #endif
+        return nil
+    }
+
+    private func loadWalkFrames(from item: PhotosPickerItem) async -> [Data]? {
+        let isMovie = item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) })
+        if !isMovie, let jpeg = await loadPhotoJPEG(from: item) {
+            return [jpeg]
         }
         #if canImport(AVFoundation) && canImport(UIKit)
         if let movie = try? await item.loadTransferable(type: WalkMovieTransfer.self) {
-            return await extractKeyFrames(from: movie.url, count: 3)
+            let frames = await extractKeyFrames(from: movie.url, count: 3)
+            return frames.isEmpty ? nil : frames
         }
         #endif
-        if let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty {
-            return [data]
+        if let jpeg = await loadPhotoJPEG(from: item) {
+            return [jpeg]
         }
         return nil
     }
@@ -416,6 +510,23 @@ public struct IvyGardenView: View {
     }
     #endif
 }
+
+#if canImport(UIKit)
+private struct GardenImageTransfer: Transferable {
+    let jpeg: Data
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .image) { data in
+            guard let image = UIImage(data: data),
+                  let jpeg = image.jpegData(compressionQuality: 0.82)
+            else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return GardenImageTransfer(jpeg: jpeg)
+        }
+    }
+}
+#endif
 
 #if canImport(AVFoundation)
 private struct WalkMovieTransfer: Transferable {
@@ -481,6 +592,7 @@ private struct PlantThumbnail: View {
 private struct PlantEditorSheet: View {
     let plant: PlantSighting
     let onSave: (String, String, String, String, Bool, Bool) -> Void
+    let onDelete: () -> Void
     let onCancel: () -> Void
 
     @State private var name: String
@@ -489,14 +601,17 @@ private struct PlantEditorSheet: View {
     @State private var careNotes: String
     @State private var isOutdoor: Bool
     @State private var frostSensitive: Bool
+    @State private var confirmDelete = false
 
     init(
         plant: PlantSighting,
         onSave: @escaping (String, String, String, String, Bool, Bool) -> Void,
+        onDelete: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.plant = plant
         self.onSave = onSave
+        self.onDelete = onDelete
         self.onCancel = onCancel
         _name = State(initialValue: plant.name)
         _species = State(initialValue: plant.species ?? "")
@@ -516,6 +631,12 @@ private struct PlantEditorSheet: View {
                     .lineLimit(3...8)
                 Toggle("Outdoor plant", isOn: $isOutdoor)
                 Toggle("Bring inside before frost", isOn: $frostSensitive)
+
+                Section {
+                    Button("Delete from gallery", role: .destructive) {
+                        confirmDelete = true
+                    }
+                }
             }
             .navigationTitle("Edit plant")
             .navigationBarTitleDisplayMode(.inline)
@@ -529,6 +650,10 @@ private struct PlantEditorSheet: View {
                     }
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+            }
+            .confirmationDialog("Remove this plant from the gallery?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button("Delete", role: .destructive, action: onDelete)
+                Button("Cancel", role: .cancel) {}
             }
         }
     }

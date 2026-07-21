@@ -220,6 +220,38 @@ public struct AgentsView: View {
                     Text("“Nova, let me talk to Claude” switches hands-free. “Nova, end the conversation” returns to Nova.")
                         .font(.caption2)
                 }
+
+                Section {
+                    if agents.activeAgent != nil {
+                        Picker(
+                            "Voice",
+                            selection: Binding(
+                                get: {
+                                    agents.activeAgent?.voice
+                                        ?? RealtimeVoice.marin.rawValue
+                                },
+                                set: { newVoice in
+                                    Task { await agents.setActiveVoice(newVoice) }
+                                }
+                            )
+                        ) {
+                            ForEach(agents.voices, id: \.rawValue) { voice in
+                                Text(agents.voicePickerLabel(for: voice))
+                                    .tag(voice.rawValue)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        Text("Select an agent above to change its voice.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Default voice · \(agents.activeName)")
+                } footer: {
+                    Text("Pick a Realtime voice for the active agent. Names after a voice show which agents already use it.")
+                        .font(.caption2)
+                }
             }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Agents")

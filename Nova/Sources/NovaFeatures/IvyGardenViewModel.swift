@@ -100,6 +100,10 @@ public final class IvyGardenViewModel {
         statusMessage = librarySaveMessage ?? statusMessage
     }
 
+    public func notePhotoLoadFailed() {
+        errorMessage = "Could not read one or more photos — try JPEG/HEIC stills from Photos."
+    }
+
     public func planItems(for season: GardenSeason) -> [GardenPlanItem] {
         GardenPlanningDiff.items(for: season, in: planItems)
     }
@@ -124,6 +128,48 @@ public final class IvyGardenViewModel {
     public func delete(_ plant: PlantSighting) async {
         await store.delete(id: plant.id)
         await load()
+        statusMessage = "Removed \(plant.name)"
+    }
+
+    /// Import one or more photos into the gallery (identify + save each).
+    public func importPhotosToGallery(_ imageDatas: [Data]) async {
+        let datas = Array(imageDatas.filter { !$0.isEmpty }.prefix(12))
+        guard !datas.isEmpty else {
+            errorMessage = "Could not read those photos — try again."
+            return
+        }
+        isBusy = true
+        errorMessage = nil
+        defer { isBusy = false }
+        var saved = 0
+        for (index, data) in datas.enumerated() {
+            statusMessage = "Adding photo \(index + 1) of \(datas.count)…"
+            let frame = CapturedFrame(imageData: data, width: 0, height: 0)
+            let countBefore = await store.all().count
+            await runIdentify(frame: frame, save: true, location: nil, switchToGallery: false)
+            var countAfter = await store.all().count
+            if countAfter <= countBefore {
+                // Vision failed — still keep the photo in the gallery.
+                _ = await store.save(
+                    imageData: data,
+                    name: "Plant",
+                    species: nil,
+                    location: nil,
+                    careNotes: "",
+                    text: await recognizeText?(data) ?? "",
+                    caption: "Added from Photos — rename in Gallery"
+                )
+                countAfter = await store.all().count
+                errorMessage = nil
+            }
+            if countAfter > countBefore { saved += 1 }
+        }
+        section = .gallery
+        await load()
+        if saved > 0 { errorMessage = nil }
+        statusMessage = saved == 0
+            ? "No plants saved from those photos"
+            : "Added \(saved) photo\(saved == 1 ? "" : "s") to gallery (\(plants.count) total)"
     }
 
     public func clearLibrary() async {
@@ -284,7 +330,7 @@ public final class IvyGardenViewModel {
     public func startGardenWalk(imageDatas: [Data], speak: Bool = true) async {
         let frames = imageDatas
             .filter { !$0.isEmpty }
-            .prefix(6)
+            .prefix(12)
             .map { CapturedFrame(imageData: $0, width: 0, height: 0) }
         guard !frames.isEmpty else {
             errorMessage = "Add a photo or video for Garden Walk."
@@ -303,14 +349,14 @@ public final class IvyGardenViewModel {
     private func runGardenWalk(frames: [CapturedFrame], speak: Bool) async {
         let library = await store.all()
         let prompt = GardenWalkDiff.analysisPrompt(library: library)
-        statusMessage = "Analyzing garden walk…"
+        statusMessage = "Analyzing \(frames.count) walk photo\(frames.count == 1 ? "" : "s")…"
         var partial: [GardenWalkResult] = []
-        for frame in frames {
+        for (index, frame) in frames.enumerated() {
+            statusMessage = "Analyzing walk photo \(index + 1) of \(frames.count)…"
             do {
                 let answer = try await analyzeImage(frame, prompt)
                 partial.append(GardenWalkDiff.parseModelJSON(answer, library: library))
             } catch {
-                // Keep other frames if one fails.
                 continue
             }
         }
@@ -348,7 +394,12 @@ public final class IvyGardenViewModel {
         }
     }
 
-    private func runIdentify(frame: CapturedFrame, save: Bool, location: String?) async {
+    private func runIdentify(
+        frame: CapturedFrame,
+        save: Bool,
+        location: String?,
+        switchToGallery: Bool = true
+    ) async {
         let library = await store.all()
         let prompt = PlantIdentifyDiff.analysisPrompt(library: library)
         do {
@@ -372,11 +423,23 @@ public final class IvyGardenViewModel {
                 statusMessage = "Saved \(plant.name) to garden library"
             } else if let top = result.plants.first {
                 statusMessage = "Identified \(top.name)"
+            } else if save {
+                // Still keep the photo in the gallery even when ID is uncertain.
+                let plant = await store.save(
+                    imageData: frame.imageData,
+                    name: "Plant",
+                    species: nil,
+                    location: location,
+                    careNotes: "",
+                    text: await recognizeText?(frame.imageData) ?? "",
+                    caption: "Unidentified — rename in Gallery"
+                )
+                statusMessage = "Saved photo as \(plant.name) — tap to rename"
             } else {
                 statusMessage = "No plant identified"
             }
             lastIdentify = result
-            section = .gallery
+            if switchToGallery { section = .gallery }
             await load()
         } catch {
             errorMessage = String(describing: error)

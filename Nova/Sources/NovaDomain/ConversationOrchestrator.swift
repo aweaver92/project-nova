@@ -604,7 +604,8 @@ public actor ConversationOrchestrator {
     /// UI-initiated activation (tapping an agent in the Agents tab).
     public func setActiveAgentFromUI(_ id: UUID) async {
         await withLifecycle {
-            if agents.isEmpty { await loadAgentRoster() }
+            // Always refresh so edits (voice, personality, tools) apply before reconnect.
+            await loadAgentRoster()
             await performSwitchAgent(toId: id, greet: streaming)
             // Do not auto-reopen Realtime from the Agents tab. Listen is only
             // armed manually on the Assistant tab.
