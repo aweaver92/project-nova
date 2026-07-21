@@ -867,7 +867,7 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
     /// Library id after catalog save/merge.
     public var savedPlantId: UUID?
     /// How many frames contributed to this merged profile (not persisted).
-    public var observationCount: Int
+    public var observationCount: Int = 1
 
     enum CodingKeys: String, CodingKey {
         case id, name, species, matchedLibraryName, matchedPlantId, confidence
