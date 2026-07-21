@@ -100,6 +100,12 @@ public actor ConversationOrchestrator {
     private var textChatOnly = false
     private var textChatBuffer = ""
     private var textChatWait: CheckedContinuation<String, Error>?
+    /// True while What's this? (or similar) runs a spoken Realtime one-shot
+    /// without arming Listen — TTS is allowed; Listen UI stays idle.
+    private var spokenOneShot = false
+    /// Optional HFP / playAndRecord activation for spoken one-shots when Listen
+    /// never opened the mic path.
+    private let audioSession: (any AudioSessionCoordinating)?
     /// Bumped when a completed transcription is handled so speech-stopped
     /// fallbacks don't double-trigger a response.
     private var utteranceEpoch = 0
@@ -173,7 +179,8 @@ public actor ConversationOrchestrator {
         activeAgentProvider: (@Sendable () async -> Agent?)? = nil,
         persistActiveAgent: (@Sendable (UUID) async -> Void)? = nil,
         agentContextProvider: (@Sendable (Agent) async -> String)? = nil,
-        audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)? = nil
+        audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)? = nil,
+        audioSession: (any AudioSessionCoordinating)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -202,6 +209,7 @@ public actor ConversationOrchestrator {
         self.persistActiveAgent = persistActiveAgent
         self.agentContextProvider = agentContextProvider
         self.audioDiagnose = audioDiagnose
+        self.audioSession = audioSession
     }
 
     /// Speak a short system note when the stream is open (coding progress, etc.).
@@ -1278,8 +1286,8 @@ public actor ConversationOrchestrator {
         inputRoute: String? = nil,
         detail: String
     ) {
-        // Typed chat without Listen must not flip the Assistant Listen UI.
-        guard !textChatOnly else { return }
+        // Typed chat / spoken vision one-shot without Listen must not flip Listen UI.
+        guard !textChatOnly, !spokenOneShot else { return }
         var next = listenHealth
         next.phase = phase
         next.micLevel = micLevel ?? next.micLevel
@@ -1370,8 +1378,92 @@ public actor ConversationOrchestrator {
         // via `.outputTranscript` while `analyze` awaits completion.
         onTranscript?(prompt, .user)
         await memory?.append(ConversationTurn(role: .user, text: prompt, workspaceId: await memoryScopeId()))
-        let answer = try await ai.analyze(image: frame, prompt: prompt)
-        return answer
+
+        // Listen already open: reuse the live Realtime socket (mic stays as-is).
+        if streaming {
+            return try await ai.analyze(image: frame, prompt: prompt)
+        }
+
+        // Listen off: open a short spoken Realtime turn, speak the answer, then
+        // disconnect — without arming Listen / mic ingress.
+        return try await runSpokenVisionOneShot(frame: frame, prompt: prompt)
+    }
+
+    private func runSpokenVisionOneShot(frame: CapturedFrame, prompt: String) async throws -> String {
+        try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: false
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            spokenOneShot = true
+            lastActivity = .now
+
+            // Playback-only (A2DP / speaker) — do NOT open HFP. Grabbing HFP for
+            // What’s this? with Listen off lets Meta AI wake on the glasses and
+            // answer in parallel with Nova.
+            do {
+                try await audioSession?.activatePlaybackOnly()
+            } catch {
+                NovaLog.audio.info(
+                    "Vision one-shot playback activate skipped: \(String(describing: error), privacy: .public)"
+                )
+            }
+
+            do {
+                try await ai.connect(config: effective)
+                let answer = try await ai.analyze(image: frame, prompt: prompt)
+                await drainSpokenOneShotPlayback()
+                spokenOneShot = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                }
+                return answer
+            } catch {
+                spokenOneShot = false
+                await egress.flush()
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                }
+                throw error
+            }
+        }
+    }
+
+    /// Wait for in-flight TTS chunks to finish before tearing down Realtime.
+    private func drainSpokenOneShotPlayback() async {
+        for _ in 0..<50 {
+            if !assistantSpeaking { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        try? await Task.sleep(for: .milliseconds(250))
+        await egress.flush()
     }
 
     private func handle(_ event: AIConversationEvent) async {
@@ -1465,6 +1557,8 @@ public actor ConversationOrchestrator {
             }
             if textChatOnly {
                 scheduleTextChatFinish()
+            } else if spokenOneShot {
+                // Vision one-shot: analyze() awaits completion; skip spoken follow-ups.
             } else {
                 await requestFollowUps()
             }

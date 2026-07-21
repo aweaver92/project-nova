@@ -2,7 +2,7 @@ import SwiftUI
 import NovaDomain
 
 /// Agents tab: Nova (master) plus specialists. Each specialist opens a dedicated
-/// push destination when active (Coding / Training / Tasks / Kitchen / Study).
+/// push destination when active (Coding / Training / Tasks / Kitchen / Study / Garden).
 public struct AgentsView: View {
     @Bindable var agents: AgentsViewModel
     @Bindable var coding: CodingViewModel
@@ -10,6 +10,7 @@ public struct AgentsView: View {
     @Bindable var tasks: SageTasksViewModel
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
+    @Bindable var garden: IvyGardenViewModel
     var showSettings: () -> Void
 
     /// Drives programmatic pushes from `agents.pendingRoute` (Assistant-tab CTAs
@@ -23,6 +24,7 @@ public struct AgentsView: View {
         tasks: SageTasksViewModel,
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
+        garden: IvyGardenViewModel,
         showSettings: @escaping () -> Void = {}
     ) {
         self.agents = agents
@@ -31,6 +33,7 @@ public struct AgentsView: View {
         self.tasks = tasks
         self.kitchen = kitchen
         self.study = study
+        self.garden = garden
         self.showSettings = showSettings
     }
 
@@ -167,6 +170,32 @@ public struct AgentsView: View {
                     }
                 }
 
+                if agents.isIvyActive {
+                    Section {
+                        NavigationLink {
+                            IvyGardenView(garden: garden, embedded: true)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Open Garden")
+                                    Text(garden.plantCount == 0
+                                         ? "Plant gallery and identify"
+                                         : "\(garden.plantCount) plants in library")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "camera.macro")
+                            }
+                        }
+                    } header: {
+                        Text("Ivy")
+                    } footer: {
+                        Text("Open Garden while talking to Ivy for the plant gallery, Garden Walk, and seasonal Planning.")
+                            .font(.caption2)
+                    }
+                }
+
                 Section {
                     ForEach(agents.agents) { agent in
                         AgentRow(
@@ -229,6 +258,7 @@ public struct AgentsView: View {
                 await tasks.load()
                 await kitchen.load()
                 await study.load()
+                await garden.load()
                 // A route requested before this tab appeared (e.g. an Assistant-tab
                 // CTA or voice command that also switched tabs) won't fire onChange,
                 // so consume any pending route once we're on screen.
@@ -259,6 +289,8 @@ public struct AgentsView: View {
             RemyKitchenView(kitchen: kitchen, embedded: true)
         case .study:
             StudyView(study: study, embedded: true)
+        case .garden:
+            IvyGardenView(garden: garden, embedded: true)
         }
     }
 }

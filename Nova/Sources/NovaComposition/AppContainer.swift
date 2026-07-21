@@ -33,6 +33,7 @@ public final class AppContainer {
     public let videoRecordings: FileVideoRecordingStore
     public let videoRecorder: GlassesVideoRecorder
     public let visualMemory: FileVisualMemoryStore
+    public let plantLibrary: FilePlantLibraryStore
     public let workspaces: FileWorkspaceStore
     public let skillStore: FileSkillStore
     public let codingPromptStore: FileCodingPromptStore
@@ -56,6 +57,7 @@ public final class AppContainer {
     public let skillsVM: SkillsViewModel
     public let knowledgeVM: KnowledgeViewModel
     public let visualMemoryVM: VisualMemoryViewModel
+    public let gardenVM: IvyGardenViewModel
     public let agentsVM: AgentsViewModel
     public let codingVM: CodingViewModel
     public let trainingVM: TrainingViewModel
@@ -167,6 +169,8 @@ public final class AppContainer {
         let ocr = VisionTextRecognizer()
         let visualStore = FileVisualMemoryStore()
         self.visualMemory = visualStore
+        let plantStore = FilePlantLibraryStore()
+        self.plantLibrary = plantStore
 
         let knowledgeSearch = KnowledgeSearch(
             notes: noteStore,
@@ -413,7 +417,26 @@ public final class AppContainer {
             DeleteStudyCardTool(store: studyStore),
             StartQuizTool(store: studyStore),
             RevealCardTool(store: studyStore),
-            GradeCardTool(store: studyStore)
+            GradeCardTool(store: studyStore),
+            // Ivy's garden / plant library tools.
+            ListPlantsTool(store: plantStore),
+            SavePlantTool(store: plantStore),
+            UpdatePlantTool(store: plantStore),
+            RemovePlantTool(store: plantStore),
+            LogPlantWateringTool(store: plantStore),
+            IdentifyPlantTool(
+                frameCapture: capture,
+                ai: ai,
+                store: plantStore,
+                isVisionReady: { await session.isRegistered() }
+            ),
+            GardenWalkTool(
+                frameCapture: capture,
+                ai: ai,
+                store: plantStore,
+                isVisionReady: { await session.isRegistered() }
+            ),
+            ListGardenPlanTool(store: plantStore)
         ]
         tools.append(HomeAssistantTool(baseURL: ha?.baseURL, token: ha?.token))
         tools.append(HomeAssistantStateTool(baseURL: ha?.baseURL, token: ha?.token))
@@ -518,6 +541,10 @@ public final class AppContainer {
                     let s = await studyStore.summary(dueLimit: 8)
                     if !s.isEmpty { parts.append(s) }
                 }
+                if names.contains("list_plants") {
+                    let s = await plantStore.summary(limit: 20)
+                    if !s.isEmpty { parts.append(s) }
+                }
                 return parts.joined(separator: "\n")
             },
             audioDiagnose: { pcm, rate, meta in
@@ -529,7 +556,8 @@ public final class AppContainer {
                 NovaLog.session.info(
                     "Realtime diagnose upload ok=\(result.ok) \(result.payloadJSON.prefix(200), privacy: .public)"
                 )
-            }
+            },
+            audioSession: coordinator
         )
         self.orchestrator = orchestrator
         switchAgentSink.bind(orchestrator)
@@ -547,6 +575,47 @@ public final class AppContainer {
         self.skillsVM = SkillsViewModel(store: skillStore, scheduler: scheduler)
         self.knowledgeVM = KnowledgeViewModel(bookmarkStore: bookmarkStore, search: knowledgeSearch)
         self.visualMemoryVM = VisualMemoryViewModel(store: visualStore)
+        let climateClient = GardenClimateClient()
+        self.gardenVM = IvyGardenViewModel(
+            store: plantStore,
+            analyzeImage: { [tokenService, useFakeAI] frame, prompt in
+                if useFakeAI {
+                    if prompt.contains("Garden Walk") {
+                        return #"{"overview":"Garden looks fair with a few thirsty pots.","health_score":"fair","findings":[{"severity":"watch","title":"Dry soil","detail":"Top soil looks dry on visible pots.","matched_library":""}],"maintenance":["Water dry pots this evening"],"mistakes":["Leaving tender plants out overnight near frost"]}"#
+                    }
+                    return #"{"plants":[{"name":"Test Monstera","species":"Monstera deliciosa","matched_library":"","confidence":0.9,"care_tips":"Bright indirect light; water when top soil is dry.","health":"ok"}],"notes":"fake"}"#
+                }
+                return try await OpenAIImageAnalyzer(tokenService: tokenService)
+                    .analyze(frame: frame, prompt: prompt)
+            },
+            captureStill: { [capture] in
+                try await capture.captureStill()
+            },
+            startLiveLook: { [capture] fps in
+                try await capture.startLiveLook(fps: fps)
+            },
+            stopLiveLook: { [capture] in
+                await capture.stopLiveLook()
+            },
+            releaseCamera: { [capture] in
+                await capture.releaseCamera()
+            },
+            isVisionReady: { [session] in
+                await session.isRegistered()
+            },
+            recognizeText: { [ocr] data in
+                await ocr.recognizeText(in: data)
+            },
+            speakAboutFrame: { [orchestrator] frame, prompt in
+                try await orchestrator.askAboutFrame(frame, prompt: prompt)
+            },
+            fetchClimate: { city in
+                try await climateClient.snapshot(city: city)
+            },
+            holdVideoForAudio: { [capture] hold in
+                await capture.setAudioPriorityHold(hold)
+            }
+        )
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)
         let codingVM = CodingViewModel(
             bridge: bridge,

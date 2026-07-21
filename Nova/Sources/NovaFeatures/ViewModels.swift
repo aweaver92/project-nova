@@ -418,10 +418,14 @@ public final class VisionViewModel {
             await bandwidth.holdVideoForAudio(true)
             let frame = try await capture.captureStill()
             try selector.validate(frame)
-            lastAnswer = try await orchestrator.askAboutFrame(frame, prompt: prompt)
+            // Drop the DAT camera session before speaking so Meta’s capture
+            // experience / LED ends before Nova TTS — reduces Meta AI piggyback.
+            await capture.releaseCamera()
             await bandwidth.holdVideoForAudio(false)
+            lastAnswer = try await orchestrator.askAboutFrame(frame, prompt: prompt)
         } catch {
             errorMessage = String(describing: error)
+            await capture.releaseCamera()
             await bandwidth.holdVideoForAudio(false)
         }
     }
@@ -3538,6 +3542,7 @@ public enum AgentsPendingRoute: String, Sendable, Hashable, Identifiable {
     case tasks
     case kitchen
     case study
+    case garden
 
     public var id: String { rawValue }
 }
@@ -3590,6 +3595,10 @@ public final class AgentsViewModel {
 
     public var isScholarActive: Bool {
         activeAgent?.id == Agent.SeedID.scholar
+    }
+
+    public var isIvyActive: Bool {
+        activeAgent?.id == Agent.SeedID.ivy
     }
 
     public func requestRoute(_ route: AgentsPendingRoute) {

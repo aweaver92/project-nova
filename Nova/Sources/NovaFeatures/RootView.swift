@@ -30,6 +30,7 @@ public struct RootView: View {
     @Bindable var tasks: SageTasksViewModel
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
+    @Bindable var garden: IvyGardenViewModel
     @Bindable var settings: SettingsViewModel
     @Bindable var toolConfirmation: ToolConfirmationCoordinator
     var appNavigation: AppNavigationBridge
@@ -59,6 +60,7 @@ public struct RootView: View {
         tasks: SageTasksViewModel,
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
+        garden: IvyGardenViewModel,
         settings: SettingsViewModel,
         toolConfirmation: ToolConfirmationCoordinator,
         appNavigation: AppNavigationBridge
@@ -79,6 +81,7 @@ public struct RootView: View {
         self.tasks = tasks
         self.kitchen = kitchen
         self.study = study
+        self.garden = garden
         self.settings = settings
         self.toolConfirmation = toolConfirmation
         self.appNavigation = appNavigation
@@ -97,6 +100,7 @@ public struct RootView: View {
                 tasks: tasks,
                 kitchen: kitchen,
                 study: study,
+                garden: garden,
                 showSettings: { showSettings = true }
             )
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }
@@ -180,6 +184,16 @@ public struct RootView: View {
                         route: .study
                     )
                 }
+                if agents.isIvyActive || garden.plantCount > 0 {
+                    specialistResumeSection(
+                        title: garden.plantCount == 0
+                            ? "Open Garden"
+                            : "Open Garden · \(garden.plantCount) plants",
+                        systemImage: "camera.macro",
+                        footer: "Opens Garden under Agents for gallery, Garden Walk, and seasonal Planning.",
+                        route: .garden
+                    )
+                }
                 if session.registrationState == .registered {
                     visionSection
                 }
@@ -230,11 +244,16 @@ public struct RootView: View {
                 Text("Bridge health reports OPENAI_API_KEY missing. Restart nova-bridge after adding the key, or open Settings to re-test.")
             }
             .task {
-                appNavigation.onOpen = { [agents, kitchen] routeKey, kitchenSection in
+                appNavigation.onOpen = { [agents, kitchen, garden] routeKey, kitchenSection in
                     if let kitchenSection,
                        let section = RemyKitchenViewModel.Section(rawValue: kitchenSection)
                     {
                         kitchen.selectedSection = section
+                    }
+                    if let kitchenSection,
+                       let section = IvyGardenViewModel.Section(rawValue: kitchenSection)
+                    {
+                        garden.section = section
                     }
                     if let route = AgentsPendingRoute(rawValue: routeKey) {
                         agents.clearPendingRoute()
@@ -371,6 +390,8 @@ public struct RootView: View {
             return (.kitchen, "Open Kitchen", "fork.knife")
         case Agent.SeedID.scholar:
             return (.study, "Open Study", "text.book.closed")
+        case Agent.SeedID.ivy:
+            return (.garden, "Open Garden", "camera.macro")
         default:
             return nil
         }
@@ -431,7 +452,7 @@ public struct RootView: View {
         } header: {
             Text("Vision")
         } footer: {
-            Text("Uses the glasses camera. Also say “Nova, what’s this?” while listening.")
+            Text("Uses the glasses camera, then speaks on the phone/A2DP (not Meta AI’s HFP call path). Works with Listen off.")
         }
     }
 

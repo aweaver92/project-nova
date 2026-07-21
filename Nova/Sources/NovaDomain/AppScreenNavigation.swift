@@ -149,6 +149,42 @@ public enum AppScreenCatalog: Sendable {
             routeKey: "study",
             title: "Study"
         ),
+        // Ivy / Garden
+        AppScreenTarget(
+            id: "garden",
+            aliases: ["plants", "plant_library", "plant library", "ivy_home", "botany"],
+            ownerAgentId: Agent.SeedID.ivy,
+            ownerName: "Ivy",
+            routeKey: "garden",
+            title: "Garden"
+        ),
+        AppScreenTarget(
+            id: "plant_scan",
+            aliases: ["identify_plant", "plant_id", "scan_plant", "scan plant"],
+            ownerAgentId: Agent.SeedID.ivy,
+            ownerName: "Ivy",
+            routeKey: "garden",
+            kitchenSection: "identify",
+            title: "Identify plant"
+        ),
+        AppScreenTarget(
+            id: "garden_walk",
+            aliases: ["garden walk", "walk the garden", "garden_check"],
+            ownerAgentId: Agent.SeedID.ivy,
+            ownerName: "Ivy",
+            routeKey: "garden",
+            kitchenSection: "identify",
+            title: "Garden Walk"
+        ),
+        AppScreenTarget(
+            id: "garden_plan",
+            aliases: ["planning", "seasonal_plan", "frost plan", "bring inside"],
+            ownerAgentId: Agent.SeedID.ivy,
+            ownerName: "Ivy",
+            routeKey: "garden",
+            kitchenSection: "planning",
+            title: "Garden Planning"
+        ),
     ]
 
     public static func resolve(_ raw: String) -> AppScreenTarget? {

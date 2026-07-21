@@ -700,6 +700,24 @@ final class WakeWordTests: XCTestCase {
         return samples.withUnsafeBytes { Data($0) }
     }
 
+    func testAskAboutFrameWithoutListenOpensSpokenOneShot() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        let frame = CapturedFrame(imageData: Data([0xFF, 0xD8, 0xFF, 0xD9]), width: 1, height: 1)
+
+        XCTAssertFalse(await orch.isStreaming)
+        XCTAssertFalse(await orch.isSessionActive)
+
+        let answer = try await orch.askAboutFrame(frame, prompt: "What am I looking at?")
+        XCTAssertEqual(answer, "ok")
+        XCTAssertEqual(await provider.connectCount, 1)
+        XCTAssertEqual(await provider.analyzeCount, 1)
+        XCTAssertEqual(await provider.disconnectCount, 1)
+        XCTAssertFalse(await provider.lastTextOutputOnly, "What's this? must request spoken audio output")
+        XCTAssertFalse(await orch.isSessionActive, "Listen must stay off")
+        XCTAssertFalse(await orch.isStreaming)
+    }
+
     private func makeOrchestrator(
         provider: MockProvider,
         frameCapture: (any FrameCapture)? = nil,
@@ -740,6 +758,7 @@ private actor MockProvider: ConversationalAIProvider {
     private(set) var disconnectCount = 0
     private(set) var lastInstructions = ""
     private(set) var lastVoice = ""
+    private(set) var lastTextOutputOnly = false
     private(set) var lastToolDefinitions: [ToolDefinition] = []
     private(set) var toolOutputs: [(callId: String, output: String)] = []
     private(set) var userTexts: [String] = []
@@ -763,6 +782,7 @@ private actor MockProvider: ConversationalAIProvider {
         connectCount += 1
         lastInstructions = config.instructions
         lastVoice = config.voice
+        lastTextOutputOnly = config.textOutputOnly
         lastToolDefinitions = config.toolDefinitions
         if let cancelAt = connectCancelOnCount, connectCount == cancelAt {
             throw CancellationError()

@@ -9,6 +9,7 @@ final class AgentCapabilityPackTests: XCTestCase {
         let max = agents.first { $0.name == "Max" }!
         let remy = agents.first { $0.name == "Remy" }!
         let sage = agents.first { $0.name == "Sage" }!
+        let ivy = agents.first { $0.name == "Ivy" }!
         let scholar = agents.first { $0.name == "Scholar" }!
         let claude = agents.first { $0.name == "Claude" }!
         let nova = agents.first { $0.isMaster }!
@@ -47,10 +48,17 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(claude.toolNames!.contains("draft_message"))
         XCTAssertTrue(claude.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(max.toolNames!.contains("open_app_screen"))
+        XCTAssertTrue(ivy.toolNames!.contains("list_plants"))
+        XCTAssertTrue(ivy.toolNames!.contains("identify_plant"))
+        XCTAssertTrue(ivy.toolNames!.contains("save_plant"))
+        XCTAssertTrue(ivy.toolNames!.contains("garden_walk"))
+        XCTAssertTrue(ivy.toolNames!.contains("list_garden_plan"))
+        XCTAssertTrue(ivy.toolNames!.contains("open_app_screen"))
+        XCTAssertTrue(ivy.personality.contains("Garden") || ivy.role.contains("botanist"))
 
         // Specialists share OpenAI's recommended Realtime voices (marin/cedar).
         // Legacy ash/sage/ballad/verse sound quieter and less clear than Nova.
-        for agent in [nova, claude, max, sage, remy, scholar] {
+        for agent in [nova, claude, max, sage, remy, ivy, scholar] {
             let voice = RealtimeVoice(rawValue: agent.voice)
             XCTAssertNotNil(voice, agent.name)
             XCTAssertTrue(voice!.isRecommendedQuality, "\(agent.name) voice \(agent.voice)")

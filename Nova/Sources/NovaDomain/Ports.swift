@@ -1435,6 +1435,10 @@ public extension Tool {
 
 public protocol AudioSessionCoordinating: Sendable {
     func activateConversationalHFP() async throws
+    /// Output-only path (phone speaker / A2DP). Does **not** open HFP SCO, so
+    /// Meta AI on the glasses is less likely to wake or answer in parallel with
+    /// Nova one-shots such as What’s this? when Listen is off.
+    func activatePlaybackOnly() async throws
     func deactivate() async
 }
 
@@ -1527,6 +1531,32 @@ public protocol VisualMemoryStoring: Sendable {
 
 public extension VisualMemoryStoring {
     func pruneOlderThan(days: Int) async -> Int { 0 }
+}
+
+/// Ivy's durable plant / garden image library (photos + care metadata).
+public protocol PlantLibraryStoring: Sendable {
+    func directory() async -> URL
+    func all() async -> [PlantSighting]
+    @discardableResult
+    func upsert(_ plant: PlantSighting) async -> PlantSighting
+    /// Persist a new plant photo into the library.
+    @discardableResult
+    func save(
+        imageData: Data,
+        name: String,
+        species: String?,
+        location: String?,
+        careNotes: String,
+        text: String,
+        caption: String
+    ) async -> PlantSighting
+    func delete(id: UUID) async
+    func clear() async
+    /// Short spoken/context summary of the garden library.
+    func summary(limit: Int) async -> String
+    /// City used for frost / seasonal planning (Open-Meteo geocode).
+    func climateCity() async -> String?
+    func setClimateCity(_ city: String?) async
 }
 
 /// Transcribes a recorded audio file to text (e.g. OpenAI Whisper).

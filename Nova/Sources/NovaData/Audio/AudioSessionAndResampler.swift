@@ -87,6 +87,36 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
         }
     }
 
+    public func activatePlaybackOnly() async throws {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // Spoken answers without Listen: keep Meta AI off the HFP mic/speaker
+            // path. A2DP (or phone speaker) is output-only and does not steal the
+            // glasses call channel Meta AI uses.
+            try session.setCategory(
+                .playback,
+                mode: .spokenAudio,
+                options: [.duckOthers, .allowBluetoothA2DP]
+            )
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+            // Prefer loud speaker when no A2DP glasses/headset route is up.
+            let outputs = session.currentRoute.outputs
+            let onA2DP = outputs.contains {
+                $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
+            }
+            if !onA2DP {
+                try? session.overrideOutputAudioPort(.speaker)
+            } else {
+                try? session.overrideOutputAudioPort(.none)
+            }
+            NovaLog.audio.info(
+                "Playback-only audio active (A2DP/speaker) — HFP left free for Meta AI"
+            )
+        } catch {
+            throw NovaError.audioSession(String(describing: error))
+        }
+    }
+
     public func deactivate() async {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -119,6 +149,7 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
     public func setPreferBuiltInMic(_ value: Bool) {}
     public func preferBuiltInMicEnabled() -> Bool { false }
     public func activateConversationalHFP() async throws {}
+    public func activatePlaybackOnly() async throws {}
     public func deactivate() async {}
     public static func currentInputDescription() -> String { "unavailable" }
 }

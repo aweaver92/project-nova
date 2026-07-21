@@ -59,6 +59,7 @@ struct NovaApp: App {
                 tasks: container.tasksVM,
                 kitchen: container.kitchenVM,
                 study: container.studyVM,
+                garden: container.gardenVM,
                 settings: container.settingsVM,
                 toolConfirmation: container.toolConfirmation,
                 appNavigation: container.appNavigation

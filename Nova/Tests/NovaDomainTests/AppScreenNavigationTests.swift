@@ -38,11 +38,26 @@ final class AppScreenNavigationTests: XCTestCase {
         XCTAssertEqual(sage, ["tasks"])
         XCTAssertEqual(AppScreenCatalog.resolve("wellness")?.id, "tasks")
         XCTAssertEqual(AppScreenCatalog.resolve("pickups")?.routeKey, "tasks")
+
+        let ivy = Set(AppScreenCatalog.owned(by: Agent.SeedID.ivy).map(\.id))
+        XCTAssertTrue(ivy.contains("garden"))
+        XCTAssertTrue(ivy.contains("plant_scan"))
+    }
+
+    func testIvyGardenDestinations() {
+        let garden = AppScreenCatalog.resolve("garden")!
+        XCTAssertEqual(garden.ownerName, "Ivy")
+        XCTAssertEqual(garden.routeKey, "garden")
+        XCTAssertEqual(AppScreenCatalog.resolve("plants")?.id, "garden")
+        XCTAssertEqual(AppScreenCatalog.resolve("plant_scan")?.kitchenSection, "identify")
+        XCTAssertEqual(AppScreenCatalog.resolve("scan plant")?.ownerAgentId, Agent.SeedID.ivy)
+        XCTAssertEqual(AppScreenCatalog.resolve("garden_walk")?.routeKey, "garden")
+        XCTAssertEqual(AppScreenCatalog.resolve("garden_plan")?.kitchenSection, "planning")
     }
 
     func testSpecialistsAdvertiseOpenAppScreen() {
         let agents = Agent.builtInAgents()
-        for name in ["Claude", "Max", "Sage", "Remy", "Scholar"] {
+        for name in ["Claude", "Max", "Sage", "Remy", "Ivy", "Scholar"] {
             let agent = agents.first { $0.name == name }!
             XCTAssertTrue(agent.toolNames?.contains("open_app_screen") == true, name)
         }

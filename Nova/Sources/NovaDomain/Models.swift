@@ -64,7 +64,7 @@ public struct AISessionConfig: Sendable, Equatable {
 
         Self-knowledge grounding: for every question about Nova's own features, capabilities, integrations, settings, limitations, or implementation, call inspect_nova_codebase before answering. Search first, then read the relevant source lines. The tool describes the configured bridge checkout, which may be newer than the IPA installed on the phone; distinguish "implemented in the source checkout" from "available in this installed build." Never infer that a feature exists merely because it sounds plausible. If the bridge is unavailable or the code evidence is inconclusive, say you cannot verify it instead of guessing.
 
-        Agent handoffs: when the user asks to talk to, switch to, or hand off to a specialist (Claude, Max, Sage, Remy, Scholar) or back to Nova, call the switch_agent tool immediately. Do not inspect the codebase for this, and do not invent configuration or Settings problems — the tool performs the switch.
+        Agent handoffs: when the user asks to talk to, switch to, or hand off to a specialist (Claude, Max, Sage, Remy, Ivy, Scholar) or back to Nova, call the switch_agent tool immediately. Do not inspect the codebase for this, and do not invent configuration or Settings problems — the tool performs the switch.
 
         Your other tools are the source of truth for their domains; never invent their results. Call the right tool for: weather; creating reminders; reading or creating calendar events; controlling smart-home devices (Home Assistant); remembering, recalling, or forgetting durable facts about the user; saving or reading notes; the daily briefing; and starting or stopping a voice recording that is saved to the phone (e.g. when the user says "begin voice recording", "start recording", or "stop recording"). Pass dates and times to tools in ISO8601. If a tool errors or returns nothing, tell the user plainly.
 
@@ -567,6 +567,260 @@ public struct VisualMemoryItem: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+/// A plant entry in Ivy's garden image library (photo + care metadata).
+public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// Image file name relative to the plant-library directory.
+    public let fileName: String
+    public var name: String
+    public var species: String?
+    public var location: String?
+    /// Care tips and notes grounded to this plant.
+    public var careNotes: String
+    /// OCR text from the photo (may be empty).
+    public var text: String
+    public var caption: String
+    public var lastWateredAt: Date?
+    /// When true (or inferred), plant lives outdoors and may need frost moves.
+    public var isOutdoor: Bool?
+    /// When true (or inferred), bring indoors before first frost.
+    public var frostSensitive: Bool?
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        fileName: String,
+        name: String,
+        species: String? = nil,
+        location: String? = nil,
+        careNotes: String = "",
+        text: String = "",
+        caption: String = "",
+        lastWateredAt: Date? = nil,
+        isOutdoor: Bool? = nil,
+        frostSensitive: Bool? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.name = name
+        self.species = species
+        self.location = location
+        self.careNotes = careNotes
+        self.text = text
+        self.caption = caption
+        self.lastWateredAt = lastWateredAt
+        self.isOutdoor = isOutdoor
+        self.frostSensitive = frostSensitive
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Calendar season used by Ivy's Planning tab.
+public enum GardenSeason: String, CaseIterable, Identifiable, Sendable, Codable {
+    case spring
+    case summer
+    case fall
+    case winter
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .spring: return "Spring"
+        case .summer: return "Summer"
+        case .fall: return "Fall"
+        case .winter: return "Winter"
+        }
+    }
+
+    /// Northern-hemisphere meteorological season for `date`.
+    public static func current(on date: Date = Date(), calendar: Calendar = .current) -> GardenSeason {
+        let month = calendar.component(.month, from: date)
+        switch month {
+        case 3, 4, 5: return .spring
+        case 6, 7, 8: return .summer
+        case 9, 10, 11: return .fall
+        default: return .winter
+        }
+    }
+}
+
+public enum GardenPlanKind: String, Sendable, Codable, Equatable {
+    case plantNew
+    case bringInside
+    case maintenance
+}
+
+/// One actionable row in Ivy's seasonal Planning tab.
+public struct GardenPlanItem: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var season: GardenSeason
+    public var kind: GardenPlanKind
+    public var title: String
+    public var detail: String
+    /// Human window such as "After last frost (~Apr 12)" or "2 weeks before first frost".
+    public var windowLabel: String
+    public var plantId: UUID?
+    public var plantName: String?
+
+    public init(
+        id: UUID = UUID(),
+        season: GardenSeason,
+        kind: GardenPlanKind,
+        title: String,
+        detail: String,
+        windowLabel: String,
+        plantId: UUID? = nil,
+        plantName: String? = nil
+    ) {
+        self.id = id
+        self.season = season
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.windowLabel = windowLabel
+        self.plantId = plantId
+        self.plantName = plantName
+    }
+}
+
+/// Climate anchors for seasonal planting / frost moves.
+public struct GardenClimateSnapshot: Sendable, Equatable, Codable {
+    public var city: String
+    public var lastSpringFrost: Date?
+    public var firstFallFrost: Date?
+    public var summary: String
+
+    public init(
+        city: String,
+        lastSpringFrost: Date? = nil,
+        firstFallFrost: Date? = nil,
+        summary: String = ""
+    ) {
+        self.city = city
+        self.lastSpringFrost = lastSpringFrost
+        self.firstFallFrost = firstFallFrost
+        self.summary = summary
+    }
+}
+
+public struct GardenWalkFinding: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var severity: String
+    public var title: String
+    public var detail: String
+    public var matchedPlantId: UUID?
+    public var matchedPlantName: String?
+
+    public init(
+        id: UUID = UUID(),
+        severity: String,
+        title: String,
+        detail: String,
+        matchedPlantId: UUID? = nil,
+        matchedPlantName: String? = nil
+    ) {
+        self.id = id
+        self.severity = severity
+        self.title = title
+        self.detail = detail
+        self.matchedPlantId = matchedPlantId
+        self.matchedPlantName = matchedPlantName
+    }
+}
+
+/// Result of an Ivy Garden Walk over live/uploaded frames.
+public struct GardenWalkResult: Sendable, Equatable, Codable {
+    public var overview: String
+    public var healthScore: String?
+    public var findings: [GardenWalkFinding]
+    public var maintenance: [String]
+    public var mistakes: [String]
+    public var walkedAt: Date
+
+    public init(
+        overview: String = "",
+        healthScore: String? = nil,
+        findings: [GardenWalkFinding] = [],
+        maintenance: [String] = [],
+        mistakes: [String] = [],
+        walkedAt: Date = Date()
+    ) {
+        self.overview = overview
+        self.healthScore = healthScore
+        self.findings = findings
+        self.maintenance = maintenance
+        self.mistakes = mistakes
+        self.walkedAt = walkedAt
+    }
+
+    public var spokenSummary: String {
+        var parts: [String] = []
+        if !overview.isEmpty { parts.append(overview) }
+        if let healthScore, !healthScore.isEmpty {
+            parts.append("Overall health: \(healthScore).")
+        }
+        if !mistakes.isEmpty {
+            parts.append("Mistakes to fix: " + mistakes.joined(separator: "; ") + ".")
+        }
+        if !maintenance.isEmpty {
+            parts.append("Maintenance: " + maintenance.joined(separator: "; ") + ".")
+        }
+        for finding in findings.prefix(4) {
+            parts.append("\(finding.title): \(finding.detail)")
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+/// Result of Ivy identifying plant(s) in a photo against the garden library.
+public struct PlantIdentifyResult: Sendable, Equatable {
+    public var plants: [PlantIdentifyHit]
+    public var notes: String?
+    public var identifiedAt: Date
+
+    public init(plants: [PlantIdentifyHit] = [], notes: String? = nil, identifiedAt: Date = Date()) {
+        self.plants = plants
+        self.notes = notes
+        self.identifiedAt = identifiedAt
+    }
+}
+
+public struct PlantIdentifyHit: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public var name: String
+    public var species: String?
+    public var matchedLibraryName: String?
+    public var matchedPlantId: UUID?
+    public var confidence: Double?
+    public var careTips: String
+    public var health: String?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        species: String? = nil,
+        matchedLibraryName: String? = nil,
+        matchedPlantId: UUID? = nil,
+        confidence: Double? = nil,
+        careTips: String = "",
+        health: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.species = species
+        self.matchedLibraryName = matchedLibraryName
+        self.matchedPlantId = matchedPlantId
+        self.confidence = confidence
+        self.careTips = careTips
+        self.health = health
+    }
+}
+
 /// A tool advertised to the model: name, description, and a JSON Schema for args.
 public struct ToolDefinition: Sendable, Equatable {
     public let name: String
@@ -756,7 +1010,9 @@ public extension Agent {
     /// v12: open_app_screen on specialists (scoped UI navigation).
     /// v15: Remy estimates macros in log_meal for the nutrition dashboard.
     /// v16: Sage becomes a cross-agent task manager (replaces wellness coach).
-    static let seedCapabilitiesVersion = 16
+    /// v17: Ivy botanist + plant garden library.
+    /// v18: Ivy Garden Walk (spoken coaching) + seasonal Planning.
+    static let seedCapabilitiesVersion = 18
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -767,6 +1023,7 @@ public extension Agent {
         public static let sage = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
         public static let remy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A5")!
         public static let scholar = UUID(uuidString: "00000000-0000-0000-0000-0000000000A6")!
+        public static let ivy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A7")!
     }
 
     /// SF Symbol reflecting this agent's specialty (list rows, CTAs).
@@ -778,6 +1035,7 @@ public extension Agent {
         case SeedID.sage: return "leaf"
         case SeedID.remy: return "fork.knife"
         case SeedID.scholar: return "text.book.closed"
+        case SeedID.ivy: return "camera.macro"
         default: return isMaster ? "crown.fill" : "person.wave.2.fill"
         }
     }
@@ -802,7 +1060,7 @@ public extension Agent {
                 name: "Nova",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "the master voice assistant",
-                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for task management across agents, Remy for cooking, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for task management across agents, Remy for cooking, Ivy for plants and gardening, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, Garden, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
                 builtIn: true
@@ -848,7 +1106,7 @@ public extension Agent {
                 name: "Sage",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "a task manager across the user's agents",
-                personality: "You are Sage, a calm, organized task manager for the user's multi-agent day. You track and summarize what they did with each specialist (Claude, Max, Remy, Scholar, Nova), keep an open task list, and help them pick up where they left off. Flow: use agent_activity to review recent work per agent → interpret unfinished threads as in_progress or incomplete → create_task / update_task with clear titles so the user can resume later → list_tasks when they ask what's open. When the user asks to see Tasks on the phone, call open_app_screen with tasks. Prefer short spoken briefings grouped by agent. Suggest only tasks that look genuinely unfinished; mark done when the user confirms. Use daily_briefing / calendar / create_reminder when helpful for scheduling pickups. When the user wants to resume a specific agent's work, call switch_agent with that name so they can continue there — you organize, they execute.",
+                personality: "You are Sage, a calm, organized task manager for the user's multi-agent day. You track and summarize what they did with each specialist (Claude, Max, Remy, Ivy, Scholar, Nova), keep an open task list, and help them pick up where they left off. Flow: use agent_activity to review recent work per agent → interpret unfinished threads as in_progress or incomplete → create_task / update_task with clear titles so the user can resume later → list_tasks when they ask what's open. When the user asks to see Tasks on the phone, call open_app_screen with tasks. Prefer short spoken briefings grouped by agent. Suggest only tasks that look genuinely unfinished; mark done when the user confirms. Use daily_briefing / calendar / create_reminder when helpful for scheduling pickups. When the user wants to resume a specific agent's work, call switch_agent with that name so they can continue there — you organize, they execute.",
                 toolNames: Agent.commonToolNames + [
                     "search_knowledge", "daily_briefing", "weather", "list_calendar_events",
                     "list_tasks", "create_task", "update_task", "agent_activity",
@@ -874,6 +1132,23 @@ public extension Agent {
                     "set_meal_plan_slot", "get_meal_plan", "clear_meal_plan_slot",
                     "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals",
                     "search_knowledge", "web_search"
+                ],
+                builtIn: true
+            ),
+            Agent(
+                id: SeedID.ivy,
+                name: "Ivy",
+                voice: RealtimeVoice.marin.rawValue,
+                role: "a botanist and gardening specialist",
+                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, and notes rather than inventing a generic garden. Proactively catch mistakes (overwatering signs, pests, plants that should already be indoors before frost, neglected watering) — don't wait to be asked. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance. Use list_garden_plan for seasonal planting and bring-inside-before-frost guidance. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing frost timing for their climate city.",
+                toolNames: Agent.commonToolNames + [
+                    "open_app_screen",
+                    "remember_visual",
+                    "list_plants", "save_plant", "update_plant", "remove_plant",
+                    "identify_plant", "log_plant_watering",
+                    "garden_walk", "list_garden_plan",
+                    "weather",
+                    "search_knowledge", "web_search", "set_timer", "cancel_timer", "list_timers"
                 ],
                 builtIn: true
             ),
