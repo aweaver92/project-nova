@@ -57,6 +57,9 @@ public struct CodingView: View {
             if coding.isCommitAndBuilding {
                 commitAndBuildBanner
                 Divider()
+            } else if let failure = coding.lastCommitAndBuildFailure {
+                commitAndBuildFailureBanner(failure)
+                Divider()
             }
             if coding.isRunning && coding.stallPhase != .looksStuck {
                 continuityBanner
@@ -257,6 +260,30 @@ public struct CodingView: View {
     }
 
     @ViewBuilder
+    private func commitAndBuildFailureBanner(_ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "xmark.octagon.fill")
+                .foregroundStyle(.red)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Commit and Build failed")
+                    .font(.caption.weight(.semibold))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 0)
+            Button("Dismiss") {
+                coding.clearCommitAndBuildFailure()
+            }
+            .font(.caption2.weight(.semibold))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.12))
+    }
+
+    @ViewBuilder
     private var continuityBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: coding.runStatus == "reconnecting"
@@ -453,7 +480,12 @@ public struct CodingView: View {
                 }
             }
 
-            if let built = coding.lastCommitAndBuildResult, !coding.isCommitAndBuilding {
+            if let failure = coding.lastCommitAndBuildFailure, !coding.isCommitAndBuilding {
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            } else if let built = coding.lastCommitAndBuildResult, !coding.isCommitAndBuilding {
                 Text(built.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)

@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 import NovaDomain
 
 /// Open-Meteo geocode + prior-year daily mins → approximate last/first frost dates.

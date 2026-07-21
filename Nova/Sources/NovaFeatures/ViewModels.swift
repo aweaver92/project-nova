@@ -1444,6 +1444,8 @@ public final class CodingViewModel {
     public private(set) var showDiff = false
     public private(set) var lastPublishResult: BridgePublishResult?
     public private(set) var lastCommitAndBuildResult: BridgeCommitAndBuildResult?
+    /// Last Commit and Build failure detail (kept until the next success/cancel).
+    public private(set) var lastCommitAndBuildFailure: String?
     public private(set) var lastCreatedProject: BridgeCreateProjectResult?
     public private(set) var isRefreshingRepo = false
     public private(set) var isCreatingProject = false
@@ -1451,7 +1453,7 @@ public final class CodingViewModel {
     public private(set) var isCommitAndBuilding = false
     /// Wall-clock start of the in-flight Commit and Build job.
     public private(set) var commitAndBuildStartedAt: Date?
-    /// Human phase label while Commit and Build is active.
+    /// Human phase label while Commit and Build is active (or last terminal phase).
     public private(set) var commitAndBuildPhaseLabel: String = ""
     /// Live preview server for the selected repo ("Preview in browser").
     public private(set) var activePreview: BridgePreviewInfo?
@@ -2290,17 +2292,18 @@ public final class CodingViewModel {
             let allowed = await confirmPublish("Commit and build IPA?", detail)
             guard allowed else {
                 statusMessage = "Commit and build cancelled."
+                commitAndBuildPhaseLabel = ""
                 return
             }
         }
         isCommitAndBuilding = true
         commitAndBuildStartedAt = Date()
         commitAndBuildPhaseLabel = "Committing & pushing…"
+        lastCommitAndBuildFailure = nil
         statusMessage = "Commit and Build started — commit, push, then GitHub Actions IPA (~10–25 min)."
         defer {
             isCommitAndBuilding = false
             commitAndBuildStartedAt = nil
-            commitAndBuildPhaseLabel = ""
         }
 
         // Keep the phone awake across the long bridge round-trip (CI often 10–25 min).
@@ -2332,15 +2335,25 @@ public final class CodingViewModel {
             let summary = Self.summarize(result.payloadJSON)
             statusMessage = summary
             commitAndBuildPhaseLabel = "Failed"
+            lastCommitAndBuildFailure = summary
+            lastCommitAndBuildResult = nil
             await notifyCommitAndBuildResult?(false, summary)
             return
         }
         lastCommitAndBuildResult = built
+        lastCommitAndBuildFailure = nil
         statusMessage = built.detail
         commitAndBuildPhaseLabel = "Succeeded"
         await notifyCommitAndBuildResult?(true, built.detail)
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+    }
+
+    public func clearCommitAndBuildFailure() {
+        lastCommitAndBuildFailure = nil
+        if commitAndBuildPhaseLabel == "Failed" {
+            commitAndBuildPhaseLabel = ""
+        }
     }
 
     private static func decodeCommitAndBuildResult(_ payloadJSON: String) -> BridgeCommitAndBuildResult? {

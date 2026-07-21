@@ -27,9 +27,17 @@ public enum LocalCommitBuildNotifier {
         } else {
             content.title = "Commit and Build failed"
             let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-            content.body = trimmed.isEmpty
-                ? "Check Coding for details."
-                : String(trimmed.prefix(180))
+            // Prefer a readable lead-in; keep enough of the Swift/xcode detail
+            // for the expanded notification (lock-screen body is still short).
+            let body: String
+            if trimmed.isEmpty {
+                body = "Open Coding for details."
+            } else if trimmed.lowercased().hasPrefix("ipa_build_failed") {
+                body = String(trimmed.prefix(240))
+            } else {
+                body = String(("IPA build failed: " + trimmed).prefix(240))
+            }
+            content.body = body
         }
         content.sound = .default
         content.userInfo = [
