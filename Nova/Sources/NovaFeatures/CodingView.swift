@@ -22,6 +22,8 @@ public struct CodingView: View {
     @State private var showEndSessionConfirm = false
     @State private var saveTemplateTitle = ""
     @State private var showSaveTemplate = false
+    /// Expanded process feed; auto-collapses when a run finishes.
+    @State private var agentProcessExpanded = true
     /// Repository browser action: preview a path, or pin it into prompts.
     @State private var browseMode: RepoBrowseMode = .preview
     #if canImport(UIKit)
@@ -862,14 +864,29 @@ public struct CodingView: View {
     private var agentProcessPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Agent process")
-                    .font(.caption.weight(.semibold))
-                    .textCase(.uppercase)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(coding.runStatus.uppercased())
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) {
+                        agentProcessExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: agentProcessExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 12)
+                        Text("Agent process")
+                            .font(.caption.weight(.semibold))
+                            .textCase(.uppercase)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Text(coding.runStatus.uppercased())
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
                 if coding.isRunning {
                     ProgressView().controlSize(.mini)
                     Button("Stop") {
@@ -879,43 +896,68 @@ public struct CodingView: View {
                 }
             }
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(coding.activitySteps.suffix(24)) { step in
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: step.symbolName)
-                                .font(.caption)
-                                .foregroundStyle(step.isDone ? Color.secondary : Color.accentColor)
-                                .frame(width: 14)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(step.text)
+            if agentProcessExpanded {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(coding.activitySteps.suffix(24)) { step in
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: step.symbolName)
                                     .font(.caption)
-                                    .foregroundStyle(step.isDone ? .secondary : .primary)
-                                    .lineLimit(2)
-                                if let detail = step.detail, !detail.isEmpty {
-                                    Text(detail)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                    .foregroundStyle(step.isDone ? Color.secondary : Color.accentColor)
+                                    .frame(width: 14)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(step.text)
+                                        .font(.caption)
+                                        .foregroundStyle(step.isDone ? .secondary : .primary)
                                         .lineLimit(2)
+                                    if let detail = step.detail, !detail.isEmpty {
+                                        Text(detail)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(2)
+                                    }
                                 }
-                            }
-                            Spacer(minLength: 0)
-                            if !step.isDone && coding.isRunning {
-                                ProgressView().controlSize(.mini)
-                            } else if step.isDone {
-                                Image(systemName: "checkmark")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                Spacer(minLength: 0)
+                                if !step.isDone && coding.isRunning {
+                                    ProgressView().controlSize(.mini)
+                                } else if step.isDone {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
                 }
+                .frame(maxHeight: coding.isRunning ? 140 : 88)
             }
-            .frame(maxHeight: coding.isRunning ? 140 : 88)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Color(.secondarySystemBackground))
+        .onChange(of: coding.runStatus) { _, newStatus in
+            syncAgentProcessExpansion(for: newStatus, isRunning: coding.isRunning)
+        }
+        .onChange(of: coding.isRunning) { _, running in
+            syncAgentProcessExpansion(for: coding.runStatus, isRunning: running)
+        }
+        .onAppear {
+            syncAgentProcessExpansion(for: coding.runStatus, isRunning: coding.isRunning)
+        }
+    }
+
+    private func syncAgentProcessExpansion(for status: String, isRunning: Bool) {
+        if isRunning {
+            agentProcessExpanded = true
+            return
+        }
+        // Auto-minimize when the run has finished (or otherwise ended).
+        let lowered = status.lowercased()
+        if lowered == "finished" || lowered == "idle" || lowered == "error"
+            || lowered == "cancelled" || lowered == "expired"
+        {
+            agentProcessExpanded = false
+        }
     }
 
     private var statusColor: Color {

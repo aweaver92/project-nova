@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 import NovaDomain
 import Observation
 
@@ -32,6 +33,7 @@ public final class IvyGardenViewModel {
     public private(set) var isBusy = false
     public private(set) var isWalking = false
     public private(set) var directoryURL: URL?
+    public private(set) var librarySaveMessage: String?
 
     private let store: any PlantLibraryStoring
     private let analyzeImage: (CapturedFrame, String) async throws -> String
@@ -42,8 +44,10 @@ public final class IvyGardenViewModel {
     private let isVisionReady: () async -> Bool
     private let recognizeText: ((Data) async -> String)?
     private let speakAboutFrame: ((CapturedFrame, String) async throws -> String)?
+    private let speakBriefing: ((String) async throws -> Void)?
     private let fetchClimate: ((String) async throws -> GardenClimateSnapshot)?
     private let holdVideoForAudio: ((Bool) async -> Void)?
+    private let saveLibraryNote: ((String) async -> Void)?
     private let selector = FrameSelector()
 
     public init(
@@ -56,8 +60,10 @@ public final class IvyGardenViewModel {
         isVisionReady: @escaping () async -> Bool = { false },
         recognizeText: ((Data) async -> String)? = nil,
         speakAboutFrame: ((CapturedFrame, String) async throws -> String)? = nil,
+        speakBriefing: ((String) async throws -> Void)? = nil,
         fetchClimate: ((String) async throws -> GardenClimateSnapshot)? = nil,
-        holdVideoForAudio: ((Bool) async -> Void)? = nil
+        holdVideoForAudio: ((Bool) async -> Void)? = nil,
+        saveLibraryNote: ((String) async -> Void)? = nil
     ) {
         self.store = store
         self.analyzeImage = analyzeImage
@@ -68,11 +74,31 @@ public final class IvyGardenViewModel {
         self.isVisionReady = isVisionReady
         self.recognizeText = recognizeText
         self.speakAboutFrame = speakAboutFrame
+        self.speakBriefing = speakBriefing
         self.fetchClimate = fetchClimate
         self.holdVideoForAudio = holdVideoForAudio
+        self.saveLibraryNote = saveLibraryNote
     }
 
     public var plantCount: Int { plants.count }
+
+    public var lastWalkShareText: String {
+        lastWalk?.shareText ?? ""
+    }
+
+    public func saveLastWalkToLibrary() async {
+        guard let walk = lastWalk else {
+            librarySaveMessage = "No Garden Walk to save yet."
+            return
+        }
+        guard let saveLibraryNote else {
+            librarySaveMessage = "Library notes unavailable."
+            return
+        }
+        await saveLibraryNote(walk.shareText)
+        librarySaveMessage = "Saved Garden Walk to Library notes"
+        statusMessage = librarySaveMessage ?? statusMessage
+    }
 
     public func planItems(for season: GardenSeason) -> [GardenPlanItem] {
         GardenPlanningDiff.items(for: season, in: planItems)
@@ -158,8 +184,12 @@ public final class IvyGardenViewModel {
             statusMessage = climate?.summary ?? "Climate updated"
             errorMessage = nil
         } catch {
-            errorMessage = String(describing: error)
-            climate = GardenClimateSnapshot(city: city, summary: "Could not refresh frost dates — using seasonal defaults.")
+            // Soft failure — keep seasonal defaults; don't paint Garden Walk red.
+            statusMessage = "Climate: \(error.localizedDescription)"
+            climate = GardenClimateSnapshot(
+                city: city,
+                summary: "Could not refresh frost dates — using seasonal defaults. Try “Philadelphia” or “Philadelphia, Pennsylvania”."
+            )
         }
         rebuildPlan()
     }
@@ -205,7 +235,9 @@ public final class IvyGardenViewModel {
             isBusy = false
         }
         do {
-            await holdVideoForAudio?(true)
+            // Do NOT hold video-for-audio while collecting walk frames — that
+            // drops every live frame (preferAudio default). Hold only after
+            // release, right before spoken briefing.
             let stream = try await startLiveLook(2)
             var collected: [CapturedFrame] = []
             let deadline = Date().addingTimeInterval(10)
@@ -215,13 +247,31 @@ public final class IvyGardenViewModel {
             }
             await stopLiveLook?()
             await releaseCamera?()
-            await holdVideoForAudio?(false)
-            let burst = selector.selectBurst(collected)
+
+            var burst = selector.selectBurst(collected)
+            // Fallback: stills if live look opened the camera but yielded no frames
+            // (e.g. prior sessionAlreadyExists race).
+            if burst.isEmpty, let captureStill {
+                statusMessage = "Garden Walk — capturing stills…"
+                var stills: [CapturedFrame] = []
+                for _ in 0..<3 {
+                    if let frame = try? await captureStill() {
+                        stills.append(frame)
+                    }
+                    try? await Task.sleep(for: .milliseconds(350))
+                }
+                await releaseCamera?()
+                burst = selector.selectBurst(stills)
+            }
+
             guard !burst.isEmpty else {
                 errorMessage = "No frames captured during Garden Walk."
                 return
             }
+
+            await holdVideoForAudio?(true)
             await runGardenWalk(frames: burst, speak: speak)
+            await holdVideoForAudio?(false)
         } catch {
             errorMessage = String(describing: error)
             await stopLiveLook?()
@@ -273,16 +323,28 @@ public final class IvyGardenViewModel {
         statusMessage = merged.healthScore.map { "Walk complete · \($0)" } ?? "Walk complete"
         rebuildPlan()
 
-        guard speak, let speakAboutFrame, let best = selector.pickBest(frames) ?? frames.last else {
-            return
-        }
+        guard speak else { return }
+        let briefing = GardenWalkDiff.speakPrompt(result: merged, library: library)
         do {
             statusMessage = "Ivy speaking walk overview…"
-            _ = try await speakAboutFrame(best, GardenWalkDiff.speakPrompt(result: merged, library: library))
+            if let speakBriefing {
+                try await speakBriefing(briefing)
+            } else if let speakAboutFrame {
+                // Legacy path: only if the frame is still fresh enough.
+                let best = selector.pickBest(frames) ?? frames.last
+                guard let best, best.age <= StreamBandwidthPolicy.default.maxFrameAgeSeconds else {
+                    throw NovaError.vision("Walk analysis is ready, but audio needs a fresh capture — open Listen or retry Walk.")
+                }
+                _ = try await speakAboutFrame(best, briefing)
+            } else {
+                return
+            }
             statusMessage = "Walk briefing finished"
+            errorMessage = nil
         } catch {
             // Silent analysis still useful if TTS fails.
-            errorMessage = "Walk analyzed, but audio briefing failed: \(error)"
+            statusMessage = "Walk analyzed (text only)"
+            errorMessage = "Audio briefing skipped: \(error.localizedDescription)"
         }
     }
 

@@ -56,13 +56,16 @@ final class AgentCapabilityPackTests: XCTestCase {
         XCTAssertTrue(ivy.toolNames!.contains("open_app_screen"))
         XCTAssertTrue(ivy.personality.contains("Garden") || ivy.role.contains("botanist"))
 
-        // Specialists share OpenAI's recommended Realtime voices (marin/cedar).
-        // Legacy ash/sage/ballad/verse sound quieter and less clear than Nova.
+        // Each built-in agent gets a unique Realtime voice (no shared marin/cedar).
+        var seenVoices = Set<String>()
         for agent in [nova, claude, max, sage, remy, ivy, scholar] {
             let voice = RealtimeVoice(rawValue: agent.voice)
             XCTAssertNotNil(voice, agent.name)
-            XCTAssertTrue(voice!.isRecommendedQuality, "\(agent.name) voice \(agent.voice)")
+            XCTAssertTrue(seenVoices.insert(agent.voice).inserted, "\(agent.name) reuses voice \(agent.voice)")
         }
+        XCTAssertEqual(nova.voice, RealtimeVoice.marin.rawValue)
+        XCTAssertEqual(claude.voice, RealtimeVoice.cedar.rawValue)
+        XCTAssertEqual(ivy.voice, RealtimeVoice.verse.rawValue)
     }
 
     func testSeedCapabilitiesRefreshUpdatesAllowlists() async throws {

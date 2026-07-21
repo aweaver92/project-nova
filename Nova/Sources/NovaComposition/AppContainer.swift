@@ -609,11 +609,17 @@ public final class AppContainer {
             speakAboutFrame: { [orchestrator] frame, prompt in
                 try await orchestrator.askAboutFrame(frame, prompt: prompt)
             },
+            speakBriefing: { [orchestrator] prompt in
+                try await orchestrator.speakBriefingWithoutListen(prompt)
+            },
             fetchClimate: { city in
                 try await climateClient.snapshot(city: city)
             },
             holdVideoForAudio: { [capture] hold in
                 await capture.setAudioPriorityHold(hold)
+            },
+            saveLibraryNote: { [noteStore] text in
+                _ = await noteStore.save(text)
             }
         )
         self.agentsVM = AgentsViewModel(store: agentStore, orchestrator: orchestrator)

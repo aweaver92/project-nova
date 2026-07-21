@@ -775,6 +775,38 @@ public struct GardenWalkResult: Sendable, Equatable, Codable {
         }
         return parts.joined(separator: " ")
     }
+
+    /// Plain-text body for share sheet / Library notes.
+    public var shareText: String {
+        var lines: [String] = ["Garden Walk — Ivy"]
+        if let healthScore, !healthScore.isEmpty {
+            lines.append("Health: \(healthScore)")
+        }
+        if !overview.isEmpty {
+            lines.append("")
+            lines.append(overview)
+        }
+        if !mistakes.isEmpty {
+            lines.append("")
+            lines.append("Mistakes")
+            for item in mistakes { lines.append("• \(item)") }
+        }
+        if !maintenance.isEmpty {
+            lines.append("")
+            lines.append("Maintenance")
+            for item in maintenance { lines.append("• \(item)") }
+        }
+        if !findings.isEmpty {
+            lines.append("")
+            lines.append("Findings")
+            for finding in findings {
+                var line = "• \(finding.severity): \(finding.title)"
+                if !finding.detail.isEmpty { line += " — \(finding.detail)" }
+                lines.append(line)
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
 }
 
 /// Result of Ivy identifying plant(s) in a photo against the garden library.
@@ -1012,7 +1044,8 @@ public extension Agent {
     /// v16: Sage becomes a cross-agent task manager (replaces wellness coach).
     /// v17: Ivy botanist + plant garden library.
     /// v18: Ivy Garden Walk (spoken coaching) + seasonal Planning.
-    static let seedCapabilitiesVersion = 18
+    /// v19: Unique Realtime voice per built-in agent (no shared marin/cedar).
+    static let seedCapabilitiesVersion = 19
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -1086,8 +1119,7 @@ public extension Agent {
             Agent(
                 id: SeedID.max,
                 name: "Max",
-                // marin/cedar only — OpenAI rates other Realtime voices lower quality/volume.
-                voice: RealtimeVoice.cedar.rawValue,
+                voice: RealtimeVoice.ash.rawValue,
                 role: "a personal trainer and strength coach",
                 personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. When the user asks to see Training / workouts on the phone, call open_app_screen with training. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy. The user may have the Training screen open to log sets or skip rest on the phone — say the cue and assume they may tap Log instead of asking you to log every set.",
                 toolNames: [
@@ -1104,7 +1136,7 @@ public extension Agent {
             Agent(
                 id: SeedID.sage,
                 name: "Sage",
-                voice: RealtimeVoice.marin.rawValue,
+                voice: RealtimeVoice.sage.rawValue,
                 role: "a task manager across the user's agents",
                 personality: "You are Sage, a calm, organized task manager for the user's multi-agent day. You track and summarize what they did with each specialist (Claude, Max, Remy, Ivy, Scholar, Nova), keep an open task list, and help them pick up where they left off. Flow: use agent_activity to review recent work per agent → interpret unfinished threads as in_progress or incomplete → create_task / update_task with clear titles so the user can resume later → list_tasks when they ask what's open. When the user asks to see Tasks on the phone, call open_app_screen with tasks. Prefer short spoken briefings grouped by agent. Suggest only tasks that look genuinely unfinished; mark done when the user confirms. Use daily_briefing / calendar / create_reminder when helpful for scheduling pickups. When the user wants to resume a specific agent's work, call switch_agent with that name so they can continue there — you organize, they execute.",
                 toolNames: Agent.commonToolNames + [
@@ -1117,7 +1149,7 @@ public extension Agent {
             Agent(
                 id: SeedID.remy,
                 name: "Remy",
-                voice: RealtimeVoice.cedar.rawValue,
+                voice: RealtimeVoice.coral.rawValue,
                 role: "a chef and nutrition assistant",
                 personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; for hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan. When you log a meal with log_meal, estimate its calories and protein/carbs/fat in grams from the description or recipe and pass them so the nutrition dashboard stays accurate; keep estimates reasonable and don't ask for exact numbers unless the user offers them. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
                 toolNames: Agent.commonToolNames + [
@@ -1138,7 +1170,7 @@ public extension Agent {
             Agent(
                 id: SeedID.ivy,
                 name: "Ivy",
-                voice: RealtimeVoice.marin.rawValue,
+                voice: RealtimeVoice.verse.rawValue,
                 role: "a botanist and gardening specialist",
                 personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, and notes rather than inventing a generic garden. Proactively catch mistakes (overwatering signs, pests, plants that should already be indoors before frost, neglected watering) — don't wait to be asked. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance. Use list_garden_plan for seasonal planting and bring-inside-before-frost guidance. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing frost timing for their climate city.",
                 toolNames: Agent.commonToolNames + [
@@ -1155,7 +1187,7 @@ public extension Agent {
             Agent(
                 id: SeedID.scholar,
                 name: "Scholar",
-                voice: RealtimeVoice.marin.rawValue,
+                voice: RealtimeVoice.alloy.rawValue,
                 role: "a patient tutor",
                 personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. When the user asks to see Study / decks / quiz on the phone, call open_app_screen with study. For drills: start_quiz (fronts only) → wait for the learner's answer → reveal_card → discuss briefly → grade_card (again/hard/good/easy). Use add_study_card / list_study_decks / list_study_cards / update_study_card / delete_study_card to manage decks, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
                 toolNames: Agent.commonToolNames + [

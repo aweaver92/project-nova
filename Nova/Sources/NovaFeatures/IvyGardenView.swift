@@ -187,11 +187,29 @@ public struct IvyGardenView: View {
                         .padding(.top, 2)
                     }
                 }
+                .textSelection(.enabled)
+                .contextMenu {
+                    ShareLink(item: walk.shareText) {
+                        Label("Share…", systemImage: "square.and.arrow.up")
+                    }
+                    Button {
+                        Task { await garden.saveLastWalkToLibrary() }
+                    } label: {
+                        Label("Save to Library", systemImage: "books.vertical")
+                    }
+                    Button {
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = walk.shareText
+                        #endif
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
             }
         } header: {
             Text("Garden Walk")
         } footer: {
-            Text("Ivy watches a live glasses feed or your upload, then speaks an overview — including mistakes you did not ask about.")
+            Text("Ivy watches a live glasses feed or your upload, then speaks an overview — including mistakes you did not ask about. Press and hold the analysis to share or save it to Library.")
                 .font(.caption2)
         }
     }

@@ -20,6 +20,16 @@ final class MetaCameraOpenRetryPolicyTests: XCTestCase {
         XCTAssertTrue(MetaCameraOpenRetryPolicy.isRetryableMessage("no device"))
     }
 
+    func testRetriesSessionAlreadyExists() {
+        XCTAssertTrue(MetaCameraOpenRetryPolicy.isSessionAlreadyExistsMessage("sessionAlreadyExists"))
+        XCTAssertTrue(MetaCameraOpenRetryPolicy.isRetryableMessage("DeviceSessionError.sessionAlreadyExists"))
+        XCTAssertTrue(
+            MetaCameraOpenRetryPolicy.isRetryable(
+                NovaError.vision("Glasses session failed: sessionAlreadyExists.")
+            )
+        )
+    }
+
     func testDoesNotRetryHardPermissionDenial() {
         let error = NovaError.vision(
             "Camera permission was not granted in Meta AI. Open Meta AI → Apps → Nova and allow camera, then retry."

@@ -16,7 +16,9 @@ public struct GardenClimateClient: Sendable {
             throw NovaError.tool("Climate city is empty")
         }
         guard let geo = try await geocode(trimmed) else {
-            throw NovaError.tool("City not found: \(trimmed)")
+            throw NovaError.tool(
+                "City not found: \(trimmed). Try “Philadelphia” or “Philadelphia, Pennsylvania”."
+            )
         }
         let year = Calendar.current.component(.year, from: now) - 1
         let mins = try await dailyMinTemps(lat: geo.lat, lon: geo.lon, year: year)
@@ -46,10 +48,20 @@ public struct GardenClimateClient: Sendable {
     private struct Geo { let name: String; let lat: Double; let lon: Double }
 
     private func geocode(_ city: String) async throws -> Geo? {
+        for candidate in Self.geocodeCandidates(city) {
+            if let hit = try await geocodeOnce(candidate) {
+                return hit
+            }
+        }
+        return nil
+    }
+
+    private func geocodeOnce(_ city: String) async throws -> Geo? {
         var comps = URLComponents(string: "https://geocoding-api.open-meteo.com/v1/search")!
         comps.queryItems = [
             .init(name: "name", value: city),
-            .init(name: "count", value: "1")
+            .init(name: "count", value: "5"),
+            .init(name: "language", value: "en")
         ]
         struct Response: Decodable {
             struct Result: Decodable {
@@ -58,15 +70,76 @@ public struct GardenClimateClient: Sendable {
                 let longitude: Double
                 let admin1: String?
                 let country: String?
+                let country_code: String?
+                let population: Int?
             }
             let results: [Result]?
         }
         let (data, _) = try await session.data(from: comps.url!)
         let decoded = try JSONDecoder().decode(Response.self, from: data)
-        guard let first = decoded.results?.first else { return nil }
-        let label = [first.name, first.admin1, first.country].compactMap { $0 }.joined(separator: ", ")
-        return Geo(name: label.isEmpty ? first.name : label, lat: first.latitude, lon: first.longitude)
+        guard let results = decoded.results, !results.isEmpty else { return nil }
+        // Prefer the most populous US/Canada hit when several match.
+        let preferred = results.max { lhs, rhs in
+            (lhs.population ?? 0) < (rhs.population ?? 0)
+        } ?? results[0]
+        let label = [preferred.name, preferred.admin1, preferred.country]
+            .compactMap { $0 }
+            .joined(separator: ", ")
+        return Geo(
+            name: label.isEmpty ? preferred.name : label,
+            lat: preferred.latitude,
+            lon: preferred.longitude
+        )
     }
+
+    /// Open-Meteo accepts "City, FullState" better than US postal abbreviations.
+    static func geocodeCandidates(_ raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var out: [String] = []
+        func add(_ value: String) {
+            let v = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !v.isEmpty, !out.contains(where: { $0.caseInsensitiveCompare(v) == .orderedSame }) else { return }
+            out.append(v)
+        }
+
+        add(trimmed)
+        if let expanded = expandUSStateAbbreviation(trimmed) {
+            add(expanded)
+        }
+        // City-only fallback (drop ", PA" / ", Pennsylvania").
+        if let comma = trimmed.firstIndex(of: ",") {
+            add(String(trimmed[..<comma]))
+        }
+        return out
+    }
+
+    /// "Philadelphia, PA" → "Philadelphia, Pennsylvania"
+    static func expandUSStateAbbreviation(_ raw: String) -> String? {
+        let parts = raw.split(separator: ",", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard parts.count == 2, parts[0].count >= 2 else { return nil }
+        let abbr = parts[1].uppercased()
+        guard let full = usStateNames[abbr] else { return nil }
+        return "\(parts[0]), \(full)"
+    }
+
+    private static let usStateNames: [String: String] = [
+        "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+        "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+        "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+        "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+        "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+        "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+        "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+        "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+        "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+        "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+        "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+        "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+        "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
+    ]
 
     private func dailyMinTemps(lat: Double, lon: Double, year: Int) async throws -> [(Date, Double)] {
         var comps = URLComponents(string: "https://archive-api.open-meteo.com/v1/archive")!
@@ -79,8 +152,8 @@ public struct GardenClimateClient: Sendable {
             .init(name: "temperature_unit", value: "fahrenheit"),
             .init(name: "timezone", value: "auto")
         ]
-        struct Response: Decodable {
-            struct Daily: Decodable {
+        struct Response: Codable {
+            struct Daily: Codable {
                 let time: [String]
                 let temperature_2m_min: [Double?]
             }

@@ -14,16 +14,17 @@ public enum MetaCameraOpenRetryPolicy {
         if let nova = error as? NovaError, case .vision(let message) = nova {
             return isRetryableMessage(message)
         }
-        #if canImport(MWDATCore) && os(iOS)
+#if canImport(MWDATCore) && os(iOS)
         if let sessionError = error as? DeviceSessionError {
             switch sessionError {
             case .noEligibleDevice:
                 return true
             default:
+                if isSessionAlreadyExists(sessionError) { return true }
                 break
             }
         }
-        #endif
+#endif
         return isRetryableMessage(String(describing: error))
     }
 
@@ -36,6 +37,28 @@ public enum MetaCameraOpenRetryPolicy {
             || lower.contains("stopped before it started")
             || lower.contains("did not start in time")
             || lower.contains("stream did not start")
+            || lower.contains("sessionalreadyexists")
+            || lower.contains("session already exists")
+    }
+
+    /// True when createSession failed because a non-stopped DAT session is still open.
+    public static func isSessionAlreadyExists(_ error: Error) -> Bool {
+        #if canImport(MWDATCore) && os(iOS)
+        if let sessionError = error as? DeviceSessionError {
+            let name = String(describing: sessionError).lowercased()
+            if name.contains("sessionalreadyexists") { return true }
+        }
+        #endif
+        if let nova = error as? NovaError, case .vision(let message) = nova {
+            return isSessionAlreadyExistsMessage(message)
+        }
+        return isSessionAlreadyExistsMessage(String(describing: error))
+    }
+
+    public static func isSessionAlreadyExistsMessage(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("sessionalreadyexists")
+            || lower.contains("session already exists")
     }
 
     /// True when the on-glasses DAT/DWA bundle must be installed or updated via Meta AI.

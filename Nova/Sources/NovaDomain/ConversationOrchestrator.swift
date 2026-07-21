@@ -1389,6 +1389,84 @@ public actor ConversationOrchestrator {
         return try await runSpokenVisionOneShot(frame: frame, prompt: prompt)
     }
 
+    /// Speak a prepared briefing with Listen off (playback-only). No camera frame
+    /// required — used after Garden Walk silent analysis so a long analyze does
+    /// not trip "Frame too stale".
+    public func speakBriefingWithoutListen(_ prompt: String) async throws {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if streaming {
+            await ai.sendUserText(trimmed)
+            return
+        }
+
+        try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: false
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            spokenOneShot = true
+            lastActivity = .now
+            onTranscript?(trimmed, .user)
+            await memory?.append(
+                ConversationTurn(role: .user, text: trimmed, workspaceId: await memoryScopeId())
+            )
+
+            do {
+                try await audioSession?.activatePlaybackOnly()
+            } catch {
+                NovaLog.audio.info(
+                    "Briefing playback activate skipped: \(String(describing: error), privacy: .public)"
+                )
+            }
+
+            do {
+                try await ai.connect(config: effective)
+                await ai.sendUserText(trimmed)
+                await drainSpokenOneShotPlayback()
+                spokenOneShot = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                }
+            } catch {
+                spokenOneShot = false
+                await egress.flush()
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                }
+                throw error
+            }
+        }
+    }
+
     private func runSpokenVisionOneShot(frame: CapturedFrame, prompt: String) async throws -> String {
         try await withLifecycle {
             if agents.isEmpty { await loadAgentRoster() }

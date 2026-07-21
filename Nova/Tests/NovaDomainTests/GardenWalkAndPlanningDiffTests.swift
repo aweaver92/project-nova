@@ -56,6 +56,22 @@ final class GardenWalkAndPlanningDiffTests: XCTestCase {
         XCTAssertFalse(springPlant.isEmpty)
     }
 
+    func testGardenWalkShareTextIncludesSections() {
+        let result = GardenWalkResult(
+            overview: "Beds look thirsty.",
+            healthScore: "fair",
+            findings: [GardenWalkFinding(severity: "watch", title: "Dry rim", detail: "Water soon")],
+            maintenance: ["Mulch beds"],
+            mistakes: ["Overcrowded pots"]
+        )
+        let text = result.shareText
+        XCTAssertTrue(text.contains("Garden Walk"))
+        XCTAssertTrue(text.contains("Beds look thirsty"))
+        XCTAssertTrue(text.contains("Overcrowded pots"))
+        XCTAssertTrue(text.contains("Mulch beds"))
+        XCTAssertTrue(text.contains("Dry rim"))
+    }
+
     func testFrostAnchorsFromDailyMins() {
         let year = 2023
         let cal = Calendar(identifier: .gregorian)
@@ -67,13 +83,10 @@ final class GardenWalkAndPlanningDiffTests: XCTestCase {
                 days.append((date, min))
             }
         }
-        // Force a spring frost on Apr 1 and fall frost on Oct 15 via extras.
         days.append((cal.date(from: DateComponents(year: year, month: 4, day: 1))!, 30))
         days.append((cal.date(from: DateComponents(year: year, month: 10, day: 15))!, 29))
-        // Sort like archive order
         days.sort { $0.0 < $1.0 }
 
-        // Use the same logic as GardenClimateClient via duplicated expectation:
         let july = cal.date(from: DateComponents(year: year, month: 7, day: 1))!
         let lastSpring = days.filter { $0.0 < july && $0.1 <= 32 }.last?.0
         let firstFall = days.filter { $0.0 >= july && $0.1 <= 32 }.first?.0

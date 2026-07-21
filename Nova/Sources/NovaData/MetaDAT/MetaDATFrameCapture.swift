@@ -97,13 +97,7 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveCont = nil
         pendingPhoto?.resume(throwing: NovaError.vision("Camera released"))
         pendingPhoto = nil
-        listenerTokens.removeAll()
-        // Dropping the strong references lets the SDK tear down the underlying
-        // session/stream so the glasses capture indicator turns off.
-        // Keep `deviceSelector` so the next open does not race discovery from zero.
-        stream = nil
-        deviceSession = nil
-        isStreaming = false
+        await stopOwnedSession()
         didAttemptDATAppUpdateRecovery = false
         didAttemptFirmwareUpdateRecovery = false
         NovaLog.vision.info("camera released")
@@ -171,6 +165,8 @@ public actor MetaDATFrameCapture: FrameCapture {
                 // After Meta AI "Always Allow", BLE/link and session settle often lag
                 // the permission callback — retry noEligibleDevice / stopped-before-start.
                 // DAT update-required is handled by the outer recovery path, not sleep-retry.
+                // sessionAlreadyExists: a prior open left a non-stopped SDK session
+                // (camera LED still on) after we dropped local refs without stop().
                 guard MetaCameraOpenRetryPolicy.isRetryable(error), attempt < 2 else {
                     throw error
                 }
@@ -178,7 +174,8 @@ public actor MetaDATFrameCapture: FrameCapture {
                     "camera open retry \(attempt + 1) after: \(String(describing: error), privacy: .public)"
                 )
                 await tearDownSessionOnly()
-                try await Task.sleep(for: .milliseconds(900))
+                let delayMs = MetaCameraOpenRetryPolicy.isSessionAlreadyExists(error) ? 1_200 : 900
+                try await Task.sleep(for: .milliseconds(delayMs))
             }
         }
         throw lastError ?? NovaError.vision("Glasses camera failed to open")
@@ -188,6 +185,11 @@ public actor MetaDATFrameCapture: FrameCapture {
         // Permission unlocks device visibility in some SDK builds; request first,
         // then wait for an *active* (connected + compatible) device before session.
         try await ensureCameraPermission()
+
+        // Drop any half-open local session before createSession (singleton-per-device).
+        if deviceSession != nil || stream != nil {
+            await stopOwnedSession()
+        }
 
         // Recreate the selector after permission so devicesStream is not stuck on a
         // pre-grant empty snapshot (Meta DAT 0.7+ community guidance).
@@ -314,11 +316,24 @@ public actor MetaDATFrameCapture: FrameCapture {
         }
     }
 
-    private func tearDownSessionOnly() {
+    private func tearDownSessionOnly() async {
+        await stopOwnedSession()
+    }
+
+    /// Stop stream + session before dropping refs. Meta DAT is singleton-per-device:
+    /// omitting stop() leaves the glasses capturing and the next createSession
+    /// fails with sessionAlreadyExists.
+    private func stopOwnedSession() async {
         listenerTokens.removeAll()
+        // session.stop() cascades to attached streams/capabilities.
+        if let deviceSession {
+            deviceSession.stop()
+        }
         stream = nil
         deviceSession = nil
         isStreaming = false
+        // Brief settle so the SDK clears the singleton before createSession.
+        try? await Task.sleep(for: .milliseconds(250))
     }
 
     private func setStreaming(_ value: Bool) { isStreaming = value }
@@ -430,7 +445,11 @@ public actor MetaDATFrameCapture: FrameCapture {
             case .noEligibleDevice:
                 tip = "Glasses not ready for camera yet (connected + compatible required). Wear them, unlock the phone, wait a few seconds after Always Allow, then retry. If this persists, Nova will open a firmware update in Meta AI."
             default:
-                tip = "Glasses session failed: \(String(describing: sessionError))."
+                if MetaCameraOpenRetryPolicy.isSessionAlreadyExists(sessionError) {
+                    tip = "A glasses camera session was already open (often from a previous capture that did not fully stop). Wait for the capture light to turn off, then retry."
+                } else {
+                    tip = "Glasses session failed: \(String(describing: sessionError))."
+                }
             }
             return NovaError.vision("\(tip)\n\n\(Self.cameraChecklist)")
         }
