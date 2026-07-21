@@ -60,8 +60,8 @@ final class GardenVideoCatalogDiffTests: XCTestCase {
         let profiles = [
             CatalogPlantDraft(
                 name: "Basil",
-                health: "stressed",
                 careTips: "Wilting",
+                health: "stressed",
                 suggestedActions: ["Water now"],
                 seasonalNotes: "Tender annual"
             ),
