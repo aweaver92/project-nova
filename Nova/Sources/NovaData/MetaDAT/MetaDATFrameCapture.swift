@@ -29,6 +29,11 @@ public actor MetaDATFrameCapture: FrameCapture {
     private var pendingPhoto: CheckedContinuation<Data, Error>?
     private var liveCont: AsyncStream<CapturedFrame>.Continuation?
 
+    /// One-shot Meta AI recovery per cold open; reset after a successful stream
+    /// or full camera release so later sessions can recover again.
+    private var didAttemptDATAppUpdateRecovery = false
+    private var didAttemptFirmwareUpdateRecovery = false
+
     public init(policy: StreamBandwidthPolicy = .default) {
         self.policy = policy
     }
@@ -99,6 +104,8 @@ public actor MetaDATFrameCapture: FrameCapture {
         stream = nil
         deviceSession = nil
         isStreaming = false
+        didAttemptDATAppUpdateRecovery = false
+        didAttemptFirmwareUpdateRecovery = false
         NovaLog.vision.info("camera released")
     }
 
@@ -107,6 +114,53 @@ public actor MetaDATFrameCapture: FrameCapture {
     private func ensureStreaming(fps: Int) async throws {
         if isStreaming, stream != nil { return }
 
+        do {
+            try await openStreamWithSoftRetries(fps: fps)
+            didAttemptDATAppUpdateRecovery = false
+            didAttemptFirmwareUpdateRecovery = false
+            return
+        } catch {
+            // DAT-on-glasses bundle missing/stale — open Meta AI update once, then retry.
+            if !didAttemptDATAppUpdateRecovery,
+               MetaCameraOpenRetryPolicy.isDATAppUpdateRequired(error) {
+                didAttemptDATAppUpdateRecovery = true
+                NovaLog.vision.info("DAT app on glasses needs update — opening Meta AI recovery")
+                await tearDownSessionOnly()
+                let opened = await MetaDATConnectionRecovery.openDATGlassesAppUpdate()
+                await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+                do {
+                    try await openStreamWithSoftRetries(fps: fps)
+                    didAttemptDATAppUpdateRecovery = false
+                    didAttemptFirmwareUpdateRecovery = false
+                    return
+                } catch {
+                    throw Self.mapCameraError(error)
+                }
+            }
+
+            // Persistent noEligibleDevice often means firmware/compat — open update once.
+            if !didAttemptFirmwareUpdateRecovery,
+               MetaCameraOpenRetryPolicy.isFirmwareUpdateLikely(error) {
+                didAttemptFirmwareUpdateRecovery = true
+                NovaLog.vision.info("Glasses not eligible after soft retries — opening firmware update")
+                await tearDownSessionOnly()
+                let opened = await MetaDATConnectionRecovery.openFirmwareUpdate()
+                await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+                do {
+                    try await openStreamWithSoftRetries(fps: fps)
+                    didAttemptDATAppUpdateRecovery = false
+                    didAttemptFirmwareUpdateRecovery = false
+                    return
+                } catch {
+                    throw Self.mapCameraError(error)
+                }
+            }
+
+            throw Self.mapCameraError(error)
+        }
+    }
+
+    private func openStreamWithSoftRetries(fps: Int) async throws {
         var lastError: Error?
         for attempt in 0..<3 {
             do {
@@ -116,8 +170,9 @@ public actor MetaDATFrameCapture: FrameCapture {
                 lastError = error
                 // After Meta AI "Always Allow", BLE/link and session settle often lag
                 // the permission callback — retry noEligibleDevice / stopped-before-start.
+                // DAT update-required is handled by the outer recovery path, not sleep-retry.
                 guard MetaCameraOpenRetryPolicy.isRetryable(error), attempt < 2 else {
-                    throw Self.mapCameraError(error)
+                    throw error
                 }
                 NovaLog.vision.info(
                     "camera open retry \(attempt + 1) after: \(String(describing: error), privacy: .public)"
@@ -126,7 +181,7 @@ public actor MetaDATFrameCapture: FrameCapture {
                 try await Task.sleep(for: .milliseconds(900))
             }
         }
-        throw Self.mapCameraError(lastError ?? NovaError.vision("Glasses camera failed to open"))
+        throw lastError ?? NovaError.vision("Glasses camera failed to open")
     }
 
     private func openStream(fps: Int) async throws {
@@ -370,8 +425,10 @@ public actor MetaDATFrameCapture: FrameCapture {
         if let sessionError = error as? DeviceSessionError {
             let tip: String
             switch sessionError {
+            case .datAppOnTheGlassesUpdateRequired:
+                tip = "The DAT app on your glasses needs an update. Nova opens Meta AI automatically for Install/Update — finish that prompt, return here, then retry What’s this? (or tap Fix glasses connection)."
             case .noEligibleDevice:
-                tip = "Glasses not ready for camera yet (connected + compatible required). Wear them, unlock the phone, wait a few seconds after Always Allow, then retry."
+                tip = "Glasses not ready for camera yet (connected + compatible required). Wear them, unlock the phone, wait a few seconds after Always Allow, then retry. If this persists, Nova will open a firmware update in Meta AI."
             default:
                 tip = "Glasses session failed: \(String(describing: sessionError))."
             }
@@ -386,8 +443,8 @@ public actor MetaDATFrameCapture: FrameCapture {
     private static let cameraChecklist = """
     Checklist:
     1) Glasses on, unfolded, paired in Meta AI
-    2) Nova shows Connected under Glasses (Register / Re-link if needed)
-    3) In Meta AI, Always Allow camera for Nova
+    2) Nova shows Connected under Glasses (Fix glasses connection / Re-link if needed)
+    3) In Meta AI, Always Allow camera for Nova; Install/Update DAT on glasses if prompted
     4) Only one Developer Mode app registered at a time
     5) Retry What’s this? a few seconds after returning from Meta AI
     """

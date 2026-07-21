@@ -535,7 +535,7 @@ public final class AppContainer {
         switchAgentSink.bind(orchestrator)
         openAppScreenSink.bind(orchestrator: orchestrator, navigation: appNavigation)
 
-        self.sessionVM = SessionViewModel(session: session)
+        self.sessionVM = SessionViewModel(session: session, frameCapture: capture)
         self.conversationVM = ConversationViewModel(
             orchestrator: orchestrator,
             metrics: metrics,

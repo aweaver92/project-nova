@@ -669,6 +669,19 @@ public struct RootView: View {
 
     @ViewBuilder
     private var glassesControls: some View {
+        Button {
+            showGlassesDetails = true
+            Task { await session.repairGlassesConnection() }
+        } label: {
+            Label(
+                session.isRepairingConnection
+                    ? "Fixing glasses connection…"
+                    : "Fix glasses connection",
+                systemImage: "wrench.and.screwdriver"
+            )
+        }
+        .disabled(session.isRepairingConnection)
+
         if session.registrationState != .registered {
             Button {
                 showGlassesDetails = true
@@ -681,6 +694,7 @@ public struct RootView: View {
                     systemImage: "link"
                 )
             }
+            .disabled(session.isRepairingConnection)
         } else {
             switch session.sessionState {
             case .active:
@@ -708,6 +722,7 @@ public struct RootView: View {
                 Label("Re-link Meta AI", systemImage: "arrow.triangle.2.circlepath")
             }
             .font(.caption)
+            .disabled(session.isRepairingConnection)
         }
         if let error = session.errorMessage {
             Text(error)
@@ -715,7 +730,7 @@ public struct RootView: View {
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
             Text("""
-            Quick checklist: Meta AI installed · glasses connected · Developer Mode OFF→ON + force-quit Meta AI · retry Register · callback nova://
+            Tip: Fix glasses connection opens Meta AI for DAT Install/Update. Wear glasses · Always Allow camera · return to Nova · retry What’s this?
             """)
             .font(.caption2)
             .foregroundStyle(.secondary)

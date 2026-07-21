@@ -108,6 +108,46 @@ public actor MetaDATWearableSession: WearableSession {
         NovaLog.session.info("DAT mock registration complete")
     }
 
+    /// Register if needed, open Meta AI’s on-glasses DAT update, wait for settle.
+    public func repairConnection() async throws {
+        #if canImport(MWDATCore) && os(iOS)
+        if !useMock {
+            diag("Repair connection — sync registration + DAT app update")
+            observeRegistration()
+            if reg != .registered {
+                do {
+                    try await register()
+                } catch {
+                    // register() may leave us awaiting Meta AI callback; continue
+                    // into the update deep-link so the user finishes both flows.
+                    diag("Register during repair threw (continuing to DAT update): \(error)")
+                }
+            }
+            let opened = await MetaDATConnectionRecovery.openDATGlassesAppUpdate()
+            if opened {
+                diag("Opened Meta AI DAT glasses app update — complete Install/Update, then return")
+            } else {
+                diag("Could not open DAT glasses app update — check Meta AI App Connections manually")
+            }
+            await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+            // Soft firmware nudge when still unregistered / device may be incompatible.
+            if reg != .registered {
+                let fw = await MetaDATConnectionRecovery.openFirmwareUpdate()
+                if fw {
+                    diag("Opened Meta AI firmware update as secondary repair step")
+                    await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: true)
+                }
+            }
+            return
+        }
+        #endif
+
+        if reg != .registered {
+            try await register()
+        }
+        diag("[mock] repairConnection complete")
+    }
+
     /// Start mirroring the SDK registration stream so a prior Meta AI link is
     /// reflected in the UI without requiring another Register tap.
     public func syncRegistrationFromSDK() async {

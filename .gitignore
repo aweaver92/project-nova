@@ -24,3 +24,6 @@ DerivedData/
 # OS
 .DS_Store
 Thumbs.db
+
+# Dropbox sync duplicates — never commit
+*conflicted copy*

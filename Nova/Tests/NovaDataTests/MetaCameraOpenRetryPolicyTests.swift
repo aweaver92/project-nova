@@ -33,4 +33,41 @@ final class MetaCameraOpenRetryPolicyTests: XCTestCase {
         XCTAssertTrue(MetaCameraOpenRetryPolicy.isPermissionUnavailableMessage("permission unavailable"))
         XCTAssertFalse(MetaCameraOpenRetryPolicy.isPermissionUnavailableMessage("user tapped deny"))
     }
+
+    func testDATAppUpdateRequiredIsNotSoftRetryable() {
+        let message = "DeviceSessionError.datAppOnTheGlassesUpdateRequired"
+        XCTAssertTrue(MetaCameraOpenRetryPolicy.isDATAppUpdateRequiredMessage(message))
+        XCTAssertFalse(MetaCameraOpenRetryPolicy.isRetryableMessage(message))
+        XCTAssertTrue(
+            MetaCameraOpenRetryPolicy.isDATAppUpdateRequired(
+                NovaError.vision("Glasses session failed: \(message).")
+            )
+        )
+        XCTAssertFalse(
+            MetaCameraOpenRetryPolicy.isRetryable(
+                NovaError.vision("Glasses session failed: \(message).")
+            )
+        )
+    }
+
+    func testDATAppUpdateRequiredHumanCopy() {
+        XCTAssertTrue(
+            MetaCameraOpenRetryPolicy.isDATAppUpdateRequiredMessage(
+                "The app on your glasses needs an update before this session can start. Go to the App Connections page in Meta AI to update it."
+            )
+        )
+    }
+
+    func testFirmwareUpdateLikelyForNoEligibleDevice() {
+        XCTAssertTrue(
+            MetaCameraOpenRetryPolicy.isFirmwareUpdateLikely(
+                NovaError.vision("Glasses session failed: DeviceSessionError.noEligibleDevice.")
+            )
+        )
+        XCTAssertFalse(
+            MetaCameraOpenRetryPolicy.isFirmwareUpdateLikely(
+                NovaError.vision("DeviceSessionError.datAppOnTheGlassesUpdateRequired")
+            )
+        )
+    }
 }

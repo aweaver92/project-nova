@@ -12,19 +12,30 @@ public final class SessionViewModel {
     public private(set) var errorMessage: String?
     /// Raw registration trace (SDK state transitions + errors) for diagnostics.
     public private(set) var registrationDiagnostics: String = ""
+    public private(set) var isRepairingConnection = false
 
     private let session: any WearableSession
+    private let frameCapture: (any FrameCapture)?
     private var tasks: [Task<Void, Never>] = []
+    /// After Connect / Fix, auto-activate logical session + prewarm camera once registered.
+    private var autoPrepareWhenRegistered = false
 
-    public init(session: any WearableSession) {
+    public init(session: any WearableSession, frameCapture: (any FrameCapture)? = nil) {
         self.session = session
+        self.frameCapture = frameCapture
         tasks.append(Task { await self.observe() })
     }
 
     private func observe() async {
         async let reg: Void = {
             for await value in session.registration {
-                await MainActor.run { self.registrationState = value }
+                await MainActor.run {
+                    self.registrationState = value
+                    if value == .registered, self.autoPrepareWhenRegistered {
+                        self.autoPrepareWhenRegistered = false
+                        Task { await self.prepareAfterRegistration() }
+                    }
+                }
             }
         }()
         async let st: Void = {
@@ -45,11 +56,16 @@ public final class SessionViewModel {
 
     public func register() async {
         errorMessage = nil
+        autoPrepareWhenRegistered = true
         do {
             try await session.register()
             // Success (including already-registered treated as connected) clears
             // any prior failure banner.
             errorMessage = nil
+            if registrationState == .registered {
+                autoPrepareWhenRegistered = false
+                await prepareAfterRegistration()
+            }
         } catch let error as NovaError {
             if case .wearable(let message) = error {
                 errorMessage = message
@@ -58,6 +74,48 @@ public final class SessionViewModel {
             }
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    /// One-tap repair: re-link if needed, open DAT (and maybe firmware) update in
+    /// Meta AI, activate session, and prewarm the glasses camera.
+    public func repairGlassesConnection() async {
+        errorMessage = nil
+        isRepairingConnection = true
+        statusMessage = "Repairing"
+        autoPrepareWhenRegistered = true
+        defer { isRepairingConnection = false }
+        do {
+            try await session.repairConnection()
+            errorMessage = nil
+            if registrationState == .registered {
+                autoPrepareWhenRegistered = false
+                await prepareAfterRegistration()
+            } else {
+                statusMessage = "Finish Meta AI update, then return"
+            }
+        } catch let error as NovaError {
+            if case .wearable(let message) = error {
+                errorMessage = message
+            } else {
+                errorMessage = String(describing: error)
+            }
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func prepareAfterRegistration() async {
+        do {
+            try await session.start()
+        } catch {
+            // Logical session start is best-effort; camera path still works when registered.
+            NovaLog.session.info(
+                "post-registration session start: \(String(describing: error), privacy: .public)"
+            )
+        }
+        if let frameCapture {
+            await frameCapture.prewarm()
         }
     }
 

@@ -74,6 +74,10 @@ public protocol WearableSession: Sendable {
     /// on-device diagnostics. Each yield is the latest multi-line snapshot.
     var diagnostics: AsyncStream<String> { get }
     func register() async throws
+    /// Best-effort connection repair: ensure Meta AI registration, open the
+    /// on-glasses DAT app update flow, and wait for settle. Mock sessions no-op
+    /// after ensuring registration.
+    func repairConnection() async throws
     func start() async throws
     func pause() async
     func resume() async

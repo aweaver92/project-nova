@@ -145,6 +145,14 @@ final class PCMResamplerTests: XCTestCase {
         await session.stop()
     }
 
+    func testMetaSessionMockRepairConnection() async throws {
+        let session = MetaDATWearableSession(useMock: true)
+        try await session.repairConnection()
+        XCTAssertTrue(await session.isRegistered())
+        try await session.repairConnection()
+        XCTAssertTrue(await session.isRegistered())
+    }
+
     func testWeatherToolSchemaAndCodes() {
         // Network-free: validate the advertised schema and WMO code mapping.
         let tool = WeatherTool()
