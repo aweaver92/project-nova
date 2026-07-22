@@ -1711,3 +1711,11 @@ public protocol PlantLibraryStoring: Sendable {
 public protocol AudioTranscribing: Sendable {
     func transcribe(fileURL: URL) async throws -> String
 }
+
+/// Ultrahuman Ring personal API (Partner daily_metrics) for Max readiness coaching.
+public protocol UltrahumanReading: Sendable {
+    func hasToken() async -> Bool
+    func saveToken(_ token: String?) async throws
+    /// Fetch and normalize daily metrics for `date` (YYYY-MM-DD local).
+    func dailyMetrics(date: Date) async throws -> RingReadinessSnapshot
+}

@@ -10,7 +10,12 @@ public enum GardenVideoCatalogDiff {
     /// Single-frame new plants need this unless they also have a solid binomial.
     public static let singleObservationConfidence: Double = 0.85
 
-    public static func framePrompt(library: [PlantSighting]) -> String {
+    public static func framePrompt(
+        library: [PlantSighting],
+        climate: GardenClimateSnapshot? = nil,
+        now: Date = Date()
+    ) -> String {
+        let frostRelevant = GardenPlanningDiff.isFrostAdviceRelevant(climate: climate, now: now)
         let known: String
         if library.isEmpty {
             known = "(none yet — only name plants you can identify with high confidence)"
@@ -20,10 +25,13 @@ public enum GardenVideoCatalogDiff {
                 if let species = plant.species, !species.isEmpty { line += " (\(species))" }
                 if let location = plant.location, !location.isEmpty { line += " @ \(location)" }
                 if plant.isOutdoor == true { line += " [outdoor]" }
-                if plant.frostSensitive == true { line += " [frost-sensitive]" }
+                if plant.frostSensitive == true, frostRelevant {
+                    line += " [frost-sensitive]"
+                }
                 return line
             }.joined(separator: "\n")
         }
+        let seasonBlock = GardenPlanningDiff.coachingContext(climate: climate, now: now)
         return """
         You are helping Ivy catalog a garden from this video frame with HIGH PRECISION.
         Rules:
@@ -37,12 +45,16 @@ public enum GardenVideoCatalogDiff {
         - Prefer one primary plant when the frame is a close-up of a single specimen.
         - If nothing is confidently identifiable, return {"plants":[]}.
         - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
-        For each kept plant include care tips, 1–4 concrete actions, and seasonal guidance.
+        - seasonal_info and suggested_actions must match the CURRENT season/climate below — \
+        do not default to frost/bring-inside advice in midsummer.
+        For each kept plant include care tips, 1–4 concrete actions, and seasonal guidance for NOW.
         Reply with ONLY valid JSON (no markdown):
         {"plants":[{"name":"Tomato","species":"Solanum lycopersicum","matched_library":"",\
         "confidence":0.0,"health":"ok|needs_water|stressed|unknown","care_tips":"…",\
         "suggested_actions":["…"],"seasonal_info":"…","is_outdoor":true,"frost_sensitive":true}],\
         "frame_notes":"optional"}
+        Season & climate:
+        \(seasonBlock)
         User's plant library:
         \(known)
         """
@@ -50,8 +62,10 @@ public enum GardenVideoCatalogDiff {
 
     public static func overviewPrompt(
         profiles: [CatalogPlantDraft],
-        climate: GardenClimateSnapshot?
+        climate: GardenClimateSnapshot?,
+        now: Date = Date()
     ) -> String {
+        let frostRelevant = GardenPlanningDiff.isFrostAdviceRelevant(climate: climate, now: now)
         let plantLines: String
         if profiles.isEmpty {
             plantLines = "(no plants cataloged)"
@@ -61,7 +75,7 @@ public enum GardenVideoCatalogDiff {
                 if let species = p.species, !species.isEmpty { line += " (\(species))" }
                 if let health = p.health, !health.isEmpty { line += " health=\(health)" }
                 if p.isOutdoor == true { line += " outdoor" }
-                if p.frostSensitive == true { line += " frost-sensitive" }
+                if p.frostSensitive == true, frostRelevant { line += " frost-sensitive" }
                 if !p.suggestedActions.isEmpty {
                     line += " actions: " + p.suggestedActions.prefix(3).joined(separator: "; ")
                 }
@@ -71,33 +85,40 @@ public enum GardenVideoCatalogDiff {
                 return line
             }.joined(separator: "\n")
         }
-        var climateLine = "Climate: unknown"
-        if let climate {
-            climateLine = "Climate city: \(climate.city)."
-            if !climate.summary.isEmpty { climateLine += " \(climate.summary)" }
-        }
+        let seasonBlock = GardenPlanningDiff.coachingContext(climate: climate, now: now)
         return """
         You are Ivy writing a Garden Overview after cataloging plants from a garden video.
-        Synthesize how the garden is doing overall, priority actions, and mistakes to avoid. \
+        Synthesize how the garden is doing overall for the CURRENT season and climate, \
+        priority actions, and mistakes to avoid. \
         Ground every claim in the catalog below — do not invent plants or rename them. \
-        Finding titles must use exact catalog plant names when referring to a plant.
+        Finding titles must use exact catalog plant names when referring to a plant. \
+        Do not lead with frost or bring-inside advice unless the season context says frost is relevant.
         Reply with ONLY valid JSON (no markdown):
         {"overview":"2-5 sentences","health_score":"excellent|good|fair|poor|unknown",\
         "findings":[{"severity":"info|watch|urgent","title":"…","detail":"…","matched_library":""}],\
         "maintenance":["priority garden-wide actions"],"mistakes":["…"]}
-        \(climateLine)
+        Season & climate:
+        \(seasonBlock)
         Cataloged plants:
         \(plantLines)
         """
     }
 
-    public static func speakPrompt(result: GardenCatalogResult) -> String {
+    public static func speakPrompt(
+        result: GardenCatalogResult,
+        climate: GardenClimateSnapshot? = nil,
+        now: Date = Date()
+    ) -> String {
         let names = result.profiles.prefix(12).map(\.name).joined(separator: ", ")
+        let season = GardenSeason.current(on: now).title
         return """
-        You are Ivy finishing a garden video catalog. Speak a concise Garden Overview \
-        (about 45–90 seconds). Lead with overall health, mention how many plants you \
+        You are Ivy finishing a garden video catalog in \(season). Speak a concise Garden Overview \
+        (about 45–90 seconds). Lead with overall health for this season, mention how many plants you \
         cataloged\(names.isEmpty ? "" : " (including \(names))"), then the top actions. \
-        Do not invent plants beyond this analysis.
+        Do not invent plants beyond this analysis. Do not add frost/bring-inside warnings \
+        unless they appear in the overview.
+        Season & climate:
+        \(GardenPlanningDiff.coachingContext(climate: climate, now: now))
         Overview:
         \(result.overview.spokenSummary)
         Plants cataloged: \(result.profiles.count).

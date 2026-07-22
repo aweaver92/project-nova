@@ -44,6 +44,41 @@ public struct OpenAIImageAnalyzer: Sendable {
         )
     }
 
+    /// Text-only Responses completion (recipe import LLM fallback). Requires on-device API key.
+    public func completeText(_ prompt: String) async throws -> String {
+        guard let apiKey, !apiKey.isEmpty else {
+            throw NovaError.vision("Text extract needs an OpenAI API key on device.")
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 45
+        let body: [String: Any] = [
+            "model": model,
+            "input": [
+                [
+                    "role": "user",
+                    "content": [
+                        ["type": "input_text", "text": prompt]
+                    ]
+                ]
+            ]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (responseData, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NovaError.vision("Text extract failed (HTTP \(code))")
+        }
+        let text = try WebSearchTool.extractText(from: responseData)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw NovaError.vision("Text extract returned no content")
+        }
+        return trimmed
+    }
+
     // MARK: - Responses API (preferred)
 
     private func analyzeViaResponses(

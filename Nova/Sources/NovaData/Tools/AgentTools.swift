@@ -482,3 +482,67 @@ public struct WorkoutHistoryTool: Tool {
         return String(decoding: data, as: UTF8.self)
     }
 }
+
+/// Ultrahuman Ring daily readiness for Max's recovery-aware coaching.
+public struct RingReadinessTool: Tool {
+    public let name = "ring_readiness"
+    public let description = """
+    Fetch today's Ultrahuman Ring recovery / sleep readiness and coaching advice. \
+    Call before prescribing hard sessions when the user asks about recovery, readiness, \
+    or how hard to train. Requires the user to save their Ultrahuman personal API token \
+    in Training settings. Optional date as YYYY-MM-DD (defaults to today).
+    """
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"date":{"type":"string","description":"Optional calendar day YYYY-MM-DD (local). Defaults to today."}},"additionalProperties":false}
+    """
+    private let ultrahuman: any UltrahumanReading
+    public init(ultrahuman: any UltrahumanReading) { self.ultrahuman = ultrahuman }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let date: String? }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(date: nil)
+        let day: Date
+        if let raw = args.date?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let parts = raw.split(separator: "-").compactMap { Int($0) }
+            guard parts.count == 3,
+                  let parsed = Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) else {
+                return #"{"ok":false,"error":"invalid_date","hint":"Use YYYY-MM-DD"}"#
+            }
+            day = parsed
+        } else {
+            day = Date()
+        }
+        do {
+            let snap = try await ultrahuman.dailyMetrics(date: day)
+            var payload: [String: Any] = [
+                "ok": true,
+                "date": snap.sourceDate,
+                "advice": snap.advice,
+                "summary": snap.spokenSummary
+            ]
+            if let v = snap.primaryRecovery { payload["recovery"] = v }
+            if let v = snap.recoveryScore { payload["recovery_score"] = v }
+            if let v = snap.recoveryIndex { payload["recovery_index"] = v }
+            if let v = snap.sleepScore { payload["sleep_score"] = v }
+            if let v = snap.totalSleepMinutes { payload["total_sleep_minutes"] = v }
+            if let v = snap.averageSleepHRV ?? snap.hrv { payload["hrv"] = v }
+            if let v = snap.nightRestingHR { payload["night_rhr"] = v }
+            if let v = snap.movementIndex { payload["movement_index"] = v }
+            if let v = snap.steps { payload["steps"] = v }
+            if let v = snap.vo2Max { payload["vo2_max"] = v }
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return #"{"ok":false,"error":"\#(Self.escape(message))"}"#
+        }
+    }
+
+    private static func escape(_ s: String) -> String {
+        s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+}

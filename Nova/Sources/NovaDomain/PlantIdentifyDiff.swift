@@ -29,6 +29,7 @@ public enum PlantIdentifyDiff {
         - Do NOT invent a Latin binomial when unsure — omit species instead.
         - If unsure, return {"plants":[]} rather than guessing among similar annuals.
         - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
+        - Care tips should fit the current season (\(GardenSeason.current().title)) — avoid off-season frost urgency in midsummer.
         Reply with ONLY valid JSON (no markdown) in this shape:
         {"plants":[{"name":"Monstera","species":"Monstera deliciosa","matched_library":"Monstera","confidence":0.0,"care_tips":"…","health":"ok|needs_water|stressed|unknown"}],"notes":"optional"}
         User's plant library:

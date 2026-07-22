@@ -9,11 +9,13 @@ final class RemyKitchenTests: XCTestCase {
         let names = remy.toolNames!
         for required in [
             "update_pantry_item", "scan_fridge",
-            "save_recipe", "list_recipes", "get_recipe",
+            "save_recipe", "list_recipes", "get_recipe", "import_recipe",
             "start_cooking", "cooking_next_step", "cooking_previous_step", "cooking_status", "end_cooking",
             "add_shopping_item", "list_shopping", "check_shopping_item", "clear_checked_shopping",
+            "build_shopping_from_meal_plan",
             "set_meal_plan_slot", "get_meal_plan", "clear_meal_plan_slot",
-            "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals"
+            "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals",
+            "lookup_food_nutrition"
         ] {
             XCTAssertTrue(names.contains(required), "missing \(required)")
         }

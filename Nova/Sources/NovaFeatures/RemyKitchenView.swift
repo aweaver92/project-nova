@@ -17,10 +17,13 @@ public struct RemyKitchenView: View {
     @State private var showNewPantry = false
     @State private var editingRecipe: Recipe?
     @State private var showNewRecipe = false
+    @State private var showImportRecipe = false
     @State private var showNewShopping = false
     @State private var newShoppingName = ""
     @State private var mealEditor: MealSlotEditor?
     @State private var mealLogDraft = ""
+    @State private var importURL = ""
+    @State private var importPaste = ""
 
     public init(kitchen: RemyKitchenViewModel, embedded: Bool = false) {
         self.kitchen = kitchen
@@ -74,6 +77,36 @@ public struct RemyKitchenView: View {
                 Task { await kitchen.saveRecipe(saved) }
             }
         }
+        .sheet(isPresented: $showImportRecipe) {
+            RecipeImportSheet(
+                urlText: $importURL,
+                pasteText: $importPaste,
+                isImporting: kitchen.isImportingRecipe,
+                onImport: {
+                    Task {
+                        await kitchen.importRecipe(
+                            url: importURL.isEmpty ? nil : importURL,
+                            text: importPaste.isEmpty ? nil : importPaste
+                        )
+                        if kitchen.recipeImportPreview != nil {
+                            showImportRecipe = false
+                            importURL = ""
+                            importPaste = ""
+                        }
+                    }
+                }
+            )
+        }
+        .sheet(item: $kitchen.recipeImportPreview, onDismiss: {
+            kitchen.recipeImportPreview = nil
+        }) { recipe in
+            RecipeEditorSheet(recipe: recipe) { saved in
+                Task {
+                    await kitchen.saveRecipe(saved)
+                    kitchen.recipeImportPreview = nil
+                }
+            }
+        }
         .sheet(item: $mealEditor) { editor in
             MealSlotSheet(
                 editor: editor,
@@ -89,9 +122,17 @@ public struct RemyKitchenView: View {
         .sheet(item: $kitchen.mealLogEditor) { draft in
             MealLogEditorSheet(
                 draft: draft,
+                hits: kitchen.foodLookupHits,
+                isLookingUp: kitchen.isLookingUpFood,
                 onCancel: { kitchen.cancelMealLogEditor() },
                 onSave: { saved in
                     Task { await kitchen.saveMealLogEditor(saved) }
+                },
+                onLookup: { query, barcode in
+                    Task { await kitchen.lookupFood(query: query, barcode: barcode) }
+                },
+                onSelectHit: { hit in
+                    kitchen.applyFoodHit(hit)
                 }
             )
         }
@@ -544,6 +585,10 @@ public struct RemyKitchenView: View {
             Button { showNewRecipe = true } label: {
                 Label("New recipe", systemImage: "plus")
             }
+            Button { showImportRecipe = true } label: {
+                Label("Import from URL or paste", systemImage: "square.and.arrow.down")
+            }
+            .disabled(kitchen.isImportingRecipe)
         }
 
         cookTonightSection
@@ -1050,10 +1095,12 @@ private struct RecipeEditorSheet: View {
     @State private var tagsText: String
     @State private var sourceNote: String
     private let recipeId: UUID
+    private let sourceURL: String?
     var onSave: (Recipe) -> Void
 
     init(recipe: Recipe, onSave: @escaping (Recipe) -> Void) {
         recipeId = recipe.id
+        sourceURL = recipe.sourceURL
         _title = State(initialValue: recipe.title)
         _servingsText = State(initialValue: recipe.servings.map(String.init) ?? "")
         _ingredientsText = State(initialValue: recipe.ingredients.map { ing in
@@ -1078,6 +1125,11 @@ private struct RecipeEditorSheet: View {
                     .lineLimit(4...16)
                 TextField("Tags (comma-separated)", text: $tagsText)
                 TextField("Source note", text: $sourceNote)
+                if let sourceURL, !sourceURL.isEmpty {
+                    Text(sourceURL)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .navigationTitle(title.isEmpty ? "New recipe" : "Edit recipe")
             .toolbar {
@@ -1109,7 +1161,8 @@ private struct RecipeEditorSheet: View {
                             ingredients: ingredients,
                             steps: steps,
                             tags: tags,
-                            sourceNote: sourceNote.isEmpty ? nil : sourceNote
+                            sourceNote: sourceNote.isEmpty ? nil : sourceNote,
+                            sourceURL: sourceURL
                         )
                         guard !recipe.title.isEmpty else { return }
                         onSave(recipe)
@@ -1121,9 +1174,59 @@ private struct RecipeEditorSheet: View {
     }
 }
 
+private struct RecipeImportSheet: View {
+    @Binding var urlText: String
+    @Binding var pasteText: String
+    var isImporting: Bool
+    var onImport: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("URL") {
+                    TextField("https://…", text: $urlText)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        .autocorrectionDisabled()
+                }
+                Section("Or paste recipe text") {
+                    TextField("Ingredients and steps…", text: $pasteText, axis: .vertical)
+                        .lineLimit(6...16)
+                }
+                Section {
+                    Button {
+                        onImport()
+                    } label: {
+                        if isImporting {
+                            ProgressView()
+                        } else {
+                            Label("Import", systemImage: "square.and.arrow.down")
+                        }
+                    }
+                    .disabled(isImporting
+                              || (urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  && pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                }
+            }
+            .navigationTitle("Import recipe")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 private struct MealLogEditorSheet: View {
     var onCancel: () -> Void
     var onSave: (MealLogEditorState) -> Void
+    var onLookup: (String?, String?) -> Void
+    var onSelectHit: (FoodNutritionHit) -> Void
+    var hits: [FoodNutritionHit]
+    var isLookingUp: Bool
 
     @State private var description: String
     @State private var kind: MealLogKind
@@ -1131,23 +1234,35 @@ private struct MealLogEditorSheet: View {
     @State private var proteinText: String
     @State private var carbsText: String
     @State private var fatText: String
+    @State private var lookupQuery: String
+    @State private var barcodeText: String
 
     private let draft: MealLogEditorState
 
     init(
         draft: MealLogEditorState,
+        hits: [FoodNutritionHit],
+        isLookingUp: Bool,
         onCancel: @escaping () -> Void,
-        onSave: @escaping (MealLogEditorState) -> Void
+        onSave: @escaping (MealLogEditorState) -> Void,
+        onLookup: @escaping (String?, String?) -> Void,
+        onSelectHit: @escaping (FoodNutritionHit) -> Void
     ) {
         self.draft = draft
+        self.hits = hits
+        self.isLookingUp = isLookingUp
         self.onCancel = onCancel
         self.onSave = onSave
+        self.onLookup = onLookup
+        self.onSelectHit = onSelectHit
         _description = State(initialValue: draft.description)
         _kind = State(initialValue: draft.kind)
         _caloriesText = State(initialValue: Self.macroField(draft.calories))
         _proteinText = State(initialValue: Self.macroField(draft.proteinGrams))
         _carbsText = State(initialValue: Self.macroField(draft.carbsGrams))
         _fatText = State(initialValue: Self.macroField(draft.fatGrams))
+        _lookupQuery = State(initialValue: draft.description)
+        _barcodeText = State(initialValue: draft.barcode ?? "")
     }
 
     var body: some View {
@@ -1168,6 +1283,50 @@ private struct MealLogEditorSheet: View {
                     Text(draft.isNew
                          ? "Prefill is from the photo analysis — adjust anything before saving."
                          : "Changes update your diary and today’s macro totals.")
+                }
+
+                Section("Open Food Facts") {
+                    TextField("Lookup name", text: $lookupQuery)
+                    TextField("Barcode (UPC/EAN)", text: $barcodeText)
+                        .keyboardType(.numberPad)
+                    Button {
+                        onLookup(
+                            lookupQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : lookupQuery,
+                            barcodeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : barcodeText
+                        )
+                    } label: {
+                        if isLookingUp {
+                            ProgressView()
+                        } else {
+                            Label("Lookup", systemImage: "magnifyingglass")
+                        }
+                    }
+                    .disabled(isLookingUp)
+
+                    ForEach(hits) { hit in
+                        Button {
+                            onSelectHit(hit)
+                            description = hit.displayName
+                            caloriesText = Self.macroField(hit.nutrition.calories)
+                            proteinText = Self.macroField(hit.nutrition.proteinGrams)
+                            carbsText = Self.macroField(hit.nutrition.carbsGrams)
+                            fatText = Self.macroField(hit.nutrition.fatGrams)
+                            barcodeText = hit.barcode ?? barcodeText
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(hit.displayName).font(.subheadline.weight(.semibold))
+                                HStack(spacing: 8) {
+                                    if let c = hit.nutrition.calories {
+                                        Text("\(Int(c)) kcal")
+                                    }
+                                    if let note = hit.servingNote {
+                                        Text(note).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
                 }
 
                 Section("Nutrition") {
@@ -1194,10 +1353,30 @@ private struct MealLogEditorSheet: View {
                         saved.proteinGrams = Self.parseMacro(proteinText)
                         saved.carbsGrams = Self.parseMacro(carbsText)
                         saved.fatGrams = Self.parseMacro(fatText)
+                        if saved.nutritionSource != .openFoodFacts {
+                            saved.nutritionSource = .manual
+                        }
+                        let code = barcodeText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        saved.barcode = code.isEmpty ? saved.barcode : code
                         onSave(saved)
                     }
                     .disabled(description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+            }
+            .onChange(of: draft.calories) { _, newValue in
+                caloriesText = Self.macroField(newValue)
+            }
+            .onChange(of: draft.proteinGrams) { _, newValue in
+                proteinText = Self.macroField(newValue)
+            }
+            .onChange(of: draft.carbsGrams) { _, newValue in
+                carbsText = Self.macroField(newValue)
+            }
+            .onChange(of: draft.fatGrams) { _, newValue in
+                fatText = Self.macroField(newValue)
+            }
+            .onChange(of: draft.description) { _, newValue in
+                description = newValue
             }
         }
     }

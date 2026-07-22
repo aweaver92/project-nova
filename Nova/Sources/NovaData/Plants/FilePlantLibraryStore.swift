@@ -139,12 +139,17 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
         guard !slice.isEmpty else {
             return "Plant library is empty — identify or save plants to build Ivy's garden context."
         }
+        var header = "Plant library (\(plants.count)) · \(GardenSeason.current().title)"
+        if let city = climateCity() {
+            header += " · climate \(city)"
+        }
+        let frostRelevant = GardenPlanningDiff.isFrostAdviceRelevant(climate: nil)
         let lines = slice.map { plant -> String in
             var line = "• \(plant.name)"
             if let species = plant.species, !species.isEmpty { line += " (\(species))" }
             if let location = plant.location, !location.isEmpty { line += " @ \(location)" }
             if plant.isOutdoor == true { line += " [outdoor]" }
-            if plant.frostSensitive == true { line += " [frost-sensitive]" }
+            if plant.frostSensitive == true, frostRelevant { line += " [frost-sensitive]" }
             if let watered = plant.lastWateredAt {
                 let days = Calendar.current.dateComponents([.day], from: watered, to: Date()).day ?? 0
                 line += days == 0 ? " · watered today" : " · watered \(days)d ago"
@@ -153,10 +158,6 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
                 line += " — \(plant.careNotes.prefix(80))"
             }
             return line
-        }
-        var header = "Plant library (\(plants.count))"
-        if let city = climateCity() {
-            header += " · climate \(city)"
         }
         return header + ":\n" + lines.joined(separator: "\n")
     }

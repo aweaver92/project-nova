@@ -44,10 +44,15 @@ public final class TrainingViewModel {
     public private(set) var restTimers: [ActiveTimer] = []
     public private(set) var personalRecords: [ExercisePR] = []
     public private(set) var statusMessage: String = ""
+    public private(set) var ringReadiness: RingReadinessSnapshot?
+    public private(set) var hasUltrahumanToken = false
+    public private(set) var isRefreshingRing = false
 
     public var logExercise: String = ""
     public var logReps: Int = 8
     public var logWeight: Double = 135
+    /// Draft field for Ultrahuman personal API token (never persisted in cleartext in memory long-term after save).
+    public var ultrahumanTokenDraft: String = ""
 
     public var hasActiveSession: Bool { activeSession != nil }
 
@@ -74,20 +79,24 @@ public final class TrainingViewModel {
     private let workouts: any WorkoutStoring
     private let plansStore: any WorkoutPlanStoring
     private let timers: any TimerScheduling
+    private let ultrahuman: (any UltrahumanReading)?
     private var pollTask: Task<Void, Never>?
 
     public init(
         workouts: any WorkoutStoring,
         plans: any WorkoutPlanStoring,
-        timers: any TimerScheduling
+        timers: any TimerScheduling,
+        ultrahuman: (any UltrahumanReading)? = nil
     ) {
         self.workouts = workouts
         self.plansStore = plans
         self.timers = timers
+        self.ultrahuman = ultrahuman
     }
 
     public func load() async {
         await refresh()
+        await refreshRingReadiness(force: false)
         updatePolling()
     }
 
@@ -105,6 +114,64 @@ public final class TrainingViewModel {
         personalRecords = ExercisePR.from(history: analyticsSessions, limit: 8)
         syncLogDefaults()
         syncRestLiveActivity()
+    }
+
+    // MARK: - Ultrahuman Ring
+
+    public func refreshRingReadiness(force: Bool = true) async {
+        guard let ultrahuman else {
+            hasUltrahumanToken = false
+            ringReadiness = nil
+            return
+        }
+        hasUltrahumanToken = await ultrahuman.hasToken()
+        guard hasUltrahumanToken else {
+            ringReadiness = nil
+            return
+        }
+        if !force, let existing = ringReadiness,
+           Calendar.current.isDate(existing.fetchedAt, inSameDayAs: Date()),
+           existing.sourceDate == UltrahumanMetricsDiff.dateString() {
+            return
+        }
+        isRefreshingRing = true
+        defer { isRefreshingRing = false }
+        do {
+            ringReadiness = try await ultrahuman.dailyMetrics(date: Date())
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    public func saveUltrahumanToken() async {
+        guard let ultrahuman else { return }
+        let trimmed = ultrahumanTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await ultrahuman.saveToken(trimmed.isEmpty ? nil : trimmed)
+            ultrahumanTokenDraft = ""
+            hasUltrahumanToken = await ultrahuman.hasToken()
+            statusMessage = hasUltrahumanToken ? "Ultrahuman token saved." : "Ultrahuman token cleared."
+            if hasUltrahumanToken {
+                await refreshRingReadiness(force: true)
+            } else {
+                ringReadiness = nil
+            }
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    public func clearUltrahumanToken() async {
+        ultrahumanTokenDraft = ""
+        guard let ultrahuman else { return }
+        do {
+            try await ultrahuman.saveToken(nil)
+            hasUltrahumanToken = false
+            ringReadiness = nil
+            statusMessage = "Ultrahuman token cleared."
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
     }
 
     /// Mirror the rest countdown to a Live Activity (lock screen / Dynamic Island).

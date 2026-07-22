@@ -2,7 +2,12 @@ import Foundation
 
 /// Pure helpers for Ivy Garden Walk prompts and JSON parsing.
 public enum GardenWalkDiff {
-    public static func analysisPrompt(library: [PlantSighting]) -> String {
+    public static func analysisPrompt(
+        library: [PlantSighting],
+        climate: GardenClimateSnapshot? = nil,
+        now: Date = Date()
+    ) -> String {
+        let frostRelevant = GardenPlanningDiff.isFrostAdviceRelevant(climate: climate, now: now)
         let known: String
         if library.isEmpty {
             known = "(none yet — coach on what you see and suggest starting a library)"
@@ -12,9 +17,11 @@ public enum GardenWalkDiff {
                 if let species = plant.species, !species.isEmpty { line += " (\(species))" }
                 if let location = plant.location, !location.isEmpty { line += " @ \(location)" }
                 if plant.isOutdoor == true { line += " [outdoor]" }
-                if plant.frostSensitive == true { line += " [frost-sensitive]" }
+                if plant.frostSensitive == true, frostRelevant {
+                    line += " [frost-sensitive]"
+                }
                 if let watered = plant.lastWateredAt {
-                    let days = Calendar.current.dateComponents([.day], from: watered, to: Date()).day ?? 0
+                    let days = Calendar.current.dateComponents([.day], from: watered, to: now).day ?? 0
                     line += days == 0 ? " watered today" : " watered \(days)d ago"
                 }
                 if !plant.careNotes.isEmpty {
@@ -23,31 +30,44 @@ public enum GardenWalkDiff {
                 return line
             }.joined(separator: "\n")
         }
+        let seasonBlock = GardenPlanningDiff.coachingContext(climate: climate, now: now)
         return """
         You are Ivy on a Garden Walk. Study this garden photo/frame carefully.
-        Give a proactive coaching assessment: overall health, what needs maintenance now, \
-        and mistakes the gardener may be making — even if they did not ask. \
+        Give a proactive coaching assessment for the CURRENT season and climate below: \
+        overall health, what needs maintenance now, and mistakes the gardener may be making. \
         Match plants to the user's library when possible.
+        Do not lead with frost or "bring inside" advice unless the season context says frost is relevant.
         Reply with ONLY valid JSON (no markdown):
         {"overview":"2-4 sentences","health_score":"excellent|good|fair|poor|unknown",\
         "findings":[{"severity":"info|watch|urgent","title":"…","detail":"…","matched_library":""}],\
         "maintenance":["…"],"mistakes":["…"]}
+        Season & climate:
+        \(seasonBlock)
         User's plant library:
         \(known)
         """
     }
 
     /// Spoken Realtime prompt: narrate a silent analysis without inventing new facts.
-    public static func speakPrompt(result: GardenWalkResult, library: [PlantSighting]) -> String {
+    public static func speakPrompt(
+        result: GardenWalkResult,
+        library: [PlantSighting],
+        climate: GardenClimateSnapshot? = nil,
+        now: Date = Date()
+    ) -> String {
         let libHint = library.isEmpty
             ? "Library empty."
             : "Library has \(library.count) plants: "
                 + library.prefix(12).map(\.name).joined(separator: ", ")
                 + "."
+        let season = GardenSeason.current(on: now).title
         return """
-        You are Ivy finishing a Garden Walk. Speak a concise coaching briefing (about 45–75 seconds). \
-        Be warm but direct: lead with how the garden is doing, then call out mistakes and maintenance \
-        without waiting to be asked. Do not invent plants or issues beyond this analysis.
+        You are Ivy finishing a Garden Walk in \(season). Speak a concise coaching briefing (about 45–75 seconds). \
+        Be warm but direct: lead with how the garden is doing for this season, then call out mistakes and maintenance \
+        without waiting to be asked. Do not invent plants or issues beyond this analysis. \
+        Do not add frost/bring-inside warnings unless they appear in the analysis.
+        Season & climate:
+        \(GardenPlanningDiff.coachingContext(climate: climate, now: now))
         Analysis to narrate:
         \(result.spokenSummary)
         \(libHint)
@@ -119,23 +139,19 @@ public enum GardenWalkDiff {
         var seen = Set<String>()
         findings = findings.filter {
             let key = $0.title.lowercased()
-            if seen.contains(key) { return false }
-            seen.insert(key)
-            return true
+            return seen.insert(key).inserted
         }
         var maintenance: [String] = []
+        var maintSeen = Set<String>()
+        for item in results.flatMap(\.maintenance) {
+            let key = item.lowercased()
+            if maintSeen.insert(key).inserted { maintenance.append(item) }
+        }
         var mistakes: [String] = []
-        var mSeen = Set<String>()
-        var xSeen = Set<String>()
-        for r in results {
-            for item in r.maintenance {
-                let key = item.lowercased()
-                if mSeen.insert(key).inserted { maintenance.append(item) }
-            }
-            for item in r.mistakes {
-                let key = item.lowercased()
-                if xSeen.insert(key).inserted { mistakes.append(item) }
-            }
+        var mistSeen = Set<String>()
+        for item in results.flatMap(\.mistakes) {
+            let key = item.lowercased()
+            if mistSeen.insert(key).inserted { mistakes.append(item) }
         }
         let health = results.compactMap(\.healthScore).first { score in
             ["poor", "fair", "good", "excellent"].contains(score.lowercased())

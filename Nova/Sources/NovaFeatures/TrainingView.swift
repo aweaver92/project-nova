@@ -10,6 +10,7 @@ public struct TrainingView: View {
     var embedded: Bool = false
     @State private var editingPlan: WorkoutPlan?
     @State private var showNewPlan = false
+    @State private var showUltrahumanSettings = false
     @State private var planPendingDelete: WorkoutPlan?
     @State private var selectedTrendExercise: String?
 
@@ -47,6 +48,7 @@ public struct TrainingView: View {
                     endButton
                 } else {
                     hubHero
+                    ringReadinessCard
                     plansCarousel
                     prStrip
                     analyticsCard
@@ -68,10 +70,17 @@ public struct TrainingView: View {
         .toolbar {
             if !training.hasActiveSession {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showNewPlan = true
-                    } label: {
-                        Label("New routine", systemImage: "plus")
+                    HStack(spacing: 12) {
+                        Button {
+                            showUltrahumanSettings = true
+                        } label: {
+                            Label("Ring", systemImage: "circle.hexagongrid.circle.fill")
+                        }
+                        Button {
+                            showNewPlan = true
+                        } label: {
+                            Label("New routine", systemImage: "plus")
+                        }
                     }
                 }
             }
@@ -85,6 +94,9 @@ public struct TrainingView: View {
             WorkoutPlanEditorSheet(plan: WorkoutPlan(name: "", exercises: [PlannedExercise(name: "")])) { saved in
                 Task { await training.savePlan(saved) }
             }
+        }
+        .sheet(isPresented: $showUltrahumanSettings) {
+            UltrahumanTokenSheet(training: training)
         }
         .alert(
             "Delete routine?",
@@ -363,6 +375,80 @@ public struct TrainingView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .background(Self.heat, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    @ViewBuilder
+    private var ringReadinessCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("RING READINESS")
+                    .font(.caption.weight(.heavy))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if training.isRefreshingRing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if training.hasUltrahumanToken {
+                    Button("Refresh") {
+                        Task { await training.refreshRingReadiness(force: true) }
+                    }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.orange)
+                }
+            }
+
+            if let snap = training.ringReadiness {
+                HStack(spacing: 16) {
+                    ringMetric(
+                        title: "Recovery",
+                        value: snap.primaryRecovery.map { String(format: "%.0f", $0) } ?? "—"
+                    )
+                    ringMetric(
+                        title: "Sleep",
+                        value: snap.sleepScore.map { String(format: "%.0f", $0) } ?? "—"
+                    )
+                    ringMetric(
+                        title: "HRV",
+                        value: (snap.averageSleepHRV ?? snap.hrv).map { String(format: "%.0f", $0) } ?? "—"
+                    )
+                }
+                Text(snap.advice)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if training.hasUltrahumanToken {
+                Text("Couldn’t load today’s metrics — tap Refresh or check your token.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Connect Ultrahuman so Max can coach from Ring recovery.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Button {
+                    showUltrahumanSettings = true
+                } label: {
+                    Label("Add API token", systemImage: "key.fill")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func ringMetric(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title2.weight(.heavy).monospacedDigit())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -780,5 +866,53 @@ private struct WorkoutPlanEditorSheet: View {
             .textFieldStyle(.roundedBorder)
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - Ultrahuman token
+
+private struct UltrahumanTokenSheet: View {
+    @Bindable var training: TrainingViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    SecureField("Personal API token", text: $training.ultrahumanTokenDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text("Create a token at vision.ultrahuman.com → developer docs. Nova stores it in Keychain and never syncs it.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Ultrahuman")
+                }
+                Section {
+                    Button("Save token") {
+                        Task {
+                            await training.saveUltrahumanToken()
+                            dismiss()
+                        }
+                    }
+                    .disabled(training.ultrahumanTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if training.hasUltrahumanToken {
+                        Button("Clear saved token", role: .destructive) {
+                            Task {
+                                await training.clearUltrahumanToken()
+                                dismiss()
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Ring API")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
     }
 }

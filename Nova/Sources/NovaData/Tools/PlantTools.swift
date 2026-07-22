@@ -271,13 +271,14 @@ public struct IdentifyPlantTool: Tool {
 
 public struct GardenWalkTool: Tool {
     public let name = "garden_walk"
-    public let description = "Capture a short glasses live look of the garden, analyze health/maintenance/mistakes grounded in the plant library, and return a coaching overview. Prefer this when the user wants a Garden Walk or proactive garden check. For a phone video, tell them to open Garden (upload) or Media → Send to Ivy."
+    public let description = "Capture a short glasses live look of the garden, analyze health/maintenance/mistakes grounded in the plant library and current season/climate, and return a coaching overview. Prefer this when the user wants a Garden Walk or proactive garden check. For a phone video, tell them to open Garden (upload) or Media → Send to Ivy."
     public let requiresConfirmation = false
     public let parametersJSON = #"{"type":"object","properties":{"duration_seconds":{"type":"number"}},"additionalProperties":false}"#
 
     private let frameCapture: any FrameCapture
     private let ai: any ConversationalAIProvider
     private let store: any PlantLibraryStoring
+    private let climateClient: GardenClimateClient
     private let isVisionReady: @Sendable () async -> Bool
     private let selector = FrameSelector()
 
@@ -285,11 +286,13 @@ public struct GardenWalkTool: Tool {
         frameCapture: any FrameCapture,
         ai: any ConversationalAIProvider,
         store: any PlantLibraryStoring,
+        climateClient: GardenClimateClient = GardenClimateClient(),
         isVisionReady: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.frameCapture = frameCapture
         self.ai = ai
         self.store = store
+        self.climateClient = climateClient
         self.isVisionReady = isVisionReady
     }
 
@@ -318,7 +321,11 @@ public struct GardenWalkTool: Tool {
         }
 
         let library = await store.all()
-        let prompt = GardenWalkDiff.analysisPrompt(library: library)
+        var climate: GardenClimateSnapshot?
+        if let city = await store.climateCity() {
+            climate = try? await climateClient.snapshot(city: city)
+        }
+        let prompt = GardenWalkDiff.analysisPrompt(library: library, climate: climate)
         var partial: [GardenWalkResult] = []
         for frame in burst {
             let answer = try await ai.analyze(image: frame, prompt: prompt)
@@ -355,10 +362,10 @@ public struct GardenWalkTool: Tool {
 
 public struct ListGardenPlanTool: Tool {
     public let name = "list_garden_plan"
-    public let description = "Seasonal garden plan: when to plant new crops and which library plants to bring inside before frost (uses climate city when set)."
+    public let description = "Seasonal garden plan for the user's climate: current-season planting, watering/heat care, and (when timely) bring-inside-before-frost guidance."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"season":{"type":"string","description":"spring|summer|fall|winter or omit for all"},"city":{"type":"string","description":"Optional climate city override"}},"additionalProperties":false}
+    {"type":"object","properties":{"season":{"type":"string","description":"spring|summer|fall|winter — omit to focus on the current season"},"city":{"type":"string","description":"Optional climate city override"}},"additionalProperties":false}
     """
 
     private let store: any PlantLibraryStoring
@@ -386,6 +393,9 @@ public struct ListGardenPlanTool: Tool {
         if let seasonRaw = args.season,
            let season = GardenSeason(rawValue: seasonRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
             plan = GardenPlanningDiff.items(for: season, in: plan)
+        } else {
+            // Default to current season so chat doesn't lead with off-season frost rows.
+            plan = GardenPlanningDiff.items(for: GardenSeason.current(), in: plan)
         }
         let summary = GardenPlanningDiff.summary(plan: plan, climate: climate)
         let rows: [[String: Any]] = plan.prefix(40).map { item in

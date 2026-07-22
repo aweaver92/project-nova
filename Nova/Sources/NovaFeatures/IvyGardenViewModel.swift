@@ -178,7 +178,7 @@ public final class IvyGardenViewModel {
         }
 
         var library = await store.all()
-        let framePrompt = GardenVideoCatalogDiff.framePrompt(library: library)
+        let framePrompt = GardenVideoCatalogDiff.framePrompt(library: library, climate: climate)
         var frameDrafts: [CatalogPlantDraft] = []
         for (index, data) in datas.enumerated() {
             statusMessage = "Cataloging frame \(index + 1) of \(datas.count)…"
@@ -244,7 +244,7 @@ public final class IvyGardenViewModel {
         errorMessage = nil
 
         guard speak else { return }
-        let briefing = GardenVideoCatalogDiff.speakPrompt(result: result)
+        let briefing = GardenVideoCatalogDiff.speakPrompt(result: result, climate: climate)
         await holdVideoForAudio?(true)
         do {
             statusMessage = "Ivy speaking Garden Overview…"
@@ -565,7 +565,7 @@ public final class IvyGardenViewModel {
 
     private func runGardenWalk(frames: [CapturedFrame], speak: Bool) async {
         let library = await store.all()
-        let prompt = GardenWalkDiff.analysisPrompt(library: library)
+        let prompt = GardenWalkDiff.analysisPrompt(library: library, climate: climate)
         statusMessage = "Analyzing \(frames.count) walk photo\(frames.count == 1 ? "" : "s")…"
         var partial: [GardenWalkResult] = []
         for (index, frame) in frames.enumerated() {
@@ -587,7 +587,7 @@ public final class IvyGardenViewModel {
         rebuildPlan()
 
         guard speak else { return }
-        let briefing = GardenWalkDiff.speakPrompt(result: merged, library: library)
+        let briefing = GardenWalkDiff.speakPrompt(result: merged, library: library, climate: climate)
         do {
             statusMessage = "Ivy speaking walk overview…"
             if let speakBriefing {

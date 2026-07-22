@@ -1214,7 +1214,9 @@ public extension Agent {
     /// v17: Ivy botanist + plant garden library.
     /// v18: Ivy Garden Walk (spoken coaching) + seasonal Planning.
     /// v19: Unique Realtime voice per built-in agent (no shared marin/cedar).
-    static let seedCapabilitiesVersion = 19
+    /// v20: Max ring_readiness (Ultrahuman daily metrics).
+    /// v21: Remy Kitchen v2 — OFF macros, recipe import, meal-plan shopping.
+    static let seedCapabilitiesVersion = 21
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -1290,11 +1292,11 @@ public extension Agent {
                 name: "Max",
                 voice: RealtimeVoice.ash.rawValue,
                 role: "a personal trainer and strength coach",
-                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. When the user asks to see Training / workouts on the phone, call open_app_screen with training. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy. The user may have the Training screen open to log sets or skip rest on the phone — say the cue and assume they may tap Log instead of asking you to log every set.",
+                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. When the user asks to see Training / workouts on the phone, call open_app_screen with training. You know past workouts and saved plans; use them to progress safely. Before hard sessions or when they ask about recovery / readiness / how hard to go, call ring_readiness (Ultrahuman Ring) and coach from that advice — never invent Ring numbers. If the tool says the token is missing, tell them to paste their Ultrahuman personal API token in Training settings. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy. The user may have the Training screen open to log sets or skip rest on the phone — say the cue and assume they may tap Log instead of asking you to log every set.",
                 toolNames: [
                     "start_workout_session", "log_workout_set", "end_workout_session",
                     "workout_history", "save_workout_plan", "list_workout_plans",
-                    "start_workout_from_plan",
+                    "start_workout_from_plan", "ring_readiness",
                     "open_app_screen",
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
                     "remember_fact", "recall_facts", "web_search", "create_reminder",
@@ -1320,18 +1322,20 @@ public extension Agent {
                 name: "Remy",
                 voice: RealtimeVoice.coral.rawValue,
                 role: "a chef and nutrition assistant",
-                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; for hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan. When you log a meal with log_meal, estimate its calories and protein/carbs/fat in grams from the description or recipe and pass them so the nutrition dashboard stays accurate; keep estimates reasonable and don't ask for exact numbers unless the user offers them. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; use import_recipe for a URL or pasted recipe text. For hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan — when they want groceries for the plan, call build_shopping_from_meal_plan. For packaged foods, call lookup_food_nutrition (name or barcode) before log_meal and pass those macros; otherwise estimate calories and protein/carbs/fat in grams from the description or recipe. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
                 toolNames: Agent.commonToolNames + [
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
                     "remember_visual",
                     "open_app_screen",
                     "add_pantry_item", "list_pantry", "remove_pantry_item", "update_pantry_item",
                     "scan_fridge",
-                    "save_recipe", "list_recipes", "get_recipe",
+                    "save_recipe", "list_recipes", "get_recipe", "import_recipe",
                     "start_cooking", "cooking_next_step", "cooking_previous_step", "cooking_status", "end_cooking",
                     "add_shopping_item", "list_shopping", "check_shopping_item", "clear_checked_shopping",
+                    "build_shopping_from_meal_plan",
                     "set_meal_plan_slot", "get_meal_plan", "clear_meal_plan_slot",
                     "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals",
+                    "lookup_food_nutrition",
                     "search_knowledge", "web_search"
                 ],
                 builtIn: true
@@ -1341,7 +1345,7 @@ public extension Agent {
                 name: "Ivy",
                 voice: RealtimeVoice.verse.rawValue,
                 role: "a botanist and gardening specialist",
-                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, and notes rather than inventing a generic garden. Proactively catch mistakes (overwatering signs, pests, plants that should already be indoors before frost, neglected watering) — don't wait to be asked. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance. Use list_garden_plan for seasonal planting and bring-inside-before-frost guidance. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing frost timing for their climate city.",
+                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, notes, the current season, and their climate city when set. Proactively catch timely mistakes (overwatering, pests, heat/drought stress in summer, neglected watering) — don't wait to be asked. Do not shoehorn frost or bring-inside advice in midsummer; save frost moves for fall/near first frost, and use list_garden_plan (optionally filtered to the current season) for seasonal planting. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance now. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing heat, rain, or frost timing for their climate city.",
                 toolNames: Agent.commonToolNames + [
                     "open_app_screen",
                     "remember_visual",
@@ -1781,6 +1785,8 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
     public var stepTimerSeconds: [Int]?
     public var tags: [String]
     public var sourceNote: String?
+    /// Original URL when imported from the web.
+    public var sourceURL: String?
     public var updatedAt: Date
 
     public init(
@@ -1792,6 +1798,7 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
         stepTimerSeconds: [Int]? = nil,
         tags: [String] = [],
         sourceNote: String? = nil,
+        sourceURL: String? = nil,
         updatedAt: Date = Date()
     ) {
         self.id = id
@@ -1802,6 +1809,7 @@ public struct Recipe: Sendable, Identifiable, Codable, Equatable {
         self.stepTimerSeconds = stepTimerSeconds
         self.tags = tags
         self.sourceNote = sourceNote
+        self.sourceURL = sourceURL
         self.updatedAt = updatedAt
     }
 
@@ -2102,10 +2110,15 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
     public var proteinGrams: Double?
     public var carbsGrams: Double?
     public var fatGrams: Double?
+    /// Provenance for macros (`llm` / `manual` / `open_food_facts`).
+    public var nutritionSource: MealNutritionSource?
+    public var barcode: String?
+    public var offProductId: String?
 
     private enum CodingKeys: String, CodingKey {
         case id, description, at, recipeId, kind
         case calories, proteinGrams, carbsGrams, fatGrams
+        case nutritionSource, barcode, offProductId
     }
 
     public init(
@@ -2117,7 +2130,10 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
         calories: Double? = nil,
         proteinGrams: Double? = nil,
         carbsGrams: Double? = nil,
-        fatGrams: Double? = nil
+        fatGrams: Double? = nil,
+        nutritionSource: MealNutritionSource? = nil,
+        barcode: String? = nil,
+        offProductId: String? = nil
     ) {
         self.id = id
         self.description = description
@@ -2128,6 +2144,9 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
         self.proteinGrams = proteinGrams
         self.carbsGrams = carbsGrams
         self.fatGrams = fatGrams
+        self.nutritionSource = nutritionSource
+        self.barcode = barcode
+        self.offProductId = offProductId
     }
 
     public init(from decoder: Decoder) throws {
@@ -2141,6 +2160,9 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
         proteinGrams = try c.decodeIfPresent(Double.self, forKey: .proteinGrams)
         carbsGrams = try c.decodeIfPresent(Double.self, forKey: .carbsGrams)
         fatGrams = try c.decodeIfPresent(Double.self, forKey: .fatGrams)
+        nutritionSource = try c.decodeIfPresent(MealNutritionSource.self, forKey: .nutritionSource)
+        barcode = try c.decodeIfPresent(String.self, forKey: .barcode)
+        offProductId = try c.decodeIfPresent(String.self, forKey: .offProductId)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -2154,6 +2176,9 @@ public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
         try c.encodeIfPresent(proteinGrams, forKey: .proteinGrams)
         try c.encodeIfPresent(carbsGrams, forKey: .carbsGrams)
         try c.encodeIfPresent(fatGrams, forKey: .fatGrams)
+        try c.encodeIfPresent(nutritionSource, forKey: .nutritionSource)
+        try c.encodeIfPresent(barcode, forKey: .barcode)
+        try c.encodeIfPresent(offProductId, forKey: .offProductId)
     }
 
     public var nutrition: MealNutrition {
@@ -2172,6 +2197,9 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
     public var fatGrams: Double?
     public var at: Date
     public var recipeId: UUID?
+    public var nutritionSource: MealNutritionSource?
+    public var barcode: String?
+    public var offProductId: String?
     /// True when confirming a new scan / manual log; false when editing a saved entry.
     public var isNew: Bool
 
@@ -2185,6 +2213,9 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
         fatGrams: Double? = nil,
         at: Date = Date(),
         recipeId: UUID? = nil,
+        nutritionSource: MealNutritionSource? = nil,
+        barcode: String? = nil,
+        offProductId: String? = nil,
         isNew: Bool
     ) {
         self.id = id
@@ -2196,6 +2227,9 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
         self.fatGrams = fatGrams
         self.at = at
         self.recipeId = recipeId
+        self.nutritionSource = nutritionSource
+        self.barcode = barcode
+        self.offProductId = offProductId
         self.isNew = isNew
     }
 
@@ -2208,6 +2242,7 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
             carbsGrams: estimate.nutrition.carbsGrams,
             fatGrams: estimate.nutrition.fatGrams,
             at: at,
+            nutritionSource: .llm,
             isNew: true
         )
     }
@@ -2223,6 +2258,9 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
             fatGrams: entry.fatGrams,
             at: entry.at,
             recipeId: entry.recipeId,
+            nutritionSource: entry.nutritionSource,
+            barcode: entry.barcode,
+            offProductId: entry.offProductId,
             isNew: false
         )
     }
@@ -2241,8 +2279,22 @@ public struct MealLogEditorState: Sendable, Identifiable, Equatable {
             calories: calories,
             proteinGrams: proteinGrams,
             carbsGrams: carbsGrams,
-            fatGrams: fatGrams
+            fatGrams: fatGrams,
+            nutritionSource: nutritionSource,
+            barcode: barcode,
+            offProductId: offProductId
         )
+    }
+
+    public mutating func applyFoodHit(_ hit: FoodNutritionHit) {
+        description = hit.displayName
+        calories = hit.nutrition.calories
+        proteinGrams = hit.nutrition.proteinGrams
+        carbsGrams = hit.nutrition.carbsGrams
+        fatGrams = hit.nutrition.fatGrams
+        nutritionSource = .openFoodFacts
+        barcode = hit.barcode
+        offProductId = hit.offProductId
     }
 }
 

@@ -208,10 +208,12 @@ public final class AppContainer {
         let studyStore = FileStudyDeckStore()
         let timerService = LocalTimerService()
         let phoneRinger = LocalPhoneRinger(phoneNumber: Self.findMyPhoneNumber)
+        let ultrahuman = UltrahumanClient()
         self.trainingVM = TrainingViewModel(
             workouts: workoutStore,
             plans: workoutPlanStore,
-            timers: timerService
+            timers: timerService,
+            ultrahuman: ultrahuman
         )
         self.tasksVM = SageTasksViewModel(store: taskStore)
         self.studyVM = StudyViewModel(store: studyStore)
@@ -369,6 +371,7 @@ public final class AppContainer {
             SaveWorkoutPlanTool(store: workoutPlanStore),
             ListWorkoutPlansTool(store: workoutPlanStore),
             StartWorkoutFromPlanTool(plans: workoutPlanStore, workouts: workoutStore),
+            RingReadinessTool(ultrahuman: ultrahuman),
             // Remy's pantry + kitchen tools.
             AddPantryItemTool(store: pantryStore),
             UpdatePantryItemTool(store: pantryStore),
@@ -384,6 +387,15 @@ public final class AppContainer {
             SaveRecipeTool(store: recipeStore),
             ListRecipesTool(store: recipeStore),
             GetRecipeTool(store: recipeStore),
+            ImportRecipeTool(
+                store: recipeStore,
+                importer: RecipeImporter(completeText: { [tokenService, useFakeAI] prompt in
+                    if useFakeAI {
+                        return #"{"title":"Test Pasta","servings":2,"ingredients":[{"name":"pasta","quantity":"200g"}],"steps":["Boil water","Cook pasta"]}"#
+                    }
+                    return try await OpenAIImageAnalyzer(tokenService: tokenService).completeText(prompt)
+                })
+            ),
             StartCookingTool(store: recipeStore),
             CookingNextStepTool(store: recipeStore),
             CookingPreviousStepTool(store: recipeStore),
@@ -393,6 +405,12 @@ public final class AppContainer {
             ListShoppingTool(store: shoppingStore),
             CheckShoppingItemTool(store: shoppingStore),
             ClearCheckedShoppingTool(store: shoppingStore),
+            BuildShoppingFromMealPlanTool(
+                shopping: shoppingStore,
+                meals: mealPlanStore,
+                recipes: recipeStore,
+                pantry: pantryStore
+            ),
             SetMealPlanSlotTool(store: mealPlanStore),
             GetMealPlanTool(store: mealPlanStore),
             ClearMealPlanSlotTool(store: mealPlanStore),
@@ -400,6 +418,7 @@ public final class AppContainer {
             UpdateNutritionProfileTool(store: nutritionStore),
             LogMealTool(store: nutritionStore),
             RecentMealsTool(store: nutritionStore),
+            LookupFoodNutritionTool(client: OpenFoodFactsClient()),
             // Sage's task-manager tools.
             ListTasksTool(store: taskStore),
             CreateTaskTool(store: taskStore, agentsProvider: { await agentStore.all() }),
@@ -581,7 +600,7 @@ public final class AppContainer {
             analyzeImage: { [tokenService, useFakeAI] frame, prompt in
                 if useFakeAI {
                     if prompt.contains("Garden Overview") || prompt.contains("Garden Walk") {
-                        return #"{"overview":"Garden looks fair with a few thirsty pots.","health_score":"fair","findings":[{"severity":"watch","title":"Dry soil","detail":"Top soil looks dry on visible pots.","matched_library":""}],"maintenance":["Water dry pots this evening"],"mistakes":["Leaving tender plants out overnight near frost"]}"#
+                        return #"{"overview":"Garden looks fair with a few thirsty pots.","health_score":"fair","findings":[{"severity":"watch","title":"Dry soil","detail":"Top soil looks dry on visible pots.","matched_library":""}],"maintenance":["Water dry pots this evening"],"mistakes":["Skipping morning water in heat"]}"#
                     }
                     if prompt.contains("catalog a garden") {
                         return #"{"plants":[{"name":"Test Monstera","species":"Monstera deliciosa","matched_library":"","confidence":0.9,"health":"ok","care_tips":"Bright indirect light; water when top soil is dry.","suggested_actions":["Wipe dusty leaves","Check for spider mites"],"seasonal_info":"Keep indoors; avoid cold drafts in winter.","is_outdoor":false,"frost_sensitive":true},{"name":"Cherry tomato","species":"Solanum lycopersicum","confidence":0.85,"health":"needs_water","care_tips":"Full sun and even moisture.","suggested_actions":["Water deeply today","Stake fruiting stems"],"seasonal_info":"Plant after last frost; harvest mid–late summer.","is_outdoor":true,"frost_sensitive":true}],"frame_notes":"fake catalog"}"#
@@ -676,6 +695,18 @@ public final class AppContainer {
             },
             isVisionReady: { [session] in
                 await session.isRegistered()
+            },
+            foodLookup: { query, barcode in
+                try await OpenFoodFactsClient().lookup(query: query, barcode: barcode)
+            },
+            importRecipeDraft: { [tokenService, useFakeAI] url, text in
+                let importer = RecipeImporter(completeText: { prompt in
+                    if useFakeAI {
+                        return #"{"title":"Test Pasta","servings":2,"ingredients":[{"name":"pasta","quantity":"200g"}],"steps":["Boil water","Cook pasta"]}"#
+                    }
+                    return try await OpenAIImageAnalyzer(tokenService: tokenService).completeText(prompt)
+                })
+                return try await importer.importDraft(url: url, text: text)
             }
         )
         let settingsVM = SettingsViewModel(

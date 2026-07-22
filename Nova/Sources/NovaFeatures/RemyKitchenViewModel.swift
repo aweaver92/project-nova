@@ -86,6 +86,8 @@ public final class RemyKitchenViewModel {
     public private(set) var statusMessage: String = ""
     /// Prefill sheet after a meal-photo scan, or when editing a saved log.
     public var mealLogEditor: MealLogEditorState?
+    /// Preview after URL/paste import — user confirms via recipe editor.
+    public var recipeImportPreview: Recipe?
     public var draftStaplesText: String = ""
     public var draftAllergensText: String = ""
     public var draftGoalsText: String = ""
@@ -96,6 +98,9 @@ public final class RemyKitchenViewModel {
     public var draftProteinTarget: String = ""
     public var draftCarbTarget: String = ""
     public var draftFatTarget: String = ""
+    public private(set) var isImportingRecipe = false
+    public private(set) var foodLookupHits: [FoodNutritionHit] = []
+    public private(set) var isLookingUpFood = false
 
     /// True while Kitchen is on-screen (drives polling for voice cook advances).
     public private(set) var isScreenVisible = false
@@ -109,6 +114,8 @@ public final class RemyKitchenViewModel {
     private let analyzeImage: (CapturedFrame, String) async throws -> String
     private let captureStill: (() async throws -> CapturedFrame)?
     private let isVisionReady: () async -> Bool
+    private let foodLookup: ((String?, String?) async throws -> [FoodNutritionHit])?
+    private let importRecipeDraft: ((String?, String?) async throws -> RecipeImportDraft)?
     private var pollTask: Task<Void, Never>?
     private var lastSyncedNutritionProfile: NutritionProfile?
 
@@ -121,7 +128,9 @@ public final class RemyKitchenViewModel {
         timers: (any TimerScheduling)? = nil,
         analyzeImage: @escaping (CapturedFrame, String) async throws -> String,
         captureStill: (() async throws -> CapturedFrame)? = nil,
-        isVisionReady: @escaping () async -> Bool = { false }
+        isVisionReady: @escaping () async -> Bool = { false },
+        foodLookup: ((String?, String?) async throws -> [FoodNutritionHit])? = nil,
+        importRecipeDraft: ((String?, String?) async throws -> RecipeImportDraft)? = nil
     ) {
         self.pantry = pantry
         self.recipesStore = recipes
@@ -132,6 +141,8 @@ public final class RemyKitchenViewModel {
         self.analyzeImage = analyzeImage
         self.captureStill = captureStill
         self.isVisionReady = isVisionReady
+        self.foodLookup = foodLookup
+        self.importRecipeDraft = importRecipeDraft
     }
 
     public var cookTimerRemainingSeconds: Int {
@@ -514,13 +525,7 @@ public final class RemyKitchenViewModel {
     }
 
     public func pantryAvailability(for recipe: Recipe) -> [(RecipeIngredient, Bool)] {
-        recipe.ingredients.map { ing in
-            let have = pantryItems.contains {
-                $0.name.localizedCaseInsensitiveCompare(ing.name) == .orderedSame
-                    && $0.stockLevel != .out
-            }
-            return (ing, have)
-        }
+        KitchenShoppingDiff.pantryAvailability(for: recipe, pantry: pantryItems, treatLowAsMissing: true)
     }
 
     // MARK: - "Cook what I have"
@@ -615,24 +620,17 @@ public final class RemyKitchenViewModel {
     /// Build the shopping list from every recipe in this week's meal plan,
     /// adding only ingredients not already in the pantry or on the list.
     public func addMissingFromMealPlan() async {
-        var seen = Set(shoppingItems.map { $0.name.lowercased() })
-        var added = 0
-        for slot in mealPlan.slots {
-            guard let recipeId = slot.recipeId,
-                  let recipe = recipes.first(where: { $0.id == recipeId }) else { continue }
-            for (ing, have) in pantryAvailability(for: recipe) where !have {
-                let key = ing.name.lowercased()
-                guard !seen.contains(key) else { continue }
-                seen.insert(key)
-                _ = await shopping.upsert(ShoppingListItem(
-                    name: ing.name,
-                    quantity: ing.quantity,
-                    fromRecipeId: recipe.id,
-                    category: inferredCategory(for: ing.name)
-                ))
-                added += 1
-            }
+        let missing = KitchenShoppingDiff.missingShoppingItems(
+            mealPlan: mealPlan,
+            recipes: recipes,
+            pantry: pantryItems,
+            existingShopping: shoppingItems,
+            treatLowAsMissing: true
+        )
+        for item in missing {
+            _ = await shopping.upsert(item)
         }
+        let added = missing.count
         await load()
         selectedSection = .shopping
         statusMessage = added > 0
@@ -643,7 +641,7 @@ public final class RemyKitchenViewModel {
     /// Best-guess category for an ingredient, matched against pantry items.
     private func inferredCategory(for name: String) -> String? {
         pantryItems.first {
-            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+            KitchenShoppingDiff.namesMatch($0.name, name)
         }?.category.rawValue
     }
 
@@ -720,6 +718,7 @@ public final class RemyKitchenViewModel {
     public func logMeal(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        foodLookupHits = []
         mealLogEditor = MealLogEditorState(
             description: trimmed,
             kind: .suggested(),
@@ -729,6 +728,7 @@ public final class RemyKitchenViewModel {
 
     /// Open the editor for a previously saved meal log entry.
     public func editMeal(_ entry: MealLogEntry) {
+        foodLookupHits = []
         mealLogEditor = MealLogEditorState(entry: entry)
     }
 
@@ -737,6 +737,7 @@ public final class RemyKitchenViewModel {
             statusMessage = "Meal not saved."
         }
         mealLogEditor = nil
+        foodLookupHits = []
     }
 
     /// Persist the editor draft — creates a new log or updates an existing one.
@@ -748,14 +749,29 @@ public final class RemyKitchenViewModel {
         }
         var cleaned = draft
         cleaned.description = description
+        if cleaned.nutritionSource == nil, !cleaned.nutrition.isEmpty {
+            cleaned.nutritionSource = .manual
+        }
         mealLogEditor = nil
+        foodLookupHits = []
         if cleaned.isNew {
-            _ = await nutrition.logMeal(
+            let logged = await nutrition.logMeal(
                 description: cleaned.description,
                 recipeId: cleaned.recipeId,
                 nutrition: cleaned.nutrition.isEmpty ? nil : cleaned.nutrition,
                 kind: cleaned.kind
             )
+            var entry = logged
+            entry.calories = cleaned.calories
+            entry.proteinGrams = cleaned.proteinGrams
+            entry.carbsGrams = cleaned.carbsGrams
+            entry.fatGrams = cleaned.fatGrams
+            entry.kind = cleaned.kind
+            entry.nutritionSource = cleaned.nutritionSource
+                ?? (cleaned.nutrition.isEmpty ? nil : .manual)
+            entry.barcode = cleaned.barcode
+            entry.offProductId = cleaned.offProductId
+            _ = await nutrition.updateMeal(entry)
             let cal = cleaned.calories.map { " · \(Int($0)) kcal" } ?? ""
             statusMessage = "Logged \(cleaned.description) (\(cleaned.kind.displayName))\(cal)"
         } else {
@@ -767,6 +783,49 @@ public final class RemyKitchenViewModel {
             statusMessage = "Updated \(cleaned.description)"
         }
         await load()
+    }
+
+    public func lookupFood(query: String?, barcode: String?) async {
+        guard let foodLookup else {
+            statusMessage = "Food lookup isn’t available."
+            return
+        }
+        isLookingUpFood = true
+        defer { isLookingUpFood = false }
+        do {
+            foodLookupHits = try await foodLookup(query, barcode)
+            if foodLookupHits.isEmpty {
+                statusMessage = "No Open Food Facts matches."
+            }
+        } catch {
+            statusMessage = "Food lookup failed: \(Self.userFacingMessage(from: error))"
+            foodLookupHits = []
+        }
+    }
+
+    public func applyFoodHit(_ hit: FoodNutritionHit) {
+        guard var draft = mealLogEditor else { return }
+        draft.applyFoodHit(hit)
+        mealLogEditor = draft
+        foodLookupHits = []
+        statusMessage = hit.servingNote.map { "Filled macros (\($0))." } ?? "Filled macros from Open Food Facts."
+    }
+
+    public func importRecipe(url: String?, text: String?) async {
+        guard let importRecipeDraft else {
+            statusMessage = "Recipe import isn’t available."
+            return
+        }
+        isImportingRecipe = true
+        defer { isImportingRecipe = false }
+        do {
+            let draft = try await importRecipeDraft(url, text)
+            recipeImportPreview = draft.asRecipe()
+            statusMessage = "Imported “\(draft.title)” via \(draft.extractionMethod.replacingOccurrences(of: "_", with: " ")). Review and save."
+            selectedSection = .recipes
+        } catch {
+            statusMessage = "Import failed: \(Self.userFacingMessage(from: error))"
+        }
     }
 
     /// Analyze a meal photo for description + macros, then open the confirm/edit sheet.

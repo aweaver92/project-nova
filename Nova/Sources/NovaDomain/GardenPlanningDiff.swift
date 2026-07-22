@@ -47,6 +47,108 @@ public enum GardenPlanningDiff {
         return formatter.string(from: date)
     }
 
+    /// Whole days from `now` until `date` (negative if already past).
+    public static func daysUntil(
+        _ date: Date?,
+        from now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Int? {
+        guard let date else { return nil }
+        return calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: now),
+            to: calendar.startOfDay(for: date)
+        ).day
+    }
+
+    /// Whether frost bring-inside / freeze warnings should lead coaching right now.
+    public static func isFrostAdviceRelevant(
+        climate: GardenClimateSnapshot?,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Bool {
+        let season = GardenSeason.current(on: now, calendar: calendar)
+        switch season {
+        case .fall, .winter:
+            return true
+        case .spring:
+            if let days = daysUntil(climate?.lastSpringFrost, from: now, calendar: calendar) {
+                return days > -14 && days < 60
+            }
+            return true
+        case .summer:
+            if let days = daysUntil(climate?.firstFallFrost, from: now, calendar: calendar) {
+                return days <= 45
+            }
+            // Midsummer without a nearby frost date — do not lead with frost.
+            return false
+        }
+    }
+
+    /// Season + climate block injected into Ivy walk/catalog/overview prompts.
+    public static func coachingContext(
+        climate: GardenClimateSnapshot?,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> String {
+        let season = GardenSeason.current(on: now, calendar: calendar)
+        var lines: [String] = [
+            "Current season: \(season.title). Coach for THIS season — do not shoehorn off-season frost advice."
+        ]
+        if let climate {
+            lines.append("Climate area: \(climate.city). \(climate.summary)")
+            if let days = daysUntil(climate.firstFallFrost, from: now, calendar: calendar) {
+                if days > 60 {
+                    lines.append(
+                        "First fall frost is ~\(days) days away — frost moves are NOT urgent; focus on heat, water, pests, harvest, and mid-season care."
+                    )
+                } else if days > 21 {
+                    lines.append(
+                        "First fall frost is ~\(days) days away — mention frost prep only lightly; prioritize current-season tasks."
+                    )
+                } else if days >= 0 {
+                    lines.append(
+                        "First fall frost is ~\(days) days away — frost-sensitive outdoor plants may need bring-inside plans soon."
+                    )
+                } else {
+                    lines.append(
+                        "Past typical first fall frost — protect frost-sensitive outdoor plants if freezes are possible."
+                    )
+                }
+            }
+            if let days = daysUntil(climate.lastSpringFrost, from: now, calendar: calendar),
+               days > 0,
+               season == .spring || season == .winter {
+                lines.append(
+                    "Last spring frost is ~\(days) days away — wait on tender transplants until after that window."
+                )
+            }
+        } else {
+            lines.append(
+                "No climate city set — use season only; avoid inventing frost urgency in midsummer."
+            )
+        }
+        switch season {
+        case .summer:
+            lines.append(
+                "Summer priorities: watering, mulch, heat stress, pests, deadheading, succession sowing, harvest. Do NOT warn about bringing plants inside for frost unless the gardener asks about fall."
+            )
+        case .spring:
+            lines.append(
+                "Spring priorities: harden-off, planting after frost risk passes, emerging pests, watering cadence."
+            )
+        case .fall:
+            lines.append(
+                "Fall priorities: harvest, cleanup, garlic/bulbs, and bring frost-sensitive plants inside before freezes."
+            )
+        case .winter:
+            lines.append(
+                "Winter priorities: indoor care, planning next season, and protecting outdoor tender plants from freezes."
+            )
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// Builds seasonal plan rows from the library + optional climate anchors.
     public static func buildPlan(
         library: [PlantSighting],
@@ -58,6 +160,8 @@ public enum GardenPlanningDiff {
         let lastFrostLabel = formatDate(climate?.lastSpringFrost, calendar: calendar)
         let firstFrostLabel = formatDate(climate?.firstFallFrost, calendar: calendar)
         let city = climate?.city
+        let seasonNow = GardenSeason.current(on: now, calendar: calendar)
+        let frostRelevant = isFrostAdviceRelevant(climate: climate, now: now, calendar: calendar)
 
         // Spring / summer planting windows.
         items.append(GardenPlanItem(
@@ -84,6 +188,15 @@ public enum GardenPlanningDiff {
             windowLabel: "Early–mid summer"
         ))
         items.append(GardenPlanItem(
+            season: .summer,
+            kind: .maintenance,
+            title: "Beat summer heat & drought stress",
+            detail: city == nil
+                ? "Water deeply in the morning, mulch beds, and watch for wilt or sunscald on tender crops."
+                : "In \(city!), prioritize deep watering, mulch, and shade for heat-sensitive plants while nights stay warm.",
+            windowLabel: "Peak summer"
+        ))
+        items.append(GardenPlanItem(
             season: .fall,
             kind: .plantNew,
             title: "Plant garlic & spring bulbs",
@@ -98,15 +211,24 @@ public enum GardenPlanningDiff {
             windowLabel: "Anytime in winter"
         ))
 
-        // Per-plant bring-inside actions.
+        // Per-plant bring-inside / harden-off — keep on the plan calendar, but
+        // only emphasize bring-inside urgency when frost is seasonally relevant.
         let frostPlants = library.filter { isLikelyOutdoor($0) && isFrostSensitive($0) }
         for plant in frostPlants {
+            let bringDetail: String
+            if frostRelevant {
+                bringDetail = plant.species.map { "\($0) is frost-sensitive — move before overnight freezes." }
+                    ?? "Frost-sensitive outdoor plant — move before overnight freezes."
+            } else {
+                bringDetail = plant.species.map {
+                    "\($0) is frost-sensitive — schedule a bring-inside move later this fall, not as a midsummer chore."
+                } ?? "Frost-sensitive outdoor plant — note for fall; not urgent in the current season."
+            }
             items.append(GardenPlanItem(
                 season: .fall,
                 kind: .bringInside,
                 title: "Bring \(plant.name) inside",
-                detail: plant.species.map { "\($0) is frost-sensitive — move before overnight freezes." }
-                    ?? "Frost-sensitive outdoor plant — move before overnight freezes.",
+                detail: bringDetail,
                 windowLabel: firstFrostLabel.map { "2 weeks before first frost (~\($0))" }
                     ?? "2 weeks before first frost",
                 plantId: plant.id,
@@ -127,7 +249,7 @@ public enum GardenPlanningDiff {
         for plant in library {
             guard let watered = plant.lastWateredAt else {
                 items.append(GardenPlanItem(
-                    season: GardenSeason.current(on: now, calendar: calendar),
+                    season: seasonNow,
                     kind: .maintenance,
                     title: "Log first watering for \(plant.name)",
                     detail: "No watering history yet — note a baseline so Ivy can coach cadence.",
@@ -140,7 +262,7 @@ public enum GardenPlanningDiff {
             let days = calendar.dateComponents([.day], from: watered, to: now).day ?? 0
             if days >= 7, isLikelyOutdoor(plant) || plant.isOutdoor != false {
                 items.append(GardenPlanItem(
-                    season: GardenSeason.current(on: now, calendar: calendar),
+                    season: seasonNow,
                     kind: .maintenance,
                     title: "Check moisture on \(plant.name)",
                     detail: "Last watered \(days) days ago — verify soil before it stresses.",
@@ -152,7 +274,6 @@ public enum GardenPlanningDiff {
         }
 
         // Suggested actions from video catalog / identify profiles.
-        let seasonNow = GardenSeason.current(on: now, calendar: calendar)
         for plant in library {
             guard let action = plant.suggestedActions.first else { continue }
             items.append(GardenPlanItem(
@@ -170,7 +291,7 @@ public enum GardenPlanningDiff {
 
         if library.isEmpty {
             items.append(GardenPlanItem(
-                season: GardenSeason.current(on: now, calendar: calendar),
+                season: seasonNow,
                 kind: .maintenance,
                 title: "Build your garden library",
                 detail: "Identify plants from photos or a Garden Walk so seasonal tips name your specific plants.",
@@ -179,10 +300,12 @@ public enum GardenPlanningDiff {
         }
 
         return items.sorted { lhs, rhs in
-            if lhs.season != rhs.season {
-                return seasonOrder(lhs.season) < seasonOrder(rhs.season)
-            }
-            return kindOrder(lhs.kind) < kindOrder(rhs.kind)
+            // Surface the current season first so summer planning isn't buried under frost rows.
+            let lhsRank = seasonPriority(lhs.season, current: seasonNow)
+            let rhsRank = seasonPriority(rhs.season, current: seasonNow)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return kindOrder(lhs.kind, frostRelevant: frostRelevant)
+                < kindOrder(rhs.kind, frostRelevant: frostRelevant)
         }
     }
 
@@ -195,30 +318,37 @@ public enum GardenPlanningDiff {
 
     public static func summary(plan: [GardenPlanItem], climate: GardenClimateSnapshot?) -> String {
         var lines: [String] = []
+        let season = GardenSeason.current()
+        lines.append("Current season: \(season.title).")
+        lines.append(coachingContext(climate: climate))
         if let climate {
             lines.append("Climate: \(climate.city). \(climate.summary)")
         }
-        for season in GardenSeason.allCases {
-            let rows = items(for: season, in: plan)
+        // Lead with this season's rows, then the rest.
+        for seasonCase in [season] + GardenSeason.allCases.filter({ $0 != season }) {
+            let rows = items(for: seasonCase, in: plan)
             guard !rows.isEmpty else { continue }
             let titles = rows.prefix(6).map(\.title).joined(separator: "; ")
-            lines.append("\(season.title): \(titles)")
+            lines.append("\(seasonCase.title): \(titles)")
         }
         return lines.isEmpty ? "No garden plan items yet." : lines.joined(separator: "\n")
     }
 
-    private static func seasonOrder(_ season: GardenSeason) -> Int {
+    private static func seasonPriority(_ season: GardenSeason, current: GardenSeason) -> Int {
+        if season == current { return 0 }
         switch season {
-        case .spring: return 0
-        case .summer: return 1
-        case .fall: return 2
-        case .winter: return 3
+        case .spring: return 1
+        case .summer: return 2
+        case .fall: return 3
+        case .winter: return 4
         }
     }
 
-    private static func kindOrder(_ kind: GardenPlanKind) -> Int {
+    private static func kindOrder(_ kind: GardenPlanKind, frostRelevant: Bool) -> Int {
         switch kind {
-        case .bringInside: return 0
+        case .bringInside:
+            // Demote frost moves when they are not timely (e.g. midsummer).
+            return frostRelevant ? 0 : 3
         case .plantNew: return 1
         case .maintenance: return 2
         }

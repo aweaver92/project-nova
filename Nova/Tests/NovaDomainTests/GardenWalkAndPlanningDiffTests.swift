@@ -56,6 +56,62 @@ final class GardenWalkAndPlanningDiffTests: XCTestCase {
         XCTAssertFalse(springPlant.isEmpty)
     }
 
+    func testFrostAdviceNotRelevantInMidsummer() {
+        let climate = GardenClimateSnapshot(
+            city: "Philadelphia",
+            lastSpringFrost: date(2026, 4, 10),
+            firstFallFrost: date(2026, 11, 5),
+            summary: "sample"
+        )
+        let midsummer = date(2026, 7, 15)
+        XCTAssertEqual(GardenSeason.current(on: midsummer), .summer)
+        XCTAssertFalse(
+            GardenPlanningDiff.isFrostAdviceRelevant(climate: climate, now: midsummer)
+        )
+        let context = GardenPlanningDiff.coachingContext(climate: climate, now: midsummer)
+        XCTAssertTrue(context.contains("Summer"))
+        XCTAssertTrue(context.localizedCaseInsensitiveContains("NOT urgent")
+            || context.localizedCaseInsensitiveContains("Do NOT warn"))
+        XCTAssertFalse(context.localizedCaseInsensitiveContains("bring-inside plans soon"))
+    }
+
+    func testFrostAdviceRelevantNearFallFrost() {
+        let climate = GardenClimateSnapshot(
+            city: "Philadelphia",
+            lastSpringFrost: date(2026, 4, 10),
+            firstFallFrost: date(2026, 10, 20),
+            summary: "sample"
+        )
+        let lateSeptember = date(2026, 9, 25)
+        XCTAssertEqual(GardenSeason.current(on: lateSeptember), .fall)
+        XCTAssertTrue(
+            GardenPlanningDiff.isFrostAdviceRelevant(climate: climate, now: lateSeptember)
+        )
+    }
+
+    func testWalkPromptOmitsFrostTagInSummer() {
+        let plant = PlantSighting(
+            fileName: "b.jpg",
+            name: "Basil",
+            isOutdoor: true,
+            frostSensitive: true
+        )
+        let climate = GardenClimateSnapshot(
+            city: "Austin",
+            lastSpringFrost: date(2026, 3, 12),
+            firstFallFrost: date(2026, 11, 20),
+            summary: "sample"
+        )
+        let prompt = GardenWalkDiff.analysisPrompt(
+            library: [plant],
+            climate: climate,
+            now: date(2026, 7, 15)
+        )
+        XCTAssertFalse(prompt.contains("[frost-sensitive]"))
+        XCTAssertTrue(prompt.contains("Summer"))
+        XCTAssertTrue(prompt.localizedCaseInsensitiveContains("Do NOT warn about bringing plants inside"))
+    }
+
     func testPlanningIncludesSuggestedActionsFromProfile() {
         let plant = PlantSighting(
             fileName: "t.jpg",

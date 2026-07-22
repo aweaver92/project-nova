@@ -98,7 +98,7 @@ public struct SaveRecipeTool: Tool {
     public let description = "Save or update a recipe with ingredients and step-by-step instructions. Optionally pass step_timers: an array of seconds aligned with steps (0 = no timer) so cook mode can auto-start each step's countdown."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"recipe_id":{"type":"string"},"title":{"type":"string"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"quantity":{"type":"string"}},"required":["name"]}},"steps":{"type":"array","items":{"type":"string"}},"step_timers":{"type":"array","items":{"type":"integer"},"description":"Seconds per step, aligned with steps; 0 for no timer."},"tags":{"type":"array","items":{"type":"string"}},"source_note":{"type":"string"}},"required":["title"],"additionalProperties":false}
+    {"type":"object","properties":{"recipe_id":{"type":"string"},"title":{"type":"string"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"quantity":{"type":"string"}},"required":["name"]}},"steps":{"type":"array","items":{"type":"string"}},"step_timers":{"type":"array","items":{"type":"integer"},"description":"Seconds per step, aligned with steps; 0 for no timer."},"tags":{"type":"array","items":{"type":"string"}},"source_note":{"type":"string"},"source_url":{"type":"string"}},"required":["title"],"additionalProperties":false}
     """
     private let store: any RecipeStoring
     public init(store: any RecipeStoring) { self.store = store }
@@ -114,6 +114,7 @@ public struct SaveRecipeTool: Tool {
             let step_timers: [Int]?
             let tags: [String]?
             let source_note: String?
+            let source_url: String?
         }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         let id = args.recipe_id.flatMap(UUID.init(uuidString:)) ?? UUID()
@@ -126,7 +127,8 @@ public struct SaveRecipeTool: Tool {
             steps: args.steps ?? [],
             stepTimerSeconds: stepTimers,
             tags: args.tags ?? [],
-            sourceNote: args.source_note
+            sourceNote: args.source_note,
+            sourceURL: args.source_url
         ))
         return #"{"ok":true,"recipe_id":"\#(recipe.id.uuidString)","title":"\#(escape(recipe.title))","steps":\#(recipe.steps.count)}"#
     }
@@ -617,4 +619,161 @@ public struct RecentMealsTool: Tool {
 private func escape(_ s: String) -> String {
     s.replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+private func jsonStringArray(_ strings: [String]) -> String {
+    let escaped = strings.map { "\"\(escape($0))\"" }.joined(separator: ",")
+    return "[\(escaped)]"
+}
+
+// MARK: - Remy Kitchen v2 tools
+
+public struct BuildShoppingFromMealPlanTool: Tool {
+    public let name = "build_shopping_from_meal_plan"
+    public let description = """
+    Add missing ingredients from this week's meal-plan recipes to the shopping list, \
+    skipping items already in the pantry (or already on the list). Treats pantry .out \
+    and .low as missing. Does not do unit math — presence only.
+    """
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"include_low":{"type":"boolean","description":"If true (default), pantry items marked low count as missing."}},"additionalProperties":false}
+    """
+    private let shopping: any ShoppingListStoring
+    private let meals: any MealPlanStoring
+    private let recipes: any RecipeStoring
+    private let pantry: any PantryStoring
+
+    public init(
+        shopping: any ShoppingListStoring,
+        meals: any MealPlanStoring,
+        recipes: any RecipeStoring,
+        pantry: any PantryStoring
+    ) {
+        self.shopping = shopping
+        self.meals = meals
+        self.recipes = recipes
+        self.pantry = pantry
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let include_low: Bool? }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(include_low: nil)
+        let treatLow = args.include_low ?? true
+        let plan = await meals.currentWeek()
+        let allRecipes = await recipes.all()
+        let pantryItems = await pantry.all()
+        let existing = await shopping.all()
+        let missing = KitchenShoppingDiff.missingShoppingItems(
+            mealPlan: plan,
+            recipes: allRecipes,
+            pantry: pantryItems,
+            existingShopping: existing,
+            treatLowAsMissing: treatLow
+        )
+        for item in missing {
+            _ = await shopping.upsert(item)
+        }
+        return #"{"ok":true,"added":\#(missing.count),"names":\#(jsonStringArray(missing.map(\.name)))}"#
+    }
+}
+
+public struct ImportRecipeTool: Tool {
+    public let name = "import_recipe"
+    public let description = """
+    Import a recipe from a URL and/or pasted text. Prefers JSON-LD on the page, then \
+    plain-text heuristics, then AI extract. Pass save=true to persist; otherwise returns a preview.
+    """
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"url":{"type":"string"},"text":{"type":"string"},"save":{"type":"boolean","description":"If true, save the recipe after extract (default true for voice)."}},"additionalProperties":false}
+    """
+    private let store: any RecipeStoring
+    private let importer: RecipeImporter
+
+    public init(store: any RecipeStoring, importer: RecipeImporter) {
+        self.store = store
+        self.importer = importer
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let url: String?
+            let text: String?
+            let save: Bool?
+        }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let draft: RecipeImportDraft
+        do {
+            draft = try await importer.importDraft(url: args.url, text: args.text)
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return #"{"ok":false,"error":"\#(escape(msg))"}"#
+        }
+        let shouldSave = args.save ?? true
+        var payload: [String: Any] = [
+            "ok": true,
+            "title": draft.title,
+            "ingredient_count": draft.ingredients.count,
+            "step_count": draft.steps.count,
+            "extraction": draft.extractionMethod,
+            "ingredients": draft.ingredients.map { ing -> [String: Any] in
+                var d: [String: Any] = ["name": ing.name]
+                if let q = ing.quantity { d["quantity"] = q }
+                return d
+            },
+            "steps": draft.steps
+        ]
+        if let servings = draft.servings { payload["servings"] = servings }
+        if let url = draft.sourceURL { payload["source_url"] = url }
+        if shouldSave {
+            let recipe = await store.upsert(draft.asRecipe())
+            payload["saved"] = true
+            payload["recipe_id"] = recipe.id.uuidString
+        } else {
+            payload["saved"] = false
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+public struct LookupFoodNutritionTool: Tool {
+    public let name = "lookup_food_nutrition"
+    public let description = """
+    Look up packaged-food macros via Open Food Facts by product name query or barcode. \
+    Prefer this before log_meal for packaged foods; then pass the returned calories/macros into log_meal.
+    """
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"query":{"type":"string","description":"Product name search."},"barcode":{"type":"string","description":"UPC/EAN barcode digits."}},"additionalProperties":false}
+    """
+    private let client: OpenFoodFactsClient
+    public init(client: OpenFoodFactsClient = OpenFoodFactsClient()) { self.client = client }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let query: String?; let barcode: String? }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let hits = try await client.lookup(query: args.query, barcode: args.barcode)
+        let rows: [[String: Any]] = hits.map { hit in
+            var d: [String: Any] = [
+                "name": hit.displayName,
+                "source": "open_food_facts"
+            ]
+            if let b = hit.barcode { d["barcode"] = b }
+            if let id = hit.offProductId { d["off_product_id"] = id }
+            if let n = hit.servingNote { d["serving_note"] = n }
+            if let c = hit.nutrition.calories { d["calories"] = c }
+            if let p = hit.nutrition.proteinGrams { d["protein_grams"] = p }
+            if let cb = hit.nutrition.carbsGrams { d["carbs_grams"] = cb }
+            if let f = hit.nutrition.fatGrams { d["fat_grams"] = f }
+            return d
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "count": rows.count,
+            "products": rows
+        ])
+        return String(decoding: data, as: UTF8.self)
+    }
 }
