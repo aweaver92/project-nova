@@ -70,6 +70,33 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isCommitAndBuilding)
     }
 
+    func testCommitAndBuildPauseDoesNotMarkFailed() async {
+        PendingCommitBuildStore.clear()
+        let bridge = DirtyRepoBridge(commitAndBuildPauseOnPoll: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
+
+        await vm.load()
+        await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
+        XCTAssertNil(notified, "Paused poll must not fire failure notification")
+        XCTAssertNil(vm.lastCommitAndBuildFailure)
+        XCTAssertFalse(vm.isCommitAndBuilding)
+        XCTAssertTrue(vm.showsCommitAndBuildProgress)
+        XCTAssertNotNil(PendingCommitBuildStore.load())
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("ci")
+            || vm.commitAndBuildPhaseLabel.localizedCaseInsensitiveContains("CI"))
+
+        await vm.resumePendingCommitAndBuildIfNeeded()
+        XCTAssertEqual(notified?.0, true)
+        XCTAssertNil(PendingCommitBuildStore.load())
+        XCTAssertFalse(vm.showsCommitAndBuildProgress)
+        PendingCommitBuildStore.clear()
+    }
+
     func testSelectRepositoryDoesNotReuseAnotherReposPinnedSession() async {
         // Bridge must report the same selected repo as settings, or load()'s
         // refreshRepositories() will overwrite and hide the per-repo pin.
@@ -725,6 +752,8 @@ private actor DirtyRepoBridge: AgentBridging {
     private(set) var publishCallCount = 0
     private(set) var commitAndBuildCallCount = 0
     private let commitAndBuildShouldFail: Bool
+    private let commitAndBuildPauseOnPoll: Bool
+    private var commitAndBuildPollCount = 0
     private(set) var receivedImageCount = 0
     private(set) var receivedCommands: [String] = []
     private(set) var receivedSessionIds: [String?] = []
@@ -754,6 +783,7 @@ private actor DirtyRepoBridge: AgentBridging {
         holdStreamUntilCancel: Bool = false,
         statusFailCount: Int = 0,
         commitAndBuildShouldFail: Bool = false,
+        commitAndBuildPauseOnPoll: Bool = false,
         selectedRepoId: String = "abcdef0123456789"
     ) {
         self.streamDelaySeconds = streamDelaySeconds
@@ -763,6 +793,7 @@ private actor DirtyRepoBridge: AgentBridging {
         self.holdStreamUntilCancel = holdStreamUntilCancel
         self.statusFailCount = statusFailCount
         self.commitAndBuildShouldFail = commitAndBuildShouldFail
+        self.commitAndBuildPauseOnPoll = commitAndBuildPauseOnPoll
         self.selectedRepoId = selectedRepoId
     }
 
@@ -887,6 +918,36 @@ private actor DirtyRepoBridge: AgentBridging {
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"jobId":"ipa-test","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
+        )
+    }
+
+    func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        if commitAndBuildPauseOnPoll {
+            commitAndBuildCallCount += 1
+            if commitAndBuildShouldFail {
+                return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"ci_failed","detail":"GitHub Actions IPA job failed"}"#)
+            }
+            return BridgeResult(
+                ok: true,
+                payloadJSON: #"{"ok":true,"jobId":"ipa-pause-test","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"buildStatus":"running","detail":"CI started"}"#
+            )
+        }
+        return await commitAndBuildIpa(request: request)
+    }
+
+    func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult {
+        if commitAndBuildPauseOnPoll {
+            commitAndBuildPollCount += 1
+            if commitAndBuildPollCount == 1 {
+                return BridgeResult(
+                    ok: true,
+                    payloadJSON: #"{"ok":true,"jobId":"\#(jobId)","buildStatus":"running","paused":true,"hint":"Still waiting on CI"}"#
+                )
+            }
+        }
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"jobId":"\#(jobId)","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
         )
     }
 

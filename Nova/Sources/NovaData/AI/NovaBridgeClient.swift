@@ -596,6 +596,20 @@ public actor NovaBridgeClient: AgentBridging {
     }
 
     public func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        let started = await startCommitAndBuildIpa(request: request)
+        guard started.ok else { return started }
+        guard let jobId = Self.stringField(started.payloadJSON, "jobId"), !jobId.isEmpty else {
+            return started
+        }
+        let status = Self.stringField(started.payloadJSON, "buildStatus")?.lowercased() ?? ""
+        if status == "completed" || status == "failed" {
+            return Self.terminalCommitAndBuildResult(started)
+        }
+        let deadline = Date().addingTimeInterval(50 * 60)
+        return await pollCommitAndBuildJob(jobId: jobId, deadline: deadline)
+    }
+
+    public func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
         var body: [String: Any] = [:]
         if let statusToken = request.statusToken, !statusToken.isEmpty {
             body["statusToken"] = statusToken
@@ -606,46 +620,46 @@ public actor NovaBridgeClient: AgentBridging {
         body["asyncPoll"] = true
         // Commit+push only — CI waits in a background bridge job. Holding one
         // HTTP request for 10–25 min is what produced "Lost connection mid-run".
-        let started = await post(path: "nova/commit-and-build", body: body, timeout: 180)
-        guard started.ok else { return started }
-        guard let jobId = Self.stringField(started.payloadJSON, "jobId"), !jobId.isEmpty else {
-            return started
-        }
-        let status = Self.stringField(started.payloadJSON, "buildStatus")?.lowercased() ?? ""
-        if status == "completed" || status == "failed" {
-            return Self.terminalCommitAndBuildResult(started)
-        }
+        return await post(path: "nova/commit-and-build", body: body, timeout: 180)
+    }
 
-        let deadline = Date().addingTimeInterval(50 * 60)
-        var consecutiveTransportFailures = 0
+    public func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult {
+        let trimmed = jobId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"missing_job_id"}"#)
+        }
         while Date() < deadline {
+            if Task.isCancelled {
+                return Self.pausedCommitAndBuildResult(jobId: trimmed)
+            }
             try? await Task.sleep(for: .seconds(8))
+            if Task.isCancelled {
+                return Self.pausedCommitAndBuildResult(jobId: trimmed)
+            }
             let poll = await send(
-                path: "nova/commit-and-build/\(jobId)",
+                path: "nova/commit-and-build/\(trimmed)",
                 method: "GET",
                 body: nil,
                 timeout: 45
             )
             if !poll.ok {
-                // Wi‑Fi blips during a long CI wait are expected — keep polling.
+                // Never mark the IPA job failed for background/Wi‑Fi blips — keep
+                // polling until the wall deadline (or Task cancel → paused).
                 if Self.isTransientBridgeTransport(poll.payloadJSON) {
-                    consecutiveTransportFailures += 1
-                    if consecutiveTransportFailures >= 20 {
-                        return poll
-                    }
                     continue
                 }
                 return poll
             }
-            consecutiveTransportFailures = 0
             let buildStatus = Self.stringField(poll.payloadJSON, "buildStatus")?.lowercased() ?? ""
             if buildStatus == "completed" || buildStatus == "failed" {
                 return Self.terminalCommitAndBuildResult(poll)
             }
         }
-        return BridgeResult(
-            ok: false,
-            payloadJSON: #"{"ok":false,"error":"ipa_build_timeout","hint":"GitHub Actions IPA is still running on the PC bridge — check Actions, or retry Commit and Build later."}"#
+        // Soft timeout: CI may still be running on the bridge — treat as pause so
+        // the phone can resume later instead of a hard failure.
+        return Self.pausedCommitAndBuildResult(
+            jobId: trimmed,
+            hint: "Still waiting on GitHub Actions. Reopen Nova to keep checking — the PC bridge job was not cancelled."
         )
     }
 
@@ -664,6 +678,18 @@ public actor NovaBridgeClient: AgentBridging {
         return result
     }
 
+    /// Soft pause — not a failure. UI resumes polling on foreground.
+    private static func pausedCommitAndBuildResult(jobId: String, hint: String? = nil) -> BridgeResult {
+        let message = hint
+            ?? "Commit and Build is still running on your PC. Nova paused checking while backgrounded — it will resume when you return."
+        let escapedJob = escape(jobId)
+        let escapedHint = escape(message)
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"jobId":"\#(escapedJob)","buildStatus":"running","paused":true,"hint":"\#(escapedHint)"}"#
+        )
+    }
+
     private static func isTransientBridgeTransport(_ payloadJSON: String) -> Bool {
         let lower = payloadJSON.lowercased()
         return lower.contains("bridge_connection_lost")
@@ -671,6 +697,8 @@ public actor NovaBridgeClient: AgentBridging {
             || lower.contains("bridge_timeout")
             || lower.contains("networkconnectionlost")
             || lower.contains("notconnectedtointernet")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
     }
 
     private static func stringField(_ payloadJSON: String, _ key: String) -> String? {

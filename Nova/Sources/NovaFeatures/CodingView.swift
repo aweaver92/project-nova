@@ -58,7 +58,7 @@ public struct CodingView: View {
         VStack(spacing: 0) {
             repoStatusCard
             Divider()
-            if coding.isCommitAndBuilding {
+            if coding.showsCommitAndBuildProgress {
                 commitAndBuildBanner
                 Divider()
             } else if let failure = coding.lastCommitAndBuildFailure {
@@ -98,19 +98,19 @@ public struct CodingView: View {
             }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text(coding.isCommitAndBuilding ? "Commit & Build" : coding.shortSessionId)
+                    Text(coding.showsCommitAndBuildProgress ? "Commit & Build" : coding.shortSessionId)
                         .font(.caption.monospaced().weight(.semibold))
                     HStack(spacing: 5) {
                         Circle()
-                            .fill(coding.isCommitAndBuilding ? Color.orange : statusColor)
+                            .fill(coding.showsCommitAndBuildProgress ? Color.orange : statusColor)
                             .frame(width: 6, height: 6)
-                        Text(coding.isCommitAndBuilding
+                        Text(coding.showsCommitAndBuildProgress
                              ? (coding.commitAndBuildPhaseLabel.isEmpty ? "building" : coding.commitAndBuildPhaseLabel)
                              : coding.runStatus)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                        if coding.isCommitAndBuilding, let started = coding.commitAndBuildStartedAt {
+                        if coding.showsCommitAndBuildProgress, let started = coding.commitAndBuildStartedAt {
                             ElapsedTimeText(since: started)
                         } else if coding.isRunning, let started = coding.runStartedAt {
                             ElapsedTimeText(since: started)
@@ -254,7 +254,7 @@ public struct CodingView: View {
                     }
                 }
                 Text(coding.statusMessage.isEmpty
-                     ? "Commit, push, then GitHub Actions IPA build. Safe to lock the phone."
+                     ? "Commit, push, then GitHub Actions IPA build. Safe to lock or switch apps."
                      : coding.statusMessage)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -489,18 +489,18 @@ public struct CodingView: View {
                 }
             }
 
-            if let failure = coding.lastCommitAndBuildFailure, !coding.isCommitAndBuilding {
+            if let failure = coding.lastCommitAndBuildFailure, !coding.showsCommitAndBuildProgress {
                 Text(failure)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
-            } else if let built = coding.lastCommitAndBuildResult, !coding.isCommitAndBuilding {
+            } else if let built = coding.lastCommitAndBuildResult, !coding.showsCommitAndBuildProgress {
                 Text(built.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if coding.isCommitAndBuilding {
+            if coding.showsCommitAndBuildProgress {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)

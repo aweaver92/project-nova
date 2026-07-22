@@ -1795,6 +1795,12 @@ public final class CodingViewModel {
             await refreshRepoStatusAndDiff()
         }
         await resumePendingClaudeIfNeeded()
+        if let pending = PendingCommitBuildStore.load(), !isCommitAndBuilding {
+            commitAndBuildStartedAt = pending.startedAt
+            commitAndBuildPhaseLabel = "Waiting for CI…"
+            statusMessage = "CI still running on your PC — checking status…"
+        }
+        await resumePendingCommitAndBuildIfNeeded()
     }
 
     /// Starts a coding chat session when Code view opens. Multiple prompts in
@@ -1869,10 +1875,21 @@ public final class CodingViewModel {
     /// persist the PC job id as a fallback, and hold a soft audio keep-alive so
     /// iOS does not suspend networking mid-run.
     public func noteEnteredBackground() async {
+        let commitPending = isCommitAndBuilding || PendingCommitBuildStore.load() != nil
+        if commitPending {
+            BackgroundNetworkKeepAlive.shared.start(reason: "commit-and-build")
+            if isCommitAndBuilding {
+                statusMessage = "Commit and Build continues on your PC — Nova will resume checking when you return."
+                commitAndBuildPhaseLabel = "Waiting for CI…"
+            }
+        }
+
         let pending = PendingCursorRunStore.load()
         let runId = activeRunId ?? pending?.runId
         guard isRunning || runId != nil else {
-            updateCodingPresence(forceActive: false)
+            if !commitPending {
+                updateCodingPresence(forceActive: false)
+            }
             return
         }
         if let runId, !runId.isEmpty {
@@ -1892,9 +1909,13 @@ public final class CodingViewModel {
 
     /// Foreground / unlock: retry attach a few times so Wi‑Fi / VPN can settle.
     public func handleBecameActive() async {
-        BackgroundNetworkKeepAlive.shared.stop(reason: "coding-foreground")
+        let commitPending = isCommitAndBuilding || PendingCommitBuildStore.load() != nil
+        if !commitPending {
+            BackgroundNetworkKeepAlive.shared.stop(reason: "coding-foreground")
+        }
         updateCodingPresence()
         await resumePendingClaudeIfNeeded()
+        await resumePendingCommitAndBuildIfNeeded()
 
         // Still running the same live SSE we kept open across background — leave it.
         // Do not require isProcessingPromptQueue here: unlock can race a quiet SSE
@@ -2458,19 +2479,16 @@ public final class CodingViewModel {
                 return
             }
         }
+        guard !isCommitAndBuilding else { return }
+
         isCommitAndBuilding = true
         commitAndBuildStartedAt = Date()
         commitAndBuildPhaseLabel = "Committing & pushing…"
         lastCommitAndBuildFailure = nil
-        statusMessage = "Commit and Build started — short commit/push, then the phone polls CI (you can lock the phone)."
-        defer {
-            isCommitAndBuilding = false
-            commitAndBuildStartedAt = nil
-        }
+        statusMessage = "Commit and Build started — short commit/push, then the phone polls CI (backgrounding is OK)."
 
-        // Keep the phone awake across commit/push + polling (CI often 10–25 min).
+        BackgroundNetworkKeepAlive.shared.start(reason: "commit-and-build")
         let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.commit-and-build"))
-        defer { Task { await BackgroundTask.end(bgBox.handle) } }
         let heartbeat = Task { @MainActor [weak self] in
             var tick = 0
             while !Task.isCancelled {
@@ -2478,21 +2496,121 @@ public final class CodingViewModel {
                 guard !Task.isCancelled, let self else { break }
                 bgBox.handle = BackgroundTask.renew(bgBox.handle, name: "nova.commit-and-build")
                 tick += 1
-                // After the first minute, most wall time is CI — update the label.
                 if tick >= 4, self.isCommitAndBuilding {
                     self.commitAndBuildPhaseLabel = "Building IPA on GitHub Actions…"
-                    self.statusMessage = "Polling GitHub Actions via bridge (often 10–25 min). Brief Wi‑Fi drops are OK."
+                    self.statusMessage = "Polling GitHub Actions via bridge (often 10–25 min). Backgrounding will not fail the job."
                 }
             }
         }
-        defer { heartbeat.cancel() }
 
         let request = BridgeCommitAndBuildRequest(
             statusToken: nil,
             commitMessage: "Nova: commit and build IPA"
         )
-        let result = await bridge.commitAndBuildIpa(request: request)
+        let started = await bridge.startCommitAndBuildIpa(request: request)
+        guard started.ok else {
+            heartbeat.cancel()
+            await BackgroundTask.end(bgBox.handle)
+            BackgroundNetworkKeepAlive.shared.stop(reason: "commit-and-build")
+            isCommitAndBuilding = false
+            commitAndBuildStartedAt = nil
+            let summary = Self.summarize(started.payloadJSON)
+            statusMessage = summary
+            commitAndBuildPhaseLabel = "Failed"
+            lastCommitAndBuildFailure = summary
+            lastCommitAndBuildResult = nil
+            PendingCommitBuildStore.clear()
+            await notifyCommitAndBuildResult?(false, summary)
+            return
+        }
+
+        let jobId = Self.string(started.payloadJSON, key: "jobId") ?? ""
+        let startStatus = Self.string(started.payloadJSON, key: "buildStatus")?.lowercased() ?? ""
+        let deadline = Date().addingTimeInterval(50 * 60)
+        if !jobId.isEmpty, startStatus != "completed", startStatus != "failed" {
+            PendingCommitBuildStore.save(
+                PendingCommitBuild(jobId: jobId, startedAt: commitAndBuildStartedAt ?? Date(), deadlineAt: deadline)
+            )
+        }
+
+        let result: BridgeResult
+        if startStatus == "completed" || startStatus == "failed" || jobId.isEmpty {
+            result = started
+        } else {
+            commitAndBuildPhaseLabel = "Building IPA on GitHub Actions…"
+            result = await bridge.pollCommitAndBuildJob(jobId: jobId, deadline: deadline)
+        }
+
         heartbeat.cancel()
+        await BackgroundTask.end(bgBox.handle)
+        await finishCommitAndBuildPoll(result: result, jobId: jobId.isEmpty ? nil : jobId)
+    }
+
+    /// True while actively polling, or while a CI job is parked waiting for resume.
+    public var showsCommitAndBuildProgress: Bool {
+        isCommitAndBuilding || PendingCommitBuildStore.load() != nil
+    }
+
+    /// After unlock / foreground: resume CI polling without committing again.
+    public func resumePendingCommitAndBuildIfNeeded() async {
+        guard !isCommitAndBuilding, let pending = PendingCommitBuildStore.load() else { return }
+        let remaining = pending.deadlineAt.timeIntervalSinceNow
+        guard remaining > 5 else {
+            PendingCommitBuildStore.clear(jobId: pending.jobId)
+            statusMessage = "Commit and Build wait window ended — check GitHub Actions, then retry if needed."
+            commitAndBuildPhaseLabel = ""
+            return
+        }
+
+        isCommitAndBuilding = true
+        commitAndBuildStartedAt = pending.startedAt
+        commitAndBuildPhaseLabel = "Resuming CI poll…"
+        lastCommitAndBuildFailure = nil
+        statusMessage = "Resuming Commit and Build status check…"
+
+        BackgroundNetworkKeepAlive.shared.start(reason: "commit-and-build")
+        let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.commit-and-build-resume"))
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { break }
+                bgBox.handle = BackgroundTask.renew(bgBox.handle, name: "nova.commit-and-build-resume")
+            }
+        }
+
+        let result = await bridge.pollCommitAndBuildJob(
+            jobId: pending.jobId,
+            deadline: pending.deadlineAt
+        )
+        heartbeat.cancel()
+        await BackgroundTask.end(bgBox.handle)
+        await finishCommitAndBuildPoll(result: result, jobId: pending.jobId)
+    }
+
+    private func finishCommitAndBuildPoll(result: BridgeResult, jobId: String?) async {
+        if Self.isPausedCommitAndBuild(result.payloadJSON) {
+            isCommitAndBuilding = false
+            // Keep startedAt so the banner can show elapsed wait if desired.
+            commitAndBuildPhaseLabel = "Waiting for CI…"
+            lastCommitAndBuildFailure = nil
+            statusMessage = Self.string(result.payloadJSON, key: "hint")
+                ?? "CI still running on your PC. Nova will resume checking when you return."
+            BackgroundNetworkKeepAlive.shared.stop(reason: "commit-and-build")
+            return
+        }
+
+        defer {
+            isCommitAndBuilding = false
+            commitAndBuildStartedAt = nil
+            BackgroundNetworkKeepAlive.shared.stop(reason: "commit-and-build")
+        }
+
+        if let jobId {
+            PendingCommitBuildStore.clear(jobId: jobId)
+        } else {
+            PendingCommitBuildStore.clear()
+        }
+
         guard result.ok, let built = Self.decodeCommitAndBuildResult(result.payloadJSON) else {
             let summary = Self.summarize(result.payloadJSON)
             statusMessage = summary
@@ -2509,6 +2627,16 @@ public final class CodingViewModel {
         await notifyCommitAndBuildResult?(true, built.detail)
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+    }
+
+    private static func isPausedCommitAndBuild(_ payloadJSON: String) -> Bool {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        if obj["paused"] as? Bool == true { return true }
+        let status = (obj["buildStatus"] as? String)?.lowercased() ?? ""
+        return status == "running" && obj["jobId"] is String && obj["ok"] as? Bool == true
+            && decodeCommitAndBuildResult(payloadJSON) == nil
     }
 
     public func clearCommitAndBuildFailure() {

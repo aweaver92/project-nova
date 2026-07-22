@@ -1366,6 +1366,10 @@ public protocol AgentBridging: Sendable {
     func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult
     /// Commit + push the Nova source checkout, then build/download `Nova/App/NovaApp.ipa`.
     func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult
+    /// Start commit+push and return the async job (`jobId` + optional terminal status).
+    func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult
+    /// Poll an existing Commit-and-Build job until terminal, deadline, or pause.
+    func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult
     func createBaseline(repoId: String) async -> BridgeResult
     func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult
     func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult
@@ -1521,6 +1525,12 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        await commitAndBuildIpa(request: request)
+    }
+    func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func createBaseline(repoId: String) async -> BridgeResult {
