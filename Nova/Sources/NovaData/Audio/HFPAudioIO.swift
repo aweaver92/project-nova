@@ -379,6 +379,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     private let engineQueue = DispatchQueue(label: "nova.hfp.egress.engine")
     private var started = false
     private var configuredSampleRate: Int = 0
+    private var lastPeak: Float = 0
 
     /// Make-up gain on the Bluetooth HFP call path (quieter than media/A2DP).
     private static let hfpGain: Float = 2.6
@@ -388,8 +389,18 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
 
     public init() {}
 
+    public func peakLevel() async -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPeak
+    }
+
     public func enqueue(_ chunk: AudioChunk) async {
         guard chunk.sampleRate > 0, !chunk.pcm.isEmpty else { return }
+        let rawPeak = Self.peakLevel(of: chunk.pcm)
+        lock.lock()
+        lastPeak = max(rawPeak, lastPeak * 0.72)
+        lock.unlock()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             engineQueue.async {
                 self.ensureStarted(sampleRate: chunk.sampleRate)
@@ -427,6 +438,9 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     }
 
     public func flush() async {
+        lock.lock()
+        lastPeak = 0
+        lock.unlock()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             engineQueue.async {
                 self.player.stop()
@@ -437,6 +451,9 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     }
 
     public func stop() async {
+        lock.lock()
+        lastPeak = 0
+        lock.unlock()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             engineQueue.async {
                 self.player.stop()
@@ -446,6 +463,20 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
                 cont.resume()
             }
         }
+    }
+
+    /// Peak absolute sample as 0...1 for talking-avatar metering.
+    private static func peakLevel(of pcm16: Data) -> Float {
+        guard pcm16.count >= 2 else { return 0 }
+        var peak: Int16 = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+            }
+        }
+        return Float(peak) / Float(Int16.max)
     }
 
     /// HFP / Bluetooth outputs keep the milder boost; built-in speaker/receiver
@@ -517,6 +548,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     public func enqueue(_ chunk: AudioChunk) async {}
     public func flush() async {}
     public func stop() async {}
+    public func peakLevel() async -> Float { 0 }
 }
 #endif
 

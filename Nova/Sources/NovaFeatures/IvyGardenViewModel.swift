@@ -51,6 +51,9 @@ public final class IvyGardenViewModel {
     private let holdVideoForAudio: ((Bool) async -> Void)?
     private let saveLibraryNote: ((String) async -> Void)?
     private let selector = FrameSelector()
+    /// Bumped by `stopGardenWalk()` so in-flight capture/analysis exits cleanly.
+    private var walkGeneration = 0
+    private var walkTask: Task<Void, Never>?
 
     public init(
         store: any PlantLibraryStoring,
@@ -485,18 +488,49 @@ public final class IvyGardenViewModel {
 
     /// Live Garden Walk from Meta glasses (~10s look), then spoken coaching overview.
     public func startGardenWalkWithGlasses(speak: Bool = true) async {
-        guard await isVisionReady(), let startLiveLook else {
+        guard await isVisionReady(), startLiveLook != nil else {
             errorMessage = "Glasses camera not ready — register Meta glasses or upload a garden video/photo."
             return
         }
+        guard !isWalking else { return }
+        walkTask?.cancel()
+        walkGeneration += 1
+        let generation = walkGeneration
+        walkTask = Task { @MainActor [weak self] in
+            await self?.performGardenWalkWithGlasses(speak: speak, generation: generation)
+        }
+        await walkTask?.value
+    }
+
+    /// Stop an in-progress glasses or photo Garden Walk (capture, analysis, or briefing).
+    public func stopGardenWalk() async {
+        walkGeneration += 1
+        walkTask?.cancel()
+        walkTask = nil
+        await stopLiveLook?()
+        await releaseCamera?()
+        await holdVideoForAudio?(false)
+        if isWalking || isBusy {
+            isWalking = false
+            isBusy = false
+            statusMessage = "Garden Walk stopped"
+            errorMessage = nil
+        }
+    }
+
+    private func performGardenWalkWithGlasses(speak: Bool, generation: Int) async {
         isWalking = true
         isBusy = true
         errorMessage = nil
         statusMessage = "Garden Walk — looking with glasses…"
         defer {
-            isWalking = false
-            isBusy = false
+            if generation == walkGeneration {
+                isWalking = false
+                isBusy = false
+                if walkTask != nil { walkTask = nil }
+            }
         }
+        guard let startLiveLook else { return }
         do {
             // Do NOT hold video-for-audio while collecting walk frames — that
             // drops every live frame (preferAudio default). Hold only after
@@ -505,8 +539,18 @@ public final class IvyGardenViewModel {
             var collected: [CapturedFrame] = []
             let deadline = Date().addingTimeInterval(10)
             for await frame in stream {
+                guard generation == walkGeneration, !Task.isCancelled else {
+                    await stopLiveLook?()
+                    await releaseCamera?()
+                    return
+                }
                 collected.append(frame)
                 if collected.count >= 8 || Date() >= deadline { break }
+            }
+            guard generation == walkGeneration, !Task.isCancelled else {
+                await stopLiveLook?()
+                await releaseCamera?()
+                return
             }
             await stopLiveLook?()
             await releaseCamera?()
@@ -518,6 +562,10 @@ public final class IvyGardenViewModel {
                 statusMessage = "Garden Walk — capturing stills…"
                 var stills: [CapturedFrame] = []
                 for _ in 0..<3 {
+                    guard generation == walkGeneration, !Task.isCancelled else {
+                        await releaseCamera?()
+                        return
+                    }
                     if let frame = try? await captureStill() {
                         stills.append(frame)
                     }
@@ -527,15 +575,21 @@ public final class IvyGardenViewModel {
                 burst = selector.selectBurst(stills)
             }
 
+            guard generation == walkGeneration, !Task.isCancelled else { return }
             guard !burst.isEmpty else {
                 errorMessage = "No frames captured during Garden Walk."
                 return
             }
 
             await holdVideoForAudio?(true)
-            await runGardenWalk(frames: burst, speak: speak)
+            await runGardenWalk(frames: burst, speak: speak, generation: generation)
+            await holdVideoForAudio?(false)
+        } catch is CancellationError {
+            await stopLiveLook?()
+            await releaseCamera?()
             await holdVideoForAudio?(false)
         } catch {
+            guard generation == walkGeneration else { return }
             errorMessage = String(describing: error)
             await stopLiveLook?()
             await releaseCamera?()
@@ -553,30 +607,46 @@ public final class IvyGardenViewModel {
             errorMessage = "Add a photo or video for Garden Walk."
             return
         }
-        isWalking = true
-        isBusy = true
-        errorMessage = nil
-        defer {
-            isWalking = false
-            isBusy = false
+        guard !isWalking else { return }
+        walkTask?.cancel()
+        walkGeneration += 1
+        let generation = walkGeneration
+        walkTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isWalking = true
+            self.isBusy = true
+            self.errorMessage = nil
+            defer {
+                if generation == self.walkGeneration {
+                    self.isWalking = false
+                    self.isBusy = false
+                    self.walkTask = nil
+                }
+            }
+            await self.runGardenWalk(frames: Array(frames), speak: speak, generation: generation)
         }
-        await runGardenWalk(frames: Array(frames), speak: speak)
+        await walkTask?.value
     }
 
-    private func runGardenWalk(frames: [CapturedFrame], speak: Bool) async {
+    private func runGardenWalk(frames: [CapturedFrame], speak: Bool, generation: Int) async {
         let library = await store.all()
         let prompt = GardenWalkDiff.analysisPrompt(library: library, climate: climate)
         statusMessage = "Analyzing \(frames.count) walk photo\(frames.count == 1 ? "" : "s")…"
         var partial: [GardenWalkResult] = []
         for (index, frame) in frames.enumerated() {
+            guard generation == walkGeneration, !Task.isCancelled else { return }
             statusMessage = "Analyzing walk photo \(index + 1) of \(frames.count)…"
             do {
                 let answer = try await analyzeImage(frame, prompt)
+                guard generation == walkGeneration, !Task.isCancelled else { return }
                 partial.append(GardenWalkDiff.parseModelJSON(answer, library: library))
+            } catch is CancellationError {
+                return
             } catch {
                 continue
             }
         }
+        guard generation == walkGeneration, !Task.isCancelled else { return }
         guard !partial.isEmpty else {
             errorMessage = "Garden Walk analysis failed."
             return
@@ -587,6 +657,7 @@ public final class IvyGardenViewModel {
         rebuildPlan()
 
         guard speak else { return }
+        guard generation == walkGeneration, !Task.isCancelled else { return }
         let briefing = GardenWalkDiff.speakPrompt(result: merged, library: library, climate: climate)
         do {
             statusMessage = "Ivy speaking walk overview…"
@@ -602,9 +673,13 @@ public final class IvyGardenViewModel {
             } else {
                 return
             }
+            guard generation == walkGeneration, !Task.isCancelled else { return }
             statusMessage = "Walk briefing finished"
             errorMessage = nil
+        } catch is CancellationError {
+            return
         } catch {
+            guard generation == walkGeneration else { return }
             // Silent analysis still useful if TTS fails.
             statusMessage = "Walk analyzed (text only)"
             errorMessage = "Audio briefing skipped: \(error.localizedDescription)"

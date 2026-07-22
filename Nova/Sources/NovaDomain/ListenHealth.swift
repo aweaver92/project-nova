@@ -24,6 +24,8 @@ public struct ListenHealth: Sendable, Equatable {
     public var chunksSent: Int
     public var bytesSent: Int
     public var userTranscriptChars: Int
+    /// Smoothed assistant TTS playback peak 0...1 (for talking avatars).
+    public var assistantAudioLevel: Float
     public var detail: String
 
     public init(
@@ -34,6 +36,7 @@ public struct ListenHealth: Sendable, Equatable {
         chunksSent: Int = 0,
         bytesSent: Int = 0,
         userTranscriptChars: Int = 0,
+        assistantAudioLevel: Float = 0,
         detail: String = ""
     ) {
         self.phase = phase
@@ -43,6 +46,7 @@ public struct ListenHealth: Sendable, Equatable {
         self.chunksSent = chunksSent
         self.bytesSent = bytesSent
         self.userTranscriptChars = userTranscriptChars
+        self.assistantAudioLevel = assistantAudioLevel
         self.detail = detail
     }
 

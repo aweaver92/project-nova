@@ -335,9 +335,12 @@ private struct AgentRow: View {
     var body: some View {
         Button(action: activate) {
             HStack(spacing: 10) {
-                Image(systemName: agent.systemImage)
-                    .foregroundStyle(isActive ? Color.accentColor : .secondary)
-                    .frame(width: 22)
+                AgentAvatarView(
+                    agent: agent,
+                    isSpeaking: false,
+                    audioLevel: 0,
+                    size: 36
+                )
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(agent.name).font(.body)

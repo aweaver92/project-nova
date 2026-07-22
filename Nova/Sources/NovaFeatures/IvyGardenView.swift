@@ -184,15 +184,20 @@ public struct IvyGardenView: View {
     @ViewBuilder
     private var gardenWalkSection: some View {
         Section {
-            Button {
-                Task { await garden.startGardenWalkWithGlasses(speak: true) }
-            } label: {
-                Label(
-                    garden.isWalking ? "Walking…" : "Garden Walk (glasses)",
-                    systemImage: "figure.walk"
-                )
+            if garden.isWalking {
+                Button(role: .destructive) {
+                    Task { await garden.stopGardenWalk() }
+                } label: {
+                    Label("Stop Garden Walk", systemImage: "stop.circle.fill")
+                }
+            } else {
+                Button {
+                    Task { await garden.startGardenWalkWithGlasses(speak: true) }
+                } label: {
+                    Label("Garden Walk (glasses)", systemImage: "figure.walk")
+                }
+                .disabled(garden.isBusy || garden.isCataloging)
             }
-            .disabled(garden.isBusy || garden.isWalking || garden.isCataloging)
 
             PhotosPicker(
                 selection: $walkPickerItems,
@@ -216,7 +221,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Garden Overview")
         } footer: {
-            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Glasses Walk is a quicker coaching look. Press and hold the overview to share or save it to Library.")
+            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Glasses Walk is a quicker coaching look — tap Stop Garden Walk to cancel mid-capture or analysis. Press and hold the overview to share or save it to Library.")
                 .font(.caption2)
         }
     }

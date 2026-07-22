@@ -1152,6 +1152,8 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
     public let builtIn: Bool
     /// When false, the agent is hidden from switching + the roster prompt.
     public var enabled: Bool
+    /// Asset catalog image name for the talking portrait (e.g. `AvatarIvy`).
+    public var avatarAssetName: String?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -1166,6 +1168,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         isMaster: Bool = false,
         builtIn: Bool = false,
         enabled: Bool = true,
+        avatarAssetName: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date? = nil
     ) {
@@ -1179,12 +1182,13 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         self.isMaster = isMaster
         self.builtIn = builtIn
         self.enabled = enabled
+        self.avatarAssetName = avatarAssetName
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, wakeWord, voice, role, personality, toolNames, isMaster, builtIn, enabled, createdAt, updatedAt
+        case id, name, wakeWord, voice, role, personality, toolNames, isMaster, builtIn, enabled, avatarAssetName, createdAt, updatedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -1199,9 +1203,27 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         isMaster = try c.decodeIfPresent(Bool.self, forKey: .isMaster) ?? false
         builtIn = try c.decodeIfPresent(Bool.self, forKey: .builtIn) ?? false
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        avatarAssetName = try c.decodeIfPresent(String.self, forKey: .avatarAssetName)
         let created = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         createdAt = created
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? created
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(wakeWord, forKey: .wakeWord)
+        try c.encode(voice, forKey: .voice)
+        try c.encode(role, forKey: .role)
+        try c.encode(personality, forKey: .personality)
+        try c.encodeIfPresent(toolNames, forKey: .toolNames)
+        try c.encode(isMaster, forKey: .isMaster)
+        try c.encode(builtIn, forKey: .builtIn)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encodeIfPresent(avatarAssetName, forKey: .avatarAssetName)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
     }
 }
 
@@ -1216,7 +1238,8 @@ public extension Agent {
     /// v19: Unique Realtime voice per built-in agent (no shared marin/cedar).
     /// v20: Max ring_readiness (Ultrahuman daily metrics).
     /// v21: Remy Kitchen v2 — OFF macros, recipe import, meal-plan shopping.
-    static let seedCapabilitiesVersion = 21
+    /// v22: Talking avatar asset names per built-in agent.
+    static let seedCapabilitiesVersion = 22
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -1244,6 +1267,25 @@ public extension Agent {
         }
     }
 
+    /// Catalog image for talking portraits; falls back to seed defaults.
+    public var resolvedAvatarAssetName: String? {
+        if let avatarAssetName, !avatarAssetName.isEmpty { return avatarAssetName }
+        return Self.defaultAvatarAssetName(for: id)
+    }
+
+    public static func defaultAvatarAssetName(for id: UUID) -> String? {
+        switch id {
+        case SeedID.nova: return "AvatarNova"
+        case SeedID.claude: return "AvatarClaude"
+        case SeedID.max: return "AvatarMax"
+        case SeedID.sage: return "AvatarSage"
+        case SeedID.remy: return "AvatarRemy"
+        case SeedID.scholar: return "AvatarScholar"
+        case SeedID.ivy: return "AvatarIvy"
+        default: return nil
+        }
+    }
+
     /// Common tools most specialists should be able to reach.
     static let commonToolNames: [String] = [
         "web_search", "inspect_nova_codebase", "remember_fact", "recall_facts",
@@ -1267,7 +1309,8 @@ public extension Agent {
                 personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for task management across agents, Remy for cooking, Ivy for plants and gardening, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, Garden, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarNova"
             ),
             Agent(
                 id: SeedID.claude,
@@ -1285,7 +1328,8 @@ public extension Agent {
                     "remember_fact", "recall_facts", "create_reminder", "draft_message",
                     "start_meeting", "end_meeting", "bookmark_conversation"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarClaude"
             ),
             Agent(
                 id: SeedID.max,
@@ -1302,7 +1346,8 @@ public extension Agent {
                     "remember_fact", "recall_facts", "web_search", "create_reminder",
                     "save_note", "list_notes", "search_knowledge", "home_assistant"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarMax"
             ),
             Agent(
                 id: SeedID.sage,
@@ -1315,7 +1360,8 @@ public extension Agent {
                     "list_tasks", "create_task", "update_task", "agent_activity",
                     "switch_agent", "open_app_screen"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarSage"
             ),
             Agent(
                 id: SeedID.remy,
@@ -1338,7 +1384,8 @@ public extension Agent {
                     "lookup_food_nutrition",
                     "search_knowledge", "web_search"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarRemy"
             ),
             Agent(
                 id: SeedID.ivy,
@@ -1355,7 +1402,8 @@ public extension Agent {
                     "weather",
                     "search_knowledge", "web_search", "set_timer", "cancel_timer", "list_timers"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarIvy"
             ),
             Agent(
                 id: SeedID.scholar,
@@ -1370,7 +1418,8 @@ public extension Agent {
                     "open_app_screen",
                     "bookmark_conversation", "web_search"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarScholar"
             ),
         ]
     }

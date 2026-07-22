@@ -309,17 +309,30 @@ public struct RootView: View {
     private var hudSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    agentPickerMenu
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text(workspaces.activeName)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                    if recording.isRecording {
-                        NovaUI.StatusChip(title: "Rec", value: "ON", color: .red)
+                HStack(alignment: .center, spacing: 12) {
+                    if let agent = agents.activeAgent {
+                        AgentAvatarView(
+                            agent: agent,
+                            isSpeaking: conversation.isAssistantSpeaking
+                                || conversation.listenHealth.phase == .speaking,
+                            audioLevel: conversation.assistantAudioLevel,
+                            size: 64
+                        )
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            agentPickerMenu
+                            Text("·")
+                                .foregroundStyle(.tertiary)
+                            Text(workspaces.activeName)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            if recording.isRecording {
+                                NovaUI.StatusChip(title: "Rec", value: "ON", color: .red)
+                            }
+                        }
                     }
                 }
                 if let feature = activeAgentFeature {

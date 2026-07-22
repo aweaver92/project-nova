@@ -155,6 +155,8 @@ public final class ConversationViewModel {
     public var transcriptLines: [String] { transcript.map(\.legacyLine) }
     public private(set) var isRunning = false
     public private(set) var isAssistantSpeaking = false
+    /// Smoothed TTS playback level 0...1 for talking avatars.
+    public var assistantAudioLevel: Float { listenHealth.assistantAudioLevel }
     public private(set) var errorMessage: String?
     public private(set) var latencyHint: String = ""
     public private(set) var latencyGateStatus: String = "Pending"

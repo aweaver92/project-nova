@@ -62,6 +62,7 @@ public actor FileAgentStore: AgentStoring {
                     isMaster: seed.isMaster,
                     builtIn: true,
                     enabled: existing.enabled,
+                    avatarAssetName: seed.avatarAssetName,
                     createdAt: existing.createdAt,
                     updatedAt: Date()
                 )

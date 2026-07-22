@@ -20,9 +20,11 @@ public struct CodingView: View {
     @State private var showKeepAllConfirm = false
     @State private var showRevertAllConfirm = false
     @State private var showEndSessionConfirm = false
+    /// Agent Keep/Revert file list: one summary row when collapsed.
+    @State private var agentReviewFilesExpanded = false
     @State private var saveTemplateTitle = ""
     @State private var showSaveTemplate = false
-    /// Expanded process feed; auto-collapses when a run finishes.
+    /// Expanded process feed; stays open after a run so summaries remain readable.
     @State private var agentProcessExpanded = true
     /// Repository browser action: preview a path, or pin it into prompts.
     @State private var browseMode: RepoBrowseMode = .preview
@@ -421,6 +423,7 @@ public struct CodingView: View {
                     if coding.agentReview != nil {
                         Button(coding.showDiff ? "Hide review" : "Review changes") {
                             coding.toggleShowDiff()
+                            agentReviewFilesExpanded = coding.showDiff
                         }
                         .font(.caption)
                     } else {
@@ -533,80 +536,144 @@ public struct CodingView: View {
     private func agentReviewPanel(_ review: BridgeAgentReview) -> some View {
         let pending = review.files.filter { !$0.kept }
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Agent changes")
-                    .font(.caption.weight(.semibold))
-                    .textCase(.uppercase)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Keep all") { showKeepAllConfirm = true }
-                    .font(.caption)
-                    .disabled(pending.isEmpty)
-                Button("Revert all", role: .destructive) { showRevertAllConfirm = true }
-                    .font(.caption)
-                    .disabled(pending.isEmpty)
-            }
-            if pending.isEmpty {
-                Text(review.keptCount > 0 ? "All agent changes kept." : "No pending agent changes.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(pending) { file in
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        coding.toggleReviewExpanded(file.path)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text(file.change.uppercased())
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(Color.orange)
-                            Text(file.path)
-                                .font(.caption.monospaced())
+            Button {
+                withAnimation(.snappy(duration: 0.2)) {
+                    agentReviewFilesExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(agentReviewFilesExpanded ? 90 : 0))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(pending.isEmpty
+                             ? (review.keptCount > 0 ? "All agent changes kept" : "No pending agent changes")
+                             : "\(pending.count) agent change\(pending.count == 1 ? "" : "s") to keep")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        if !pending.isEmpty {
+                            Text(pending.prefix(3).map(\.path).joined(separator: " · "))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Spacer()
-                            Image(systemName: coding.expandedReviewPath == file.path ? "chevron.up" : "chevron.down")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    if coding.expandedReviewPath == file.path {
-                        if file.binary {
-                            Text("Binary file — preview unavailable.")
+                        } else if review.keptCount > 0 {
+                            Text("\(review.keptCount) kept")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                        } else {
-                            ScrollView {
-                                Text(file.diff.isEmpty ? "(no textual diff)" : file.diff)
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 140)
-                        }
-                        if file.truncated {
-                            Text("Diff truncated.")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                        HStack {
-                            Button("Keep") {
-                                Task { await coding.keepReviewPaths([file.path]) }
-                            }
-                            .font(.caption.weight(.semibold))
-                            Button("Revert", role: .destructive) {
-                                Task { await coding.revertReviewPaths([file.path]) }
-                            }
-                            .font(.caption.weight(.semibold))
-                            Spacer()
                         }
                     }
+                    Spacer(minLength: 0)
+                    if !pending.isEmpty {
+                        Text("Review")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                    }
                 }
-                .padding(8)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                pending.isEmpty
+                    ? "Agent changes"
+                    : "\(pending.count) agent changes to keep"
+            )
+            .accessibilityHint(agentReviewFilesExpanded ? "Collapse" : "Expand to review and keep or revert")
+
+            if !pending.isEmpty {
+                HStack(spacing: 12) {
+                    Button("Keep all") { showKeepAllConfirm = true }
+                        .font(.caption.weight(.semibold))
+                    Button("Revert all", role: .destructive) { showRevertAllConfirm = true }
+                        .font(.caption.weight(.semibold))
+                    Spacer(minLength: 0)
+                }
+            }
+
+            if agentReviewFilesExpanded {
+                if pending.isEmpty {
+                    Text(review.keptCount > 0 ? "All agent changes kept." : "No pending agent changes.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(pending) { file in
+                                agentReviewFileRow(file)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 260)
+                }
             }
         }
+        .padding(10)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .onChange(of: review.pendingCount) { _, count in
+            if count == 0 {
+                agentReviewFilesExpanded = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func agentReviewFileRow(_ file: BridgeAgentReviewFile) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                coding.toggleReviewExpanded(file.path)
+            } label: {
+                HStack(spacing: 8) {
+                    Text(file.change.uppercased())
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Color.orange)
+                    Text(file.path)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Image(systemName: coding.expandedReviewPath == file.path ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if coding.expandedReviewPath == file.path {
+                if file.binary {
+                    Text("Binary file — preview unavailable.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        Text(file.diff.isEmpty ? "(no textual diff)" : file.diff)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 140)
+                }
+                if file.truncated {
+                    Text("Diff truncated.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                HStack {
+                    Button("Keep") {
+                        Task { await coding.keepReviewPaths([file.path]) }
+                    }
+                    .font(.caption.weight(.semibold))
+                    Button("Revert", role: .destructive) {
+                        Task { await coding.revertReviewPaths([file.path]) }
+                    }
+                    .font(.caption.weight(.semibold))
+                    Spacer()
+                }
+            }
+        }
+        .padding(8)
+        .background(Color(.tertiarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder
@@ -1026,40 +1093,28 @@ public struct CodingView: View {
                         }
                     }
                 }
-                .frame(maxHeight: coding.isRunning ? 140 : 88)
+                .frame(maxHeight: 160)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Color(.secondarySystemBackground))
-        .onChange(of: coding.runStatus) { _, newStatus in
-            syncAgentProcessExpansion(for: newStatus, isRunning: coding.isRunning)
-        }
         .onChange(of: coding.isRunning) { _, running in
-            syncAgentProcessExpansion(for: coding.runStatus, isRunning: running)
+            // Only force-open when a new run starts; do not auto-hide when it ends.
+            if running {
+                agentProcessExpanded = true
+            }
         }
         .onAppear {
-            syncAgentProcessExpansion(for: coding.runStatus, isRunning: coding.isRunning)
-        }
-    }
-
-    private func syncAgentProcessExpansion(for status: String, isRunning: Bool) {
-        if isRunning {
-            agentProcessExpanded = true
-            return
-        }
-        // Auto-minimize when the run has finished (or otherwise ended).
-        let lowered = status.lowercased()
-        if lowered == "finished" || lowered == "idle" || lowered == "error"
-            || lowered == "cancelled" || lowered == "expired"
-        {
-            agentProcessExpanded = false
+            if coding.isRunning {
+                agentProcessExpanded = true
+            }
         }
     }
 
     private var statusColor: Color {
         switch coding.runStatus.lowercased() {
-        case "running", "creating", "connecting": return .green
+        case "running", "creating", "connecting", "reconnecting": return .green
         case "finished", "idle": return .secondary.opacity(0.6)
         case "error", "expired": return .red
         case "cancelled": return .orange

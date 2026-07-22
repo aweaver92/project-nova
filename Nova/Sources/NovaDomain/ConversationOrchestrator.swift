@@ -155,6 +155,8 @@ public actor ConversationOrchestrator {
     private var needsCleanMicEngage = false
     /// Skip silence/stall classification until SCO / route flip settles.
     private var micEngageGraceUntil: ContinuousClock.Instant?
+    /// Smoothed TTS peak for talking avatars (updated on outputAudio).
+    private var lastAssistantAudioLevel: Float = 0
 
     public init(
         ai: any ConversationalAIProvider,
@@ -1387,6 +1389,15 @@ public actor ConversationOrchestrator {
     ) {
         // Typed chat / spoken vision one-shot without Listen must not flip Listen UI.
         guard !textChatOnly, !spokenOneShot else { return }
+        if !assistantSpeaking {
+            lastAssistantAudioLevel = AssistantTalkMeter.smooth(
+                previous: lastAssistantAudioLevel,
+                sample: 0,
+                attack: 0.55,
+                release: 0.28
+            )
+            if lastAssistantAudioLevel < 0.02 { lastAssistantAudioLevel = 0 }
+        }
         var next = listenHealth
         next.phase = phase
         next.micLevel = micLevel ?? next.micLevel
@@ -1395,6 +1406,7 @@ public actor ConversationOrchestrator {
         next.chunksSent = micChunksSent
         next.bytesSent = micBytesSent
         next.userTranscriptChars = userTranscriptChars
+        next.assistantAudioLevel = lastAssistantAudioLevel
         next.detail = detail
         listenHealth = next
         onListenHealth?(next)
@@ -1705,6 +1717,17 @@ public actor ConversationOrchestrator {
             // final conversion so wideband HFP can be used when negotiated.
             await egress.enqueue(AudioChunk(pcm: pcm24, sampleRate: 24_000))
             metrics.mark(.audioToSpeaker, startedAt: t0)
+            let peak = await egress.peakLevel()
+            lastAssistantAudioLevel = AssistantTalkMeter.smooth(
+                previous: lastAssistantAudioLevel,
+                sample: peak
+            )
+            if assistantSpeaking {
+                publishListenHealth(
+                    phase: .speaking,
+                    detail: "Playing assistant audio — speak to interrupt"
+                )
+            }
         case .responseStarted:
             assistantSpeaking = true
             lastOutputAudioAt = .now

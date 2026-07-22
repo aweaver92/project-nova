@@ -55,6 +55,12 @@ public protocol AudioEgress: Sendable {
     func enqueue(_ chunk: AudioChunk) async
     func flush() async
     func stop() async
+    /// Latest smoothed playback peak in 0...1 (TTS / assistant audio).
+    func peakLevel() async -> Float
+}
+
+public extension AudioEgress {
+    func peakLevel() async -> Float { 0 }
 }
 
 /// On-device wake-word listener. While active it owns the microphone and emits a
