@@ -269,7 +269,10 @@ public enum RecipeImportDiff {
     private static func parseYield(_ value: Any?) -> Int? {
         if let n = value as? Int { return n }
         if let n = value as? Double { return Int(n) }
-        if let s = value as? String { return parseServings(s) }
+        if let s = value as? String {
+            if let n = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) { return n }
+            return parseServings(s)
+        }
         if let arr = value as? [Any], let first = arr.first { return parseYield(first) }
         return nil
     }
