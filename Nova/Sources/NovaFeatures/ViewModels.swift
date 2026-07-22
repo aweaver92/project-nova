@@ -829,18 +829,27 @@ public final class SettingsViewModel {
     /// When true, Realtime tokens come from the bridge (no baked-in OpenAI key).
     public var realtimeUsesBridge: Bool = true
 
+    public private(set) var billingSpend: OpenAIBillingPeriodSpend?
+    public private(set) var hasOpenAIAdminKey = false
+    public private(set) var isLoadingBillingSpend = false
+    public private(set) var billingSpendError: String = ""
+    public var openAIAdminKeyDraft: String = ""
+
     private let store: any SettingsStoring
     private let bridge: any AgentBridging
     private let bridgeDiscovery: any BridgeDiscovering
+    private let billing: (any OpenAIBillingReading)?
 
     public init(
         store: any SettingsStoring,
         bridge: any AgentBridging,
-        bridgeDiscovery: any BridgeDiscovering = UnavailableBridgeDiscovery()
+        bridgeDiscovery: any BridgeDiscovering = UnavailableBridgeDiscovery(),
+        billing: (any OpenAIBillingReading)? = nil
     ) {
         self.store = store
         self.bridge = bridge
         self.bridgeDiscovery = bridgeDiscovery
+        self.billing = billing
     }
 
     /// True when Listen will fail because bridge Realtime minting lacks OPENAI_API_KEY.
@@ -961,6 +970,7 @@ public final class SettingsViewModel {
         bridgeToken = await store.bridgeToken() ?? ""
         bridgeProfiles = await store.bridgeProfiles()
         codingWorkingDirectory = await store.codingWorkingDirectory() ?? ""
+        await refreshBillingSpend(force: false)
         let reachable = await refreshBridgeHealth()
         if !reachable {
             // Do not hold up app launch while Bonjour resolves (or the bounded
@@ -1106,6 +1116,65 @@ public final class SettingsViewModel {
         await store.setVisualMemoryRetentionDays(max(0, visualMemoryRetentionDays))
     }
 
+    // MARK: - OpenAI org spend (Admin Costs API)
+
+    public func refreshBillingSpend(force: Bool = true) async {
+        guard let billing else {
+            hasOpenAIAdminKey = false
+            billingSpend = nil
+            billingSpendError = ""
+            return
+        }
+        hasOpenAIAdminKey = await billing.hasAdminKey()
+        guard hasOpenAIAdminKey else {
+            billingSpend = nil
+            if force {
+                billingSpendError = "Add an OpenAI Admin API key to load this month’s org spend."
+            }
+            return
+        }
+        if !force, billingSpend != nil { return }
+        isLoadingBillingSpend = true
+        defer { isLoadingBillingSpend = false }
+        do {
+            billingSpend = try await billing.fetchCurrentPeriodSpend()
+            billingSpendError = ""
+        } catch {
+            billingSpendError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    public func saveOpenAIAdminKey() async {
+        guard let billing else { return }
+        let trimmed = openAIAdminKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await billing.saveAdminKey(trimmed.isEmpty ? nil : trimmed)
+            openAIAdminKeyDraft = ""
+            hasOpenAIAdminKey = await billing.hasAdminKey()
+            billingSpendError = hasOpenAIAdminKey ? "Admin key saved." : "Admin key cleared."
+            if hasOpenAIAdminKey {
+                await refreshBillingSpend(force: true)
+            } else {
+                billingSpend = nil
+            }
+        } catch {
+            billingSpendError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    public func clearOpenAIAdminKey() async {
+        openAIAdminKeyDraft = ""
+        guard let billing else { return }
+        do {
+            try await billing.saveAdminKey(nil)
+            hasOpenAIAdminKey = false
+            billingSpend = nil
+            billingSpendError = "Admin key cleared."
+        } catch {
+            billingSpendError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
     /// Persist bridge settings and probe `/health`.
     public func saveBridge() async {
         let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1232,6 +1301,44 @@ public final class SettingsViewModel {
 }
 
 /// A single row in the Coding-tab transcript (user prompt, assistant text, tool, etc.).
+public struct CodingPendingPlan: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public var title: String
+    public var overview: String?
+    public var markdown: String
+    public var path: String?
+    public var isExpanded: Bool
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        overview: String? = nil,
+        markdown: String,
+        path: String? = nil,
+        isExpanded: Bool = true
+    ) {
+        self.id = id
+        self.title = title
+        self.overview = overview
+        self.markdown = markdown
+        self.path = path
+        self.isExpanded = isExpanded
+    }
+
+    /// Short preview for the collapsed card (overview, else first non-heading lines).
+    public var summaryPreview: String {
+        if let overview, !overview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return overview
+        }
+        let lines = markdown
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        return lines.prefix(4).joined(separator: " ")
+    }
+}
+
+/// A single row in the Coding-tab transcript (user prompt, assistant text, tool, etc.).
 public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
     public enum Kind: String, Sendable, Equatable {
         case user
@@ -1295,6 +1402,7 @@ public struct CodingTranscriptItem: Identifiable, Equatable, Sendable {
         case "delete": return "trash"
         case "todo", "updatetodos": return "checklist"
         case "task": return "person.2"
+        case "createplan", "updateplan": return "list.bullet.clipboard"
         default: return "wrench.and.screwdriver"
         }
     }
@@ -1402,6 +1510,7 @@ public struct CodingActivityStep: Identifiable, Equatable, Sendable {
         case "assistant": return "text.bubble"
         case "system": return "cpu"
         case "task": return "checkmark.circle"
+        case "plan": return "list.bullet.clipboard"
         default: return "circle.dotted"
         }
     }
@@ -1486,6 +1595,8 @@ public final class CodingViewModel {
     public private(set) var agentReview: BridgeAgentReview?
     public private(set) var activeBaselineId: String?
     public private(set) var expandedReviewPath: String?
+    /// Plan-mode result awaiting Approve & build / Modify (from createPlan or fallback).
+    public private(set) var pendingPlan: CodingPendingPlan?
     public private(set) var pinnedPaths: [CodingContextPin] = []
     public private(set) var savedTemplates: [CodingPromptTemplate] = []
     public private(set) var promptHistory: [CodingPromptHistoryEntry] = []
@@ -1537,6 +1648,8 @@ public final class CodingViewModel {
     private var streamingThinkingId: UUID?
     private var lastSpokenAt: Date = .distantPast
     private var runGeneration = 0
+    private var activeRunMode: CodingAgentMode = .agent
+    private var capturedPlanThisRun = false
     private var queuedPrompts: [QueuedCodingPrompt] = []
     private var isProcessingPromptQueue = false
     private var isResumingCursorRun = false
@@ -2475,6 +2588,8 @@ public final class CodingViewModel {
         pinnedSessionId = nil
         await settings.setCodingSessionId(nil)
         items = []
+        pendingPlan = nil
+        capturedPlanThisRun = false
         activeRunId = nil
         isRunning = false
         runStartedAt = nil
@@ -2697,6 +2812,8 @@ public final class CodingViewModel {
         isRunning = true
         runStatus = "running"
         stallPhase = .running
+        activeRunMode = prompt.mode
+        capturedPlanThisRun = false
         switch prompt.mode {
         case .ask:
             statusMessage = "Ask mode — answering without coding updates…"
@@ -3449,15 +3566,107 @@ public final class CodingViewModel {
             for idx in items.indices where items[idx].kind == .tool && !items[idx].isDone {
                 items[idx].isDone = true
             }
+            if activeRunMode == .plan, !capturedPlanThisRun, runStatus == "finished" {
+                capturePlanFallbackFromTranscript(result: event.result)
+            }
             upsertActivity(
                 phase: "status",
                 text: runStatus == "finished" ? "Finished" : runStatus.capitalized,
                 done: true
             )
             speakProgress(runStatus == "error" ? "Coding run failed." : "Coding run finished.")
+        case "plan":
+            let markdown = (event.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !markdown.isEmpty else { break }
+            let title = (event.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingPlan = CodingPendingPlan(
+                title: title.isEmpty ? "Implementation plan" : title,
+                overview: event.summary,
+                markdown: markdown,
+                path: event.path,
+                isExpanded: true
+            )
+            capturedPlanThisRun = true
+            upsertActivity(
+                phase: "plan",
+                text: title.isEmpty ? "Plan ready" : "Plan ready · \(title)",
+                detail: event.summary,
+                done: true
+            )
+            statusMessage = "Review the plan, then Approve & build or Modify."
         default:
             break
         }
+    }
+
+    private func capturePlanFallbackFromTranscript(result: String?) {
+        let assistantText = items.last(where: { $0.kind == .assistant })?.text
+            ?? result
+            ?? ""
+        let trimmed = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 80 else { return }
+        pendingPlan = CodingPendingPlan(
+            title: "Implementation plan",
+            overview: nil,
+            markdown: trimmed,
+            isExpanded: true
+        )
+        capturedPlanThisRun = true
+        statusMessage = "Review the plan, then Approve & build or Modify."
+    }
+
+    public func togglePendingPlanExpanded() {
+        guard pendingPlan != nil else { return }
+        pendingPlan?.isExpanded.toggle()
+    }
+
+    public func dismissPendingPlan() {
+        pendingPlan = nil
+        statusMessage = ""
+    }
+
+    /// Switch to Agent and implement the approved plan.
+    public func approvePendingPlanAndBuild() async {
+        guard let plan = pendingPlan else { return }
+        let body = """
+        Implement the approved plan below. Follow it closely; do not redesign unless blocked.
+
+        # \(plan.title)
+
+        \(plan.overview.map { "Overview: \($0)\n\n" } ?? "")\(plan.markdown)
+        """
+        pendingPlan = nil
+        selectedAgentMode = .agent
+        draft = ""
+        statusMessage = "Approved — building from plan…"
+        queuedPrompts.append(
+            QueuedCodingPrompt(
+                userText: "Implement approved plan: \(plan.title)",
+                bridgeCommand: body,
+                images: [],
+                repoId: selectedRepoId,
+                workingDirectory: workingDirectory,
+                source: .typed,
+                isAskOnly: false,
+                mode: .agent,
+                rawUserText: body,
+                completion: nil
+            )
+        )
+        queuedPromptCount = queuedPrompts.count
+        guard !isProcessingPromptQueue else {
+            statusMessage = "Approved plan queued · \(queuedPromptCount) waiting"
+            return
+        }
+        await drainPromptQueue()
+    }
+
+    /// Keep Plan mode and let the user revise (composer focused with a revise prefix).
+    public func modifyPendingPlan() {
+        guard let plan = pendingPlan else { return }
+        selectedAgentMode = .plan
+        draft = "Revise the plan \"\(plan.title)\": "
+        statusMessage = "Edit your feedback, then send to update the plan."
     }
 
     private func upsertActivity(phase: String, text: String, detail: String? = nil, done: Bool) {

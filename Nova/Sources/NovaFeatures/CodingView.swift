@@ -75,6 +75,10 @@ public struct CodingView: View {
                 agentProcessPanel
                 Divider()
             }
+            if let plan = coding.pendingPlan {
+                pendingPlanPanel(plan)
+                Divider()
+            }
             transcript
             Divider()
             composer
@@ -603,6 +607,99 @@ public struct CodingView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
         }
+    }
+
+    @ViewBuilder
+    private func pendingPlanPanel(_ plan: CodingPendingPlan) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Label("Plan ready", systemImage: "list.bullet.clipboard.fill")
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    coding.togglePendingPlanExpanded()
+                } label: {
+                    Image(systemName: plan.isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                Button {
+                    coding.dismissPendingPlan()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(plan.title)
+                .font(.headline)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let overview = plan.overview, !overview.isEmpty {
+                Text(overview)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if !plan.isExpanded {
+                Text(plan.summaryPreview)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+
+            if plan.isExpanded {
+                ScrollView {
+                    Text(plan.markdown)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 220)
+                .padding(8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
+            if let path = plan.path, !path.isEmpty {
+                Text(path)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await coding.approvePendingPlanAndBuild() }
+                } label: {
+                    Label("Approve & build", systemImage: "hammer.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(coding.isRunning)
+
+                Button {
+                    coding.modifyPendingPlan()
+                } label: {
+                    Label("Modify plan", systemImage: "pencil")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(coding.isRunning)
+            }
+        }
+        .padding(12)
+        .background(Color(.tertiarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
     }
 
     /// Live preview: serve the repo from the bridge PC and open it in Safari.

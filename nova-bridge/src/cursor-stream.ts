@@ -9,6 +9,13 @@ export type CodingEvent =
   | { type: "tool_start"; name: string; summary?: string; path?: string }
   | { type: "tool_end"; name: string; summary?: string; path?: string; diff?: string }
   | {
+      type: "plan";
+      text: string;
+      name?: string;
+      summary?: string;
+      path?: string;
+    }
+  | {
       type: "activity";
       phase: string;
       text: string;
@@ -82,6 +89,106 @@ function summaryFrom(value: unknown, fallback?: string): string | undefined {
     }
   }
   return fallback;
+}
+
+function isCreatePlanName(name: string): boolean {
+  const n = name.toLowerCase().replace(/[_\s-]/g, "");
+  return n === "createplan" || n === "createaplan" || n === "updateplan";
+}
+
+/** Pull full plan markdown from createPlan args/result (schema is unstable). */
+export function extractCreatePlan(
+  toolCall: unknown,
+  args?: unknown,
+  result?: unknown,
+): { text: string; name?: string; summary?: string; path?: string } | null {
+  const t = asRecord(toolCall);
+  const nameHint =
+    (typeof t?.type === "string" && t.type) ||
+    (typeof t?.name === "string" && t.name) ||
+    "";
+  const fromArgs = asRecord(args ?? t?.args ?? t?.arguments);
+  const resultRec = asRecord(result ?? t?.result);
+  const resultValue = asRecord(resultRec?.value) ?? resultRec;
+  const sources = [fromArgs, resultValue, resultRec, t].filter(Boolean) as Loose[];
+
+  let planText = "";
+  let title: string | undefined;
+  let overview: string | undefined;
+  let path: string | undefined;
+
+  for (const src of sources) {
+    for (const key of ["plan", "markdown", "content", "body", "text"]) {
+      const v = src[key];
+      if (typeof v === "string" && v.trim().length > planText.length) {
+        planText = v.trim();
+      }
+    }
+    for (const key of ["name", "title"]) {
+      const v = src[key];
+      if (typeof v === "string" && v.trim() && !title) title = v.trim();
+    }
+    for (const key of ["overview", "summary", "description"]) {
+      const v = src[key];
+      if (typeof v === "string" && v.trim() && !overview) overview = v.trim();
+    }
+    if (!path) path = pathFromArgs(src);
+  }
+
+  if (!planText && typeof result === "string" && result.trim().length > 80) {
+    planText = result.trim();
+  }
+  if (!planText && typeof resultRec?.value === "string" && resultRec.value.trim().length > 80) {
+    planText = String(resultRec.value).trim();
+  }
+
+  if (!planText) return null;
+  if (
+    !isCreatePlanName(nameHint) &&
+    !(
+      planText.length > 120 &&
+      (/^#\s/m.test(planText) || /##\s/m.test(planText) || /todo/i.test(planText))
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    text: planText,
+    ...(title ? { name: title } : {}),
+    ...(overview ? { summary: overview } : {}),
+    ...(path ? { path } : {}),
+  };
+}
+
+function planEventsFromTool(
+  name: string,
+  toolCall: unknown,
+  args?: unknown,
+  result?: unknown,
+): CodingEvent[] {
+  const base = asRecord(toolCall) ?? {};
+  const enriched = {
+    ...base,
+    name: name || (typeof base.name === "string" ? base.name : undefined),
+    type: name || (typeof base.type === "string" ? base.type : undefined),
+  };
+  const plan = extractCreatePlan(
+    enriched,
+    args ?? base.args ?? base.arguments,
+    result ?? base.result,
+  );
+  if (!plan) return [];
+  return [
+    {
+      type: "plan",
+      text: plan.text,
+      ...(plan.name ? { name: plan.name } : {}),
+      ...(plan.summary ? { summary: plan.summary } : {}),
+      ...(plan.path ? { path: plan.path } : {}),
+    },
+    activity("plan", plan.name ? `Plan ready · ${plan.name}` : "Plan ready", plan.summary, true),
+  ];
 }
 
 function toolCallFields(toolCall: unknown): {
@@ -226,6 +333,7 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           summaryFrom(m.result, status === "error" ? "error" : undefined),
           true,
         ),
+        ...planEventsFromTool(name, m, m.args ?? m.arguments, m.result),
       ];
     }
     case "tool-call-completed":
@@ -246,6 +354,7 @@ export function normalizeSdkMessage(msg: unknown): CodingEvent[] {
           summaryFrom(m.result),
           true,
         ),
+        ...planEventsFromTool(name, m, m.args ?? m.arguments, m.result),
       ];
     }
     case "status": {
@@ -356,6 +465,7 @@ export function normalizeInteractionUpdate(update: unknown): CodingEvent[] {
           fields.summary,
           true,
         ),
+        ...planEventsFromTool(fields.name, u.toolCall),
       ];
     }
     case "step-started": {

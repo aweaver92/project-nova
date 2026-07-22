@@ -13,6 +13,7 @@ Same domain contracts on both sides. Validate conversation quality in `nova-sim`
 
 ## Documentation
 
+- [Feature setup (keys, bridge, pending features)](Docs/feature-setup.md)
 - [Roadmap & milestones](Docs/roadmap.md)
 - [Feature rollout roadmap (phases)](Docs/feature-roadmap.md)
 - [ADRs](Docs/adr/)

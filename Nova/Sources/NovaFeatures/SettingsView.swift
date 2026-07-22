@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import NovaCore
 import NovaDomain
 #if canImport(UIKit)
@@ -51,6 +52,95 @@ public struct SettingsView: View {
                     Text("Cost & privacy")
                 } footer: {
                     Text("Defaults favor lower spend: follow-ups, web search, and meeting cloud off; local wake word on for idle mode. Tapping Listen opens the voice Realtime session; typed chat works separately without enabling Listen. ChatGPT Plus does not cover these API calls — they bill your OpenAI API key.")
+                }
+
+                Section {
+                    if let spend = settings.billingSpend {
+                        HStack {
+                            Text(spend.periodLabel)
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Text(Self.formatUSD(spend.totalUSD))
+                                .font(.title3.monospacedDigit().weight(.bold))
+                        }
+                        if spend.lineItems.isEmpty {
+                            Text("No billed usage yet this month.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Chart(spend.chartItems()) { item in
+                                BarMark(
+                                    x: .value("USD", item.amountUSD),
+                                    y: .value("API", item.name)
+                                )
+                                .foregroundStyle(.orange.gradient)
+                            }
+                            .chartXAxis {
+                                AxisMarks(format: .currency(code: "USD"))
+                            }
+                            .frame(height: CGFloat(max(120, spend.chartItems().count * 28)))
+                            .padding(.vertical, 4)
+
+                            ForEach(spend.lineItems.prefix(12)) { item in
+                                HStack {
+                                    Text(item.name)
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text(Self.formatUSD(item.amountUSD))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    } else if settings.isLoadingBillingSpend {
+                        HStack {
+                            ProgressView()
+                            Text("Loading OpenAI spend…")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if !settings.hasOpenAIAdminKey {
+                        Text("Paste an OpenAI Admin API key to show this month’s org spend by product.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if !settings.billingSpendError.isEmpty {
+                        Text(settings.billingSpendError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    SecureField("OpenAI Admin API key (sk-admin-…)", text: $settings.openAIAdminKeyDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    HStack {
+                        Button("Save Admin key") {
+                            Task { await settings.saveOpenAIAdminKey() }
+                        }
+                        .disabled(settings.openAIAdminKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        if settings.hasOpenAIAdminKey {
+                            Button("Clear", role: .destructive) {
+                                Task { await settings.clearOpenAIAdminKey() }
+                            }
+                        }
+                        Spacer()
+                        Button {
+                            Task { await settings.refreshBillingSpend(force: true) }
+                        } label: {
+                            if settings.isLoadingBillingSpend {
+                                ProgressView()
+                            } else {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(!settings.hasOpenAIAdminKey || settings.isLoadingBillingSpend)
+                    }
+                } header: {
+                    Text("OpenAI spend")
+                } footer: {
+                    Text("Uses OpenAI’s organization Costs API for the current calendar month, grouped by line item. Requires an org Admin key — project keys cannot read billing. Key stays in Keychain on this device.")
                 }
 
                 Section {
@@ -272,6 +362,10 @@ public struct SettingsView: View {
             }
             .task { await settings.load() }
         }
+    }
+
+    private static func formatUSD(_ value: Double) -> String {
+        value.formatted(.currency(code: "USD").precision(.fractionLength(2...3)))
     }
 
     private func bridgeSetupRow(_ step: BridgeSetupStep) -> some View {

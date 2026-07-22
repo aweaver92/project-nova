@@ -712,7 +712,8 @@ public final class AppContainer {
         let settingsVM = SettingsViewModel(
             store: settingsStore,
             bridge: bridge,
-            bridgeDiscovery: LANBridgeDiscovery()
+            bridgeDiscovery: LANBridgeDiscovery(),
+            billing: OpenAICostsClient()
         )
         settingsVM.realtimeUsesBridge = usesBridgeRealtime
         self.settingsVM = settingsVM

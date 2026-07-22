@@ -1719,3 +1719,10 @@ public protocol UltrahumanReading: Sendable {
     /// Fetch and normalize daily metrics for `date` (YYYY-MM-DD local).
     func dailyMetrics(date: Date) async throws -> RingReadinessSnapshot
 }
+
+/// OpenAI Admin Costs API for org billing-period spend (requires Admin API key).
+public protocol OpenAIBillingReading: Sendable {
+    func hasAdminKey() async -> Bool
+    func saveAdminKey(_ key: String?) async throws
+    func fetchCurrentPeriodSpend() async throws -> OpenAIBillingPeriodSpend
+}

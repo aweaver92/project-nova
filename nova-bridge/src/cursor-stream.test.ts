@@ -49,6 +49,29 @@ assert(
   "diff",
 );
 
+const createPlan = normalizeSdkMessage({
+  type: "tool_call",
+  name: "createPlan",
+  status: "completed",
+  args: {
+    name: "Spend visual",
+    overview: "Add OpenAI costs chart",
+    plan: "# Spend visual\n\n## Summary\nPull Admin Costs API.\n\n## Todos\n- Parse JSON\n- Chart UI",
+  },
+  result: { ok: true },
+});
+assert(createPlan.some((e) => e.type === "plan"), "plan event");
+assert(
+  createPlan.some(
+    (e) =>
+      e.type === "plan" &&
+      e.name === "Spend visual" &&
+      e.text.includes("Admin Costs API") &&
+      e.summary === "Add OpenAI costs chart",
+  ),
+  "plan body",
+);
+
 const hist = normalizeHistoryMessage({
   type: "user",
   uuid: "u1",
