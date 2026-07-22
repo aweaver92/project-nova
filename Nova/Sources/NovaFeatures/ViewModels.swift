@@ -202,6 +202,10 @@ public final class ConversationViewModel {
         await orchestrator.setErrorHandler { message in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if message.isEmpty {
+                    self.errorMessage = nil
+                    return
+                }
                 // Soft lock-screen reconnect notes — keep Stop visible.
                 if message.localizedCaseInsensitiveContains("unlock the phone")
                     || message.localizedCaseInsensitiveContains("Realtime paused")

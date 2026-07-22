@@ -66,6 +66,9 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
                 NovaLog.audio.info("Preferred input fallback: built-in mic (\(builtIn.portName, privacy: .public))")
             }
 
+            // Preferred input can lag behind currentRoute; nudge once if mismatch.
+            try await Self.verifyPreferredInputSettled(wantBuiltIn: wantBuiltIn)
+
             if session.availableInputs?.contains(where: { $0.portType == .bluetoothHFP }) == true {
                 // Glasses/headset present: let the system keep HFP for playback.
                 try? session.overrideOutputAudioPort(.none)
@@ -125,6 +128,33 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
         let inputs = AVAudioSession.sharedInstance().currentRoute.inputs
         if inputs.isEmpty { return "no-input" }
         return inputs.map { "\($0.portName)[\($0.portType.rawValue)]" }.joined(separator: ", ")
+    }
+
+    /// After setPreferredInput, currentRoute can still show the old port for a
+    /// beat. Retry once so Listen does not install a tap on a dead HFP node.
+    private static func verifyPreferredInputSettled(wantBuiltIn: Bool) async throws {
+        let session = AVAudioSession.sharedInstance()
+        for attempt in 0..<3 {
+            let inputs = session.currentRoute.inputs
+            let hasBuiltIn = inputs.contains { $0.portType == .builtInMic }
+            let hasHFP = inputs.contains { $0.portType == .bluetoothHFP }
+            if wantBuiltIn {
+                if hasBuiltIn || session.availableInputs?.contains(where: { $0.portType == .builtInMic }) != true {
+                    return
+                }
+            } else if hasHFP || session.availableInputs?.contains(where: { $0.portType == .bluetoothHFP }) != true {
+                return
+            }
+            NovaLog.audio.warning(
+                "Preferred input not settled (wantBuiltIn=\(wantBuiltIn), route=\(Self.currentInputDescription(), privacy: .public)); retry \(attempt + 1)"
+            )
+            if wantBuiltIn, let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try? session.setPreferredInput(builtIn)
+            } else if !wantBuiltIn, let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+                try? session.setPreferredInput(hfp)
+            }
+            try? await Task.sleep(for: .milliseconds(80))
+        }
     }
 
     private static func ensureRecordPermission() async -> Bool {

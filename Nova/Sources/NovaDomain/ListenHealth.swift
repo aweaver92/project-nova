@@ -60,6 +60,11 @@ public struct ListenHealth: Sendable, Equatable {
         case .error: return "Error"
         }
     }
+
+    /// Detail line after glasses→phone failover (keeps UI honest about route).
+    public static func failoverWaitingDetail(route: String, chunks: Int) -> String {
+        "Route \(route) · chunks \(chunks) · using iPhone mic (glasses silent)"
+    }
 }
 
 /// Optional mic-route controls for ingress implementations that can flip inputs

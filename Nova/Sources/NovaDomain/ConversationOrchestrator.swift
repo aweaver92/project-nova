@@ -151,6 +151,10 @@ public actor ConversationOrchestrator {
     private var cloudVadSpeechEvents = 0
     private var didFailoverMicRoute = false
     private var didAnnounceMicSilent = false
+    /// After agent switch / playback-only one-shots, next Listen must fully re-arm HFP.
+    private var needsCleanMicEngage = false
+    /// Skip silence/stall classification until SCO / route flip settles.
+    private var micEngageGraceUntil: ContinuousClock.Instant?
 
     public init(
         ai: any ConversationalAIProvider,
@@ -552,15 +556,20 @@ public actor ConversationOrchestrator {
         await persistActiveAgent?(target.id)
         onAgentChanged?(target)
         NovaLog.session.info("Active agent → \(target.name, privacy: .public)")
+        // Specialist switch (idle or live) often leaves playback-only / wedged HFP;
+        // next Listen must deactivate + re-arm rather than reuse a half-dead route.
+        needsCleanMicEngage = true
 
         // Reconnect so the voice/instructions actually change (voice is fixed for
         // the life of a Realtime connection).
         if streaming {
+            let micAlreadyBad =
+                listenHealth.phase == .micSilent || listenHealth.phase == .streamStalled
             // Reconnect ONLY the Realtime session for the new voice/persona and
-            // keep the mic + playback engines running. Restarting Core Audio here
-            // raced the greeting's playback route change and stalled the mic after
-            // ~20 chunks. Fall back to a full re-engage only if the light path fails.
-            let reconnected = await reconnectAIForActiveAgent()
+            // keep the mic + playback engines running — unless mic is already dead.
+            // Restarting Core Audio raced greeting playback and stalled after ~20
+            // chunks; full re-engage is safer when health already reports silence.
+            let reconnected = micAlreadyBad ? false : await reconnectAIForActiveAgent()
             if !reconnected {
                 await teardownStreaming(cancelToolTask: false)
                 do {
@@ -578,8 +587,9 @@ public actor ConversationOrchestrator {
                 }
             }
         } else {
-            // Not currently streaming (e.g. UI toggle while idle): selection is
-            // persisted and will apply on the next engagement.
+            // Idle UI toggle: drop leftover playback-only session so the next
+            // Listen owns a fresh playAndRecord / HFP activate.
+            await audioSession?.deactivate()
             return
         }
 
@@ -1002,6 +1012,22 @@ public actor ConversationOrchestrator {
         cloudVadSpeechEvents = 0
         didFailoverMicRoute = false
         didAnnounceMicSilent = false
+        if needsCleanMicEngage {
+            needsCleanMicEngage = false
+            // Playback-only / agent-switch often leaves the session category wrong
+            // for HFP SCO. Hard reset before ingress.start() re-activates.
+            await audioSession?.deactivate()
+            try? await Task.sleep(for: .milliseconds(200))
+            guard gen == streamGeneration, isRunning else {
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
+            NovaLog.session.info("Clean mic engage after agent switch / playback-only")
+        }
+        // Ignore silence/stall for a beat while Bluetooth SCO negotiates.
+        micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
+        clearStickyMicError()
         publishListenHealth(
             phase: .waitingForSpeech,
             detail: "Realtime connected — starting microphone (Allow if prompted)…"
@@ -1015,6 +1041,7 @@ public actor ConversationOrchestrator {
                 streaming = false
                 throw CancellationError()
             }
+            micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
             publishListenHealth(
                 phase: .waitingForSpeech,
                 detail: "Realtime connected — speak or type."
@@ -1186,6 +1213,18 @@ public actor ConversationOrchestrator {
         }
 
         let now = ContinuousClock.Instant.now
+        if let graceUntil = micEngageGraceUntil, now < graceUntil {
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: didFailoverMicRoute
+                    ? "Using iPhone mic after glasses silence — speak again…"
+                    : "Re-arming mic after agent switch… (\(micChunksSent) chunks)"
+            )
+            return
+        }
+
         if assistantSpeaking {
             // Server owns turn-taking now. If audio stalled well past any
             // plausible reply, unstick so the UI doesn't lock in "speaking".
@@ -1214,6 +1253,24 @@ public actor ConversationOrchestrator {
         }
 
         if let lastChunkAt, now - lastChunkAt > .seconds(1.5) {
+            // Same class of failure as digital silence after agent switch (~11–20
+            // chunks then SCO dies). Flip once before sticking on "Mic stalled".
+            if await failoverMicIfNeeded(
+                reason: "stalled",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                let message = """
+                Mic stream stalled on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
             publishListenHealth(
                 phase: .streamStalled,
                 micLevel: liveLevel,
@@ -1225,20 +1282,11 @@ public actor ConversationOrchestrator {
 
         let heardRecently = lastMicEnergyAt.map { now - $0 < .seconds(1.2) } ?? false
         if !heardRecently, micPeakHeard < 0.02, now - (lastChunkAt ?? now) < .seconds(1) {
-            // Chunks flowing but digital silence — try alternate input once.
-            if !didFailoverMicRoute, let mic = ingress as? any MicRouteControlling {
-                didFailoverMicRoute = true
-                onTranscript?(
-                    "[diag] Mic is open but silent on \(route). Switching input and retrying…",
-                    .system
-                )
-                await mic.flipPreferredInput()
-                publishListenHealth(
-                    phase: .micSilent,
-                    micLevel: liveLevel,
-                    inputRoute: await mic.inputRouteLabel(),
-                    detail: "Silent input — flipped mic route. Speak again."
-                )
+            if await failoverMicIfNeeded(
+                reason: "silent",
+                route: route,
+                liveLevel: liveLevel
+            ) {
                 return
             }
             if !didAnnounceMicSilent {
@@ -1259,6 +1307,13 @@ public actor ConversationOrchestrator {
             return
         }
 
+        // Healthy energy / waiting — drop stale HFP-silent banners from failover.
+        if lastError?.localizedCaseInsensitiveContains("silent") == true
+            || lastError?.localizedCaseInsensitiveContains("stalled") == true
+        {
+            clearStickyMicError()
+        }
+
         if heardRecently || userTranscriptChars > 0 {
             // Speech energy or transcript is flowing; the server VAD will commit
             // and reply when it detects end of turn.
@@ -1277,8 +1332,51 @@ public actor ConversationOrchestrator {
             phase: .waitingForSpeech,
             micLevel: liveLevel,
             inputRoute: route,
-            detail: "Route \(route) · chunks \(micChunksSent)"
+            detail: didFailoverMicRoute
+                ? ListenHealth.failoverWaitingDetail(route: route, chunks: micChunksSent)
+                : "Route \(route) · chunks \(micChunksSent)"
         )
+    }
+
+    /// Flip HFP ↔ built-in once, reset peak counters, and grace the health monitor.
+    @discardableResult
+    private func failoverMicIfNeeded(
+        reason: String,
+        route: String,
+        liveLevel: Float
+    ) async -> Bool {
+        guard !didFailoverMicRoute, let mic = ingress as? any MicRouteControlling else {
+            return false
+        }
+        didFailoverMicRoute = true
+        didAnnounceMicSilent = false
+        onTranscript?(
+            "[diag] Mic \(reason) on \(route). Switching input and retrying…",
+            .system
+        )
+        await mic.flipPreferredInput()
+        micPeakHeard = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = ContinuousClock.Instant.now
+        micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
+        let newRoute = await mic.inputRouteLabel()
+        let message = "Glasses mic \(reason) — switched to \(newRoute). Speak again."
+        lastError = message
+        onError?(message)
+        publishListenHealth(
+            phase: .micSilent,
+            micLevel: liveLevel,
+            inputRoute: newRoute,
+            detail: "Silent/stalled input — flipped mic route. Speak again."
+        )
+        return true
+    }
+
+    private func clearStickyMicError() {
+        if lastError != nil {
+            lastError = nil
+            onError?("")
+        }
     }
 
     private func publishListenHealth(
@@ -1452,6 +1550,7 @@ public actor ConversationOrchestrator {
                     eventTask = nil
                     await egress.stop()
                     await audioSession?.deactivate()
+                    needsCleanMicEngage = true
                 }
             } catch {
                 spokenOneShot = false
@@ -1462,6 +1561,7 @@ public actor ConversationOrchestrator {
                     eventTask = nil
                     await egress.stop()
                     await audioSession?.deactivate()
+                    needsCleanMicEngage = true
                 }
                 throw error
             }
@@ -1518,6 +1618,7 @@ public actor ConversationOrchestrator {
                     eventTask = nil
                     await egress.stop()
                     await audioSession?.deactivate()
+                    needsCleanMicEngage = true
                 }
                 return answer
             } catch {
@@ -1529,6 +1630,7 @@ public actor ConversationOrchestrator {
                     eventTask = nil
                     await egress.stop()
                     await audioSession?.deactivate()
+                    needsCleanMicEngage = true
                 }
                 throw error
             }

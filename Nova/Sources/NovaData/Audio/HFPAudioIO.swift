@@ -283,8 +283,20 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
                 try await self.coordinator.activateConversationalHFP()
                 self.lock.lock()
                 let stillAlive = self.recoveryGeneration == generation && self.running
+                let wantBuiltIn = self.coordinator.preferBuiltInMicEnabled()
                 self.lock.unlock()
                 guard stillAlive else { return }
+                let route = AudioSessionCoordinator.currentInputDescription()
+                let routeOK = wantBuiltIn
+                    ? route.contains("BuiltInMic") || route.contains("MicrophoneBuiltIn")
+                    : route.contains("BluetoothHFP") || !route.contains("BuiltIn")
+                if !routeOK {
+                    NovaLog.audio.warning(
+                        "HFP recover route mismatch (wantBuiltIn=\(wantBuiltIn), route=\(route, privacy: .public)); re-activating"
+                    )
+                    try await self.coordinator.activateConversationalHFP()
+                    try? await Task.sleep(for: .milliseconds(60))
+                }
                 try await self.mutateEngine {
                     try self.installTapAndStartEngine()
                 }

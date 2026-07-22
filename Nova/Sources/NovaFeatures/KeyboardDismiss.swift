@@ -18,11 +18,16 @@ public enum KeyboardDismiss {
 }
 
 public extension View {
-    /// Tap anywhere to dismiss the keyboard without delaying buttons / NavigationLinks.
+    /// Tap outside editable text to dismiss the keyboard without delaying buttons /
+    /// NavigationLinks.
     ///
     /// Uses a window-level UIKit recognizer (`cancelsTouchesInView = false`) instead of
     /// SwiftUI `simultaneousGesture(TapGesture)`, which races List row recognition and
     /// makes quick taps feel like they require a press-and-hold.
+    ///
+    /// Taps on `UITextField` / `UITextView` (SwiftUI `TextField` / `TextEditor`) are
+    /// ignored so caret placement, double-tap select, and press-and-hold copy/paste
+    /// keep working.
     func dismissKeyboardOnTap() -> some View {
         #if canImport(UIKit)
         background(WindowKeyboardDismissInstaller())
@@ -66,7 +71,7 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
 
         func installIfNeeded() {
             guard recognizer == nil, let window = anchorView?.window else { return }
-            let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+            let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             tap.cancelsTouchesInView = false
             tap.delegate = self
             window.addGestureRecognizer(tap)
@@ -82,8 +87,29 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
             window = nil
         }
 
-        @objc private func handleTap() {
+        @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard let host = gesture.view else {
+                KeyboardDismiss.hide()
+                return
+            }
+            let point = gesture.location(in: host)
+            if let hit = host.hitTest(point, with: nil), Self.isEditableTextSurface(hit) {
+                // Let the field place the caret / handle double-tap / show the edit menu.
+                return
+            }
             KeyboardDismiss.hide()
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldReceive touch: UITouch
+        ) -> Bool {
+            // Don't even begin recognizing on text surfaces — avoids racing caret
+            // placement with resignFirstResponder.
+            if let view = touch.view, Self.isEditableTextSurface(view) {
+                return false
+            }
+            return true
         }
 
         func gestureRecognizer(
@@ -91,6 +117,24 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
             true
+        }
+
+        /// True when the touch is inside a text field, text view, or search bar
+        /// (walks superviews for SwiftUI hosting wrappers).
+        static func isEditableTextSurface(_ view: UIView) -> Bool {
+            var current: UIView? = view
+            while let node = current {
+                if node is UITextField || node is UITextView || node is UISearchBar {
+                    return true
+                }
+                // SwiftUI sometimes inserts private subclasses; class name is stable enough.
+                let name = String(describing: type(of: node))
+                if name.contains("TextField") || name.contains("TextEditor") || name.contains("UIText") {
+                    return true
+                }
+                current = node.superview
+            }
+            return false
         }
     }
 }
