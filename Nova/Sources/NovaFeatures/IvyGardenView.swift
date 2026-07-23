@@ -566,7 +566,7 @@ public struct IvyGardenView: View {
                 }
             }
         } header: {
-            recommendationHeader
+            Text(recommendationHeader)
         } footer: {
             Text("Picks matched to \(GardenSeason.current().title.lowercased()) planting windows and your active zone. Prefer seed, transplant, bulb, or indoor starts as labeled.")
                 .font(.caption2)
