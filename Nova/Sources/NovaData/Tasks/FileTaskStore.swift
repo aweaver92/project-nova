@@ -4,11 +4,15 @@ import NovaDomain
 
 public actor FileTaskStore: AgentTaskStoring {
     private let url: URL
+    private let imagesDir: URL
     private var tasks: [AgentTask]
 
     public init(url: URL? = nil) {
         let resolved = url ?? Self.defaultURL()
         self.url = resolved
+        self.imagesDir = resolved.deletingLastPathComponent()
+            .appendingPathComponent("nova-task-images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
         self.tasks = Self.load(from: resolved)
     }
 
@@ -43,6 +47,9 @@ public actor FileTaskStore: AgentTaskStoring {
         next.updatedAt = Date()
         if let idx = tasks.firstIndex(where: { $0.id == next.id }) {
             next.createdAt = tasks[idx].createdAt
+            // Drop image files removed from the task.
+            let removed = Set(tasks[idx].imageFileNames).subtracting(next.imageFileNames)
+            for name in removed { removeImageFile(name) }
             tasks[idx] = next
         } else {
             tasks.append(next)
@@ -61,6 +68,11 @@ public actor FileTaskStore: AgentTaskStoring {
     }
 
     public func delete(id: UUID) {
+        if let task = tasks.first(where: { $0.id == id }) {
+            for name in task.imageFileNames {
+                removeImageFile(name)
+            }
+        }
         tasks.removeAll { $0.id == id }
         persist()
     }
@@ -74,9 +86,36 @@ public actor FileTaskStore: AgentTaskStoring {
             if let detail = task.detail, !detail.isEmpty {
                 line += " — \(detail)"
             }
+            if !task.imageFileNames.isEmpty {
+                line += " · \(task.imageFileNames.count) image\(task.imageFileNames.count == 1 ? "" : "s")"
+            }
             lines.append(line)
         }
         return lines.joined(separator: "\n")
+    }
+
+    public func saveTaskImage(_ jpegData: Data) -> String {
+        let name = "nova-task-\(UUID().uuidString).jpg"
+        let dest = imagesDir.appendingPathComponent(name)
+        try? jpegData.write(to: dest, options: .atomic)
+        return name
+    }
+
+    public func taskImageURL(fileName: String) -> URL? {
+        let trimmed = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("/") , !trimmed.contains("\\") else { return nil }
+        let url = imagesDir.appendingPathComponent(trimmed)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    public func removeTaskImage(fileName: String) {
+        removeImageFile(fileName)
+    }
+
+    private func removeImageFile(_ fileName: String) {
+        let trimmed = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? FileManager.default.removeItem(at: imagesDir.appendingPathComponent(trimmed))
     }
 
     private func persist() {

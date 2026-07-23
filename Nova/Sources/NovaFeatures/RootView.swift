@@ -101,6 +101,7 @@ public struct RootView: View {
                 kitchen: kitchen,
                 study: study,
                 garden: garden,
+                conversation: conversation,
                 showSettings: { showSettings = true }
             )
                 .tabItem { Label("Agents", systemImage: "person.2.wave.2") }

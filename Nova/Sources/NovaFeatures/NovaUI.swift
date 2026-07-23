@@ -24,6 +24,48 @@ enum NovaUI {
         }
     }
 
+    /// Voice Listen toggle for specialist main screens (same session as Assistant).
+    struct AgentVoiceChatBar: View {
+        @Bindable var conversation: ConversationViewModel
+
+        var body: some View {
+            HStack(spacing: 12) {
+                Image(systemName: conversation.isRunning ? "mic.fill" : "mic.slash")
+                    .foregroundStyle(conversation.isRunning ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Voice chat")
+                        .font(.subheadline.weight(.semibold))
+                    Text(conversation.isRunning ? "Listening — same session as Assistant" : "Off — tap to talk with the active agent")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                Toggle(
+                    "Voice chat",
+                    isOn: Binding(
+                        get: { conversation.isRunning },
+                        set: { enabled in
+                            Task {
+                                if enabled {
+                                    await conversation.start()
+                                } else {
+                                    await conversation.stop()
+                                }
+                            }
+                        }
+                    )
+                )
+                .labelsHidden()
+                .tint(.accentColor)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .accessibilityElement(children: .combine)
+        }
+    }
+
     /// Confirmation alert for destructive bulk clears.
     struct ClearConfirmModifier: ViewModifier {
         @Binding var isPresented: Bool

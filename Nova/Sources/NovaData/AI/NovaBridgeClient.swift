@@ -65,6 +65,15 @@ public actor NovaBridgeClient: AgentBridging {
         await send(path: "health", method: "GET", body: nil, timeout: 15)
     }
 
+    public func restartBridge() async -> BridgeResult {
+        await post(path: "admin/restart", body: [:], timeout: 15)
+    }
+
+    /// Hits the watchdog kick listener (usually host:8788) when the main bridge is down.
+    public func kickBridgeWatchdog(baseURL: URL) async -> BridgeResult {
+        await sendAbsolute(url: baseURL.appending(path: "restart"), method: "POST", body: [:], timeout: 15)
+    }
+
     public func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         // Detach on the bridge so Claude keeps running after the phone locks.
         // The action id makes every retry/poll idempotent (one process per id).
@@ -803,7 +812,7 @@ public actor NovaBridgeClient: AgentBridging {
         timeout: TimeInterval,
         queryItems: [URLQueryItem] = []
     ) async -> BridgeResult {
-        let (base, token) = await configProvider()
+        let (base, _) = await configProvider()
         guard let base else { return Self.notConfigured }
 
         let endpoint = Self.url(base: base, path: path)
@@ -814,6 +823,16 @@ public actor NovaBridgeClient: AgentBridging {
         guard let url = components?.url else {
             return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"invalid_bridge_url"}"#)
         }
+        return await sendAbsolute(url: url, method: method, body: body, timeout: timeout)
+    }
+
+    private func sendAbsolute(
+        url: URL,
+        method: String,
+        body: [String: Any]?,
+        timeout: TimeInterval
+    ) async -> BridgeResult {
+        let (_, token) = await configProvider()
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout

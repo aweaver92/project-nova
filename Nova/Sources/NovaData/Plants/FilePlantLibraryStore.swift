@@ -7,24 +7,31 @@ import NovaDomain
 public actor FilePlantLibraryStore: PlantLibraryStoring {
     private struct Meta: Codable {
         var climateCity: String?
+        var hardinessZone: Int?
     }
 
     private let dir: URL
     private let indexURL: URL
     private let metaURL: URL
+    private let walksURL: URL
     private var plants: [PlantSighting]
+    private var walks: [GardenWalkResult]
     private var meta: Meta
     private let maxItems: Int
+    private let maxWalks: Int
 
-    public init(directory: URL? = nil, maxItems: Int = 1_000) {
+    public init(directory: URL? = nil, maxItems: Int = 1_000, maxWalks: Int = 40) {
         let resolved = directory ?? Self.defaultDirectory()
         try? FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
         self.dir = resolved
         self.indexURL = resolved.appendingPathComponent("index.json")
         self.metaURL = resolved.appendingPathComponent("meta.json")
+        self.walksURL = resolved.appendingPathComponent("walks.json")
         self.plants = Self.load(from: indexURL)
+        self.walks = Self.loadWalks(from: walksURL)
         self.meta = Self.loadMeta(from: metaURL)
         self.maxItems = maxItems
+        self.maxWalks = maxWalks
     }
 
     public func directory() -> URL { dir }
@@ -42,6 +49,34 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
         let trimmed = city?.trimmingCharacters(in: .whitespacesAndNewlines)
         meta.climateCity = (trimmed?.isEmpty == false) ? trimmed : nil
         persistMeta()
+    }
+
+    public func hardinessZone() -> Int? {
+        GardenLifeCycleDiff.clampZone(meta.hardinessZone)
+    }
+
+    public func setHardinessZone(_ zone: Int?) {
+        meta.hardinessZone = GardenLifeCycleDiff.clampZone(zone)
+        persistMeta()
+    }
+
+    public func gardenWalks() -> [GardenWalkResult] {
+        walks.sorted { $0.walkedAt > $1.walkedAt }
+    }
+
+    @discardableResult
+    public func appendGardenWalk(_ walk: GardenWalkResult) -> GardenWalkResult {
+        let next = walk
+        if let idx = walks.firstIndex(where: { $0.id == next.id }) {
+            walks[idx] = next
+        } else {
+            walks.insert(next, at: 0)
+        }
+        if walks.count > maxWalks {
+            walks = Array(walks.sorted { $0.walkedAt > $1.walkedAt }.prefix(maxWalks))
+        }
+        persistWalks()
+        return next
     }
 
     @discardableResult
@@ -63,6 +98,7 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
                     lastWateredAt: next.lastWateredAt,
                     isOutdoor: next.isOutdoor ?? plants[idx].isOutdoor,
                     frostSensitive: next.frostSensitive ?? plants[idx].frostSensitive,
+                    lifeCycle: next.lifeCycle ?? plants[idx].lifeCycle,
                     suggestedActions: next.suggestedActions.isEmpty
                         ? plants[idx].suggestedActions
                         : next.suggestedActions,
@@ -101,7 +137,7 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
             fileName = "nova-plant-\(id.uuidString).jpg"
             try? imageData.write(to: dir.appendingPathComponent(fileName), options: .atomic)
         }
-        let plant = PlantSighting(
+        var plant = PlantSighting(
             id: id,
             fileName: fileName,
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Plant" : name,
@@ -111,6 +147,7 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
             text: text,
             caption: caption
         )
+        plant.lifeCycle = GardenLifeCycleDiff.classify(plant, zone: hardinessZone())
         plants.append(plant)
         pruneIfNeeded()
         persist()
@@ -143,11 +180,15 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
         if let city = climateCity() {
             header += " · climate \(city)"
         }
+        if let zone = hardinessZone() {
+            header += " · zone \(zone)"
+        }
         let frostRelevant = GardenPlanningDiff.isFrostAdviceRelevant(climate: nil)
         let lines = slice.map { plant -> String in
             var line = "• \(plant.name)"
             if let species = plant.species, !species.isEmpty { line += " (\(species))" }
             if let location = plant.location, !location.isEmpty { line += " @ \(location)" }
+            if let life = plant.lifeCycle { line += " [\(life.title)]" }
             if plant.isOutdoor == true { line += " [outdoor]" }
             if plant.frostSensitive == true, frostRelevant { line += " [frost-sensitive]" }
             if let watered = plant.lastWateredAt {
@@ -192,23 +233,35 @@ public actor FilePlantLibraryStore: PlantLibraryStoring {
         }
     }
 
+    private func persistWalks() {
+        do {
+            let data = try JSONEncoder().encode(walks)
+            try data.write(to: walksURL, options: .atomic)
+        } catch {
+            NovaLog.session.error("Plant library walks persist failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
     private static func load(from url: URL) -> [PlantSighting] {
         guard let data = try? Data(contentsOf: url) else { return [] }
         return (try? JSONDecoder().decode([PlantSighting].self, from: data)) ?? []
     }
 
+    private static func loadWalks(from url: URL) -> [GardenWalkResult] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([GardenWalkResult].self, from: data)) ?? []
+    }
+
     private static func loadMeta(from url: URL) -> Meta {
         guard let data = try? Data(contentsOf: url),
-              let meta = try? JSONDecoder().decode(Meta.self, from: data) else {
-            return Meta(climateCity: nil)
-        }
+              let meta = try? JSONDecoder().decode(Meta.self, from: data)
+        else { return Meta() }
         return meta
     }
 
     private static func defaultDirectory() -> URL {
-        let fm = FileManager.default
-        let base = (try? fm.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
-            ?? fm.temporaryDirectory
-        return base.appendingPathComponent("PlantLibrary", isDirectory: true)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return docs.appendingPathComponent("PlantLibrary", isDirectory: true)
     }
 }

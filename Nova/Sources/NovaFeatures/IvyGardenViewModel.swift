@@ -27,8 +27,14 @@ public final class IvyGardenViewModel {
     public private(set) var lastWalk: GardenWalkResult?
     public private(set) var lastCatalog: GardenCatalogResult?
     public private(set) var planItems: [GardenPlanItem] = []
+    public private(set) var savedWalks: [GardenWalkResult] = []
+    public private(set) var suggestedTips: [GardenSuggestedTip] = []
+    public private(set) var plantRecommendations: [GardenPlantRecommendation] = []
     public private(set) var climate: GardenClimateSnapshot?
+    /// Active USDA zone (1…13) driving Annual/Perennial gallery tags.
+    public private(set) var activeHardinessZone: Int?
     public var climateCityDraft: String = ""
+    public var hardinessZoneDraft: Int = 7
     public private(set) var statusMessage: String = ""
     public private(set) var errorMessage: String?
     public private(set) var isBusy = false
@@ -127,7 +133,27 @@ public final class IvyGardenViewModel {
         plants = await store.all()
         directoryURL = await store.directory()
         climateCityDraft = await store.climateCity() ?? climateCityDraft
+        if let zone = await store.hardinessZone() {
+            activeHardinessZone = zone
+            hardinessZoneDraft = zone
+        } else if let climateZone = climate?.hardinessZone {
+            activeHardinessZone = climateZone
+            hardinessZoneDraft = climateZone
+        }
+        savedWalks = await store.gardenWalks()
+        await retagPlantsForActiveZone(persist: activeHardinessZone != nil || climate?.hardinessZone != nil)
         rebuildPlan()
+    }
+
+    /// Persist zone, retag every gallery plant as Annual/Perennial for that zone.
+    public func saveHardinessZone() async {
+        let zone = GardenLifeCycleDiff.clampZone(hardinessZoneDraft) ?? hardinessZoneDraft
+        hardinessZoneDraft = zone
+        activeHardinessZone = zone
+        await store.setHardinessZone(zone)
+        await retagPlantsForActiveZone(persist: true)
+        rebuildPlan()
+        statusMessage = "Zone \(zone) saved — gallery tagged Annual/Perennial"
     }
 
     public func imageURL(for plant: PlantSighting) -> URL? {
@@ -242,6 +268,8 @@ public final class IvyGardenViewModel {
         let result = GardenCatalogResult(overview: overview, profiles: merged)
         lastCatalog = result
         lastWalk = overview
+        _ = await store.appendGardenWalk(overview)
+        savedWalks = await store.gardenWalks()
         rebuildPlan()
         statusMessage = "Cataloged \(merged.count) plant\(merged.count == 1 ? "" : "s") · overview ready"
         errorMessage = nil
@@ -421,6 +449,7 @@ public final class IvyGardenViewModel {
         next.healthStatus = healthStatus?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
             ? nil
             : healthStatus
+        next.lifeCycle = GardenLifeCycleDiff.classify(next, zone: activeHardinessZone)
         _ = await store.upsert(next)
         await load()
     }
@@ -447,6 +476,12 @@ public final class IvyGardenViewModel {
         defer { isBusy = false }
         do {
             climate = try await fetchClimate(city)
+            if let zone = climate?.hardinessZone {
+                activeHardinessZone = zone
+                hardinessZoneDraft = zone
+                await store.setHardinessZone(zone)
+                await retagPlantsForActiveZone(persist: true)
+            }
             statusMessage = climate?.summary ?? "Climate updated"
             errorMessage = nil
         } catch {
@@ -653,6 +688,8 @@ public final class IvyGardenViewModel {
         }
         let merged = GardenWalkDiff.merge(partial)
         lastWalk = merged
+        _ = await store.appendGardenWalk(merged)
+        savedWalks = await store.gardenWalks()
         statusMessage = merged.healthScore.map { "Walk complete · \($0)" } ?? "Walk complete"
         rebuildPlan()
 
@@ -756,5 +793,24 @@ public final class IvyGardenViewModel {
 
     private func rebuildPlan() {
         planItems = GardenPlanningDiff.buildPlan(library: plants, climate: climate)
+        suggestedTips = GardenLifeCycleDiff.suggestedTips(from: savedWalks)
+        let zone = activeHardinessZone ?? climate?.hardinessZone
+        plantRecommendations = GardenPlantingRecommendationsDiff.recommendations(
+            zone: zone,
+            climate: climate,
+            library: plants
+        )
+    }
+
+    /// Recompute Annual/Perennial for every plant from the active zone.
+    private func retagPlantsForActiveZone(persist: Bool) async {
+        let zone = activeHardinessZone ?? climate?.hardinessZone
+        let tagged = GardenLifeCycleDiff.retag(plants, zone: zone)
+        plants = tagged.sorted { $0.updatedAt > $1.updatedAt }
+        guard persist else { return }
+        for plant in tagged where plant.lifeCycle != nil {
+            _ = await store.upsert(plant)
+        }
+        plants = await store.all()
     }
 }

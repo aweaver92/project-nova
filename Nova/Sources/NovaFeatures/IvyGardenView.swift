@@ -9,6 +9,7 @@ import UIKit
 /// Ivy's garden workspace: gallery, identify, Garden Walk, and seasonal planning.
 public struct IvyGardenView: View {
     @Bindable var garden: IvyGardenViewModel
+    @Bindable var conversation: ConversationViewModel
     var embedded: Bool = false
     @State private var identifyPickerItem: PhotosPickerItem?
     @State private var galleryPickerItems: [PhotosPickerItem] = []
@@ -17,8 +18,9 @@ public struct IvyGardenView: View {
     @State private var editing: PlantSighting?
     @State private var isGalleryEditing = false
 
-    public init(garden: IvyGardenViewModel, embedded: Bool = false) {
+    public init(garden: IvyGardenViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
         self.garden = garden
+        self.conversation = conversation
         self.embedded = embedded
     }
 
@@ -40,6 +42,12 @@ public struct IvyGardenView: View {
 
     private var content: some View {
         List {
+            Section {
+                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                    .listRowBackground(Color.clear)
+            }
+
             gardenWalkSection
 
             Picker("Section", selection: $garden.section) {
@@ -387,7 +395,11 @@ public struct IvyGardenView: View {
                                     editing = plant
                                 }
                             } label: {
-                                PlantThumbnail(url: garden.imageURL(for: plant), title: plant.name)
+                                PlantThumbnail(
+                                    url: garden.imageURL(for: plant),
+                                    title: plant.name,
+                                    lifeCycle: plant.lifeCycle
+                                )
                             }
                             .buttonStyle(.plain)
 
@@ -413,13 +425,21 @@ public struct IvyGardenView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
             }
         } header: {
-            Text("Gallery · \(garden.plantCount)")
+            Text(galleryHeader)
         } footer: {
             Text(isGalleryEditing
                  ? "Tap a plant to remove it. Tap Done when finished."
-                 : "Add photos or a video to build Ivy’s library. Tap a plant to edit; long-press to water or delete. Use Edit to remove several quickly.")
+                 : "Add photos or a video to build Ivy’s library. Plants are tagged Annual or Perennial for your active hardiness zone. Tap a plant to edit; long-press to water or delete.")
                 .font(.caption2)
         }
+    }
+
+    private var galleryHeader: String {
+        var title = "Gallery · \(garden.plantCount)"
+        if let zone = garden.activeHardinessZone {
+            title += " · Zone \(zone)"
+        }
+        return title
     }
 
     @ViewBuilder
@@ -487,11 +507,143 @@ public struct IvyGardenView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Stepper(
+                "USDA zone \(garden.hardinessZoneDraft)",
+                value: $garden.hardinessZoneDraft,
+                in: 1...13
+            )
+            Button {
+                Task { await garden.saveHardinessZone() }
+            } label: {
+                Label("Save zone & retag gallery", systemImage: "leaf")
+            }
+            .disabled(garden.isBusy)
         } header: {
-            Text("Climate")
+            Text("Climate & zone")
         } footer: {
-            Text("Frost windows use a prior-year Open-Meteo sample for your city.")
+            Text("Frost windows use a prior-year Open-Meteo sample. Saving a city also estimates USDA zone; Annual/Perennial tags follow the active zone.")
                 .font(.caption2)
+        }
+
+        Section {
+            if garden.plantRecommendations.isEmpty {
+                Text("No planting picks for this season yet. Save a climate city or USDA zone and pull to refresh Planning.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(garden.plantRecommendations) { rec in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(rec.name)
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Text(rec.method.title)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.tint)
+                        }
+                        HStack(spacing: 8) {
+                            Text(rec.lifeCycle.title)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text("·")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(rec.windowLabel)
+                                .font(.caption2)
+                                .foregroundStyle(.tint)
+                        }
+                        Text(rec.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if rec.alreadyInLibrary {
+                            Text("Already in your gallery — consider succession or a second variety.")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        } header: {
+            recommendationHeader
+        } footer: {
+            Text("Picks matched to \(GardenSeason.current().title.lowercased()) planting windows and your active zone. Prefer seed, transplant, bulb, or indoor starts as labeled.")
+                .font(.caption2)
+        }
+
+        Section {
+            if garden.suggestedTips.isEmpty {
+                Text("No tips yet — finish a Garden Walk or catalog and Ivy will compile top action items here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(garden.suggestedTips) { tip in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(tip.priority.title.uppercased())
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(tipPriorityColor(tip.priority))
+                            Spacer()
+                            Text(tipDateLabel(tip.date))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(tip.title)
+                            .font(.subheadline.weight(.semibold))
+                        if let plant = tip.plantName, !plant.isEmpty {
+                            Text(plant)
+                                .font(.caption2)
+                                .foregroundStyle(.tint)
+                        }
+                        if !tip.detail.isEmpty {
+                            Text(tip.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        } header: {
+            Text("Suggested Tips")
+        } footer: {
+            Text("Condensed from garden walks — urgent first, then by date.")
+                .font(.caption2)
+        }
+
+        Section {
+            if garden.savedWalks.isEmpty {
+                Text("Garden walk summaries will appear here after Walk or Catalog.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(garden.savedWalks) { walk in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(tipDateLabel(walk.walkedAt))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.tint)
+                            if let health = walk.healthScore, !health.isEmpty {
+                                Text("· \(health)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text(walk.planningPreview)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                        if !walk.maintenance.isEmpty {
+                            Text(walk.maintenance.prefix(3).map { "• \($0)" }.joined(separator: "\n"))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        } header: {
+            Text("Garden walk summaries")
         }
 
         ForEach(GardenSeason.allCases) { season in
@@ -532,6 +684,30 @@ public struct IvyGardenView: View {
                 Text(season.title)
             }
         }
+    }
+
+    private var recommendationHeader: String {
+        var title = "New plant recommendations"
+        if let zone = garden.activeHardinessZone {
+            title += " · Zone \(zone)"
+        }
+        title += " · \(GardenSeason.current().title)"
+        return title
+    }
+
+    private func tipPriorityColor(_ priority: GardenTipPriority) -> Color {
+        switch priority {
+        case .urgent: return .red
+        case .high: return .orange
+        case .normal: return .secondary
+        }
+    }
+
+    private func tipDateLabel(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: date)
     }
 
     private func kindLabel(_ kind: GardenPlanKind) -> String {
@@ -633,10 +809,11 @@ private struct PlantThumbnail: View {
     let url: URL?
     let title: String
     var compact: Bool = false
+    var lifeCycle: PlantLifeCycle? = nil
 
     var body: some View {
         VStack(spacing: 4) {
-            ZStack {
+            ZStack(alignment: .bottomLeading) {
                 RoundedRectangle(cornerRadius: compact ? 8 : 10, style: .continuous)
                     .fill(Color.secondary.opacity(0.12))
                 #if canImport(UIKit)
@@ -660,6 +837,14 @@ private struct PlantThumbnail: View {
                 Image(systemName: "camera.macro")
                     .foregroundStyle(.secondary)
                 #endif
+                if !compact, let lifeCycle {
+                    Text(lifeCycle.title)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(6)
+                }
             }
             .frame(height: compact ? 52 : 88)
             if !title.isEmpty {
@@ -725,6 +910,9 @@ private struct PlantEditorSheet: View {
                     .lineLimit(3...8)
                 Toggle("Outdoor plant", isOn: $isOutdoor)
                 Toggle("Bring inside before frost", isOn: $frostSensitive)
+                if let life = plant.lifeCycle {
+                    LabeledContent("For active zone", value: life.title)
+                }
 
                 Section {
                     Button("Delete from gallery", role: .destructive) {

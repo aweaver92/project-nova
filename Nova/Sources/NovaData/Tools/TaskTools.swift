@@ -47,6 +47,10 @@ public struct ListTasksTool: Tool {
             if let detail = task.detail { d["detail"] = detail }
             if let agentId = task.agentId { d["agentId"] = agentId.uuidString }
             if let summary = task.activitySummary { d["activitySummary"] = summary }
+            if !task.imageFileNames.isEmpty {
+                d["imageCount"] = task.imageFileNames.count
+                d["imageFileNames"] = task.imageFileNames
+            }
             return d
         }
         let data = try JSONSerialization.data(withJSONObject: ["ok": true, "count": payload.count, "tasks": payload])

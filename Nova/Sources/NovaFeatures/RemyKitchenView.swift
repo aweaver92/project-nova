@@ -9,6 +9,7 @@ import UIKit
 /// Remy-exclusive Kitchen destination (Claude → Coding pattern).
 public struct RemyKitchenView: View {
     @Bindable var kitchen: RemyKitchenViewModel
+    @Bindable var conversation: ConversationViewModel
     var embedded: Bool
 
     @State private var photoItems: [PhotosPickerItem] = []
@@ -25,8 +26,9 @@ public struct RemyKitchenView: View {
     @State private var importURL = ""
     @State private var importPaste = ""
 
-    public init(kitchen: RemyKitchenViewModel, embedded: Bool = false) {
+    public init(kitchen: RemyKitchenViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
         self.kitchen = kitchen
+        self.conversation = conversation
         self.embedded = embedded
     }
 
@@ -140,6 +142,12 @@ public struct RemyKitchenView: View {
 
     private var kitchenList: some View {
         List {
+            Section {
+                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                    .listRowBackground(Color.clear)
+            }
+
             Section {
                 VStack(spacing: 10) {
                     if let session = kitchen.cookingSession {

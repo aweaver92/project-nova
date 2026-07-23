@@ -93,6 +93,21 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(savedURL, "http://192.168.1.44:8787")
         XCTAssertEqual(savedToken, "keep-me")
     }
+
+    func testRestartBridgeFromAppUsesAdminRestart() async {
+        let store = SettingsStoreMock(
+            baseURL: "http://192.168.0.103:8787",
+            token: "secret"
+        )
+        let viewModel = SettingsViewModel(store: store, bridge: HealthyBridgeMock())
+        await viewModel.load()
+        await viewModel.restartBridgeFromApp()
+        XCTAssertTrue(
+            viewModel.bridgeStatus.contains("Bridge restarted (bridge)"),
+            viewModel.bridgeStatus
+        )
+        XCTAssertEqual(viewModel.kickPort, 8788)
+    }
 }
 
 private actor BridgeDiscoveryMock: BridgeDiscovering {
@@ -106,8 +121,14 @@ private struct HealthyBridgeMock: AgentBridging {
     func health() async -> BridgeResult {
         BridgeResult(
             ok: true,
-            payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true,"gitReady":true,"ghReady":true,"repoRootCount":2,"previewRemoteReady":true,"tailscaleIp":"100.64.1.2","defaultCwd":"C:\\src","tokenConfigured":true}"#
+            payloadJSON: #"{"ok":true,"service":"nova-bridge","openaiConfigured":true,"cursorConfigured":true,"gitReady":true,"ghReady":true,"repoRootCount":2,"previewRemoteReady":true,"tailscaleIp":"100.64.1.2","defaultCwd":"C:\\src","tokenConfigured":true,"kickPort":8788}"#
         )
+    }
+    func listRepos() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"repos":[],"selectedRepoId":null}"#)
+    }
+    func restartBridge() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"restarting":true}"#)
     }
 }
 

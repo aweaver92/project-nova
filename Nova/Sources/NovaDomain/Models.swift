@@ -585,6 +585,8 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
     public var isOutdoor: Bool?
     /// When true (or inferred), bring indoors before first frost.
     public var frostSensitive: Bool?
+    /// Annual vs perennial for the gardener's active hardiness zone.
+    public var lifeCycle: PlantLifeCycle?
     /// Concrete next steps from video catalog / identify (water, prune, move, etc.).
     public var suggestedActions: [String]
     /// Seasonal coaching (plant-out, frost, dormancy) for this specimen.
@@ -606,6 +608,7 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
         lastWateredAt: Date? = nil,
         isOutdoor: Bool? = nil,
         frostSensitive: Bool? = nil,
+        lifeCycle: PlantLifeCycle? = nil,
         suggestedActions: [String] = [],
         seasonalNotes: String = "",
         healthStatus: String? = nil,
@@ -623,6 +626,7 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
         self.lastWateredAt = lastWateredAt
         self.isOutdoor = isOutdoor
         self.frostSensitive = frostSensitive
+        self.lifeCycle = lifeCycle
         self.suggestedActions = suggestedActions
         self.seasonalNotes = seasonalNotes
         self.healthStatus = healthStatus
@@ -632,7 +636,7 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, fileName, name, species, location, careNotes, text, caption
-        case lastWateredAt, isOutdoor, frostSensitive
+        case lastWateredAt, isOutdoor, frostSensitive, lifeCycle
         case suggestedActions, seasonalNotes, healthStatus
         case createdAt, updatedAt
     }
@@ -650,11 +654,27 @@ public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
         lastWateredAt = try c.decodeIfPresent(Date.self, forKey: .lastWateredAt)
         isOutdoor = try c.decodeIfPresent(Bool.self, forKey: .isOutdoor)
         frostSensitive = try c.decodeIfPresent(Bool.self, forKey: .frostSensitive)
+        lifeCycle = try c.decodeIfPresent(PlantLifeCycle.self, forKey: .lifeCycle)
         suggestedActions = try c.decodeIfPresent([String].self, forKey: .suggestedActions) ?? []
         seasonalNotes = try c.decodeIfPresent(String.self, forKey: .seasonalNotes) ?? ""
         healthStatus = try c.decodeIfPresent(String.self, forKey: .healthStatus)
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+    }
+}
+
+/// How a plant behaves in the gardener's active USDA hardiness zone.
+public enum PlantLifeCycle: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case annual
+    case perennial
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .annual: return "Annual"
+        case .perennial: return "Perennial"
+        }
     }
 }
 
@@ -732,17 +752,21 @@ public struct GardenClimateSnapshot: Sendable, Equatable, Codable {
     public var city: String
     public var lastSpringFrost: Date?
     public var firstFallFrost: Date?
+    /// Approximate USDA hardiness zone (1…13) from extreme winter lows.
+    public var hardinessZone: Int?
     public var summary: String
 
     public init(
         city: String,
         lastSpringFrost: Date? = nil,
         firstFallFrost: Date? = nil,
+        hardinessZone: Int? = nil,
         summary: String = ""
     ) {
         self.city = city
         self.lastSpringFrost = lastSpringFrost
         self.firstFallFrost = firstFallFrost
+        self.hardinessZone = hardinessZone
         self.summary = summary
     }
 }
@@ -773,7 +797,8 @@ public struct GardenWalkFinding: Sendable, Identifiable, Equatable, Codable {
 }
 
 /// Result of an Ivy Garden Walk over live/uploaded frames.
-public struct GardenWalkResult: Sendable, Equatable, Codable {
+public struct GardenWalkResult: Sendable, Equatable, Codable, Identifiable {
+    public var id: UUID
     public var overview: String
     public var healthScore: String?
     public var findings: [GardenWalkFinding]
@@ -782,6 +807,7 @@ public struct GardenWalkResult: Sendable, Equatable, Codable {
     public var walkedAt: Date
 
     public init(
+        id: UUID = UUID(),
         overview: String = "",
         healthScore: String? = nil,
         findings: [GardenWalkFinding] = [],
@@ -789,12 +815,28 @@ public struct GardenWalkResult: Sendable, Equatable, Codable {
         mistakes: [String] = [],
         walkedAt: Date = Date()
     ) {
+        self.id = id
         self.overview = overview
         self.healthScore = healthScore
         self.findings = findings
         self.maintenance = maintenance
         self.mistakes = mistakes
         self.walkedAt = walkedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, overview, healthScore, findings, maintenance, mistakes, walkedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        overview = try c.decodeIfPresent(String.self, forKey: .overview) ?? ""
+        healthScore = try c.decodeIfPresent(String.self, forKey: .healthScore)
+        findings = try c.decodeIfPresent([GardenWalkFinding].self, forKey: .findings) ?? []
+        maintenance = try c.decodeIfPresent([String].self, forKey: .maintenance) ?? []
+        mistakes = try c.decodeIfPresent([String].self, forKey: .mistakes) ?? []
+        walkedAt = try c.decodeIfPresent(Date.self, forKey: .walkedAt) ?? Date()
     }
 
     public var spokenSummary: String {
@@ -845,6 +887,130 @@ public struct GardenWalkResult: Sendable, Equatable, Codable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// One-line planning-tab preview.
+    public var planningPreview: String {
+        let trimmed = overview.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return String(trimmed.prefix(160)) }
+        if let first = findings.first {
+            return "\(first.title): \(first.detail)".trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let first = maintenance.first { return first }
+        return "Garden walk notes"
+    }
+}
+
+/// Priority for condensed Suggested Tips derived from garden walks.
+public enum GardenTipPriority: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case urgent
+    case high
+    case normal
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .urgent: return "Urgent"
+        case .high: return "High"
+        case .normal: return "Normal"
+        }
+    }
+
+    public var sortRank: Int {
+        switch self {
+        case .urgent: return 0
+        case .high: return 1
+        case .normal: return 2
+        }
+    }
+}
+
+/// Condensed action item for Ivy's Planning → Suggested Tips.
+public struct GardenSuggestedTip: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var title: String
+    public var detail: String
+    public var priority: GardenTipPriority
+    public var date: Date
+    public var plantName: String?
+    public var sourceWalkId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        detail: String = "",
+        priority: GardenTipPriority,
+        date: Date,
+        plantName: String? = nil,
+        sourceWalkId: UUID? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.priority = priority
+        self.date = date
+        self.plantName = plantName
+        self.sourceWalkId = sourceWalkId
+    }
+}
+
+/// How to start a recommended plant/seed this season.
+public enum GardenPlantingMethod: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case seed
+    case transplant
+    case bulb
+    case startIndoors
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .seed: return "Seed"
+        case .transplant: return "Transplant"
+        case .bulb: return "Bulb"
+        case .startIndoors: return "Start indoors"
+        }
+    }
+}
+
+/// A plant or seed Ivy recommends planting now for the active zone + season.
+public struct GardenPlantRecommendation: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var name: String
+    public var method: GardenPlantingMethod
+    public var lifeCycle: PlantLifeCycle
+    public var detail: String
+    public var windowLabel: String
+    public var season: GardenSeason
+    /// Inclusive USDA zone range where this pick is a good fit.
+    public var minZone: Int
+    public var maxZone: Int
+    /// True when a similar plant is already in the gallery.
+    public var alreadyInLibrary: Bool
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        method: GardenPlantingMethod,
+        lifeCycle: PlantLifeCycle,
+        detail: String,
+        windowLabel: String,
+        season: GardenSeason,
+        minZone: Int = 1,
+        maxZone: Int = 13,
+        alreadyInLibrary: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.method = method
+        self.lifeCycle = lifeCycle
+        self.detail = detail
+        self.windowLabel = windowLabel
+        self.season = season
+        self.minZone = minZone
+        self.maxZone = maxZone
+        self.alreadyInLibrary = alreadyInLibrary
     }
 }
 
@@ -1392,7 +1558,7 @@ public extension Agent {
                 name: "Ivy",
                 voice: RealtimeVoice.verse.rawValue,
                 role: "a botanist and gardening specialist",
-                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, notes, the current season, and their climate city when set. Proactively catch timely mistakes (overwatering, pests, heat/drought stress in summer, neglected watering) — don't wait to be asked. Do not shoehorn frost or bring-inside advice in midsummer; save frost moves for fall/near first frost, and use list_garden_plan (optionally filtered to the current season) for seasonal planting. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance now. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing heat, rain, or frost timing for their climate city.",
+                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, Annual/Perennial tags for their active USDA zone, notes, the current season, and their climate city when set. When they ask what to plant or which seeds to buy now, use list_garden_plan and highlight new_plant_recommendations for the current season and zone. Proactively catch timely mistakes (overwatering, pests, heat/drought stress in summer, neglected watering) — don't wait to be asked. Do not shoehorn frost or bring-inside advice in midsummer; save frost moves for fall/near first frost, and use list_garden_plan (optionally filtered to the current season) for seasonal planting plus Suggested Tips from saved garden walks. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance now — walks are saved into Planning. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing heat, rain, or frost timing for their climate city.",
                 toolNames: Agent.commonToolNames + [
                     "open_app_screen",
                     "remember_visual",
@@ -2444,6 +2610,8 @@ public struct AgentTask: Sendable, Identifiable, Codable, Equatable {
     public var source: String
     /// Short snapshot of the activity that motivated this task.
     public var activitySummary: String?
+    /// JPEG file names relative to the task-images directory.
+    public var imageFileNames: [String]
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -2456,6 +2624,7 @@ public struct AgentTask: Sendable, Identifiable, Codable, Equatable {
         status: AgentTaskStatus = .suggested,
         source: String = "manual",
         activitySummary: String? = nil,
+        imageFileNames: [String] = [],
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -2467,8 +2636,29 @@ public struct AgentTask: Sendable, Identifiable, Codable, Equatable {
         self.status = status
         self.source = source
         self.activitySummary = activitySummary
+        self.imageFileNames = imageFileNames
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, detail, agentName, agentId, status, source
+        case activitySummary, imageFileNames, createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        agentName = try c.decode(String.self, forKey: .agentName)
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
+        status = try c.decode(AgentTaskStatus.self, forKey: .status)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "manual"
+        activitySummary = try c.decodeIfPresent(String.self, forKey: .activitySummary)
+        imageFileNames = try c.decodeIfPresent([String].self, forKey: .imageFileNames) ?? []
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 }
 

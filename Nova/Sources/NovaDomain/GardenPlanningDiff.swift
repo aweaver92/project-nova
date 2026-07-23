@@ -97,6 +97,9 @@ public enum GardenPlanningDiff {
         ]
         if let climate {
             lines.append("Climate area: \(climate.city). \(climate.summary)")
+            if let zone = climate.hardinessZone {
+                lines.append("Active USDA hardiness zone: \(zone). Tag Annual vs Perennial for this zone.")
+            }
             if let days = daysUntil(climate.firstFallFrost, from: now, calendar: calendar) {
                 if days > 60 {
                     lines.append(

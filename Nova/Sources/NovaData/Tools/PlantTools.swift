@@ -332,6 +332,7 @@ public struct GardenWalkTool: Tool {
             partial.append(GardenWalkDiff.parseModelJSON(answer, library: library))
         }
         let merged = GardenWalkDiff.merge(partial)
+        _ = await store.appendGardenWalk(merged)
         return try Self.encode(merged)
     }
 
@@ -362,7 +363,7 @@ public struct GardenWalkTool: Tool {
 
 public struct ListGardenPlanTool: Tool {
     public let name = "list_garden_plan"
-    public let description = "Seasonal garden plan for the user's climate: current-season planting, watering/heat care, and (when timely) bring-inside-before-frost guidance."
+    public let description = "Seasonal garden plan for the user's climate: current-season planting, New Plant Recommendations (seeds/transplants/bulbs for the active USDA zone), watering/heat care, Suggested Tips from saved garden walks (priority + date), and (when timely) bring-inside-before-frost guidance."
     public let requiresConfirmation = false
     public let parametersJSON = """
     {"type":"object","properties":{"season":{"type":"string","description":"spring|summer|fall|winter — omit to focus on the current season"},"city":{"type":"string","description":"Optional climate city override"}},"additionalProperties":false}
@@ -388,8 +389,16 @@ public struct ListGardenPlanTool: Tool {
         var climate: GardenClimateSnapshot?
         if let city = await store.climateCity() {
             climate = try? await climateClient.snapshot(city: city)
+            if let zone = climate?.hardinessZone {
+                await store.setHardinessZone(zone)
+            }
         }
-        var plan = GardenPlanningDiff.buildPlan(library: library, climate: climate)
+        let zone = await store.hardinessZone() ?? climate?.hardinessZone
+        let tagged = GardenLifeCycleDiff.retag(library, zone: zone)
+        for plant in tagged {
+            _ = await store.upsert(plant)
+        }
+        var plan = GardenPlanningDiff.buildPlan(library: tagged, climate: climate)
         if let seasonRaw = args.season,
            let season = GardenSeason(rawValue: seasonRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
             plan = GardenPlanningDiff.items(for: season, in: plan)
@@ -397,6 +406,14 @@ public struct ListGardenPlanTool: Tool {
             // Default to current season so chat doesn't lead with off-season frost rows.
             plan = GardenPlanningDiff.items(for: GardenSeason.current(), in: plan)
         }
+        let walks = await store.gardenWalks()
+        let tips = GardenLifeCycleDiff.suggestedTips(from: walks, limit: 12)
+        let recommendations = GardenPlantingRecommendationsDiff.recommendations(
+            zone: zone,
+            climate: climate,
+            library: tagged,
+            limit: 10
+        )
         let summary = GardenPlanningDiff.summary(plan: plan, climate: climate)
         let rows: [[String: Any]] = plan.prefix(40).map { item in
             var d: [String: Any] = [
@@ -410,11 +427,37 @@ public struct ListGardenPlanTool: Tool {
             if let name = item.plantName { d["plant_name"] = name }
             return d
         }
+        let tipRows: [[String: Any]] = tips.map { tip in
+            var d: [String: Any] = [
+                "title": tip.title,
+                "detail": tip.detail,
+                "priority": tip.priority.rawValue,
+                "date": ISO8601DateFormatter().string(from: tip.date)
+            ]
+            if let plant = tip.plantName { d["plant_name"] = plant }
+            return d
+        }
+        let recRows: [[String: Any]] = recommendations.map { rec in
+            [
+                "name": rec.name,
+                "method": rec.method.rawValue,
+                "life_cycle": rec.lifeCycle.rawValue,
+                "detail": rec.detail,
+                "window": rec.windowLabel,
+                "season": rec.season.rawValue,
+                "min_zone": rec.minZone,
+                "max_zone": rec.maxZone,
+                "already_in_library": rec.alreadyInLibrary
+            ]
+        }
         var payload: [String: Any] = [
             "ok": true,
             "summary": summary,
-            "items": rows
+            "items": rows,
+            "suggested_tips": tipRows,
+            "new_plant_recommendations": recRows
         ]
+        if let zone { payload["hardiness_zone"] = zone }
         if let climate {
             payload["climate_city"] = climate.city
             payload["climate_summary"] = climate.summary

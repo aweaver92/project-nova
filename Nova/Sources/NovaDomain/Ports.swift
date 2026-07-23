@@ -482,6 +482,10 @@ public protocol AgentTaskStoring: Sendable {
     func delete(id: UUID) async
     /// Human-readable open-task summary for injecting into Sage's context.
     func summary(limit: Int) async -> String
+    /// Persist a JPEG for task attachments; returns relative file name.
+    func saveTaskImage(_ jpegData: Data) async -> String
+    func taskImageURL(fileName: String) async -> URL?
+    func removeTaskImage(fileName: String) async
 }
 
 /// Scholar's spaced-repetition study decks.
@@ -1309,6 +1313,10 @@ public protocol AgentBridging: Sendable {
     /// Surfaces whether the configured URL is reachable, so the UI can give the
     /// user real feedback instead of failing silently on the first coding task.
     func health() async -> BridgeResult
+    /// Ask the bridge to restart itself (`POST /admin/restart`).
+    func restartBridge() async -> BridgeResult
+    /// Ask the PC watchdog kick listener to restart the bridge when :8787 is dead.
+    func kickBridgeWatchdog(baseURL: URL) async -> BridgeResult
     func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult
     /// Reattach to a Claude Code job after unlock/foreground (bridge owns the process).
     func resumePendingClaudeCode() async -> BridgeResult?
@@ -1391,6 +1399,12 @@ public protocol AgentBridging: Sendable {
 public extension AgentBridging {
     // Default keeps mocks/older conformers source-compatible.
     func health() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func restartBridge() async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func kickBridgeWatchdog(baseURL: URL) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func listCursorSessions() async -> BridgeResult {
@@ -1721,6 +1735,13 @@ public protocol PlantLibraryStoring: Sendable {
     /// City used for frost / seasonal planning (Open-Meteo geocode).
     func climateCity() async -> String?
     func setClimateCity(_ city: String?) async
+    /// Active USDA hardiness zone (1…13) for Annual/Perennial tagging.
+    func hardinessZone() async -> Int?
+    func setHardinessZone(_ zone: Int?) async
+    /// Persisted garden walk summaries for the Planning tab.
+    func gardenWalks() async -> [GardenWalkResult]
+    @discardableResult
+    func appendGardenWalk(_ walk: GardenWalkResult) async -> GardenWalkResult
 }
 
 /// Transcribes a recorded audio file to text (e.g. OpenAI Whisper).

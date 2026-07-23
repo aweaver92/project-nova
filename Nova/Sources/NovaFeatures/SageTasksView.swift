@@ -1,17 +1,33 @@
 import SwiftUI
 import NovaDomain
+import PhotosUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Sage-exclusive task manager. Soft sage-green wash with pickup tasks
 /// grouped by agent so the user can resume unfinished work through the day.
 public struct SageTasksView: View {
     @Bindable var tasks: SageTasksViewModel
+    @Bindable var conversation: ConversationViewModel
     var embedded: Bool = false
+
+    #if canImport(UIKit)
+    @State private var draftPhotoItems: [PhotosPickerItem] = []
+    @State private var attachTarget: AgentTask?
+    @State private var attachPhotoItems: [PhotosPickerItem] = []
+    #endif
 
     private static let sage = Color(red: 0.35, green: 0.55, blue: 0.45)
     private static let sageSoft = Color(red: 0.35, green: 0.55, blue: 0.45).opacity(0.12)
 
-    public init(tasks: SageTasksViewModel, embedded: Bool = false) {
+    public init(
+        tasks: SageTasksViewModel,
+        conversation: ConversationViewModel,
+        embedded: Bool = false
+    ) {
         self.tasks = tasks
+        self.conversation = conversation
         self.embedded = embedded
     }
 
@@ -30,6 +46,7 @@ public struct SageTasksView: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 20) {
+                NovaUI.AgentVoiceChatBar(conversation: conversation)
                 header
                 addTaskCard
                 if tasks.openTasks.isEmpty {
@@ -58,6 +75,51 @@ public struct SageTasksView: View {
         .task { await tasks.load() }
         .onAppear { tasks.setScreenVisible(true) }
         .onDisappear { tasks.setScreenVisible(false) }
+        #if canImport(UIKit)
+        .onChange(of: draftPhotoItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task { await ingestDraftPhotos(items) }
+        }
+        .sheet(item: $attachTarget) { task in
+            NavigationStack {
+                VStack(spacing: 16) {
+                    Text("Attach photos to “\(task.title)”")
+                        .font(.headline)
+                        .multilineTextAlignment(.center)
+                        .padding(.top)
+                    PhotosPicker(
+                        selection: $attachPhotoItems,
+                        maxSelectionCount: max(1, SageTasksViewModel.maxImagesPerTask - task.imageFileNames.count),
+                        matching: .images
+                    ) {
+                        Label("Choose photos", systemImage: "photo.on.rectangle.angled")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.horizontal)
+                    Spacer()
+                }
+                .navigationTitle("Attach")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            attachTarget = nil
+                            attachPhotoItems = []
+                        }
+                    }
+                }
+                .onChange(of: attachPhotoItems) { _, items in
+                    guard !items.isEmpty else { return }
+                    Task {
+                        await ingestAttachPhotos(items, to: task)
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
+        #endif
     }
 
     private var header: some View {
@@ -69,7 +131,7 @@ public struct SageTasksView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 8)
+        .padding(.top, 4)
     }
 
     private var greeting: String {
@@ -99,6 +161,50 @@ public struct SageTasksView: View {
                 }
             }
             .pickerStyle(.menu)
+
+            #if canImport(UIKit)
+            PhotosPicker(
+                selection: $draftPhotoItems,
+                maxSelectionCount: max(1, SageTasksViewModel.maxImagesPerTask - tasks.draftImageData.count),
+                matching: .images
+            ) {
+                Label(
+                    tasks.draftImageData.isEmpty
+                        ? "Add photos"
+                        : "Add more photos (\(tasks.draftImageData.count)/\(SageTasksViewModel.maxImagesPerTask))",
+                    systemImage: "photo.on.rectangle.angled"
+                )
+            }
+            .disabled(tasks.draftImageData.count >= SageTasksViewModel.maxImagesPerTask)
+
+            if !tasks.draftImageData.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(tasks.draftImageData.enumerated()), id: \.offset) { index, data in
+                            ZStack(alignment: .topTrailing) {
+                                if let ui = UIImage(data: data) {
+                                    Image(uiImage: ui)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 64, height: 64)
+                                        .clipped()
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                                Button {
+                                    tasks.removeDraftImage(at: index)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .symbolRenderingMode(.palette)
+                                        .foregroundStyle(.white, .black.opacity(0.55))
+                                }
+                                .offset(x: 4, y: -4)
+                            }
+                        }
+                    }
+                }
+            }
+            #endif
+
             Button {
                 Task { await tasks.addDraftTask() }
             } label: {
@@ -118,7 +224,7 @@ public struct SageTasksView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Nothing open")
                 .font(.system(.headline, design: .serif))
-            Text("Ask Sage to review recent agent activity, or add a pickup above. Suggested tasks appear here when work looks unfinished.")
+            Text("Ask Sage to review recent agent activity, or add a pickup above. Attach photos when a task needs a visual reminder.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -175,6 +281,20 @@ public struct SageTasksView: View {
                         .foregroundStyle(.tertiary)
                 }
                 Spacer(minLength: 0)
+                #if canImport(UIKit)
+                if task.imageFileNames.count < SageTasksViewModel.maxImagesPerTask {
+                    Button {
+                        attachTarget = task
+                        attachPhotoItems = []
+                    } label: {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.title3)
+                            .foregroundStyle(Self.sage.opacity(0.85))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Attach photos")
+                }
+                #endif
                 Button {
                     Task { await tasks.markDone(task) }
                 } label: {
@@ -184,6 +304,12 @@ public struct SageTasksView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Mark done")
+            }
+
+            if !task.imageFileNames.isEmpty {
+                TaskImageStrip(fileNames: task.imageFileNames, tasks: tasks) { fileName in
+                    Task { await tasks.removeImage(from: task, fileName: fileName) }
+                }
             }
         }
         .padding(.vertical, 4)
@@ -197,6 +323,14 @@ public struct SageTasksView: View {
             Button("Mark done") {
                 Task { await tasks.markDone(task) }
             }
+            #if canImport(UIKit)
+            Button {
+                attachTarget = task
+                attachPhotoItems = []
+            } label: {
+                Label("Attach photos…", systemImage: "photo.badge.plus")
+            }
+            #endif
             Button("Delete", role: .destructive) {
                 Task { await tasks.delete(task) }
             }
@@ -209,14 +343,15 @@ public struct SageTasksView: View {
                 .font(.system(.headline, design: .serif))
             ForEach(tasks.recentDone) { task in
                 HStack {
-                    Text(task.agentName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Self.sage)
-                        .frame(width: 64, alignment: .leading)
-                    Text(task.title)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Self.sage.opacity(0.7))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(task.title)
+                            .font(.subheadline)
+                        Text("\(task.agentName) · \(Self.dateLabel(task.updatedAt))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
                 }
             }
@@ -231,25 +366,110 @@ public struct SageTasksView: View {
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .foregroundStyle(Self.sage)
             .background(Self.sage.opacity(0.15), in: Capsule())
+            .foregroundStyle(Self.sage)
     }
+
+    #if canImport(UIKit)
+    private func ingestDraftPhotos(_ items: [PhotosPickerItem]) async {
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self),
+                  let jpeg = SageTasksViewModel.jpegAttachment(from: data)
+            else { continue }
+            tasks.addDraftImage(jpeg)
+        }
+        draftPhotoItems = []
+    }
+
+    private func ingestAttachPhotos(_ items: [PhotosPickerItem], to task: AgentTask) async {
+        var jpegs: [Data] = []
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self),
+                  let jpeg = SageTasksViewModel.jpegAttachment(from: data)
+            else { continue }
+            jpegs.append(jpeg)
+        }
+        await tasks.attachImages(to: task, jpegData: jpegs)
+        attachPhotoItems = []
+        attachTarget = nil
+    }
+    #endif
 
     private static func icon(for agent: String) -> String {
         switch agent.lowercased() {
         case "claude": return "chevron.left.forwardslash.chevron.right"
         case "max": return "figure.strengthtraining.traditional"
         case "remy": return "fork.knife"
-        case "scholar": return "text.book.closed"
+        case "scholar": return "book"
+        case "ivy": return "leaf"
         case "sage": return "checklist"
         default: return "sparkles"
         }
     }
 
     private static func dateLabel(_ date: Date) -> String {
-        let df = DateFormatter()
-        df.dateStyle = .medium
-        df.timeStyle = .short
-        return df.string(from: date)
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+/// Horizontal thumbnails for persisted task images.
+private struct TaskImageStrip: View {
+    let fileNames: [String]
+    let tasks: SageTasksViewModel
+    let onRemove: (String) -> Void
+    @State private var urls: [String: URL] = [:]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(fileNames, id: \.self) { name in
+                    ZStack(alignment: .topTrailing) {
+                        Group {
+                            #if canImport(UIKit)
+                            if let url = urls[name],
+                               let data = try? Data(contentsOf: url),
+                               let ui = UIImage(data: data)
+                            {
+                                Image(uiImage: ui)
+                                    .resizable()
+                                    .scaledToFill()
+                            } else {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.secondary.opacity(0.15))
+                                    .overlay { ProgressView().scaleEffect(0.7) }
+                            }
+                            #else
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.15))
+                            #endif
+                        }
+                        .frame(width: 56, height: 56)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                        Button {
+                            onRemove(name)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.55))
+                        }
+                        .offset(x: 4, y: -4)
+                    }
+                }
+            }
+        }
+        .task(id: fileNames.joined(separator: ",")) {
+            var next: [String: URL] = [:]
+            for name in fileNames {
+                if let url = await tasks.imageURL(for: name) {
+                    next[name] = url
+                }
+            }
+            urls = next
+        }
     }
 }

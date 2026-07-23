@@ -244,10 +244,22 @@ public struct SettingsView: View {
                         Label("Re-check bridge", systemImage: "stethoscope")
                     }
                     .disabled(settings.bridgeChecking || settings.bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button {
+                        Task { await settings.restartBridgeFromApp() }
+                    } label: {
+                        HStack {
+                            Label("Restart bridge on PC", systemImage: "arrow.triangle.2.circlepath")
+                            if settings.bridgeChecking {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(settings.bridgeChecking || settings.bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || settings.bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 } header: {
                     Text("Bridge setup")
                 } footer: {
-                    Text("Work top to bottom until Coding tools respond. Missing Cursor/OpenAI keys are configured on the PC in nova-bridge/.env, not in the app.")
+                    Text("Work top to bottom until Coding tools respond. Missing Cursor/OpenAI keys are configured on the PC in nova-bridge/.env, not in the app. “Restart bridge on PC” uses /admin/restart when the bridge is up, or the watchdog kick port (:\(settings.kickPort)) when it is hung/dead on the same LAN/Tailscale IP.")
                 }
 
                 Section {

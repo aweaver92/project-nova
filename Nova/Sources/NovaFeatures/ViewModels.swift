@@ -831,6 +831,8 @@ public final class SettingsViewModel {
     public private(set) var tokenConfiguredOnBridge: Bool?
     public private(set) var previewRemoteReady: Bool?
     public private(set) var tailscaleIp: String?
+    /// Watchdog kick listener port from last successful `/health` (default 8788).
+    public private(set) var kickPort: Int = 8788
     public private(set) var bridgeReachable = false
     /// When true, Realtime tokens come from the bridge (no baked-in OpenAI key).
     public var realtimeUsesBridge: Bool = true
@@ -1271,6 +1273,86 @@ public final class SettingsViewModel {
         return false
     }
 
+    /// Restart the PC bridge from the phone.
+    /// 1. Prefer `POST /admin/restart` when the bridge still answers.
+    /// 2. Otherwise hit the watchdog kick listener on `:kickPort` (LAN / Tailscale IP).
+    /// 3. Poll `/health` until the process is back.
+    public func restartBridgeFromApp() async {
+        let trimmedURL = bridgeBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty else {
+            bridgeStatus = "Set a bridge URL first."
+            return
+        }
+        await store.setBridgeBaseURL(trimmedURL)
+        await store.setBridgeToken(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        bridgeChecking = true
+        defer { bridgeChecking = false }
+
+        bridgeStatus = "Requesting bridge restart…"
+        var accepted = false
+        var via = "bridge"
+
+        let direct = await bridge.restartBridge()
+        if direct.ok {
+            accepted = true
+            via = "bridge"
+        } else {
+            bridgeStatus = "Bridge not responding — trying watchdog kick…"
+            for candidate in kickBaseURLCandidates(bridgeURLString: trimmedURL) {
+                let kick = await bridge.kickBridgeWatchdog(baseURL: candidate)
+                if kick.ok {
+                    accepted = true
+                    via = "watchdog"
+                    break
+                }
+            }
+        }
+
+        guard accepted else {
+            bridgeStatus = """
+            Couldn’t reach the bridge or watchdog kick port (:\(kickPort)). \
+            On the PC run: npm run service:start (in nova-bridge) and ensure NovaBridgeWatchdog is installed.
+            """
+            bridgeReachable = false
+            return
+        }
+
+        bridgeStatus = "Restart accepted via \(via). Waiting for bridge…"
+        // Give the old process a moment to exit before polling.
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        let deadline = Date().addingTimeInterval(55)
+        while Date() < deadline {
+            if await refreshBridgeHealth() {
+                bridgeStatus = "Bridge restarted (\(via)). " + bridgeStatus
+                return
+            }
+            bridgeStatus = "Restart accepted via \(via). Waiting for bridge…"
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+
+        bridgeStatus = "Restart was requested (\(via)), but /health did not recover within 60s."
+        bridgeReachable = false
+    }
+
+    private func kickBaseURLCandidates(bridgeURLString: String) -> [URL] {
+        var hosts: [String] = []
+        if let url = URL(string: bridgeURLString), let host = url.host, !host.isEmpty {
+            hosts.append(host)
+        }
+        if let ip = tailscaleIp, !ip.isEmpty {
+            hosts.append(ip)
+        }
+        // Prefer raw IPs for the kick listener; Tailscale Serve hostnames
+        // usually only forward the main bridge port.
+        let unique = hosts.reduce(into: [String]()) { result, host in
+            if !result.contains(host) { result.append(host) }
+        }
+        return unique.compactMap { host in
+            URL(string: "http://\(host):\(kickPort)/")
+        }
+    }
+
     private func applyHealthPayload(_ payloadJSON: String) {
         guard let data = payloadJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -1292,6 +1374,11 @@ public final class SettingsViewModel {
             tailscaleIp = ip
         } else {
             tailscaleIp = nil
+        }
+        if let port = obj["kickPort"] as? Int, port > 0 {
+            kickPort = port
+        } else if let port = obj["kickPort"] as? NSNumber, port.intValue > 0 {
+            kickPort = port.intValue
         }
     }
 

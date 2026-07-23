@@ -11,6 +11,7 @@ public struct AgentsView: View {
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var study: StudyViewModel
     @Bindable var garden: IvyGardenViewModel
+    @Bindable var conversation: ConversationViewModel
     var showSettings: () -> Void
 
     /// Drives programmatic pushes from `agents.pendingRoute` (Assistant-tab CTAs
@@ -25,6 +26,7 @@ public struct AgentsView: View {
         kitchen: RemyKitchenViewModel,
         study: StudyViewModel,
         garden: IvyGardenViewModel,
+        conversation: ConversationViewModel,
         showSettings: @escaping () -> Void = {}
     ) {
         self.agents = agents
@@ -34,16 +36,23 @@ public struct AgentsView: View {
         self.kitchen = kitchen
         self.study = study
         self.garden = garden
+        self.conversation = conversation
         self.showSettings = showSettings
     }
 
     public var body: some View {
         NavigationStack(path: $path) {
             List {
+                Section {
+                    NovaUI.AgentVoiceChatBar(conversation: conversation)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        .listRowBackground(Color.clear)
+                }
+
                 if agents.isClaudeActive {
                     Section {
                         NavigationLink {
-                            CodingView(coding: coding, embedded: true)
+                            CodingView(coding: coding, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -73,7 +82,7 @@ public struct AgentsView: View {
                 if agents.isMaxActive {
                     Section {
                         NavigationLink {
-                            TrainingView(training: training, embedded: true)
+                            TrainingView(training: training, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -99,7 +108,7 @@ public struct AgentsView: View {
                 if agents.isSageActive {
                     Section {
                         NavigationLink {
-                            SageTasksView(tasks: tasks, embedded: true)
+                            SageTasksView(tasks: tasks, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -123,7 +132,7 @@ public struct AgentsView: View {
                 if agents.isRemyActive {
                     Section {
                         NavigationLink {
-                            RemyKitchenView(kitchen: kitchen, embedded: true)
+                            RemyKitchenView(kitchen: kitchen, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -149,7 +158,7 @@ public struct AgentsView: View {
                 if agents.isScholarActive {
                     Section {
                         NavigationLink {
-                            StudyView(study: study, embedded: true)
+                            StudyView(study: study, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -173,7 +182,7 @@ public struct AgentsView: View {
                 if agents.isIvyActive {
                     Section {
                         NavigationLink {
-                            IvyGardenView(garden: garden, embedded: true)
+                            IvyGardenView(garden: garden, conversation: conversation, embedded: true)
                         } label: {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -275,7 +284,7 @@ public struct AgentsView: View {
                 get: { study.shouldPresentStudy },
                 set: { if !$0 { study.clearPresentFlag() } }
             )) {
-                StudyView(study: study, embedded: true)
+                StudyView(study: study, conversation: conversation, embedded: true)
             }
             .navigationDestination(for: AgentsPendingRoute.self) { route in
                 specialistDestination(route)
@@ -312,17 +321,17 @@ public struct AgentsView: View {
     private func specialistDestination(_ route: AgentsPendingRoute) -> some View {
         switch route {
         case .coding:
-            CodingView(coding: coding, embedded: true)
+            CodingView(coding: coding, conversation: conversation, embedded: true)
         case .training:
-            TrainingView(training: training, embedded: true)
+            TrainingView(training: training, conversation: conversation, embedded: true)
         case .tasks:
-            SageTasksView(tasks: tasks, embedded: true)
+            SageTasksView(tasks: tasks, conversation: conversation, embedded: true)
         case .kitchen:
-            RemyKitchenView(kitchen: kitchen, embedded: true)
+            RemyKitchenView(kitchen: kitchen, conversation: conversation, embedded: true)
         case .study:
-            StudyView(study: study, embedded: true)
+            StudyView(study: study, conversation: conversation, embedded: true)
         case .garden:
-            IvyGardenView(garden: garden, embedded: true)
+            IvyGardenView(garden: garden, conversation: conversation, embedded: true)
         }
     }
 }

@@ -25,8 +25,13 @@ public struct GardenClimateClient: Sendable {
         let (lastSpring, firstFall) = Self.frostAnchors(dailyMins: mins, year: year)
         let mappedLast = Self.mapDayOfYear(lastSpring, onto: now)
         let mappedFirst = Self.mapDayOfYear(firstFall, onto: now)
+        let extremeMin = mins.map(\.1).min()
+        let zone = extremeMin.map { GardenLifeCycleDiff.usdaZone(fromExtremeMinFahrenheit: $0) }
 
         var parts: [String] = []
+        if let zone {
+            parts.append("approx. USDA zone \(zone)")
+        }
         if let mappedLast, let label = GardenPlanningDiff.formatDate(mappedLast) {
             parts.append("typical last spring frost ~\(label)")
         }
@@ -41,6 +46,7 @@ public struct GardenClimateClient: Sendable {
             city: geo.name,
             lastSpringFrost: mappedLast,
             firstFallFrost: mappedFirst,
+            hardinessZone: zone,
             summary: summary
         )
     }

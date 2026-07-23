@@ -47,7 +47,9 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /preview                  active previews
  *   POST /preview/start            { repoId, path? }  → LAN preview URL
  *   POST /preview/stop             { repoId }
+ *   POST /admin/restart            → spawn start-bridge.ps1 and exit (auth)
  *   GET  /health                   (unauthenticated liveness check)
+ *                                  also reports kickPort for the watchdog kick listener
  */
 
 // --- Minimal .env loader (no dependency) -----------------------------------
@@ -77,6 +79,7 @@ const RIPGREP_PATH = bootstrapCursorRipgrep();
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST?.trim() || "0.0.0.0";
+const KICK_PORT = Number(process.env.NOVA_BRIDGE_KICK_PORT ?? 8788);
 const TOKEN = process.env.NOVA_BRIDGE_TOKEN ?? "";
 const CURSOR_API_KEY = process.env.CURSOR_API_KEY ?? "";
 const CURSOR_MODEL = process.env.CURSOR_MODEL ?? "composer-2.5";
@@ -179,7 +182,62 @@ app.get("/health", (_req, res) => {
     tokenConfigured: TOKEN.length > 0,
     tailscaleIp: tsIp,
     previewRemoteReady: Boolean(tsIp),
+    kickPort: Number.isFinite(KICK_PORT) && KICK_PORT > 0 ? KICK_PORT : 8788,
   });
+});
+
+/**
+ * Phone "Restart bridge" control. Responds first, then launches start-bridge.ps1
+ * (which kills this process and starts a fresh one). Requires the bridge token —
+ * when the bridge is fully dead, use the watchdog kick listener on `kickPort`.
+ */
+app.post("/admin/restart", requireAuth, (_req, res) => {
+  const script = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "scripts",
+    "start-bridge.ps1",
+  );
+  if (!existsSync(script)) {
+    res.status(500).json({
+      ok: false,
+      error: "restart_script_missing",
+      detail: script,
+    });
+    return;
+  }
+  res.json({
+    ok: true,
+    restarting: true,
+    hint: "Bridge is restarting; poll /health for ~30s.",
+  });
+  setTimeout(() => {
+    try {
+      const child = spawn(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          script,
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+          cwd: path.dirname(script),
+        },
+      );
+      child.unref();
+    } catch (err) {
+      console.error("admin/restart spawn failed:", describe(err));
+    }
+    // Give the HTTP response a moment to flush, then drop this process so
+    // start-bridge can bind the port (it also force-kills stale server.ts).
+    setTimeout(() => process.exit(0), 150).unref();
+  }, 50).unref();
 });
 
 // --- Repositories -----------------------------------------------------------

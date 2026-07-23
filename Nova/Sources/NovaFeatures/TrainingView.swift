@@ -7,6 +7,7 @@ import NovaDomain
 /// calmer specialist screens.
 public struct TrainingView: View {
     @Bindable var training: TrainingViewModel
+    @Bindable var conversation: ConversationViewModel
     var embedded: Bool = false
     @State private var editingPlan: WorkoutPlan?
     @State private var showNewPlan = false
@@ -20,8 +21,9 @@ public struct TrainingView: View {
         endPoint: .bottomTrailing
     )
 
-    public init(training: TrainingViewModel, embedded: Bool = false) {
+    public init(training: TrainingViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
         self.training = training
+        self.conversation = conversation
         self.embedded = embedded
     }
 
@@ -40,6 +42,7 @@ public struct TrainingView: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 14) {
+                NovaUI.AgentVoiceChatBar(conversation: conversation)
                 if training.hasActiveSession {
                     liveHero
                     restCard

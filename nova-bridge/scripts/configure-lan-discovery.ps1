@@ -24,12 +24,15 @@ if (-not $isAdmin) {
 
 $root = Split-Path -Parent (Split-Path -Parent $scriptPath)
 $port = 8787
+$kickPort = 8788
 $envFile = Join-Path $root ".env"
 if (Test-Path $envFile) {
     foreach ($line in Get-Content $envFile) {
         if ($line -match '^\s*PORT\s*=\s*(\d+)') {
             $port = [int]$Matches[1]
-            break
+        }
+        if ($line -match '^\s*NOVA_BRIDGE_KICK_PORT\s*=\s*(\d+)') {
+            $kickPort = [int]$Matches[1]
         }
     }
 }
@@ -39,6 +42,11 @@ $rules = @(
         Name = "Nova Bridge API (Private LAN)"
         Protocol = "TCP"
         Port = $port
+    },
+    @{
+        Name = "Nova Bridge Kick (Private LAN)"
+        Protocol = "TCP"
+        Port = $kickPort
     },
     @{
         Name = "Nova Bridge Bonjour (Private LAN)"
