@@ -1886,12 +1886,15 @@ export class RepoService {
     } catch (err) {
       const existing = this.ipaJobs.get(jobId);
       if (!existing) return;
-      const message =
+      const raw =
         err instanceof Error ? err.message.slice(0, 400) : "ipa_build_failed";
+      const detail = /process_timeout_\d+ms/i.test(raw)
+        ? `GitHub Actions IPA job did not finish within ${Math.round(IPA_BUILD_TIMEOUT_MS / 60_000)} minutes (bridge stopped waiting). Check Actions on GitHub — the workflow may still be running or queued. If it finished later, run Commit and Build again or download the IPA with Nova/scripts/run-ipa-ci.ps1.`
+        : raw;
       this.ipaJobs.set(jobId, {
         ...existing,
         buildStatus: "failed",
-        detail: message,
+        detail,
         errorCode: "ipa_build_failed",
         updatedAt: Date.now(),
       });
@@ -2030,6 +2033,11 @@ export function extractPrUrl(text: string): string | null {
 
 /** Prefer Swift/xcodebuild errors over Node/action deprecation noise in IPA logs. */
 export function summarizeIpaBuildFailure(combined: string): string {
+  const timeout = combined.match(/process_timeout_(\d+)ms/i);
+  if (timeout) {
+    const minutes = Math.max(1, Math.round(Number(timeout[1]) / 60_000));
+    return `GitHub Actions IPA wait timed out after ${minutes} minutes. Check the Actions tab — CI may still be running; retry Commit and Build or run Nova/scripts/run-ipa-ci.ps1 when it finishes.`;
+  }
   const lines = combined.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const noise =
     /Node\.js 20|actions\/checkout|actions\/setup-node|github\.blog\/changelog|DEPRECATED/i;

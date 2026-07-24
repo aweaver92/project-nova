@@ -141,6 +141,9 @@ section("summarizeIpaBuildFailure prefers Swift errors");
   const summary = summarizeIpaBuildFailure(noisy);
   assert.match(summary, /isStreaming|isSessionActive/);
   assert.doesNotMatch(summary, /checkout@v4|setup-node@v4/);
+  const timedOut = summarizeIpaBuildFailure("process_timeout_2700000ms");
+  assert.match(timedOut, /45 minutes/i);
+  assert.match(timedOut, /Actions/i);
 }
 
 section("path containment rejects symlink escape");
