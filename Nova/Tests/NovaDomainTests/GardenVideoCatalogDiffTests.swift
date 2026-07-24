@@ -1,4 +1,5 @@
 import XCTest
+@testable import NovaCore
 @testable import NovaDomain
 
 final class GardenVideoCatalogDiffTests: XCTestCase {
@@ -245,5 +246,76 @@ final class GardenVideoCatalogDiffTests: XCTestCase {
         XCTAssertEqual(plants[0].suggestedActions, [])
         XCTAssertEqual(plants[0].seasonalNotes, "")
         XCTAssertNil(plants[0].healthStatus)
+    }
+
+    func testParseBoundingBoxFromArray() {
+        let box = GardenVideoCatalogDiff.parseBoundingBox([0.1, 0.2, 0.3, 0.4])
+        XCTAssertEqual(box?.x ?? -1, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(box?.y ?? -1, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(box?.width ?? -1, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(box?.height ?? -1, 0.4, accuracy: 0.0001)
+        XCTAssertNil(GardenVideoCatalogDiff.parseBoundingBox([0.1, 0.2]))
+        XCTAssertNil(GardenVideoCatalogDiff.parseBoundingBox([0, 0, 0.005, 0.005]))
+    }
+
+    func testParseFrameJSONReadsBBox() {
+        let json = """
+        {"plants":[{"name":"Basil","species":"Ocimum basilicum","confidence":0.9,
+          "care_tips":"Pinch","bbox":[0.05,0.1,0.4,0.6]},
+         {"name":"Tomato","species":"Solanum lycopersicum","confidence":0.88,
+          "care_tips":"Water","bbox":[0.55,0.15,0.4,0.7]}]}
+        """
+        let drafts = GardenVideoCatalogDiff.parseFrameJSON(json, library: [])
+        XCTAssertEqual(drafts.count, 2)
+        XCTAssertEqual(drafts[0].boundingBox?.width ?? 0, 0.4, accuracy: 0.001)
+        XCTAssertEqual(drafts[1].boundingBox?.x ?? 0, 0.55, accuracy: 0.001)
+    }
+
+    func testMergeKeepsDistinctBoxedSpecimensSeparate() {
+        let left = CatalogPlantDraft(
+            name: "Tomato",
+            species: "Solanum lycopersicum",
+            confidence: 0.9,
+            boundingBox: PlantBoundingBox(x: 0.05, y: 0.1, width: 0.35, height: 0.7)
+        )
+        let right = CatalogPlantDraft(
+            name: "Tomato",
+            species: "Solanum lycopersicum",
+            confidence: 0.88,
+            boundingBox: PlantBoundingBox(x: 0.55, y: 0.1, width: 0.4, height: 0.7)
+        )
+        let merged = GardenVideoCatalogDiff.mergeDrafts([left, right])
+        XCTAssertEqual(merged.count, 2)
+    }
+
+    func testDedupeLibraryMatchesForMultiPlant() {
+        let id = UUID()
+        let a = CatalogPlantDraft(
+            name: "Tomato",
+            matchedPlantId: id,
+            confidence: 0.95,
+            boundingBox: PlantBoundingBox(x: 0.0, y: 0.0, width: 0.4, height: 0.8)
+        )
+        let b = CatalogPlantDraft(
+            name: "Tomato",
+            matchedPlantId: id,
+            confidence: 0.8,
+            boundingBox: PlantBoundingBox(x: 0.5, y: 0.0, width: 0.4, height: 0.8)
+        )
+        let prepared = GardenVideoCatalogDiff.dedupeLibraryMatchesForMultiPlant([a, b])
+        XCTAssertEqual(prepared.filter { $0.matchedPlantId == id }.count, 1)
+        XCTAssertEqual(prepared.filter { $0.matchedPlantId == nil }.count, 1)
+    }
+
+    func testBoundingBoxPixelRectAppliesPadding() {
+        let box = PlantBoundingBox(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        let rect = box.pixelRect(imageWidth: 100, imageHeight: 100, padding: 0.0)
+        XCTAssertEqual(rect?.x, 25)
+        XCTAssertEqual(rect?.y, 25)
+        XCTAssertEqual(rect?.width, 50)
+        XCTAssertEqual(rect?.height, 50)
+        let padded = box.pixelRect(imageWidth: 100, imageHeight: 100, padding: 0.1)
+        XCTAssertEqual(padded?.x, 20)
+        XCTAssertEqual(padded?.width, 60)
     }
 }

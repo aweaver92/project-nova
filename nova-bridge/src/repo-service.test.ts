@@ -275,6 +275,37 @@ async function realGitIntegration(): Promise<void> {
     assert.throws(() => svc.resolveRepoPath(repoId, "../outside"), RepoError);
     assert.throws(() => svc.resolveRepoPath(repoId, ".git/config"), RepoError);
 
+    section("repository file upload");
+    const uploaded = svc.writeFile(
+      repoId,
+      "src/from-phone.txt",
+      Buffer.from("hello from phone", "utf8"),
+      { overwrite: false },
+    );
+    assert.equal(uploaded.path, "src/from-phone.txt");
+    assert.equal(uploaded.created, true);
+    assert.equal(uploaded.size, Buffer.byteLength("hello from phone"));
+    assert.equal(
+      readFileSync(join(base, "src", "from-phone.txt"), "utf8"),
+      "hello from phone",
+    );
+    assert.throws(
+      () =>
+        svc.writeFile(repoId, "src/from-phone.txt", Buffer.from("x"), {
+          overwrite: false,
+        }),
+      RepoError,
+    );
+    const replaced = svc.writeFile(
+      repoId,
+      "src/from-phone.txt",
+      Buffer.from("replaced", "utf8"),
+      { overwrite: true },
+    );
+    assert.equal(replaced.created, false);
+    assert.throws(() => svc.writeFile(repoId, "../escape.txt", Buffer.from("x")), RepoError);
+    assert.throws(() => svc.writeFile(repoId, ".env", Buffer.from("x")), RepoError);
+
     section("bounded Nova self-code search + read");
     const selfRepo = svc.resolveNovaRepo();
     assert.equal(selfRepo.id, repoId);

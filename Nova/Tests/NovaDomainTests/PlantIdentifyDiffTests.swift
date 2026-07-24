@@ -1,4 +1,5 @@
 import XCTest
+@testable import NovaCore
 @testable import NovaDomain
 
 final class PlantIdentifyDiffTests: XCTestCase {
@@ -71,6 +72,30 @@ final class PlantIdentifyDiffTests: XCTestCase {
         XCTAssertEqual(result.plants.count, 1)
         XCTAssertEqual(result.plants[0].name, "Basil")
         XCTAssertTrue(PlantIdentifyDiff.shouldSaveAsNew(result.plants[0]))
+    }
+
+    func testParseModelJSONReadsBBox() {
+        let json = """
+        {"plants":[
+          {"name":"Basil","species":"Ocimum basilicum","confidence":0.9,"care_tips":"Pinch","bbox":[0.1,0.2,0.3,0.4]},
+          {"name":"Mint","species":"Mentha spicata","confidence":0.88,"care_tips":"Trim","bbox":[0.55,0.2,0.35,0.5]}
+        ]}
+        """
+        let result = PlantIdentifyDiff.parseModelJSON(json, library: [])
+        XCTAssertEqual(result.plants.count, 2)
+        XCTAssertEqual(result.plants[0].boundingBox?.x ?? -1, 0.1, accuracy: 0.001)
+        XCTAssertEqual(result.plants[1].boundingBox?.width ?? -1, 0.35, accuracy: 0.001)
+    }
+
+    func testDedupeLibraryMatchesForMultiPlantHits() {
+        let id = UUID()
+        let hits = [
+            PlantIdentifyHit(name: "Tomato", matchedPlantId: id, confidence: 0.95),
+            PlantIdentifyHit(name: "Tomato", matchedPlantId: id, confidence: 0.8)
+        ]
+        let prepared = PlantIdentifyDiff.dedupeLibraryMatchesForMultiPlant(hits)
+        XCTAssertEqual(prepared.filter { $0.matchedPlantId == id }.count, 1)
+        XCTAssertEqual(prepared.filter { $0.matchedPlantId == nil }.count, 1)
     }
 
     func testShouldPersistLibraryMatchButNotSaveAsNew() {

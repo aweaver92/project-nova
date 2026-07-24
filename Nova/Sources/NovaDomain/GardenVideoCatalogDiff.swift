@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 
 /// Pure helpers for Ivy's video plant catalog: enumerate every distinct plant,
 /// build profiles (actions + seasonal notes), and synthesize a Garden Overview.
@@ -43,6 +44,10 @@ public enum GardenVideoCatalogDiff {
         - Do NOT invent a Latin binomial when unsure — omit species instead.
         - In a mixed bed, list only distinct, clearly identifiable types — never guess among similar annuals.
         - Prefer one primary plant when the frame is a close-up of a single specimen.
+        - When MULTIPLE distinct plants are clearly visible, list EACH separately and give a tight \
+        bbox [x,y,width,height] normalized 0–1 (origin top-left) around that plant only so each \
+        can be cropped into its own profile photo.
+        - For a single close-up, bbox may be omitted or nearly full-frame.
         - If nothing is confidently identifiable, return {"plants":[]}.
         - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
         - seasonal_info and suggested_actions must match the CURRENT season/climate below — \
@@ -51,7 +56,8 @@ public enum GardenVideoCatalogDiff {
         Reply with ONLY valid JSON (no markdown):
         {"plants":[{"name":"Tomato","species":"Solanum lycopersicum","matched_library":"",\
         "confidence":0.0,"health":"ok|needs_water|stressed|unknown","care_tips":"…",\
-        "suggested_actions":["…"],"seasonal_info":"…","is_outdoor":true,"frost_sensitive":true}],\
+        "suggested_actions":["…"],"seasonal_info":"…","is_outdoor":true,"frost_sensitive":true,\
+        "bbox":[0.1,0.2,0.35,0.5]}],\
         "frame_notes":"optional"}
         Season & climate:
         \(seasonBlock)
@@ -161,10 +167,67 @@ public enum GardenVideoCatalogDiff {
                 isOutdoor: dict["is_outdoor"] as? Bool,
                 frostSensitive: dict["frost_sensitive"] as? Bool,
                 imageData: imageData,
+                boundingBox: parseBoundingBox(dict["bbox"] ?? dict["bounding_box"]),
                 observationCount: 1
             )
         }
         return filterReliableDrafts(drafts)
+    }
+
+    /// Parse `[x,y,w,h]` or `{x,y,width,height}` normalized boxes.
+    public static func parseBoundingBox(_ value: Any?) -> PlantBoundingBox? {
+        if let arr = value as? [Double], arr.count >= 4 {
+            let box = PlantBoundingBox(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
+            return box.isValid ? box.clamped() : nil
+        }
+        if let arr = value as? [NSNumber], arr.count >= 4 {
+            let box = PlantBoundingBox(
+                x: arr[0].doubleValue,
+                y: arr[1].doubleValue,
+                width: arr[2].doubleValue,
+                height: arr[3].doubleValue
+            )
+            return box.isValid ? box.clamped() : nil
+        }
+        if let arr = value as? [Any], arr.count >= 4 {
+            let nums = arr.prefix(4).compactMap { parseConfidence($0) }
+            guard nums.count == 4 else { return nil }
+            let box = PlantBoundingBox(x: nums[0], y: nums[1], width: nums[2], height: nums[3])
+            return box.isValid ? box.clamped() : nil
+        }
+        if let dict = value as? [String: Any] {
+            guard let x = parseConfidence(dict["x"]),
+                  let y = parseConfidence(dict["y"])
+            else { return nil }
+            let w = parseConfidence(dict["width"] ?? dict["w"])
+            let h = parseConfidence(dict["height"] ?? dict["h"])
+            guard let w, let h else { return nil }
+            let box = PlantBoundingBox(x: x, y: y, width: w, height: h)
+            return box.isValid ? box.clamped() : nil
+        }
+        return nil
+    }
+
+    /// When several plants in one frame resolve to the same library row, keep the
+    /// match on the strongest hit only so the others become separate profiles.
+    public static func dedupeLibraryMatchesForMultiPlant(_ drafts: [CatalogPlantDraft]) -> [CatalogPlantDraft] {
+        guard drafts.count > 1 else { return drafts }
+        var claimed = Set<UUID>()
+        let ranked = drafts.sorted { ($0.confidence ?? 0) > ($1.confidence ?? 0) }
+        var keepMatchIds = Set<UUID>()
+        for draft in ranked {
+            guard let id = draft.matchedPlantId else { continue }
+            if claimed.insert(id).inserted {
+                keepMatchIds.insert(draft.id)
+            }
+        }
+        return drafts.map { draft in
+            guard draft.matchedPlantId != nil, !keepMatchIds.contains(draft.id) else { return draft }
+            var next = draft
+            next.matchedPlantId = nil
+            next.matchedLibraryName = nil
+            return next
+        }
     }
 
     /// Drop vague / low-confidence IDs before merge or save.
@@ -441,42 +504,61 @@ public enum GardenVideoCatalogDiff {
     }
 
     /// Prefer library id; only merge by species when names also agree; fuzzy names carefully.
+    /// Distinct non-overlapping bounding boxes stay separate specimens (even same species).
     private static func canonicalMergeKey(
         for draft: CatalogPlantDraft,
         existingKeys: [String],
         groups: [String: [CatalogPlantDraft]]
     ) -> String {
         if let id = draft.matchedPlantId {
-            return "id:\(id.uuidString.lowercased())"
+            let key = "id:\(id.uuidString.lowercased())"
+            if let peers = groups[key], isDistinctBoxedSpecimen(draft, from: peers) {
+                return "specimen:\(draft.id.uuidString.lowercased())"
+            }
+            return key
         }
 
         let tokens = nameTokens(draft.name)
-        // Match an existing name cluster when tokens strongly agree.
         for key in existingKeys where key.hasPrefix("name:") {
             let other = String(key.dropFirst("name:".count))
             if nameTokensCompatible(tokens, nameTokens(other), requireStrongToken: true) {
+                if let peers = groups[key], isDistinctBoxedSpecimen(draft, from: peers) {
+                    return "specimen:\(draft.id.uuidString.lowercased())"
+                }
                 return key
             }
         }
-        // Species merge only when an existing draft of that species has a compatible name.
+
         let speciesKey = (draft.species ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !speciesKey.isEmpty {
             let sp = "sp:\(speciesKey)"
             if existingKeys.contains(sp), let existing = groups[sp]?.first {
+                if let peers = groups[sp], isDistinctBoxedSpecimen(draft, from: peers) {
+                    return "specimen:\(draft.id.uuidString.lowercased())"
+                }
                 if nameTokensCompatible(tokens, nameTokens(existing.name), requireStrongToken: false)
                     || namesLikelySame(draft.name, existing.name)
                 {
                     return sp
                 }
-                // Same species but different common names → keep separate specimens.
                 return "name:\(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
             }
-            // First time we see this species: use species key only if name is empty of tokens? Prefer name key.
-            // Use species key so later compatible frames can join.
             return sp
         }
 
         return "name:\(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+    }
+
+    /// True when this draft's box clearly does not overlap an existing peer box.
+    private static func isDistinctBoxedSpecimen(
+        _ draft: CatalogPlantDraft,
+        from peers: [CatalogPlantDraft]
+    ) -> Bool {
+        guard let box = draft.boundingBox else { return false }
+        return peers.contains { peer in
+            guard let peerBox = peer.boundingBox else { return false }
+            return box.iou(with: peerBox) < 0.25
+        }
     }
 
     private static func resolveConsensus(_ drafts: [CatalogPlantDraft]) -> CatalogPlantDraft? {
@@ -575,9 +657,21 @@ public enum GardenVideoCatalogDiff {
             if (merged.imageData == nil || merged.imageData?.isEmpty == true),
                let image = draft.imageData, !image.isEmpty {
                 merged.imageData = image
+                if merged.boundingBox == nil { merged.boundingBox = draft.boundingBox }
             } else if (draft.confidence ?? 0) > (merged.confidence ?? 0),
                       let image = draft.imageData, !image.isEmpty {
                 merged.imageData = image
+                merged.boundingBox = draft.boundingBox ?? merged.boundingBox
+            } else if merged.boundingBox == nil {
+                merged.boundingBox = draft.boundingBox
+            } else if let draftBox = draft.boundingBox,
+                      let mergedBox = merged.boundingBox,
+                      draftBox.area < mergedBox.area * 0.85,
+                      (draft.confidence ?? 0) + 0.05 >= (merged.confidence ?? 0),
+                      let image = draft.imageData, !image.isEmpty {
+                // Prefer a tighter crop of the same plant when confidence is comparable.
+                merged.imageData = image
+                merged.boundingBox = draftBox
             }
             if let conf = draft.confidence, conf > (merged.confidence ?? 0) {
                 merged.confidence = conf

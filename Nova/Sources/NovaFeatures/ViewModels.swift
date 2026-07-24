@@ -2027,6 +2027,8 @@ public final class CodingViewModel {
     /// survived phone lock / SSE drop without replaying the prompt.
     public func resumePendingCursorRunIfNeeded() async {
         if isResumingCursorRun { return }
+        // Live execute owns the SSE — never cancel it to "reattach".
+        if isProcessingPromptQueue { return }
 
         let pending = PendingCursorRunStore.load()
         let runId = pending?.runId ?? activeRunId
@@ -2034,10 +2036,7 @@ public final class CodingViewModel {
         // Live execute still owns the SSE — never cancel/reconnect underneath it,
         // even if events went quiet while the phone was locked.
         if isRunning, runStatus == "running" {
-            if isProcessingPromptQueue
-                || hasFreshSSEActivity
-                || isHoldingBackgroundCodingConnection
-            {
+            if hasFreshSSEActivity || isHoldingBackgroundCodingConnection {
                 return
             }
         }
@@ -2070,11 +2069,12 @@ public final class CodingViewModel {
         stallPhase = .stillWorking
         runStartedAt = runStartedAt ?? pending?.startedAt ?? Date()
         lastSSEActivityAt = Date()
-        statusMessage = "Reconnecting to the coding run that kept going on your PC…"
+        let short = Self.shortId(runId)
+        statusMessage = "Reconnecting to Cursor run \(short) on your PC — poll only, prompt will not be resent…"
         upsertActivity(
             phase: "status",
             text: "Reconnecting after unlock…",
-            detail: runId,
+            detail: "run \(short) · session \(Self.shortId(pinnedSessionId)) · poll status",
             done: false
         )
         updateCodingPresence(forceActive: true)
@@ -2112,6 +2112,57 @@ public final class CodingViewModel {
         await refreshSessions()
         await refreshRepoStatusAndDiff()
         await refreshAgentReview()
+
+        // Prompts queued while Cursor was busy can start now.
+        if !isProcessingPromptQueue, !queuedPrompts.isEmpty {
+            statusMessage = "Active run finished — starting \(queuedPrompts.count) queued prompt\(queuedPrompts.count == 1 ? "" : "s")…"
+            upsertActivity(
+                phase: "status",
+                text: "Draining prompt queue",
+                detail: "\(queuedPrompts.count) waiting",
+                done: false
+            )
+            await drainPromptQueue()
+        }
+    }
+
+    /// True while a Cursor run is live or we are reattaching — never start a second send.
+    public var blocksNewCursorSend: Bool {
+        isRunning || isResumingCursorRun || runStatus == "reconnecting"
+    }
+
+    /// A persisted or in-memory run id we can poll without sending a new prompt.
+    public var canReattachToActiveRun: Bool {
+        let runId = activeRunId ?? PendingCursorRunStore.load()?.runId
+        return runId?.isEmpty == false
+    }
+
+    /// User-facing: reattach to the PC run without replaying the prompt.
+    public func reattachToActiveRun(userInitiated: Bool = true) async {
+        let runId = activeRunId ?? PendingCursorRunStore.load()?.runId
+        guard let runId, !runId.isEmpty else {
+            statusMessage = "No active Cursor run to reattach to. Send a new prompt when ready."
+            upsertActivity(
+                phase: "status",
+                text: "Nothing to reattach",
+                detail: "No pending run id on this phone",
+                done: true
+            )
+            return
+        }
+        if userInitiated {
+            statusMessage = "Reattaching to Cursor run \(Self.shortId(runId)) — checking status on your PC (prompt not resent)…"
+            upsertActivity(
+                phase: "status",
+                text: "Reattach requested",
+                detail: "run \(Self.shortId(runId)) · poll only",
+                done: false
+            )
+        }
+        await resumePendingCursorRunIfNeeded()
+        if !blocksNewCursorSend, !isProcessingPromptQueue, !queuedPrompts.isEmpty {
+            await drainPromptQueue()
+        }
     }
 
     private var hasFreshSSEActivity: Bool {
@@ -2367,6 +2418,62 @@ public final class CodingViewModel {
         guard !repoBrowsePath.isEmpty else { return }
         let parent = repoBrowsePath.split(separator: "/").dropLast().joined(separator: "/")
         await browseRepository(path: parent)
+    }
+
+    /// Write a phone-picked file into the selected repo under `repoBrowsePath`
+    /// (or repo root). Returns true on success.
+    @discardableResult
+    public func uploadFileToCurrentRepo(
+        fileName: String,
+        data: Data,
+        overwrite: Bool = true
+    ) async -> Bool {
+        guard let repoId = selectedRepoId, !repoId.isEmpty else {
+            statusMessage = "Select a repository before uploading."
+            return false
+        }
+        let leaf = (fileName as NSString).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !leaf.isEmpty, !leaf.hasPrefix("."), !leaf.contains("/"), !leaf.contains("\\") else {
+            statusMessage = "Invalid file name for upload."
+            return false
+        }
+        guard !data.isEmpty else {
+            statusMessage = "That file is empty."
+            return false
+        }
+        guard data.count <= 8 * 1024 * 1024 else {
+            statusMessage = "File is larger than 8 MB — pick a smaller file."
+            return false
+        }
+        let directory = repoBrowsePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let relativePath = directory.isEmpty ? leaf : "\(directory)/\(leaf)"
+        isLoadingRepoFiles = true
+        defer { isLoadingRepoFiles = false }
+        statusMessage = "Uploading \(leaf) to \(selectedRepoName)…"
+        let result = await bridge.writeRepositoryFile(
+            repoId: repoId,
+            path: relativePath,
+            data: data,
+            overwrite: overwrite
+        )
+        guard result.ok else {
+            statusMessage = "Upload failed: \(Self.summarize(result.payloadJSON))"
+            return false
+        }
+        let sizeLabel = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+        var created = true
+        if let data = result.payloadJSON.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let flag = obj["created"] as? Bool {
+            created = flag
+        }
+        statusMessage = created
+            ? "Uploaded \(relativePath) (\(sizeLabel))"
+            : "Replaced \(relativePath) (\(sizeLabel))"
+        await browseRepository(path: repoBrowsePath)
+        await refreshRepoStatusAndDiff()
+        return true
     }
 
     public func choosePreviewTarget(_ path: String?) {
@@ -2902,6 +3009,24 @@ public final class CodingViewModel {
         )
         queuedPromptCount = queuedPrompts.count
 
+        // Never start a second Cursor send while a run is live or reattaching —
+        // that produces "already has active run" and leaves Coding stuck.
+        if blocksNewCursorSend {
+            let runHint = Self.shortId(activeRunId ?? PendingCursorRunStore.load()?.runId)
+            statusMessage = "Queued behind the active Cursor run\(runHint.isEmpty ? "" : " (\(runHint))") · \(queuedPromptCount) waiting. Will start after this run ends (no second send)…"
+            upsertActivity(
+                phase: "status",
+                text: "Prompt queued — Cursor still busy",
+                detail: "run \(runHint.isEmpty ? "unknown" : runHint) · status \(runStatus) · will start after this run ends",
+                done: true
+            )
+            // Only reattach when we're mid-recovery — never cancel a live execute SSE.
+            if runStatus == "reconnecting" || isResumingCursorRun {
+                await reattachToActiveRun(userInitiated: false)
+            }
+            return
+        }
+
         guard !isProcessingPromptQueue else {
             statusMessage = "Added to queue · \(queuedPromptCount) waiting"
             return
@@ -2990,6 +3115,13 @@ public final class CodingViewModel {
                 )
             )
             queuedPromptCount = queuedPrompts.count
+            if blocksNewCursorSend {
+                statusMessage = "Voice prompt queued behind active Cursor run · \(queuedPromptCount) waiting"
+                Task { @MainActor [weak self] in
+                    await self?.reattachToActiveRun(userInitiated: false)
+                }
+                return
+            }
             if isProcessingPromptQueue {
                 statusMessage = "Voice prompt queued · \(queuedPromptCount) waiting"
                 return
@@ -3001,9 +3133,23 @@ public final class CodingViewModel {
     }
 
     private func drainPromptQueue() async {
+        guard !blocksNewCursorSend else {
+            statusMessage = "Waiting for the active Cursor run before starting queued prompts…"
+            upsertActivity(
+                phase: "status",
+                text: "Queue paused",
+                detail: "\(queuedPrompts.count) waiting · status \(runStatus)",
+                done: false
+            )
+            return
+        }
         isProcessingPromptQueue = true
         defer { isProcessingPromptQueue = false }
         while isCodeViewSessionActive, !queuedPrompts.isEmpty {
+            if blocksNewCursorSend {
+                statusMessage = "Paused queue — Cursor became busy again · \(queuedPrompts.count) still waiting"
+                break
+            }
             let prompt = queuedPrompts.removeFirst()
             queuedPromptCount = queuedPrompts.count
             await execute(prompt)
@@ -3132,6 +3278,63 @@ public final class CodingViewModel {
             completeVoicePrompt(prompt, payload: #"{"ok":false,"error":"cancelled","status":"cancelled"}"#)
             return
         }
+
+        // Second send while Cursor was busy — switch to poll-only recovery.
+        if Self.isActiveRunConflict(result.payloadJSON)
+            || (runStatus == "reconnecting" && items.contains(where: {
+                $0.kind == .error && Self.isActiveRunConflict($0.text)
+            }))
+        {
+            let runId = activeRunId
+                ?? PendingCursorRunStore.load()?.runId
+                ?? Self.string(result.payloadJSON, key: "runId")
+                ?? ""
+            if !runId.isEmpty {
+                activeRunId = runId
+                persistPendingCursorRun(runId: runId)
+                stopWatchdog()
+                statusMessage = "Reattaching to existing Cursor run \(Self.shortId(runId)) after “already has active run”…"
+                upsertActivity(
+                    phase: "status",
+                    text: "Switching to reattach",
+                    detail: "run \(Self.shortId(runId)) · poll only",
+                    done: false
+                )
+                if let recovered = await recoverRunAfterDisconnect(
+                    runId: runId,
+                    generation: generation,
+                    pollImmediately: true
+                ) {
+                    result = recovered
+                    if let sid = Self.string(recovered.payloadJSON, key: "sessionId"), !sid.isEmpty {
+                        pinnedSessionId = sid
+                        await settings.setCodingSessionId(sid)
+                        await loadMessages(sessionId: sid)
+                    }
+                } else {
+                    if generation == runGeneration {
+                        // Recover still owns the loop via unlock, or was aborted.
+                        await persistHistoryTranscript(
+                            entry: historyEntry,
+                            repoId: repoId,
+                            startIndex: transcriptStartIndex
+                        )
+                        completeVoicePrompt(
+                            prompt,
+                            payload: voicePayload(
+                                ok: false,
+                                sessionId: pinnedSessionId,
+                                status: "running",
+                                resultText: "Coding run still in progress on the PC.",
+                                fallback: result.payloadJSON
+                            )
+                        )
+                    }
+                    return
+                }
+            }
+        }
+
         if !result.ok,
            Self.string(result.payloadJSON, key: "status")?.lowercased() == "running",
            let runId = (activeRunId ?? Self.string(result.payloadJSON, key: "runId")),
@@ -3295,31 +3498,30 @@ public final class CodingViewModel {
 
         var attempt = 0
         var delayBeforePoll = !pollImmediately
+        let short = Self.shortId(runId)
         while generation == runGeneration, isRunning {
             attempt += 1
             bgBox.handle = await BackgroundTask.renew(bgBox.handle, name: "nova.cursor-recover")
             runStatus = "reconnecting"
             stallPhase = .stillWorking
             if delayBeforePoll {
-                statusMessage = "Connection lost. Checking the existing action again shortly…"
+                let delay = min(reconnectRetrySeconds, max(0.01, Double(attempt) * 2.0))
+                statusMessage = "Connection lost to run \(short). Waiting \(Int(delay))s then polling PC status (attempt \(attempt)) — prompt will not be resent…"
                 upsertActivity(
                     phase: "status",
                     text: "Reconnecting…",
-                    detail: "Attempt \(attempt) · run \(runId)",
+                    detail: "attempt \(attempt) · run \(short) · wait \(Int(delay))s · poll only",
                     done: false
                 )
-                // Ramp up quickly after unlock (2s, 4s, …) instead of sitting on 15s
-                // while the bridge/VPN is still coming back.
-                let delay = min(reconnectRetrySeconds, max(0.01, Double(attempt) * 2.0))
                 let nanos = UInt64(delay * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
                 guard generation == runGeneration, isRunning else { return nil }
             } else {
-                statusMessage = "Checking the coding run that kept going on your PC…"
+                statusMessage = "Checking Cursor run \(short) on your PC (attempt \(attempt)) — poll only…"
                 upsertActivity(
                     phase: "status",
                     text: "Reconnecting…",
-                    detail: "Attempt \(attempt) · run \(runId)",
+                    detail: "attempt \(attempt) · run \(short) · immediate poll",
                     done: false
                 )
                 delayBeforePoll = true
@@ -3332,12 +3534,24 @@ public final class CodingViewModel {
             {
                 PendingCursorRunStore.clear(runId: runId)
                 runStatus = "error"
-                statusMessage = "That coding run is no longer on the bridge."
-                upsertActivity(phase: "status", text: "Run not found", detail: runId, done: true)
+                statusMessage = "Run \(short) is no longer on the bridge — it may have finished or the bridge restarted. Stop, then send a new prompt if needed."
+                upsertActivity(
+                    phase: "status",
+                    text: "Run not found on bridge",
+                    detail: "run \(short) · \(Self.summarize(statusResult.payloadJSON))",
+                    done: true
+                )
                 return statusResult
             }
             guard statusResult.ok else {
-                statusMessage = "Bridge still unavailable. Retrying shortly…"
+                let summary = Self.summarize(statusResult.payloadJSON)
+                statusMessage = "Bridge unreachable while checking run \(short) (attempt \(attempt)): \(summary). Retrying…"
+                upsertActivity(
+                    phase: "status",
+                    text: "Bridge unavailable",
+                    detail: "attempt \(attempt) · \(summary)",
+                    done: false
+                )
                 continue
             }
 
@@ -3353,11 +3567,11 @@ public final class CodingViewModel {
                 // the job and skip recovery entirely.
                 runStatus = "reconnecting"
                 lastSSEActivityAt = nil
-                statusMessage = "Reconnected. The existing action is still running on your PC."
+                statusMessage = "PC reports run \(short) still running (poll #\(attempt)). Waiting for it to finish — not starting another send…"
                 upsertActivity(
                     phase: "status",
-                    text: "Reconnected — still working…",
-                    detail: runId,
+                    text: "Still running on PC…",
+                    detail: "attempt \(attempt) · run \(short) · status running",
                     done: false
                 )
                 continue
@@ -3365,12 +3579,12 @@ public final class CodingViewModel {
 
             runStatus = status
             statusMessage = status == "finished"
-                ? "Connection restored. Action finished."
-                : "Connection restored. Action ended with status: \(status)."
+                ? "Connection restored. Run \(short) finished on your PC."
+                : "Connection restored. Run \(short) ended with status: \(status)."
             upsertActivity(
                 phase: "status",
-                text: status == "finished" ? "Finished after reconnect" : status.capitalized,
-                detail: runId,
+                text: status == "finished" ? "Finished after reconnect" : "Ended · \(status)",
+                detail: "run \(short) · after \(attempt) poll\(attempt == 1 ? "" : "s")",
                 done: true
             )
             return statusResult
@@ -3413,8 +3627,20 @@ public final class CodingViewModel {
     }
 
     /// Re-send the last prompt (used by the Retry button on error rows).
+    /// If Cursor still has an active/pending run, reattach instead — never double-send.
     public func retryLast() async {
         guard !lastSentCommand.isEmpty else { return }
+        if blocksNewCursorSend || PendingCursorRunStore.load() != nil {
+            statusMessage = "Retry skipped — Cursor still has an active run. Reattaching instead of starting a second one…"
+            upsertActivity(
+                phase: "status",
+                text: "Retry → reattach",
+                detail: "Avoids “already has active run” · run \(Self.shortId(activeRunId ?? PendingCursorRunStore.load()?.runId))",
+                done: true
+            )
+            await reattachToActiveRun(userInitiated: true)
+            return
+        }
         draft = lastSentCommand
         pendingImages = lastSentImages
         await send()
@@ -3769,19 +3995,49 @@ public final class CodingViewModel {
                 items.append(item)
             }
         case "error":
-            items.append(CodingTranscriptItem(kind: .error, text: event.error ?? "Unknown error"))
-            runStatus = "error"
-            upsertActivity(phase: "status", text: "Error", detail: event.error, done: true)
+            let raw = event.error ?? "Unknown error"
+            if Self.isActiveRunConflict(raw) {
+                let short = Self.shortId(activeRunId ?? PendingCursorRunStore.load()?.runId)
+                let friendly = """
+                Cursor refused a second start — that agent already has an active run\
+                \(short.isEmpty ? "" : " (\(short))"). Nova will reattach to the PC run instead of sending again.
+                """
+                items.append(CodingTranscriptItem(kind: .error, text: friendly))
+                runStatus = "reconnecting"
+                statusMessage = friendly
+                upsertActivity(
+                    phase: "status",
+                    text: "Already has active run",
+                    detail: short.isEmpty ? "will reattach after stream ends" : "run \(short) · will reattach",
+                    done: true
+                )
+            } else {
+                items.append(CodingTranscriptItem(kind: .error, text: raw))
+                runStatus = "error"
+                statusMessage = raw
+                upsertActivity(phase: "status", text: "Error", detail: raw, done: true)
+            }
         case "done":
             if let sid = event.sessionId, !sid.isEmpty {
                 pinnedSessionId = sid
                 Task { await settings.setCodingSessionId(sid) }
             }
-            if let runId = event.runId, !runId.isEmpty {
+            if let runId = event.runId, !runId.isEmpty, runId.lowercased() != "unknown" {
                 activeRunId = runId
             }
-            PendingCursorRunStore.clear(runId: event.runId ?? activeRunId)
-            runStatus = (event.status ?? "finished").lowercased()
+            let nextStatus = (event.status ?? "finished").lowercased()
+            let conflict = items.contains {
+                $0.kind == .error && Self.isActiveRunConflict($0.text)
+            }
+            // Keep the pending run id after an “already has active run” conflict so
+            // execute/reattach can poll the live job instead of losing it.
+            if !conflict {
+                PendingCursorRunStore.clear(runId: event.runId ?? activeRunId)
+            } else if let runId = event.runId ?? activeRunId ?? PendingCursorRunStore.load()?.runId,
+                      !runId.isEmpty {
+                persistPendingCursorRun(runId: runId)
+            }
+            runStatus = conflict ? "reconnecting" : nextStatus
             streamingAssistantId = nil
             streamingThinkingId = nil
             for idx in items.indices where items[idx].kind == .tool && !items[idx].isDone {
@@ -3792,10 +4048,17 @@ public final class CodingViewModel {
             }
             upsertActivity(
                 phase: "status",
-                text: runStatus == "finished" ? "Finished" : runStatus.capitalized,
+                text: conflict
+                    ? "Blocked — will reattach"
+                    : (runStatus == "finished" ? "Finished" : runStatus.capitalized),
+                detail: conflict
+                    ? "run \(Self.shortId(activeRunId ?? PendingCursorRunStore.load()?.runId)) · poll only next"
+                    : event.runId,
                 done: true
             )
-            speakProgress(runStatus == "error" ? "Coding run failed." : "Coding run finished.")
+            if !conflict {
+                speakProgress(runStatus == "error" ? "Coding run failed." : "Coding run finished.")
+            }
         case "plan":
             let markdown = (event.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !markdown.isEmpty else { break }
@@ -3985,6 +4248,20 @@ public final class CodingViewModel {
         else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Cursor SDK rejects a second `send` on an agent that still has a live run.
+    private static func isActiveRunConflict(_ text: String) -> Bool {
+        text.localizedCaseInsensitiveContains("already has active run")
+    }
+
+    /// Short id for status banners (full UUIDs are hard to read on phone).
+    private static func shortId(_ value: String?) -> String {
+        guard let value else { return "" }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if trimmed.count <= 12 { return trimmed }
+        return String(trimmed.prefix(8)) + "…"
     }
 
     private static func summarize(_ payloadJSON: String) -> String {

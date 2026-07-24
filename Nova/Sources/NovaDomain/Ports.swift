@@ -1367,6 +1367,13 @@ public protocol AgentBridging: Sendable {
     func repositoryStatus(repoId: String) async -> BridgeResult
     func repositoryDiff(repoId: String) async -> BridgeResult
     func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult
+    /// Upload a file into the repository (phone → PC checkout).
+    func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult
     /// Read-only retrieval against Nova's own source repository, independent of
     /// the Coding-tab repository selection.
     func searchNovaCode(query: String) async -> BridgeResult
@@ -1527,6 +1534,14 @@ public extension AgentBridging {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
+    }
+    func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"unsupported"}"#)
     }
     func searchNovaCode(query: String) async -> BridgeResult {

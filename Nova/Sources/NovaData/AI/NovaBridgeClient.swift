@@ -575,6 +575,35 @@ public actor NovaBridgeClient: AgentBridging {
         }
     }
 
+    public func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"missing_path"}"#)
+        }
+        guard !data.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"empty_file"}"#)
+        }
+        // Keep under the bridge's 16 MB JSON ceiling (base64 expands ~4/3).
+        guard data.count <= 8 * 1024 * 1024 else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"too_large","detail":"max_8mb"}"#)
+        }
+        return await post(
+            path: "repos/\(escaped)/files",
+            body: [
+                "path": trimmedPath,
+                "contentBase64": data.base64EncodedString(),
+                "overwrite": overwrite,
+            ],
+            timeout: 120
+        )
+    }
+
     public func searchNovaCode(query: String) async -> BridgeResult {
         await post(path: "self-code/search", body: ["query": query], timeout: 30)
     }

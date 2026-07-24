@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 import NovaDomain
 
 // MARK: - List / mutate
@@ -159,10 +160,10 @@ public struct LogPlantWateringTool: Tool {
 
 public struct IdentifyPlantTool: Tool {
     public let name = "identify_plant"
-    public let description = "Capture a still from the glasses camera, identify plant(s) with vision grounded in the garden library, and optionally save the primary match into the library."
+    public let description = "Capture a still from the glasses camera, identify plant(s) with vision grounded in the garden library, and optionally save each distinct plant as its own library profile (cropped when multiple plants are in frame)."
     public let requiresConfirmation = false
     public let parametersJSON = """
-    {"type":"object","properties":{"save":{"type":"boolean","description":"If true, save the top identified plant into the library."},"location":{"type":"string"}},"additionalProperties":false}
+    {"type":"object","properties":{"save":{"type":"boolean","description":"If true, save each confidently identified plant into the library (isolated crops when multiple)."},"location":{"type":"string"}},"additionalProperties":false}
     """
 
     private let frameCapture: any FrameCapture
@@ -193,57 +194,72 @@ public struct IdentifyPlantTool: Tool {
         let frame = try await frameCapture.captureStill()
         await frameCapture.releaseCamera()
 
-        let library = await store.all()
+        var library = await store.all()
         let prompt = PlantIdentifyDiff.analysisPrompt(library: library)
         let answer = try await ai.analyze(image: frame, prompt: prompt)
         var result = PlantIdentifyDiff.parseModelJSON(answer, library: library)
+        result.plants = PlantIdentifyDiff.dedupeLibraryMatchesForMultiPlant(result.plants)
 
-        var savedId: String?
-        if args.save == true, let top = result.plants.first, PlantIdentifyDiff.shouldPersist(top) {
-            if let matchId = top.matchedPlantId,
-               var existing = library.first(where: { $0.id == matchId }) {
-                if let species = top.species, !species.isEmpty {
-                    if existing.species == nil || existing.species?.isEmpty == true
-                        || (top.confidence ?? 0) >= 0.8 {
-                        existing.species = species
+        var savedIds: [String] = []
+        if args.save == true {
+            for hit in result.plants where PlantIdentifyDiff.shouldPersist(hit) {
+                let plantImage: Data
+                if let box = hit.boundingBox,
+                   let cropped = PlantImageIsolator.cropJPEG(frame.imageData, box: box) {
+                    plantImage = cropped
+                } else {
+                    plantImage = frame.imageData
+                }
+
+                if let matchId = hit.matchedPlantId,
+                   var existing = library.first(where: { $0.id == matchId }) {
+                    if let species = hit.species, !species.isEmpty {
+                        if existing.species == nil || existing.species?.isEmpty == true
+                            || (hit.confidence ?? 0) >= 0.8 {
+                            existing.species = species
+                        }
                     }
-                }
-                if !top.careTips.isEmpty { existing.careNotes = top.careTips }
-                if let health = top.health, !health.isEmpty {
-                    existing.healthStatus = health
-                    existing.caption = health
-                }
-                if let location = args.location, !location.isEmpty {
-                    existing.location = location
-                }
-                let plant = await store.upsert(existing)
-                savedId = plant.id.uuidString
-                if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                    result.plants[idx].matchedPlantId = plant.id
-                    result.plants[idx].matchedLibraryName = plant.name
-                }
-            } else if PlantIdentifyDiff.shouldSaveAsNew(top) {
-                let plant = await store.save(
-                    imageData: frame.imageData,
-                    name: top.name,
-                    species: top.species,
-                    location: args.location,
-                    careNotes: top.careTips,
-                    text: "",
-                    caption: top.health ?? ""
-                )
-                savedId = plant.id.uuidString
-                if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                    result.plants[idx].matchedPlantId = plant.id
-                    result.plants[idx].matchedLibraryName = plant.name
+                    if !hit.careTips.isEmpty { existing.careNotes = hit.careTips }
+                    if let health = hit.health, !health.isEmpty {
+                        existing.healthStatus = health
+                        existing.caption = health
+                    }
+                    if let location = args.location, !location.isEmpty {
+                        existing.location = location
+                    }
+                    let plant = await store.upsert(existing)
+                    if let idx = library.firstIndex(where: { $0.id == plant.id }) {
+                        library[idx] = plant
+                    }
+                    savedIds.append(plant.id.uuidString)
+                    if let idx = result.plants.firstIndex(where: { $0.id == hit.id }) {
+                        result.plants[idx].matchedPlantId = plant.id
+                        result.plants[idx].matchedLibraryName = plant.name
+                    }
+                } else if PlantIdentifyDiff.shouldSaveAsNew(hit) {
+                    let plant = await store.save(
+                        imageData: plantImage,
+                        name: hit.name,
+                        species: hit.species,
+                        location: args.location,
+                        careNotes: hit.careTips,
+                        text: "",
+                        caption: hit.health ?? ""
+                    )
+                    library.append(plant)
+                    savedIds.append(plant.id.uuidString)
+                    if let idx = result.plants.firstIndex(where: { $0.id == hit.id }) {
+                        result.plants[idx].matchedPlantId = plant.id
+                        result.plants[idx].matchedLibraryName = plant.name
+                    }
                 }
             }
         }
 
-        return try Self.encode(result, savedId: savedId)
+        return try Self.encode(result, savedIds: savedIds)
     }
 
-    static func encode(_ result: PlantIdentifyResult, savedId: String?) throws -> String {
+    static func encode(_ result: PlantIdentifyResult, savedIds: [String]) throws -> String {
         let plants: [[String: Any]] = result.plants.map { hit in
             var d: [String: Any] = [
                 "name": hit.name,
@@ -254,6 +270,9 @@ public struct IdentifyPlantTool: Tool {
             if let id = hit.matchedPlantId { d["plant_id"] = id.uuidString }
             if let confidence = hit.confidence { d["confidence"] = confidence }
             if let health = hit.health { d["health"] = health }
+            if let box = hit.boundingBox {
+                d["bbox"] = [box.x, box.y, box.width, box.height]
+            }
             return d
         }
         var payload: [String: Any] = [
@@ -261,7 +280,8 @@ public struct IdentifyPlantTool: Tool {
             "plants": plants
         ]
         if let notes = result.notes { payload["notes"] = notes }
-        if let savedId { payload["saved_id"] = savedId }
+        if let first = savedIds.first { payload["saved_id"] = first }
+        if !savedIds.isEmpty { payload["saved_ids"] = savedIds }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         return String(data: data, encoding: .utf8) ?? #"{"ok":false}"#
     }

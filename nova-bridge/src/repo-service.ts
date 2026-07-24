@@ -750,6 +750,87 @@ export class RepoService {
   }
 
   /**
+   * Write a phone-uploaded file into the repository. Creates missing parent
+   * directories under the repo only. Rejects escapes, hidden segments, and
+   * oversized payloads.
+   */
+  writeFile(
+    repoId: string,
+    requestedPath: string,
+    content: Buffer,
+    opts?: { overwrite?: boolean },
+  ): { repoId: string; path: string; size: number; created: boolean } {
+    const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+    if (!Buffer.isBuffer(content)) {
+      throw new RepoError("invalid_args", "content_required", 400);
+    }
+    if (content.length === 0) {
+      throw new RepoError("invalid_args", "empty_file", 400);
+    }
+    if (content.length > MAX_UPLOAD_BYTES) {
+      throw new RepoError("too_large", `max_${MAX_UPLOAD_BYTES}_bytes`, 413);
+    }
+
+    const repo = this.resolveRepo(repoId);
+    const relativePath = (requestedPath ?? "").trim().replace(/\\/g, "/");
+    if (!relativePath) {
+      throw new RepoError("invalid_path", "missing_path", 400);
+    }
+    assertSafeRelPath(relativePath);
+    const parts = relativePath.split("/");
+    if (parts.some((part) => !part || part.startsWith("."))) {
+      throw new RepoError("invalid_path", "hidden_path_rejected", 403);
+    }
+
+    const absolutePath = pathResolve(repo.path, ...parts);
+    const parentAbs = dirname(absolutePath);
+    let parentReal: string;
+    try {
+      parentReal = realpathSync(parentAbs);
+    } catch {
+      mkdirSync(parentAbs, { recursive: true });
+      parentReal = realpathSync(parentAbs);
+    }
+    if (!isInsideRoot(parentReal, repo.path)) {
+      throw new RepoError("path_escape", "outside_repository", 403);
+    }
+    const candidate = join(parentReal, basename(absolutePath));
+    if (!isInsideRoot(candidate, repo.path)) {
+      throw new RepoError("path_escape", "outside_repository", 403);
+    }
+
+    const overwrite = opts?.overwrite === true;
+    const existed = existsSync(candidate);
+    if (existed) {
+      const st = lstatSync(candidate);
+      if (st.isSymbolicLink() || st.isDirectory()) {
+        throw new RepoError("invalid_path", "cannot_overwrite_directory", 400);
+      }
+      if (!overwrite) {
+        throw new RepoError("already_exists", "file_exists", 409);
+      }
+    }
+
+    writeFileSync(candidate, content);
+    const written = realpathSync(candidate);
+    if (!isInsideRoot(written, repo.path)) {
+      try {
+        rmSync(written, { force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+      throw new RepoError("path_escape", "outside_repository", 403);
+    }
+
+    return {
+      repoId: repo.id,
+      path: relativePath,
+      size: content.length,
+      created: !existed,
+    };
+  }
+
+  /**
    * Locate Nova's own monorepo independently of the Coding-tab selection.
    * This prevents a user-selected project from becoming the source of truth for
    * questions such as "can Nova record video?".

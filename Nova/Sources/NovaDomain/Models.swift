@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 
 public enum WearableSessionState: String, Sendable, Equatable {
     case idle
@@ -1030,6 +1031,8 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
     public var frostSensitive: Bool?
     /// Best source frame JPEG used when saving a new library entry.
     public var imageData: Data?
+    /// Plant region in the source frame (used to isolate one plant per profile).
+    public var boundingBox: PlantBoundingBox?
     /// Library id after catalog save/merge.
     public var savedPlantId: UUID?
     /// How many frames contributed to this merged profile (not persisted).
@@ -1038,7 +1041,7 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, name, species, matchedLibraryName, matchedPlantId, confidence
         case careTips, health, suggestedActions, seasonalNotes, isOutdoor, frostSensitive
-        case imageData, savedPlantId
+        case imageData, boundingBox, savedPlantId
     }
 
     public init(
@@ -1055,6 +1058,7 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
         isOutdoor: Bool? = nil,
         frostSensitive: Bool? = nil,
         imageData: Data? = nil,
+        boundingBox: PlantBoundingBox? = nil,
         savedPlantId: UUID? = nil,
         observationCount: Int = 1
     ) {
@@ -1071,6 +1075,7 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
         self.isOutdoor = isOutdoor
         self.frostSensitive = frostSensitive
         self.imageData = imageData
+        self.boundingBox = boundingBox
         self.savedPlantId = savedPlantId
         self.observationCount = max(1, observationCount)
     }
@@ -1166,6 +1171,8 @@ public struct PlantIdentifyHit: Sendable, Equatable, Identifiable {
     public var confidence: Double?
     public var careTips: String
     public var health: String?
+    /// Plant region in the source photo (normalized 0…1) for per-plant crops.
+    public var boundingBox: PlantBoundingBox?
 
     public init(
         id: UUID = UUID(),
@@ -1175,7 +1182,8 @@ public struct PlantIdentifyHit: Sendable, Equatable, Identifiable {
         matchedPlantId: UUID? = nil,
         confidence: Double? = nil,
         careTips: String = "",
-        health: String? = nil
+        health: String? = nil,
+        boundingBox: PlantBoundingBox? = nil
     ) {
         self.id = id
         self.name = name
@@ -1185,6 +1193,7 @@ public struct PlantIdentifyHit: Sendable, Equatable, Identifiable {
         self.confidence = confidence
         self.careTips = careTips
         self.health = health
+        self.boundingBox = boundingBox
     }
 }
 

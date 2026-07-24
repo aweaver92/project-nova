@@ -219,13 +219,16 @@ public final class IvyGardenViewModel {
                     library: library,
                     imageData: data
                 )
-                frameDrafts.append(contentsOf: parsed)
+                let isolated = Self.isolatePlantDrafts(parsed, sourceImage: data)
+                let prepared = GardenVideoCatalogDiff.dedupeLibraryMatchesForMultiPlant(isolated)
+                frameDrafts.append(contentsOf: prepared)
             } catch {
                 continue
             }
         }
 
         var merged = GardenVideoCatalogDiff.mergeDrafts(frameDrafts)
+        merged = GardenVideoCatalogDiff.dedupeLibraryMatchesForMultiPlant(merged)
         guard !merged.isEmpty else {
             errorMessage = "No confident plant IDs in that media — try a closer photo of leaves/flowers."
             statusMessage = "Catalog empty"
@@ -729,65 +732,117 @@ public final class IvyGardenViewModel {
         location: String?,
         switchToGallery: Bool = true
     ) async {
-        let library = await store.all()
+        var library = await store.all()
         let prompt = PlantIdentifyDiff.analysisPrompt(library: library)
         do {
             let answer = try await analyzeImage(frame, prompt)
             var result = PlantIdentifyDiff.parseModelJSON(answer, library: library)
-            if save, let top = result.plants.first, PlantIdentifyDiff.shouldPersist(top) {
-                let ocrText = await recognizeText?(frame.imageData) ?? ""
-                if let matchId = top.matchedPlantId,
-                   var existing = library.first(where: { $0.id == matchId }) {
-                    if let species = top.species, !species.isEmpty {
-                        if existing.species == nil || existing.species?.isEmpty == true
-                            || (top.confidence ?? 0) >= 0.8 {
-                            existing.species = species
+            result.plants = PlantIdentifyDiff.dedupeLibraryMatchesForMultiPlant(result.plants)
+
+            if save {
+                var savedNames: [String] = []
+                var skippedNames: [String] = []
+                for hit in result.plants where PlantIdentifyDiff.shouldPersist(hit) {
+                    let plantImage: Data
+                    if let box = hit.boundingBox,
+                       let cropped = PlantImageIsolator.cropJPEG(frame.imageData, box: box) {
+                        plantImage = cropped
+                    } else {
+                        plantImage = frame.imageData
+                    }
+                    let ocrText = await recognizeText?(plantImage) ?? ""
+
+                    if let matchId = hit.matchedPlantId,
+                       var existing = library.first(where: { $0.id == matchId }) {
+                        if let species = hit.species, !species.isEmpty {
+                            if existing.species == nil || existing.species?.isEmpty == true
+                                || (hit.confidence ?? 0) >= 0.8 {
+                                existing.species = species
+                            }
                         }
+                        if !hit.careTips.isEmpty { existing.careNotes = hit.careTips }
+                        if let health = hit.health, !health.isEmpty {
+                            existing.healthStatus = health
+                            existing.caption = health
+                        }
+                        if let location, !location.isEmpty { existing.location = location }
+                        let plant = await store.upsert(existing)
+                        if let idx = library.firstIndex(where: { $0.id == plant.id }) {
+                            library[idx] = plant
+                        }
+                        if let idx = result.plants.firstIndex(where: { $0.id == hit.id }) {
+                            result.plants[idx].matchedPlantId = plant.id
+                            result.plants[idx].matchedLibraryName = plant.name
+                        }
+                        savedNames.append(plant.name)
+                    } else if PlantIdentifyDiff.shouldSaveAsNew(hit) {
+                        let plant = await store.save(
+                            imageData: plantImage,
+                            name: hit.name,
+                            species: hit.species,
+                            location: location,
+                            careNotes: hit.careTips,
+                            text: ocrText,
+                            caption: hit.health ?? ""
+                        )
+                        library.append(plant)
+                        if let idx = result.plants.firstIndex(where: { $0.id == hit.id }) {
+                            result.plants[idx].matchedPlantId = plant.id
+                            result.plants[idx].matchedLibraryName = plant.name
+                        }
+                        savedNames.append(plant.name)
+                    } else {
+                        skippedNames.append(hit.name)
                     }
-                    if !top.careTips.isEmpty { existing.careNotes = top.careTips }
-                    if let health = top.health, !health.isEmpty {
-                        existing.healthStatus = health
-                        existing.caption = health
+                }
+
+                if !savedNames.isEmpty {
+                    var unique: [String] = []
+                    var seen = Set<String>()
+                    for name in savedNames where seen.insert(name).inserted {
+                        unique.append(name)
                     }
-                    if let location, !location.isEmpty { existing.location = location }
-                    let plant = await store.upsert(existing)
-                    if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                        result.plants[idx].matchedPlantId = plant.id
-                        result.plants[idx].matchedLibraryName = plant.name
-                    }
-                    statusMessage = "Updated \(plant.name) in garden library"
-                } else if PlantIdentifyDiff.shouldSaveAsNew(top) {
-                    let plant = await store.save(
-                        imageData: frame.imageData,
-                        name: top.name,
-                        species: top.species,
-                        location: location,
-                        careNotes: top.careTips,
-                        text: ocrText,
-                        caption: top.health ?? ""
-                    )
-                    if let idx = result.plants.firstIndex(where: { $0.id == top.id }) {
-                        result.plants[idx].matchedPlantId = plant.id
-                        result.plants[idx].matchedLibraryName = plant.name
-                    }
-                    statusMessage = "Saved \(plant.name) to garden library"
-                } else {
+                    statusMessage = unique.count == 1
+                        ? "Saved \(unique[0]) to garden library"
+                        : "Saved \(unique.count) plant profiles (\(unique.joined(separator: ", ")))"
+                } else if let top = result.plants.first {
                     statusMessage = "Skipped weak ID (\(top.name)) — try a closer photo"
+                } else {
+                    statusMessage = "No confident plant ID — photo not saved"
+                }
+                if !skippedNames.isEmpty, !savedNames.isEmpty {
+                    statusMessage += " · skipped \(skippedNames.count) weak"
                 }
             } else if let top = result.plants.first {
-                statusMessage = save
-                    ? "Skipped weak ID (\(top.name)) — try a closer photo"
-                    : "Identified \(top.name)"
+                statusMessage = result.plants.count == 1
+                    ? "Identified \(top.name)"
+                    : "Identified \(result.plants.count) plants"
             } else {
-                statusMessage = save
-                    ? "No confident plant ID — photo not saved"
-                    : "No plant identified"
+                statusMessage = "No plant identified"
             }
             lastIdentify = result
             if switchToGallery { section = .gallery }
             await load()
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    /// Crop each detected plant out of the shared frame so profiles get isolated photos.
+    private static func isolatePlantDrafts(
+        _ drafts: [CatalogPlantDraft],
+        sourceImage: Data
+    ) -> [CatalogPlantDraft] {
+        let multi = drafts.count > 1
+        return drafts.map { draft in
+            var next = draft
+            guard let box = draft.boundingBox else { return next }
+            // Single plant with a huge box → leave full frame.
+            if !multi, box.area >= 0.85 { return next }
+            if let cropped = PlantImageIsolator.cropJPEG(sourceImage, box: box) {
+                next.imageData = cropped
+            }
+            return next
         }
     }
 

@@ -36,6 +36,7 @@ import { RepoError, RepoService, timingSafeTokenEqual } from "./repo-service.js"
  *   GET  /repos
  *   POST /repos/clone | /repos/create | /repos/select
  *   GET  /repos/:repoId/status | /diff | /files?path=
+ *   POST /repos/:repoId/files  (upload file into repo; body path + contentBase64)
  *   POST /self-code/search | /self-code/read       → read-only Nova grounding
  *   POST /repos/:repoId/publish
  *   POST /nova/commit-and-build        → commit+push Nova checkout, start IPA job (returns jobId)
@@ -323,6 +324,43 @@ app.get("/repos/:repoId/files", requireAuth, (req, res) => {
       typeof req.query.path === "string" ? req.query.path.trim() : "";
     const listing = repos.listFiles(String(req.params.repoId ?? ""), requestedPath);
     res.json({ ok: true, ...listing });
+  } catch (err) {
+    sendRepoError(res, err);
+  }
+});
+
+/** Upload a file from the phone into the selected repository. */
+app.post("/repos/:repoId/files", requireAuth, (req, res) => {
+  try {
+    const requestedPath = String(req.body?.path ?? "").trim();
+    const overwrite = req.body?.overwrite === true;
+    const b64 = String(req.body?.contentBase64 ?? req.body?.content_base64 ?? "");
+    if (!requestedPath) {
+      res.status(400).json({ ok: false, error: "missing_path" });
+      return;
+    }
+    if (!b64) {
+      res.status(400).json({ ok: false, error: "missing_content" });
+      return;
+    }
+    let content: Buffer;
+    try {
+      content = Buffer.from(b64, "base64");
+    } catch {
+      res.status(400).json({ ok: false, error: "invalid_base64" });
+      return;
+    }
+    if (!content.length) {
+      res.status(400).json({ ok: false, error: "empty_file" });
+      return;
+    }
+    const written = repos.writeFile(
+      String(req.params.repoId ?? ""),
+      requestedPath,
+      content,
+      { overwrite },
+    );
+    res.json({ ok: true, ...written });
   } catch (err) {
     sendRepoError(res, err);
   }
@@ -1360,14 +1398,18 @@ app.post("/cursor/runs", requireAuth, async (req, res) => {
       });
     }
     const friendly =
-      message.includes("timeout_after_")
-        ? `Cursor agent timed out (${message}). Tap New session and try again.`
-        : message;
+      /already has active run/i.test(message)
+        ? `Cursor agent already has an active run — Nova should reattach instead of starting a second one. (${message})`
+        : message.includes("timeout_after_")
+          ? `Cursor agent timed out (${message}). Tap New session and try again.`
+          : message;
     write({ type: "error", error: friendly });
     write({
       type: "activity",
       phase: "status",
-      text: "Failed to start",
+      text: /already has active run/i.test(message)
+        ? "Blocked — agent already busy"
+        : "Failed to start",
       detail: friendly,
       done: true,
     });

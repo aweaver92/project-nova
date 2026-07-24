@@ -229,7 +229,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Garden Overview")
         } footer: {
-            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Glasses Walk is a quicker coaching look — tap Stop Garden Walk to cancel mid-capture or analysis. Press and hold the overview to share or save it to Library.")
+            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Multiple plants in one frame are cropped into separate profile photos. Glasses Walk is a quicker coaching look — tap Stop Garden Walk to cancel mid-capture or analysis. Press and hold the overview to share or save it to Library.")
                 .font(.caption2)
         }
     }
@@ -485,7 +485,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Identify")
         } footer: {
-            Text("Photos, videos (sampled as keyframes), and glasses stills are matched against your garden library when possible.")
+            Text("Photos, videos (sampled as keyframes), and glasses stills are matched against your garden library when possible. If several plants are in one photo, Ivy crops each one and creates a separate profile.")
                 .font(.caption2)
         }
     }

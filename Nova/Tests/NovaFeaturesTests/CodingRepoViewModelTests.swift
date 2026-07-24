@@ -286,6 +286,22 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertEqual(userRows.count, 2)
     }
 
+    func testUploadFileToCurrentRepoWritesViaBridge() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.browseRepository()
+
+        let ok = await vm.uploadFileToCurrentRepo(
+            fileName: "notes.txt",
+            data: Data("hello".utf8),
+            overwrite: true
+        )
+        XCTAssertTrue(ok)
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("notes.txt"))
+    }
+
     func testBrowsesFoldersAndStartsSelectedFilePreview() async {
         let bridge = DirtyRepoBridge()
         let settings = MemorySettings(repoId: "abcdef0123456789")
@@ -623,6 +639,76 @@ final class CodingRepoViewModelTests: XCTestCase {
         XCTAssertNil(PendingCursorRunStore.load())
     }
 
+    func testRetryDuringReconnectReattachesWithoutSecondSend() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "original work"
+            await vm.send()
+        }
+
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(vm.activeRunId, "run-test")
+
+        // Drop SSE → disconnect recovery leaves us reconnecting / pending.
+        _ = await bridge.cancelActiveStream()
+        // Let execute enter recover (status still "running" on first poll).
+        try? await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertTrue(vm.blocksNewCursorSend || PendingCursorRunStore.load() != nil)
+
+        await vm.retryLast()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["original work"], "retry must not start a second Cursor send")
+        XCTAssertTrue(
+            vm.activitySteps.contains(where: { $0.text.contains("reattach") || $0.text.contains("Reattach") || $0.text.contains("Retry → reattach") }),
+            "expected reattach activity log"
+        )
+
+        await vm.cancel()
+        await sendTask.value
+        PendingCursorRunStore.clear()
+    }
+
+    func testSendWhileBusyQueuesWithoutSecondStream() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "first"
+            await vm.send()
+        }
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(vm.blocksNewCursorSend)
+
+        vm.draft = "second should queue"
+        await vm.send()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["first"], "busy send must not open a second stream")
+        XCTAssertEqual(vm.queuedPromptCount, 1)
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("queue"))
+
+        await vm.cancel()
+        await sendTask.value
+        PendingCursorRunStore.clear()
+    }
+
     func testTemplatesAndHistoryPersistPerRepo() async {
         let prompts = InMemoryCodingPromptStore()
         let bridge = DirtyRepoBridge()
@@ -840,6 +926,21 @@ private actor DirtyRepoBridge: AgentBridging {
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","path":"","entries":[{"name":"src","path":"src","kind":"directory"},{"name":"index.html","path":"index.html","kind":"file","size":100}]}"#
+        )
+    }
+
+    func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult {
+        let escapedPath = path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return BridgeResult(
+            ok: true,
+            payloadJSON: "{\"ok\":true,\"repoId\":\"\(repoId)\",\"path\":\"\(escapedPath)\",\"size\":\(data.count),\"created\":true}"
         )
     }
 

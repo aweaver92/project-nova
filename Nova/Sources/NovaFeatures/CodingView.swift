@@ -1,5 +1,6 @@
 import SwiftUI
 import NovaDomain
+import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 import PhotosUI
@@ -16,6 +17,8 @@ public struct CodingView: View {
     @State private var showPublish = false
     @State private var showCommitAndBuildConfirm = false
     @State private var showRepoFiles = false
+    @State private var showRepoFileImporter = false
+    @State private var isUploadingRepoFiles = false
     @State private var showPromptHistory = false
     @State private var showTemplates = false
     @State private var showKeepAllConfirm = false
@@ -176,6 +179,13 @@ public struct CodingView: View {
         .sheet(isPresented: $showCreateProject) { createProjectSheet }
         .sheet(isPresented: $showPublish) { publishSheet }
         .sheet(isPresented: $showRepoFiles) { repositoryFileBrowser }
+        .fileImporter(
+            isPresented: $showRepoFileImporter,
+            allowedContentTypes: [.item, .data, .content, .image, .pdf, .plainText, .sourceCode],
+            allowsMultipleSelection: true
+        ) { result in
+            Task { await importFilesIntoCurrentRepo(result) }
+        }
         .sheet(isPresented: $showPromptHistory) { promptHistorySheet }
         .sheet(isPresented: $showTemplates) { templatesSheet }
         .alert("Keep all agent changes?", isPresented: $showKeepAllConfirm) {
@@ -309,11 +319,11 @@ public struct CodingView: View {
                     Text("Reconnecting to PC…")
                         .font(.caption.weight(.semibold))
                     Text(coding.statusMessage.isEmpty
-                         ? "Checking the coding run that kept going on your PC."
+                         ? "Checking the coding run that kept going on your PC (poll only — prompt not resent)."
                          : coding.statusMessage)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .lineLimit(4)
                 } else if coding.stallPhase == .stillWorking {
                     Text("Working on PC · quiet for a bit")
                         .font(.caption.weight(.semibold))
@@ -386,6 +396,17 @@ public struct CodingView: View {
                             .font(.subheadline.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
+                    Button {
+                        showRepoFileImporter = true
+                    } label: {
+                        Label(
+                            isUploadingRepoFiles ? "Uploading…" : "Upload",
+                            systemImage: "square.and.arrow.up"
+                        )
+                        .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isUploadingRepoFiles || coding.isLoadingRepoFiles)
                 }
                 Spacer()
                 Button {
@@ -965,6 +986,17 @@ public struct CodingView: View {
                     }
                     .disabled(coding.isLoadingRepoFiles)
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showRepoFileImporter = true
+                    } label: {
+                        Label(
+                            isUploadingRepoFiles ? "Uploading…" : "Upload",
+                            systemImage: "square.and.arrow.up"
+                        )
+                    }
+                    .disabled(isUploadingRepoFiles || coding.isLoadingRepoFiles)
+                }
                 ToolbarItemGroup(placement: .bottomBar) {
                     Button {
                         Task { await coding.browseParentDirectory() }
@@ -1014,6 +1046,39 @@ public struct CodingView: View {
             }
             .task {
                 await coding.browseRepository(path: coding.repoBrowsePath)
+            }
+        }
+    }
+
+    private func importFilesIntoCurrentRepo(_ result: Result<[URL], Error>) async {
+        switch result {
+        case .failure(let error):
+            coding.noteStatus("Upload cancelled: \(error.localizedDescription)")
+        case .success(let urls):
+            guard !urls.isEmpty else { return }
+            isUploadingRepoFiles = true
+            defer { isUploadingRepoFiles = false }
+            var okCount = 0
+            for url in urls.prefix(12) {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer {
+                    if accessed { url.stopAccessingSecurityScopedResource() }
+                }
+                do {
+                    let data = try Data(contentsOf: url)
+                    let name = url.lastPathComponent
+                    if await coding.uploadFileToCurrentRepo(fileName: name, data: data, overwrite: true) {
+                        okCount += 1
+                    }
+                } catch {
+                    coding.noteStatus("Could not read \(url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            if okCount > 1 {
+                coding.noteStatus("Uploaded \(okCount) files into \(coding.selectedRepoName)")
+            }
+            if !showRepoFiles, okCount > 0 {
+                showRepoFiles = true
             }
         }
     }
@@ -1364,11 +1429,24 @@ public struct CodingView: View {
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                 }
+                if coding.blocksNewCursorSend || coding.canReattachToActiveRun {
+                    Button {
+                        Task { await coding.reattachToActiveRun(userInitiated: true) }
+                    } label: {
+                        Label("Reattach to running job", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
                 if coding.canRetry {
                     Button {
                         Task { await coding.retryLast() }
                     } label: {
-                        Label("Retry last prompt", systemImage: "arrow.clockwise")
+                        Label(
+                            coding.blocksNewCursorSend ? "Retry (reattach if busy)" : "Retry last prompt",
+                            systemImage: "arrow.clockwise"
+                        )
                             .font(.caption.weight(.semibold))
                     }
                     .buttonStyle(.bordered)

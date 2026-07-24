@@ -24,6 +24,9 @@ public enum PlantIdentifyDiff {
         - Prefer matching the user's garden library when the same specimen appears.
         - matched_library MUST be an exact library name from the list below, or "".
         - Only name plants that are clearly identifiable in the photo.
+        - When MULTIPLE distinct plants are clearly visible, list EACH and give a tight \
+        bbox [x,y,width,height] normalized 0–1 (origin top-left) around that plant only.
+        - For a single close-up, bbox may be omitted or nearly full-frame.
         - Do NOT invent plants for empty lawn, driveway, boats, fences, or distant scenery.
         - Do NOT use vague names (Unknown Vine, General Garden Plants, Mixed Flowers, Plant).
         - Do NOT invent a Latin binomial when unsure — omit species instead.
@@ -31,7 +34,7 @@ public enum PlantIdentifyDiff {
         - Set confidence honestly from 0.0–1.0 (use <0.6 when unsure; never omit confidence).
         - Care tips should fit the current season (\(GardenSeason.current().title)) — avoid off-season frost urgency in midsummer.
         Reply with ONLY valid JSON (no markdown) in this shape:
-        {"plants":[{"name":"Monstera","species":"Monstera deliciosa","matched_library":"Monstera","confidence":0.0,"care_tips":"…","health":"ok|needs_water|stressed|unknown"}],"notes":"optional"}
+        {"plants":[{"name":"Monstera","species":"Monstera deliciosa","matched_library":"Monstera","confidence":0.0,"care_tips":"…","health":"ok|needs_water|stressed|unknown","bbox":[0.1,0.2,0.4,0.55]}],"notes":"optional"}
         User's plant library:
         \(known)
         """
@@ -87,10 +90,33 @@ public enum PlantIdentifyDiff {
                 matchedPlantId: match?.id,
                 confidence: GardenVideoCatalogDiff.parseConfidence(dict["confidence"]),
                 careTips: (dict["care_tips"] as? String) ?? "",
-                health: dict["health"] as? String
+                health: dict["health"] as? String,
+                boundingBox: GardenVideoCatalogDiff.parseBoundingBox(dict["bbox"] ?? dict["bounding_box"])
             )
         }
         return PlantIdentifyResult(plants: filterReliableHits(plants), notes: notes)
+    }
+
+    /// When several hits resolve to the same library row, keep the match on the
+    /// strongest hit only so the others can become separate profiles.
+    public static func dedupeLibraryMatchesForMultiPlant(_ hits: [PlantIdentifyHit]) -> [PlantIdentifyHit] {
+        guard hits.count > 1 else { return hits }
+        var claimed = Set<UUID>()
+        let ranked = hits.sorted { ($0.confidence ?? 0) > ($1.confidence ?? 0) }
+        var keepMatchIds = Set<UUID>()
+        for hit in ranked {
+            guard let id = hit.matchedPlantId else { continue }
+            if claimed.insert(id).inserted {
+                keepMatchIds.insert(hit.id)
+            }
+        }
+        return hits.map { hit in
+            guard hit.matchedPlantId != nil, !keepMatchIds.contains(hit.id) else { return hit }
+            var next = hit
+            next.matchedPlantId = nil
+            next.matchedLibraryName = nil
+            return next
+        }
     }
 
     /// Drop vague / low-confidence IDs before showing or saving.
