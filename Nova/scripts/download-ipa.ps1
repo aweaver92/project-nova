@@ -123,7 +123,7 @@ try {
                 }
             }
             if ((Get-Date) -gt $deadline) {
-                Write-Warning "Timed out after $WaitMinutes min waiting for run $RunId — cancelling so it cannot block the next IPA."
+                Write-Warning "Timed out after $WaitMinutes min waiting for run $RunId - cancelling so it cannot block the next IPA."
                 & $gh run cancel $RunId 2>$null | Out-Null
                 throw "Timed out waiting for run $RunId after $WaitMinutes minutes (cancelled). Check GitHub Actions and retry Commit and Build."
             }
@@ -141,7 +141,7 @@ try {
                 }
             }
             $failedJobsText = if ($failedJobs.Count -gt 0) {
-                ($failedJobs -join ", ")
+                ($failedJobs -join ', ')
             } else {
                 "(see Actions run $RunId)"
             }
@@ -160,7 +160,7 @@ try {
                 $errorLines = $errorLines[($errorLines.Count - 6)..($errorLines.Count - 1)]
             }
             if ($errorLines.Count -gt 0) {
-                $detail = $errorLines -join " | "
+                $detail = $errorLines -join ' | '
             } else {
                 $detail = "no compile errors extracted - open Actions run $RunId"
             }
@@ -171,7 +171,7 @@ try {
     $runMeta = & $gh run view $RunId --json headSha,createdAt,event,headBranch,url,conclusion | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "gh run view failed for $RunId" }
     Write-Host ("Run {0}: {1}" -f $RunId, $runMeta.url)
-    Write-Host ("  built from {0} ({1} on {2})" -f $runMeta.headSha, $runMeta.event, $runMeta.headBranch)
+    Write-Host ('  built from {0} ({1} on {2})' -f $runMeta.headSha, $runMeta.event, $runMeta.headBranch)
 
     $art = Get-RunIpaArtifact -Gh $gh -Id $RunId
     if (-not $art) {
