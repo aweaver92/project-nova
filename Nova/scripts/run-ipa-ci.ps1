@@ -100,6 +100,24 @@ try {
         throw "Remote branch '$Ref' not visible on origin yet. Push may still be propagating - retry Commit and Build."
     }
 
+    # Cancel leftover workflow_dispatch runs on this branch so a hung macOS job
+    # cannot block the new IPA behind concurrency (even with cancel-in-progress,
+    # clearing explicitly makes Commit-and-Build recover immediately).
+    $stuckJson = & $gh run list --workflow CI --event workflow_dispatch --branch $Ref --limit 10 --json databaseId,status,createdAt 2>$null
+    if ($LASTEXITCODE -eq 0 -and $stuckJson) {
+        $stuck = ("$stuckJson" | ConvertFrom-Json) | Where-Object {
+            $_.status -in @("queued", "in_progress", "pending", "waiting", "requested")
+        }
+        foreach ($run in $stuck) {
+            $id = [string]$run.databaseId
+            Write-Warning "Cancelling stuck/prior IPA run $id (status=$($run.status), created=$($run.createdAt))..."
+            & $gh run cancel $id 2>$null | Out-Null
+        }
+        if ($stuck) {
+            Start-Sleep -Seconds 5
+        }
+    }
+
     $beforeJson = & $gh run list --workflow CI --event workflow_dispatch --limit 1 --json databaseId,createdAt 2>&1
     $beforeId = $null
     if ($LASTEXITCODE -eq 0 -and $beforeJson) {
@@ -145,8 +163,8 @@ try {
         throw "Timed out waiting for the new workflow run to appear. Check GitHub Actions."
     }
 
-    Write-Host "Run $runId started. Waiting for completion (this is the macOS build; often 10-25 min)..."
-    & $DownloadScript -RunId $runId -Wait
+    Write-Host "Run $runId started. Waiting for completion (device IPA; usually 8-20 min, hard cap 40 min)..."
+    & $DownloadScript -RunId $runId -Wait -WaitMinutes 40
 }
 finally {
     Pop-Location

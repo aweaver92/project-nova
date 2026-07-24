@@ -643,7 +643,7 @@ public actor NovaBridgeClient: AgentBridging {
         if status == "completed" || status == "failed" {
             return Self.terminalCommitAndBuildResult(started)
         }
-        let deadline = Date().addingTimeInterval(50 * 60)
+        let deadline = Date().addingTimeInterval(60 * 60)
         return await pollCommitAndBuildJob(jobId: jobId, deadline: deadline)
     }
 

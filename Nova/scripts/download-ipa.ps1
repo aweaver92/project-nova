@@ -13,6 +13,10 @@
 .PARAMETER Wait
   If set with -RunId, poll until that run finishes before downloading.
 
+.PARAMETER WaitMinutes
+  Max minutes to wait when -Wait is set (default 40). On timeout the Actions
+  run is cancelled so it cannot block the next Commit-and-Build.
+
 .EXAMPLE
   .\scripts\download-ipa.ps1
   .\scripts\download-ipa.ps1 -RunId 1234567890 -Wait
@@ -20,7 +24,8 @@
 [CmdletBinding()]
 param(
     [string]$RunId,
-    [switch]$Wait
+    [switch]$Wait,
+    [int]$WaitMinutes = 40
 )
 
 $ErrorActionPreference = "Stop"
@@ -104,12 +109,42 @@ try {
     }
 
     if ($Wait) {
-        Write-Host "Waiting for run $RunId to finish..."
-        & $gh run watch $RunId --exit-status
-        if ($LASTEXITCODE -ne 0) {
-            $failedJobs = & $gh run view $RunId --json jobs --jq '.jobs[] | select(.conclusion=="failure") | "\(.name) (ID \(.databaseId))"' 2>$null
-            $failedJobs = ("$failedJobs" -replace "`r", "").Trim()
-            if (-not $failedJobs) { $failedJobs = "(see Actions run $RunId)" }
+        if ($WaitMinutes -lt 5) { $WaitMinutes = 5 }
+        $deadline = (Get-Date).AddMinutes($WaitMinutes)
+        Write-Host "Waiting for run $RunId to finish (up to $WaitMinutes min)..."
+        $watchExit = 0
+        while ($true) {
+            $metaJson = & $gh run view $RunId --json status,conclusion 2>$null
+            if ($LASTEXITCODE -eq 0 -and $metaJson) {
+                $meta = "$metaJson" | ConvertFrom-Json
+                if ($meta.status -eq "completed") {
+                    if ($meta.conclusion -ne "success") { $watchExit = 1 }
+                    break
+                }
+            }
+            if ((Get-Date) -gt $deadline) {
+                Write-Warning "Timed out after $WaitMinutes min waiting for run $RunId — cancelling so it cannot block the next IPA."
+                & $gh run cancel $RunId 2>$null | Out-Null
+                throw "Timed out waiting for run $RunId after $WaitMinutes minutes (cancelled). Check GitHub Actions and retry Commit and Build."
+            }
+            Start-Sleep -Seconds 15
+        }
+        if ($watchExit -ne 0) {
+            $failedJobs = @()
+            $jobsJson = & $gh run view $RunId --json jobs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $jobsJson) {
+                $jobsPayload = "$jobsJson" | ConvertFrom-Json
+                foreach ($job in @($jobsPayload.jobs)) {
+                    if ($job.conclusion -eq "failure") {
+                        $failedJobs += ("{0} (ID {1})" -f $job.name, $job.databaseId)
+                    }
+                }
+            }
+            $failedJobsText = if ($failedJobs.Count -gt 0) {
+                ($failedJobs -join ", ")
+            } else {
+                "(see Actions run $RunId)"
+            }
 
             # Surface real compile/test errors - gh often dumps Node/action
             # deprecation noise at the end, which is useless on the phone.
@@ -129,7 +164,7 @@ try {
             } else {
                 $detail = "no compile errors extracted - open Actions run $RunId"
             }
-            throw "Run $RunId did not succeed. Failed: $failedJobs. $detail"
+            throw "Run $RunId did not succeed. Failed: $failedJobsText. $detail"
         }
     }
 

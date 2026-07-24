@@ -259,7 +259,7 @@ public struct CodingView: View {
         return """
         Are you sure?
 
-        This commits ALL local changes on \(branch) (\(changed) file(s)), pushes to origin, runs the GitHub Actions IPA job (often 10–25 minutes), and overwrites Nova/App/NovaApp.ipa for SideStore.
+        This commits ALL local changes on \(branch) (\(changed) file(s)), pushes to origin, runs the GitHub Actions IPA job (usually 8–20 minutes; hard-capped), and overwrites Nova/App/NovaApp.ipa for SideStore.
 
         Cancel if you are not ready to publish these changes.
         """

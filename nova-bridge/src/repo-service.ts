@@ -175,7 +175,7 @@ type IpaBuildJob = CommitAndBuildResult & {
   updatedAt: number;
 };
 
-const IPA_BUILD_TIMEOUT_MS = 45 * 60_000;
+const IPA_BUILD_TIMEOUT_MS = 55 * 60_000;
 const IPA_JOB_TTL_MS = 2 * 60 * 60_000;
 
 export const WEB_PROJECT_TEMPLATES = [
@@ -525,7 +525,20 @@ export async function runProcess(
       windowsHide: true,
     });
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      // On Windows SIGKILL often leaves gh/pwsh grandchildren alive; kill the tree.
+      if (process.platform === "win32" && typeof child.pid === "number") {
+        try {
+          spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+            shell: false,
+            windowsHide: true,
+            stdio: "ignore",
+          });
+        } catch {
+          child.kill("SIGKILL");
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
       rejectPromise(new RepoError("timeout", `process_timeout_${timeoutMs}ms`, 504));
     }, timeoutMs);
 

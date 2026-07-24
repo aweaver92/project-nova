@@ -2720,7 +2720,7 @@ public final class CodingViewModel {
 
         let jobId = Self.string(started.payloadJSON, key: "jobId") ?? ""
         let startStatus = Self.string(started.payloadJSON, key: "buildStatus")?.lowercased() ?? ""
-        let deadline = Date().addingTimeInterval(50 * 60)
+        let deadline = Date().addingTimeInterval(60 * 60)
         if !jobId.isEmpty, startStatus != "completed", startStatus != "failed" {
             PendingCommitBuildStore.save(
                 PendingCommitBuild(jobId: jobId, startedAt: commitAndBuildStartedAt ?? Date(), deadlineAt: deadline)
@@ -2748,12 +2748,24 @@ public final class CodingViewModel {
     /// After unlock / foreground: resume CI polling without committing again.
     public func resumePendingCommitAndBuildIfNeeded() async {
         guard !isCommitAndBuilding, let pending = PendingCommitBuildStore.load() else { return }
-        let remaining = pending.deadlineAt.timeIntervalSinceNow
-        guard remaining > 5 else {
+        // Soft-extend the wait window on resume so a brief unlock gap does not
+        // abandon a healthy Actions job that is still within the bridge budget.
+        let absoluteCap = pending.startedAt.addingTimeInterval(90 * 60)
+        var deadline = pending.deadlineAt
+        let minRemaining: TimeInterval = 20 * 60
+        if deadline.timeIntervalSinceNow < minRemaining {
+            deadline = min(Date().addingTimeInterval(minRemaining), absoluteCap)
+        }
+        guard deadline.timeIntervalSinceNow > 5 else {
             PendingCommitBuildStore.clear(jobId: pending.jobId)
             statusMessage = "Commit and Build wait window ended — check GitHub Actions, then retry if needed."
             commitAndBuildPhaseLabel = ""
             return
+        }
+        if deadline != pending.deadlineAt {
+            PendingCommitBuildStore.save(
+                PendingCommitBuild(jobId: pending.jobId, startedAt: pending.startedAt, deadlineAt: deadline)
+            )
         }
 
         isCommitAndBuilding = true
@@ -2774,7 +2786,7 @@ public final class CodingViewModel {
 
         let result = await bridge.pollCommitAndBuildJob(
             jobId: pending.jobId,
-            deadline: pending.deadlineAt
+            deadline: deadline
         )
         heartbeat.cancel()
         await BackgroundTask.end(bgBox.handle)
