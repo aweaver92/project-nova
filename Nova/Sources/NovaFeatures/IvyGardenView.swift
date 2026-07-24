@@ -10,6 +10,8 @@ import UIKit
 public struct IvyGardenView: View {
     @Bindable var garden: IvyGardenViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool = false
+    var onOpenSettings: (() -> Void)? = nil
     var embedded: Bool = false
     @State private var identifyPickerItem: PhotosPickerItem?
     @State private var galleryPickerItems: [PhotosPickerItem] = []
@@ -18,9 +20,17 @@ public struct IvyGardenView: View {
     @State private var editing: PlantSighting?
     @State private var isGalleryEditing = false
 
-    public init(garden: IvyGardenViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
+    public init(
+        garden: IvyGardenViewModel,
+        conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
+        embedded: Bool = false
+    ) {
         self.garden = garden
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -43,7 +53,11 @@ public struct IvyGardenView: View {
     private var content: some View {
         List {
             Section {
-                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
                     .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                     .listRowBackground(Color.clear)
             }

@@ -1,4 +1,5 @@
 import SwiftUI
+import NovaDomain
 
 /// Compact shared UI primitives for the power-user shell.
 enum NovaUI {
@@ -24,45 +25,162 @@ enum NovaUI {
         }
     }
 
-    /// Voice Listen toggle for specialist main screens (same session as Assistant).
+    /// Voice Listen controls for specialist main screens (same session as Assistant).
+    /// Gates on bridge Realtime mint, shows compact listen health, and Interrupt.
     struct AgentVoiceChatBar: View {
         @Bindable var conversation: ConversationViewModel
+        /// When true, Listen would fail until bridge has OPENAI_API_KEY (same as Assistant).
+        var realtimeMintBlocked: Bool = false
+        var onOpenSettings: (() -> Void)? = nil
+
+        @State private var showRealtimeWarning = false
 
         var body: some View {
-            HStack(spacing: 12) {
-                Image(systemName: conversation.isRunning ? "mic.fill" : "mic.slash")
-                    .foregroundStyle(conversation.isRunning ? Color.accentColor : .secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Voice chat")
-                        .font(.subheadline.weight(.semibold))
-                    Text(conversation.isRunning ? "Listening — same session as Assistant" : "Off — tap to talk with the active agent")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                Spacer(minLength: 8)
-                Toggle(
-                    "Voice chat",
-                    isOn: Binding(
-                        get: { conversation.isRunning },
-                        set: { enabled in
-                            Task {
-                                if enabled {
-                                    await conversation.start()
-                                } else {
-                                    await conversation.stop()
-                                }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: conversation.isRunning ? "mic.fill" : "mic.slash")
+                        .foregroundStyle(micIconColor)
+                        .frame(width: 20)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Voice chat")
+                            .font(.subheadline.weight(.semibold))
+                        Text(statusCaption)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        Task { await conversation.bargeIn() }
+                    } label: {
+                        Image(systemName: "hand.raised")
+                            .frame(minWidth: 36, minHeight: 32)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!conversation.isRunning)
+                    .accessibilityLabel("Interrupt")
+
+                    Toggle(
+                        "Voice chat",
+                        isOn: Binding(
+                            get: { conversation.isRunning },
+                            set: { enabled in
+                                Task { await setVoiceEnabled(enabled) }
                             }
-                        }
+                        )
                     )
-                )
-                .labelsHidden()
-                .tint(.accentColor)
+                    .labelsHidden()
+                    .tint(.accentColor)
+                }
+
+                if showsHealthStrip {
+                    healthStrip
+                }
+
+                if let error = conversation.errorMessage, !error.isEmpty {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .accessibilityElement(children: .combine)
+            .alert("Realtime unavailable", isPresented: $showRealtimeWarning) {
+                if let onOpenSettings {
+                    Button("Open Settings", action: onOpenSettings)
+                }
+                Button("Start anyway") {
+                    Task { await conversation.start() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Bridge health reports OPENAI_API_KEY missing. Restart nova-bridge after adding the key, or open Settings to re-test.")
+            }
+        }
+
+        private var statusCaption: String {
+            if conversation.isRunning {
+                let label = conversation.listenHealth.statusLabel
+                let route = conversation.listenHealth.inputRoute
+                if route != "—" && !route.isEmpty {
+                    return "\(label) · \(route)"
+                }
+                return "\(label) — same session as Assistant"
+            }
+            if realtimeMintBlocked {
+                return "Realtime blocked — bridge missing OPENAI_API_KEY"
+            }
+            return "Off — tap to talk with the active agent"
+        }
+
+        private var showsHealthStrip: Bool {
+            conversation.isRunning
+                || conversation.listenHealth.phase == .connecting
+                || conversation.listenHealth.phase == .awaitingWakeWord
+        }
+
+        private var healthStrip: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(healthColor)
+                        .frame(width: 7, height: 7)
+                    Text(conversation.listenHealth.statusLabel)
+                        .font(.caption2.weight(.semibold))
+                    Spacer(minLength: 4)
+                    Text(conversation.listenHealth.inputRoute)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.15))
+                        Capsule()
+                            .fill(healthColor.opacity(0.85))
+                            .frame(width: max(4, geo.size.width * CGFloat(min(1, conversation.listenHealth.micLevel * 4))))
+                    }
+                }
+                .frame(height: 6)
+                if !conversation.listenHealth.detail.isEmpty {
+                    Text(conversation.listenHealth.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+
+        private var micIconColor: Color {
+            if !conversation.isRunning { return .secondary }
+            return healthColor
+        }
+
+        private var healthColor: Color {
+            switch conversation.listenHealth.phase {
+            case .hearingYou, .speaking: return .green
+            case .waitingForSpeech, .connecting: return .orange
+            case .awaitingWakeWord: return .purple
+            case .micSilent, .streamStalled, .cloudQuiet, .error: return .red
+            case .idle: return .secondary
+            }
+        }
+
+        private func setVoiceEnabled(_ enabled: Bool) async {
+            if enabled {
+                if realtimeMintBlocked {
+                    showRealtimeWarning = true
+                } else {
+                    await conversation.start()
+                }
+            } else {
+                await conversation.stop()
+            }
         }
     }
 

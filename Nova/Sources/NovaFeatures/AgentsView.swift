@@ -12,6 +12,7 @@ public struct AgentsView: View {
     @Bindable var study: StudyViewModel
     @Bindable var garden: IvyGardenViewModel
     @Bindable var conversation: ConversationViewModel
+    @Bindable var settings: SettingsViewModel
     var showSettings: () -> Void
 
     /// Drives programmatic pushes from `agents.pendingRoute` (Assistant-tab CTAs
@@ -27,6 +28,7 @@ public struct AgentsView: View {
         study: StudyViewModel,
         garden: IvyGardenViewModel,
         conversation: ConversationViewModel,
+        settings: SettingsViewModel,
         showSettings: @escaping () -> Void = {}
     ) {
         self.agents = agents
@@ -37,6 +39,7 @@ public struct AgentsView: View {
         self.study = study
         self.garden = garden
         self.conversation = conversation
+        self.settings = settings
         self.showSettings = showSettings
     }
 
@@ -44,16 +47,18 @@ public struct AgentsView: View {
         NavigationStack(path: $path) {
             List {
                 Section {
-                    NovaUI.AgentVoiceChatBar(conversation: conversation)
-                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                        .listRowBackground(Color.clear)
+                    NovaUI.AgentVoiceChatBar(
+                        conversation: conversation,
+                        realtimeMintBlocked: settings.realtimeMintBlocked,
+                        onOpenSettings: showSettings
+                    )
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    .listRowBackground(Color.clear)
                 }
 
-                if agents.isClaudeActive {
+                if isSpecialistEnabled(Agent.SeedID.claude) {
                     Section {
-                        NavigationLink {
-                            CodingView(coding: coding, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.coding) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Coding")
@@ -76,14 +81,17 @@ public struct AgentsView: View {
                         }
                     } header: {
                         Text("Claude")
+                    } footer: {
+                        Text(agents.isClaudeActive
+                             ? "Open Coding while talking to Claude."
+                             : "Opens Coding and switches voice to Claude.")
+                            .font(.caption2)
                     }
                 }
 
-                if agents.isMaxActive {
+                if isSpecialistEnabled(Agent.SeedID.max) {
                     Section {
-                        NavigationLink {
-                            TrainingView(training: training, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.training) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Training")
@@ -100,16 +108,16 @@ public struct AgentsView: View {
                     } header: {
                         Text("Max")
                     } footer: {
-                        Text("Open Training while talking to Max for live sets and rest.")
+                        Text(agents.isMaxActive
+                             ? "Open Training while talking to Max for live sets and rest."
+                             : "Opens Training and switches voice to Max.")
                             .font(.caption2)
                     }
                 }
 
-                if agents.isSageActive {
+                if isSpecialistEnabled(Agent.SeedID.sage) {
                     Section {
-                        NavigationLink {
-                            SageTasksView(tasks: tasks, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.tasks) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Tasks")
@@ -124,16 +132,16 @@ public struct AgentsView: View {
                     } header: {
                         Text("Sage")
                     } footer: {
-                        Text("Open Tasks while talking to Sage for pickups across agents.")
+                        Text(agents.isSageActive
+                             ? "Open Tasks while talking to Sage for pickups across agents."
+                             : "Opens Tasks and switches voice to Sage.")
                             .font(.caption2)
                     }
                 }
 
-                if agents.isRemyActive {
+                if isSpecialistEnabled(Agent.SeedID.remy) {
                     Section {
-                        NavigationLink {
-                            RemyKitchenView(kitchen: kitchen, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.kitchen) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Kitchen")
@@ -150,16 +158,16 @@ public struct AgentsView: View {
                     } header: {
                         Text("Remy")
                     } footer: {
-                        Text("Open Kitchen while talking to Remy for pantry, fridge scan, and cook mode.")
+                        Text(agents.isRemyActive
+                             ? "Open Kitchen while talking to Remy for pantry, fridge scan, and cook mode."
+                             : "Opens Kitchen and switches voice to Remy.")
                             .font(.caption2)
                     }
                 }
 
-                if agents.isScholarActive {
+                if isSpecialistEnabled(Agent.SeedID.scholar) {
                     Section {
-                        NavigationLink {
-                            StudyView(study: study, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.study) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Study")
@@ -174,16 +182,16 @@ public struct AgentsView: View {
                     } header: {
                         Text("Scholar")
                     } footer: {
-                        Text("Open Study while talking to Scholar for decks and spaced-repetition review.")
+                        Text(agents.isScholarActive
+                             ? "Open Study while talking to Scholar for decks and spaced-repetition review."
+                             : "Opens Study and switches voice to Scholar.")
                             .font(.caption2)
                     }
                 }
 
-                if agents.isIvyActive {
+                if isSpecialistEnabled(Agent.SeedID.ivy) {
                     Section {
-                        NavigationLink {
-                            IvyGardenView(garden: garden, conversation: conversation, embedded: true)
-                        } label: {
+                        NavigationLink(value: AgentsPendingRoute.garden) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Open Garden")
@@ -200,7 +208,9 @@ public struct AgentsView: View {
                     } header: {
                         Text("Ivy")
                     } footer: {
-                        Text("Open Garden while talking to Ivy for the plant gallery, Garden Walk, and seasonal Planning.")
+                        Text(agents.isIvyActive
+                             ? "Open Garden while talking to Ivy for the plant gallery, Garden Walk, and seasonal Planning."
+                             : "Opens Garden and switches voice to Ivy.")
                             .font(.caption2)
                     }
                 }
@@ -284,7 +294,7 @@ public struct AgentsView: View {
                 get: { study.shouldPresentStudy },
                 set: { if !$0 { study.clearPresentFlag() } }
             )) {
-                StudyView(study: study, conversation: conversation, embedded: true)
+                specialistDestination(.study)
             }
             .navigationDestination(for: AgentsPendingRoute.self) { route in
                 specialistDestination(route)
@@ -308,9 +318,13 @@ public struct AgentsView: View {
         }
     }
 
+    private func isSpecialistEnabled(_ seedId: UUID) -> Bool {
+        agents.agents.first(where: { $0.id == seedId })?.enabled ?? true
+    }
+
     /// Push the specialist screen for a programmatic route, then clear the flag so
-    /// it can't re-fire. Unlike the gated "Open …" sections, this works regardless
-    /// of which agent is active (the caller decides when it's appropriate).
+    /// it can't re-fire. Unlike older gated "Open …" sections, this works regardless
+    /// of which agent is active — opening activates the matching specialist.
     private func consumePendingRoute() {
         guard let route = agents.pendingRoute else { return }
         agents.clearPendingRoute()
@@ -319,19 +333,60 @@ public struct AgentsView: View {
 
     @ViewBuilder
     private func specialistDestination(_ route: AgentsPendingRoute) -> some View {
-        switch route {
-        case .coding:
-            CodingView(coding: coding, conversation: conversation, embedded: true)
-        case .training:
-            TrainingView(training: training, conversation: conversation, embedded: true)
-        case .tasks:
-            SageTasksView(tasks: tasks, conversation: conversation, embedded: true)
-        case .kitchen:
-            RemyKitchenView(kitchen: kitchen, conversation: conversation, embedded: true)
-        case .study:
-            StudyView(study: study, conversation: conversation, embedded: true)
-        case .garden:
-            IvyGardenView(garden: garden, conversation: conversation, embedded: true)
+        Group {
+            switch route {
+            case .coding:
+                CodingView(
+                    coding: coding,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            case .training:
+                TrainingView(
+                    training: training,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            case .tasks:
+                SageTasksView(
+                    tasks: tasks,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            case .kitchen:
+                RemyKitchenView(
+                    kitchen: kitchen,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            case .study:
+                StudyView(
+                    study: study,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            case .garden:
+                IvyGardenView(
+                    garden: garden,
+                    conversation: conversation,
+                    realtimeMintBlocked: settings.realtimeMintBlocked,
+                    onOpenSettings: showSettings,
+                    embedded: true
+                )
+            }
+        }
+        .task {
+            await agents.activateSpecialist(for: route)
         }
     }
 }

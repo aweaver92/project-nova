@@ -4420,6 +4420,26 @@ public final class AgentsViewModel {
         await load()
     }
 
+    /// Activate the specialist that owns a given Agents-tab screen (Coding → Claude, etc.).
+    /// No-op when that agent is already active or missing from the store.
+    public func activateSpecialist(for route: AgentsPendingRoute) async {
+        let seedId: UUID
+        switch route {
+        case .coding: seedId = Agent.SeedID.claude
+        case .training: seedId = Agent.SeedID.max
+        case .tasks: seedId = Agent.SeedID.sage
+        case .kitchen: seedId = Agent.SeedID.remy
+        case .study: seedId = Agent.SeedID.scholar
+        case .garden: seedId = Agent.SeedID.ivy
+        }
+        if agents.isEmpty {
+            await load()
+        }
+        guard let agent = agents.first(where: { $0.id == seedId }) else { return }
+        guard activeAgent?.id != seedId else { return }
+        await activate(agent)
+    }
+
     /// Change the active agent's default Realtime voice and reapply if listening.
     public func setActiveVoice(_ voice: String) async {
         let trimmed = voice.trimmingCharacters(in: .whitespacesAndNewlines)

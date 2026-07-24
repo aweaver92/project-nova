@@ -7,6 +7,8 @@ import NovaDomain
 public struct StudyView: View {
     @Bindable var study: StudyViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool
+    var onOpenSettings: (() -> Void)?
     var embedded: Bool
     @State private var editingCard: StudyCard?
     @State private var showNewCard = false
@@ -14,9 +16,17 @@ public struct StudyView: View {
     static let ink = Color(red: 0.30, green: 0.30, blue: 0.65)
     private static let inkSoft = Color(red: 0.30, green: 0.30, blue: 0.65).opacity(0.10)
 
-    public init(study: StudyViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
+    public init(
+        study: StudyViewModel,
+        conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
+        embedded: Bool = false
+    ) {
         self.study = study
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -35,7 +45,11 @@ public struct StudyView: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 16) {
-                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
                 dueHero
                 deckGrid
             }

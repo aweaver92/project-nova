@@ -9,6 +9,8 @@ import PhotosUI
 public struct CodingView: View {
     @Bindable var coding: CodingViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool
+    var onOpenSettings: (() -> Void)?
     var embedded: Bool
     @State private var showSessions = false
     @State private var showRepos = false
@@ -41,9 +43,17 @@ public struct CodingView: View {
         case pin
     }
 
-    public init(coding: CodingViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
+    public init(
+        coding: CodingViewModel,
+        conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
+        embedded: Bool = false
+    ) {
         self.coding = coding
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -61,7 +71,11 @@ public struct CodingView: View {
 
     private var content: some View {
         VStack(spacing: 0) {
-            NovaUI.AgentVoiceChatBar(conversation: conversation)
+            NovaUI.AgentVoiceChatBar(
+                conversation: conversation,
+                realtimeMintBlocked: realtimeMintBlocked,
+                onOpenSettings: onOpenSettings
+            )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             Divider()

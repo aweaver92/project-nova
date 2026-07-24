@@ -10,6 +10,8 @@ import UIKit
 public struct SageTasksView: View {
     @Bindable var tasks: SageTasksViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool = false
+    var onOpenSettings: (() -> Void)? = nil
     var embedded: Bool = false
 
     #if canImport(UIKit)
@@ -24,10 +26,14 @@ public struct SageTasksView: View {
     public init(
         tasks: SageTasksViewModel,
         conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
         embedded: Bool = false
     ) {
         self.tasks = tasks
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -46,7 +52,11 @@ public struct SageTasksView: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 20) {
-                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
                 header
                 addTaskCard
                 if tasks.openTasks.isEmpty {

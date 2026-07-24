@@ -8,6 +8,8 @@ import NovaDomain
 public struct TrainingView: View {
     @Bindable var training: TrainingViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool = false
+    var onOpenSettings: (() -> Void)? = nil
     var embedded: Bool = false
     @State private var editingPlan: WorkoutPlan?
     @State private var showNewPlan = false
@@ -21,9 +23,17 @@ public struct TrainingView: View {
         endPoint: .bottomTrailing
     )
 
-    public init(training: TrainingViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
+    public init(
+        training: TrainingViewModel,
+        conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
+        embedded: Bool = false
+    ) {
         self.training = training
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -42,7 +52,11 @@ public struct TrainingView: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 14) {
-                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
                 if training.hasActiveSession {
                     liveHero
                     restCard

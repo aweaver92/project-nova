@@ -10,6 +10,8 @@ import UIKit
 public struct RemyKitchenView: View {
     @Bindable var kitchen: RemyKitchenViewModel
     @Bindable var conversation: ConversationViewModel
+    var realtimeMintBlocked: Bool
+    var onOpenSettings: (() -> Void)?
     var embedded: Bool
 
     @State private var photoItems: [PhotosPickerItem] = []
@@ -26,9 +28,17 @@ public struct RemyKitchenView: View {
     @State private var importURL = ""
     @State private var importPaste = ""
 
-    public init(kitchen: RemyKitchenViewModel, conversation: ConversationViewModel, embedded: Bool = false) {
+    public init(
+        kitchen: RemyKitchenViewModel,
+        conversation: ConversationViewModel,
+        realtimeMintBlocked: Bool = false,
+        onOpenSettings: (() -> Void)? = nil,
+        embedded: Bool = false
+    ) {
         self.kitchen = kitchen
         self.conversation = conversation
+        self.realtimeMintBlocked = realtimeMintBlocked
+        self.onOpenSettings = onOpenSettings
         self.embedded = embedded
     }
 
@@ -143,7 +153,11 @@ public struct RemyKitchenView: View {
     private var kitchenList: some View {
         List {
             Section {
-                NovaUI.AgentVoiceChatBar(conversation: conversation)
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
                     .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                     .listRowBackground(Color.clear)
             }
@@ -182,6 +196,12 @@ public struct RemyKitchenView: View {
     private var cookModeHUD: some View {
         ScrollView {
             VStack(spacing: 16) {
+                NovaUI.AgentVoiceChatBar(
+                    conversation: conversation,
+                    realtimeMintBlocked: realtimeMintBlocked,
+                    onOpenSettings: onOpenSettings
+                )
+
                 if let session = kitchen.cookingSession, let recipe = kitchen.cookingRecipe {
                     let idx = session.currentStepIndex
                     let total = max(1, recipe.steps.count)
