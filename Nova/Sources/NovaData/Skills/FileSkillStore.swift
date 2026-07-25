@@ -11,11 +11,34 @@ public actor FileSkillStore: SkillStoring {
         let resolved = url ?? Self.defaultURL()
         self.url = resolved
         var loaded = Self.load(from: resolved)
-        // Seed built-in showcase skills if missing (idempotent by id).
+        // Seed / refresh built-in showcase skills (idempotent by id).
         var dirty = false
-        for seed in Agent.builtInSkills() where !loaded.contains(where: { $0.id == seed.id }) {
-            loaded.append(seed)
-            dirty = true
+        for seed in Agent.builtInSkills() {
+            if let idx = loaded.firstIndex(where: { $0.id == seed.id }) {
+                let existing = loaded[idx]
+                // Refresh content only — ignore createdAt/updatedAt and step UUID churn.
+                if existing.name != seed.name
+                    || existing.triggerPhrases != seed.triggerPhrases
+                    || existing.workspaceId != seed.workspaceId
+                    || existing.schedule != seed.schedule
+                    || !Self.stepsMatchIgnoringIds(existing.steps, seed.steps)
+                {
+                    loaded[idx] = Skill(
+                        id: seed.id,
+                        name: seed.name,
+                        triggerPhrases: seed.triggerPhrases,
+                        steps: seed.steps,
+                        workspaceId: seed.workspaceId,
+                        schedule: seed.schedule,
+                        createdAt: existing.createdAt,
+                        updatedAt: Date()
+                    )
+                    dirty = true
+                }
+            } else {
+                loaded.append(seed)
+                dirty = true
+            }
         }
         self.skills = loaded
         if dirty { Self.persist(loaded, to: resolved) }
@@ -65,5 +88,23 @@ public actor FileSkillStore: SkillStoring {
         let dir = (try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
             ?? fm.temporaryDirectory
         return dir.appendingPathComponent("nova-skills.json")
+    }
+
+    /// Built-in skill steps use fresh UUIDs each seed; compare by content.
+    private static func stepsMatchIgnoringIds(_ lhs: [SkillStep], _ rhs: [SkillStep]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { a, b in
+            a.kind == b.kind
+                && a.text == b.text
+                && a.dateISO == b.dateISO
+                && a.durationMinutes == b.durationMinutes
+                && a.url == b.url
+                && a.seconds == b.seconds
+                && a.httpMethod == b.httpMethod
+                && a.outputVariable == b.outputVariable
+                && a.condition == b.condition
+                && a.retryPolicy == b.retryPolicy
+                && a.requiresConfirmation == b.requiresConfirmation
+        }
     }
 }

@@ -25,11 +25,16 @@ public actor FilePantryStore: PantryStoring {
         } else if let idx = items.firstIndex(where: {
             $0.name.localizedCaseInsensitiveCompare(item.name) == .orderedSame
         }) {
+            let prior = items[idx]
             updated = PantryItem(
-                id: items[idx].id,
+                id: prior.id,
                 name: item.name,
-                quantity: item.quantity ?? items[idx].quantity,
-                notes: item.notes ?? items[idx].notes,
+                quantity: item.quantity ?? prior.quantity,
+                notes: item.notes ?? prior.notes,
+                category: item.category == .other && prior.category != .other ? prior.category : item.category,
+                location: item.location == .pantry && prior.location != .pantry ? prior.location : item.location,
+                stockLevel: item.stockLevel,
+                expiresAt: item.expiresAt ?? prior.expiresAt,
                 updatedAt: Date()
             )
             items[idx] = updated
@@ -54,10 +59,23 @@ public actor FilePantryStore: PantryStoring {
         let all = all()
         guard !all.isEmpty else { return "" }
         let list = all.map { item -> String in
-            if let q = item.quantity, !q.isEmpty { return "\(item.name) (\(q))" }
-            return item.name
+            var parts = [item.name]
+            if let q = item.quantity, !q.isEmpty { parts.append("(\(q))") }
+            if item.stockLevel != .ok { parts.append("[\(item.stockLevel.rawValue)]") }
+            if let exp = item.expiresAt {
+                let df = DateFormatter()
+                df.dateStyle = .short
+                parts.append("exp \(df.string(from: exp))")
+            }
+            parts.append("@\(item.location.rawValue)")
+            return parts.joined(separator: " ")
         }.joined(separator: "; ")
-        return "Pantry / fridge inventory: \(list)."
+        let low = all.filter { $0.stockLevel == .low || $0.stockLevel == .out }.map(\.name)
+        var text = "Pantry / fridge inventory: \(list)."
+        if !low.isEmpty {
+            text += " Low/out: \(low.joined(separator: ", "))."
+        }
+        return text
     }
 
     private func persist() {

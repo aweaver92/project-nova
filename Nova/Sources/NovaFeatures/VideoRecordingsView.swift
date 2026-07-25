@@ -10,11 +10,19 @@ import NovaDomain
 public struct VideoRecordingsView: View {
     @Bindable var video: VideoRecordingViewModel
     var embedded: Bool
+    /// Sends a local movie into Ivy's Garden Walk (keyframes → analyze → brief).
+    var onShareToIvy: ((URL) -> Void)?
     @State private var confirmClear = false
+    @State private var sharingToIvyId: UUID?
 
-    public init(video: VideoRecordingViewModel, embedded: Bool = false) {
+    public init(
+        video: VideoRecordingViewModel,
+        embedded: Bool = false,
+        onShareToIvy: ((URL) -> Void)? = nil
+    ) {
         self.video = video
         self.embedded = embedded
+        self.onShareToIvy = onShareToIvy
     }
 
     public var body: some View {
@@ -42,9 +50,22 @@ public struct VideoRecordingsView: View {
                 List {
                     ForEach(video.recordings) { item in
                         NavigationLink {
-                            VideoPlayerScreen(url: video.fileURL(for: item), title: item.createdAt.formatted(date: .abbreviated, time: .shortened))
+                            VideoPlayerScreen(
+                                url: video.fileURL(for: item),
+                                title: item.createdAt.formatted(date: .abbreviated, time: .shortened),
+                                onShareToIvy: onShareToIvy.map { handler in
+                                    { url in shareToIvy(item: item, url: url, handler: handler) }
+                                }
+                            )
                         } label: {
-                            VideoRow(item: item, url: video.fileURL(for: item))
+                            VideoRow(
+                                item: item,
+                                url: video.fileURL(for: item),
+                                isSharingToIvy: sharingToIvyId == item.id,
+                                onShareToIvy: onShareToIvy.map { handler in
+                                    { url in shareToIvy(item: item, url: url, handler: handler) }
+                                }
+                            )
                         }
                     }
                     .onDelete { offsets in
@@ -108,6 +129,16 @@ public struct VideoRecordingsView: View {
         .task { await video.load() }
     }
 
+    private func shareToIvy(item: VideoRecording, url: URL, handler: @escaping (URL) -> Void) {
+        sharingToIvyId = item.id
+        handler(url)
+        // Clear spinner shortly after handoff; Garden shows its own walk status.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(600))
+            if sharingToIvyId == item.id { sharingToIvyId = nil }
+        }
+    }
+
     static func elapsed(from start: Date, to now: Date) -> String {
         let seconds = max(0, Int(now.timeIntervalSince(start)))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
@@ -117,6 +148,8 @@ public struct VideoRecordingsView: View {
 private struct VideoRow: View {
     let item: VideoRecording
     let url: URL?
+    var isSharingToIvy: Bool = false
+    var onShareToIvy: ((URL) -> Void)?
 
     var body: some View {
         HStack {
@@ -132,6 +165,20 @@ private struct VideoRow: View {
             }
             Spacer()
             if let url {
+                if let onShareToIvy {
+                    Button {
+                        onShareToIvy(url)
+                    } label: {
+                        if isSharingToIvy {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "camera.macro")
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isSharingToIvy)
+                    .accessibilityLabel("Send to Ivy for Garden Walk")
+                }
                 ShareLink(item: url) {
                     Image(systemName: "square.and.arrow.up")
                 }
@@ -140,6 +187,20 @@ private struct VideoRow: View {
             }
         }
         .padding(.vertical, 2)
+        .contextMenu {
+            if let url, let onShareToIvy {
+                Button {
+                    onShareToIvy(url)
+                } label: {
+                    Label("Send to Ivy", systemImage: "camera.macro")
+                }
+            }
+            if let url {
+                ShareLink(item: url) {
+                    Label("Share…", systemImage: "square.and.arrow.up")
+                }
+            }
+        }
     }
 
     private static func duration(_ seconds: TimeInterval) -> String {
@@ -151,6 +212,7 @@ private struct VideoRow: View {
 private struct VideoPlayerScreen: View {
     let url: URL?
     let title: String
+    var onShareToIvy: ((URL) -> Void)?
 
     var body: some View {
         Group {
@@ -163,5 +225,23 @@ private struct VideoPlayerScreen: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if let url, let onShareToIvy {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        onShareToIvy(url)
+                    } label: {
+                        Label("Send to Ivy", systemImage: "camera.macro")
+                    }
+                }
+            }
+            if let url {
+                ToolbarItem(placement: .topBarTrailing) {
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+            }
+        }
     }
 }

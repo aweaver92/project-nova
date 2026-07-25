@@ -33,23 +33,39 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     // same session shape.
     private var lastConfig: AISessionConfig?
     private var reconnectAttempts = 0
-    private let maxReconnectAttempts = 5
+    private let maxReconnectAttempts = 8
     private var reconnectStartedAt: ContinuousClock.Instant?
+    /// False while the phone is locked / backgrounded. Exhaustion is deferred
+    /// until the app is active again so lock-screen suspend cannot burn the budget.
+    private var appIsActive = true
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectGeneration = 0
     private var waitingForSessionUpdated = false
+    /// Set when an `error` event arrives while waiting for `session.updated`.
+    private var sessionUpdateError: String?
     private static let sessionReadyTimeout: Duration = .seconds(8)
     /// Newest-event bound so a stalled UI/orchestrator cannot grow unboundedly.
     private static let eventBufferCapacity = 256
+    /// When set, `analyze` awaits the matching response transcript instead of returning a placeholder.
+    private var analyzeWait: CheckedContinuation<String, Error>?
+    private var analyzeBuffer = ""
+    private let usage: UsageMeter?
+    /// Completes when `input_audio_buffer.committed` arrives (or times out).
+    private var commitWait: CheckedContinuation<Void, Never>?
+    private var commitWaitGeneration = 0
 
     public init(
         tokenService: any TokenService,
         tokenStore: any SecureTokenStore,
         metrics: (any LatencyMetricsRecorder)? = nil,
+        usage: UsageMeter? = nil,
         model: String = "gpt-realtime",
         url: URL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime")!
     ) {
         self.tokenService = tokenService
         self.tokenStore = tokenStore
         self.metrics = metrics
+        self.usage = usage
         self.model = model
         self.url = url
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -70,10 +86,38 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
     private func openSocket(config: AISessionConfig) async throws {
         let connectStarted = ContinuousClock.Instant.now
+        // Run connect on this actor (no nested TaskGroup re-entry). Bound hangs
+        // with request timeouts + session.updated wait inside unrestricted path.
+        do {
+            try await openSocketUnrestricted(config: config)
+        } catch {
+            await tearDownSocket(clearConfig: false)
+            metrics?.increment(.sessionFailures)
+            throw error
+        }
+        metrics?.mark(.connectReady, startedAt: connectStarted)
+        if let reconnectStartedAt {
+            metrics?.mark(.reconnectDowntime, startedAt: reconnectStartedAt)
+            self.reconnectStartedAt = nil
+        }
+        NovaLog.ai.info("Realtime connected")
+    }
+
+    private func openSocketUnrestricted(config: AISessionConfig) async throws {
+        // Always remint: OpenAI ephemeral client secrets authenticate a single
+        // WebSocket. Reusing the Nova-session token after an agent-switch
+        // disconnect left Listen hung on "Minting Realtime token…".
+        try? tokenStore.clear()
         let credential = try await resolveCredential()
-        let session = URLSession(configuration: .default)
+        let configuration = URLSessionConfiguration.default
+        // After unlock, cellular/Wi‑Fi can lag; waiting briefly beats instant fails.
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 45
+        let session = URLSession(configuration: configuration)
         self.session = session
         var request = URLRequest(url: url)
+        request.timeoutInterval = 30
         request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
 
         let task = session.webSocketTask(with: request)
@@ -84,33 +128,43 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         // GA Realtime session shape: session.type, output_modalities, and audio
         // config nested under audio.input / audio.output (24 kHz PCM both ways).
+        // Kitchen silent vision uses text-only so meal/fridge analysis never TTS.
+        let modalities: [String] = config.textOutputOnly ? ["text"] : ["audio"]
         var sessionDict: [String: Any] = [
             "type": "realtime",
             "model": model,
-            "output_modalities": ["audio"],
-            "instructions": config.instructions,
-            "audio": [
+            "output_modalities": modalities,
+            "instructions": config.instructions
+        ]
+        if config.textOutputOnly {
+            // No mic / VAD / TTS — one-shot image→text for Kitchen photo logging.
+        } else {
+            sessionDict["audio"] = [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    // Server-side noise reduction runs before VAD + the model.
-                    // `near_field` suits the close-talking glasses mic and
-                    // improves turn detection and perceived input quality.
                     "noise_reduction": ["type": "near_field"],
-                    // With a wake word required, the server still detects
-                    // turns and transcribes, but must NOT auto-reply — the
-                    // orchestrator decides whether "Nova" was addressed.
-                    "turn_detection": config.enableServerVAD ? [
-                        "type": "semantic_vad",
-                        "create_response": !config.requireWakeWord
-                    ] as [String: Any] : NSNull(),
-                    "transcription": ["model": "whisper-1", "language": "en"]
+                    // Server-side VAD owns turn-taking: OpenAI detects end of
+                    // speech, commits the buffer, and auto-creates the response.
+                    // This replaces the client energy VAD + manual commit loop.
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 600,
+                        "create_response": true,
+                        "interrupt_response": true
+                    ],
+                    "transcription": [
+                        "model": "gpt-4o-mini-transcribe",
+                        "language": "en"
+                    ]
                 ] as [String: Any],
                 "output": [
                     "format": ["type": "audio/pcm", "rate": 24000],
                     "voice": config.voice
                 ] as [String: Any]
             ] as [String: Any]
-        ]
+        }
 
         // Advertise tools so the model can emit function calls the orchestrator
         // dispatches through ToolRouter.
@@ -130,16 +184,20 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
 
         // Start the receive loop before session.update so we can observe session.updated.
         receiveTask?.cancel()
-        waitingForSessionUpdated = true
         receiveTask = Task { await self.receiveLoop(generation: generation) }
 
         do {
+            // Arm the wait *immediately before* session.update. Treating
+            // `session.created` as ready (old behavior) raced: created arrives on
+            // connect, clears the flag, and we start streaming into a default
+            // session with no input transcription → local mic energy, no You: lines.
+            waitingForSessionUpdated = true
+            sessionUpdateError = nil
             try await sendJSON(["type": "session.update", "session": sessionDict])
             try await waitForSessionUpdated(timeout: Self.sessionReadyTimeout)
         } catch {
             waitingForSessionUpdated = false
-            await tearDownSocket(clearConfig: false)
-            metrics?.increment(.sessionFailures)
+            sessionUpdateError = nil
             throw error
         }
 
@@ -149,12 +207,6 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         cancelledResponseId = nil
         ttfaMark = nil
         speechEndMark = nil
-        metrics?.mark(.connectReady, startedAt: connectStarted)
-        if let reconnectStartedAt {
-            metrics?.mark(.reconnectDowntime, startedAt: reconnectStartedAt)
-            self.reconnectStartedAt = nil
-        }
-        NovaLog.ai.info("Realtime connected")
     }
 
     private func waitForSessionUpdated(timeout: Duration) async throws {
@@ -168,10 +220,19 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             }
             try await Task.sleep(for: .milliseconds(20))
         }
+        if let sessionUpdateError {
+            let message = sessionUpdateError
+            self.sessionUpdateError = nil
+            throw NovaError.aiProvider(message)
+        }
     }
 
     public func disconnect() async {
         await tearDownSocket(clearConfig: true)
+        // Ephemeral Realtime client secrets are single-use per WebSocket.
+        // Drop the cache so the next connect (agent switch / re-engage) remints
+        // instead of hanging on a reused secret.
+        try? tokenStore.clear()
         // Deliberately do NOT finish `events`: the orchestrator keeps a single,
         // long-lived consumer across engage/disengage cycles (wake-word gating)
         // and reconnects. The stream ends when this provider is deallocated.
@@ -184,11 +245,19 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         cancelledResponseId = nil
         ttfaMark = nil
         speechEndMark = nil
+        // Unblock any in-flight commitInputAudio wait so agent-switch reconnect
+        // cannot stall behind a continuation that will never see `.committed`.
+        finishCommitWait(generation: commitWaitGeneration)
+        failAnalyzeWait(NovaError.cancelled)
+        reconnectTask?.cancel()
+        reconnectTask = nil
         if clearConfig {
             lastConfig = nil
             reconnectStartedAt = nil
+            reconnectAttempts = 0
         }
         waitingForSessionUpdated = false
+        sessionUpdateError = nil
         receiveTask?.cancel()
         receiveTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
@@ -221,19 +290,20 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         }
     }
 
-    public func createResponse() async {
-        guard connected else { return }
-        // Wake-word path: the orchestrator decides to answer after speech ended.
-        // Prefer the speech-end mark so TTFA includes model think time.
-        if ttfaMark == nil {
-            ttfaMark = speechEndMark ?? .now
-        }
-        do {
-            try await sendJSON(["type": "response.create"])
-        } catch {
-            metrics?.increment(.sendFailures)
-        }
+    /// No-op under server-side VAD: OpenAI commits the input buffer itself when
+    /// it detects end of speech. Kept to satisfy the provider protocol.
+    public func commitInputAudio() async {}
+
+    private func finishCommitWait(generation: Int) {
+        guard generation == commitWaitGeneration, let wait = commitWait else { return }
+        commitWait = nil
+        wait.resume()
     }
+
+    /// No-op under server-side VAD: `create_response: true` makes OpenAI create
+    /// the response automatically at end of turn. Kept for protocol conformance
+    /// and for the tool-output path, which still creates a response explicitly.
+    public func createResponse() async {}
 
     public func sendToolOutput(callId: String, outputJSON: String) async {
         guard connected else { return }
@@ -275,6 +345,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     public func interrupt() async {
         // Only cancel when a response is actually streaming; otherwise the server
         // rejects with "Cancellation failed: no active response found".
+        // Do NOT clear the input buffer here — a clear while the user is speaking
+        // (handoff / barge-in races) wipes audio that VAD has not committed yet.
+        // Agent switches tear down the socket instead.
         guard responseActive else { return }
         cancelledResponseId = activeResponseId
         responseActive = false
@@ -286,17 +359,29 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     public func analyze(image: CapturedFrame, prompt: String) async throws -> String {
-        // Realtime image input varies by model revision; Phase 2 uses a REST fallback path via chat completions style payload over WS item create when available.
+        try await analyze(image: image, prompt: prompt, speak: true)
+    }
+
+    /// Vision turn. When `speak` is false, request text-only output so Kitchen
+    /// photo logging never plays TTS through the glasses.
+    public func analyze(image: CapturedFrame, prompt: String, speak: Bool) async throws -> String {
         // Downscale/recompress before base64 so the WebSocket payload (and the
         // model's decode time) stays small — this is the dominant, tunable slice
         // of end-to-end vision latency. base64 also inflates bytes ~33%.
         let t0 = Date()
-        let (data, mime) = Self.prepareForUpload(image)
+        // Prefer higher-fidelity stills for one-shot vision (plants, meals, etc.).
+        // Streaming chat frames can keep the smaller realtime defaults elsewhere.
+        let (data, mime) = Self.prepareForUpload(image, maxDimension: 1536, quality: 0.82)
         let b64 = data.base64EncodedString()
         let encodeMs = Int(Date().timeIntervalSince(t0) * 1000)
         NovaLog.vision.info(
             "vision upload prep: \(image.imageData.count, privacy: .public)B → \(data.count, privacy: .public)B in \(encodeMs, privacy: .public)ms"
         )
+        if let prior = analyzeWait {
+            analyzeWait = nil
+            prior.resume(throwing: NovaError.cancelled)
+        }
+        analyzeBuffer = ""
         try await sendJSON([
             "type": "conversation.item.create",
             "item": [
@@ -312,15 +397,58 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             ]
         ])
         ttfaMark = .now
-        try await sendJSON(["type": "response.create"])
-        return "(multimodal response streaming via events)"
+        if speak {
+            try await sendJSON(["type": "response.create"])
+        } else {
+            try await sendJSON([
+                "type": "response.create",
+                "response": [
+                    "output_modalities": ["text"]
+                ]
+            ])
+        }
+        // Await the correlated transcript while the receive loop still streams
+        // `.outputTranscript` events for live UI. Cap wait so a stuck socket cannot
+        // hang the vision path forever.
+        do {
+            return try await withThrowingTaskGroup(of: String.self) { group in
+                group.addTask { [weak self] in
+                    guard let self else { throw NovaError.cancelled }
+                    return try await self.waitForAnalyzeResult()
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(45))
+                    throw NovaError.vision("Vision analysis timed out")
+                }
+                let answer = try await group.next()!
+                group.cancelAll()
+                return answer
+            }
+        } catch {
+            failAnalyzeWait(error)
+            throw error
+        }
+    }
+
+    private func waitForAnalyzeResult() async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            analyzeWait = cont
+        }
+    }
+
+    private func failAnalyzeWait(_ error: Error) {
+        if let wait = analyzeWait {
+            analyzeWait = nil
+            analyzeBuffer = ""
+            wait.resume(throwing: error)
+        }
     }
 
     /// Shrinks a captured still to a model-friendly size and re-encodes as JPEG.
     /// Returns the original bytes unchanged when UIKit isn't available or the
     /// image is already small enough. Longest side is capped so upload + model
     /// decode stay fast without hurting recognition quality.
-    static func prepareForUpload(_ frame: CapturedFrame, maxDimension: CGFloat = 768, quality: CGFloat = 0.5) -> (Data, String) {
+    public static func prepareForUpload(_ frame: CapturedFrame, maxDimension: CGFloat = 768, quality: CGFloat = 0.5) -> (Data, String) {
         #if canImport(UIKit)
         guard let image = UIImage(data: frame.imageData) else { return (frame.imageData, frame.mimeType) }
         let longest = max(image.size.width, image.size.height)
@@ -342,6 +470,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     private func resolveCredential() async throws -> EphemeralCredential {
+        // Prefer a cached secret only if this process has not yet opened a socket
+        // with it. After disconnect we clear the store; a still-cached value is
+        // from a failed/partial connect attempt and may be reused once.
         if let existing = try tokenStore.load(), !existing.isExpired {
             return existing
         }
@@ -358,7 +489,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     }
 
     private func sendJSON(_ object: [String: Any]) async throws {
-        guard let socket else { throw NovaError.aiProvider("Not connected") }
+        guard let socket else {
+            throw NovaError.aiProvider(
+                "Voice isn’t connected — open Assistant, tap Listen, then try again."
+            )
+        }
         let data = try JSONSerialization.data(withJSONObject: object)
         guard let text = String(data: data, encoding: .utf8) else {
             throw NovaError.aiProvider("JSON encode failed")
@@ -393,8 +528,31 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
     /// Re-establish a dropped socket with exponential backoff. Refreshes the
     /// ephemeral credential if it expired, re-sends `session.update`, and resumes
     /// the receive loop, emitting `.reconnected` on success or `.error` if the
-    /// attempts are exhausted.
+    /// attempts are exhausted *while the app is foregrounded*.
     private func reconnect() async {
+        guard lastConfig != nil else {
+            connected = false
+            return
+        }
+        // Coalesce overlapping reconnect kicks (receive-loop error + append failure).
+        if let existing = reconnectTask, !existing.isCancelled {
+            await existing.value
+            return
+        }
+        reconnectGeneration += 1
+        let myGeneration = reconnectGeneration
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.runReconnectLoop()
+        }
+        reconnectTask = task
+        await task.value
+        if reconnectGeneration == myGeneration {
+            reconnectTask = nil
+        }
+    }
+
+    private func runReconnectLoop() async {
         guard let config = lastConfig else {
             connected = false
             return
@@ -410,16 +568,54 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
 
-        while reconnectAttempts < maxReconnectAttempts {
+        #if canImport(UIKit)
+        let bg = await MainActor.run { BackgroundTask.begin(name: "nova.realtime-reconnect") }
+        defer { Task { @MainActor in BackgroundTask.end(bg) } }
+        #endif
+
+        while lastConfig != nil {
+            if Task.isCancelled { return }
+            if reconnectAttempts >= maxReconnectAttempts {
+                if !appIsActive {
+                    // Keep lastConfig; unlock calls resumeTransportIfNeeded.
+                    NovaLog.ai.warning(
+                        "Realtime reconnect budget hit while backgrounded — waiting for unlock"
+                    )
+                    eventsContinuation?.yield(
+                        .error(message: "Realtime paused — unlock the phone to reconnect")
+                    )
+                    return
+                }
+                metrics?.increment(.reconnectExhausted)
+                metrics?.increment(.sessionFailures)
+                reconnectStartedAt = nil
+                eventsContinuation?.yield(
+                    .error(message: "Realtime disconnected (reconnect attempts exhausted)")
+                )
+                return
+            }
+
             reconnectAttempts += 1
             metrics?.increment(.reconnectAttempts)
             let delay = min(pow(2.0, Double(reconnectAttempts - 1)), 16)
-            // Small jitter so multiple devices don't reconnect in lockstep.
             let jitter = Double.random(in: 0...(delay * 0.2))
-            NovaLog.ai.warning("Realtime dropped; reconnect attempt \(self.reconnectAttempts) in \(delay + jitter)s")
+            NovaLog.ai.warning(
+                "Realtime dropped; reconnect attempt \(self.reconnectAttempts) in \(delay + jitter)s"
+            )
             try? await Task.sleep(for: .seconds(delay + jitter))
             if Task.isCancelled || lastConfig == nil { return }
+
+            // Prefer parking while locked over burning attempts on dead radio.
+            if !appIsActive {
+                NovaLog.ai.info("Deferring Realtime reconnect until the phone is unlocked")
+                eventsContinuation?.yield(
+                    .error(message: "Realtime paused — unlock the phone to reconnect")
+                )
+                return
+            }
+
             do {
+                try? tokenStore.clear()
                 try await openSocket(config: config)
                 reconnectAttempts = 0
                 eventsContinuation?.yield(.reconnected)
@@ -429,10 +625,24 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 NovaLog.ai.error("Reconnect failed: \(String(describing: error), privacy: .public)")
             }
         }
-        metrics?.increment(.reconnectExhausted)
-        metrics?.increment(.sessionFailures)
-        reconnectStartedAt = nil
-        eventsContinuation?.yield(.error(message: "Realtime disconnected (reconnect attempts exhausted)"))
+    }
+
+    public func noteAppLifecycle(isActive: Bool) async {
+        let wasActive = appIsActive
+        appIsActive = isActive
+        if isActive, !wasActive {
+            // Fresh radio + user attention — reset budget. Orchestrator calls
+            // `resumeTransportIfNeeded` to actually reopen the socket.
+            reconnectAttempts = 0
+        }
+    }
+
+    public func resumeTransportIfNeeded() async -> Bool {
+        guard lastConfig != nil else { return false }
+        if connected { return true }
+        reconnectAttempts = 0
+        await reconnect()
+        return connected
     }
 
     private func handleMessage(_ text: String) async {
@@ -443,8 +653,20 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         else { return }
 
         switch type {
-        case "session.updated", "session.created":
+        case "session.updated":
+            sessionUpdateError = nil
             waitingForSessionUpdated = false
+            if let session = json["session"] as? [String: Any],
+               let audio = session["audio"] as? [String: Any],
+               let input = audio["input"] as? [String: Any]
+            {
+                let vad = (input["turn_detection"] as? [String: Any])?["type"] as? String ?? "none"
+                let stt = (input["transcription"] as? [String: Any])?["model"] as? String ?? "none"
+                NovaLog.ai.info("session.updated vad=\(vad, privacy: .public) stt=\(stt, privacy: .public)")
+            }
+        case "session.created":
+            // Informational only — do not clear the session.update wait.
+            break
         case "response.audio.delta", "response.output_audio.delta":
             // Suppress late audio from a cancelled response.
             if let cancelled = cancelledResponseId,
@@ -461,8 +683,10 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 }
                 eventsContinuation?.yield(.outputAudio(pcm16_24k: pcm))
             }
-        case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+        case "response.audio_transcript.delta", "response.output_audio_transcript.delta",
+             "response.output_text.delta", "response.text.delta":
             if let delta = json["delta"] as? String {
+                if analyzeWait != nil { analyzeBuffer += delta }
                 eventsContinuation?.yield(.outputTranscript(delta: delta))
             }
         case "conversation.item.input_audio_transcription.delta":
@@ -472,6 +696,11 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
         case "conversation.item.input_audio_transcription.completed":
             let transcript = json["transcript"] as? String ?? ""
             eventsContinuation?.yield(.inputTranscriptionCompleted(transcript: transcript))
+        case "conversation.item.input_audio_transcription.failed":
+            let message = (json["error"] as? [String: Any])?["message"] as? String
+                ?? (json["message"] as? String)
+                ?? "input audio transcription failed"
+            eventsContinuation?.yield(.error(message: "Realtime STT failed: \(message)"))
         case "input_audio_buffer.speech_started":
             eventsContinuation?.yield(.speechStarted)
         case "input_audio_buffer.speech_stopped":
@@ -482,6 +711,9 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
                 ttfaMark = speechEndMark
             }
             eventsContinuation?.yield(.speechStopped)
+        case "input_audio_buffer.committed":
+            speechEndMark = .now
+            finishCommitWait(generation: commitWaitGeneration)
         case "response.created":
             responseActive = true
             activeResponseId = (json["response"] as? [String: Any])?["id"] as? String
@@ -499,6 +731,21 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             if ttfaMark != nil {
                 ttfaMark = nil
             }
+            if let usageObj = (json["response"] as? [String: Any])?["usage"] as? [String: Any] {
+                let input = usageObj["input_tokens"] as? Int
+                    ?? usageObj["prompt_tokens"] as? Int
+                    ?? 0
+                let output = usageObj["output_tokens"] as? Int
+                    ?? usageObj["completion_tokens"] as? Int
+                    ?? 0
+                usage?.recordTokens(input: input, output: output)
+            }
+            if let wait = analyzeWait {
+                analyzeWait = nil
+                let answer = analyzeBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                wait.resume(returning: answer.isEmpty ? "(no spoken answer)" : answer)
+                analyzeBuffer = ""
+            }
             eventsContinuation?.yield(.responseEnded)
         case "response.function_call_arguments.done":
             let id = json["call_id"] as? String ?? UUID().uuidString
@@ -507,10 +754,21 @@ public actor OpenAIRealtimeProvider: ConversationalAIProvider {
             eventsContinuation?.yield(.toolCall(id: id, name: name, argumentsJSON: args))
         case "error":
             let message = (json["error"] as? [String: Any])?["message"] as? String ?? "unknown"
-            // Benign under server VAD barge-in: a cancel can race with the response
-            // completing, so the server reports no active response to cancel.
+            // Unblock a pending commit wait so the orchestrator can unlock/retry.
+            finishCommitWait(generation: commitWaitGeneration)
+            // session.update rejection must not leave connect() spinning until timeout.
+            if waitingForSessionUpdated {
+                sessionUpdateError = message
+                waitingForSessionUpdated = false
+            }
+            // Benign under barge-in: cancel can race with response.done so the
+            // server reports nothing to cancel. Do NOT swallow "already has an
+            // active response" — the orchestrator needs that to unlock/retry.
             let lowered = message.lowercased()
-            if lowered.contains("no active response") || lowered.contains("cancellation failed") {
+            if lowered.contains("cancellation failed")
+                || lowered.contains("no active response to cancel")
+                || (lowered.contains("no active response") && !lowered.contains("already has"))
+            {
                 break
             }
             // Auth failure: clear cached secret so the next connect remints.

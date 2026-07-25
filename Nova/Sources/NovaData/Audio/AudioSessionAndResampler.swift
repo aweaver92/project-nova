@@ -5,21 +5,76 @@ import NovaDomain
 
 #if os(iOS)
 public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked Sendable {
+    private let lock = NSLock()
+    /// Default false = HFP-first (early builds that worked with glasses).
+    /// Flip to true when silence diagnostics detect a dead HFP mic.
+    private var preferBuiltInMic = false
+
     public init() {}
+
+    public func setPreferBuiltInMic(_ value: Bool) {
+        lock.lock()
+        preferBuiltInMic = value
+        lock.unlock()
+    }
+
+    public func preferBuiltInMicEnabled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return preferBuiltInMic
+    }
 
     public func activateConversationalHFP() async throws {
         let session = AVAudioSession.sharedInstance()
         do {
+            let granted = await Self.ensureRecordPermission()
+            guard granted else {
+                throw NovaError.audioSession(
+                    "Microphone permission denied — enable Mic for Nova in iOS Settings → Nova"
+                )
+            }
+
             // `.voiceChat` routes capture/playback through the system voice-processing
             // path (echo cancellation, noise suppression, automatic gain control),
             // which materially improves intelligibility on the narrowband HFP link.
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .duckOthers])
+            // `.defaultToSpeaker` matters when glasses/HFP disconnect: without it,
+            // playAndRecord + voiceChat lands on the quiet earpiece instead of the
+            // loud speaker. Bluetooth HFP still takes precedence when present.
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetooth, .defaultToSpeaker, .duckOthers]
+            )
             try session.setActive(true, options: .notifyOthersOnDeactivation)
-            if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+
+            // Early working builds preferred HFP when glasses were present. Built-in
+            // is used only after a silent-mic failover flips the preference.
+            let wantBuiltIn = preferBuiltInMicEnabled()
+            if wantBuiltIn {
+                if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                    try session.setPreferredInput(builtIn)
+                    NovaLog.audio.info("Preferred input: built-in mic (\(builtIn.portName, privacy: .public))")
+                } else if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+                    try session.setPreferredInput(hfp)
+                    NovaLog.audio.info("Preferred input fallback: HFP \(hfp.portName, privacy: .public)")
+                }
+            } else if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
                 try session.setPreferredInput(hfp)
-                NovaLog.audio.info("HFP preferred input: \(hfp.portName, privacy: .public)")
+                NovaLog.audio.info("Preferred input: HFP \(hfp.portName, privacy: .public)")
+            } else if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try session.setPreferredInput(builtIn)
+                NovaLog.audio.info("Preferred input fallback: built-in mic (\(builtIn.portName, privacy: .public))")
+            }
+
+            // Preferred input can lag behind currentRoute; nudge once if mismatch.
+            try await Self.verifyPreferredInputSettled(wantBuiltIn: wantBuiltIn)
+
+            if session.availableInputs?.contains(where: { $0.portType == .bluetoothHFP }) == true {
+                // Glasses/headset present: let the system keep HFP for playback.
+                try? session.overrideOutputAudioPort(.none)
             } else {
-                NovaLog.audio.warning("No bluetoothHFP input yet; continuing with current route")
+                try? session.overrideOutputAudioPort(.speaker)
+                NovaLog.audio.warning("No bluetoothHFP route; playback on phone speaker")
             }
             // Prefer wideband HFP (mSBC, 16 kHz) over narrowband (CVSD, 8 kHz).
             // Modern Bluetooth headsets — including the Meta glasses — negotiate
@@ -29,6 +84,37 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
             // Match the ~20 ms conversational cadence: small enough to keep latency
             // low, large enough to avoid render underruns / choppy playback.
             try? session.setPreferredIOBufferDuration(0.02)
+            NovaLog.audio.info("Active input route: \(Self.currentInputDescription(), privacy: .public)")
+        } catch {
+            throw NovaError.audioSession(String(describing: error))
+        }
+    }
+
+    public func activatePlaybackOnly() async throws {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // Spoken answers without Listen: keep Meta AI off the HFP mic/speaker
+            // path. A2DP (or phone speaker) is output-only and does not steal the
+            // glasses call channel Meta AI uses.
+            try session.setCategory(
+                .playback,
+                mode: .spokenAudio,
+                options: [.duckOthers, .allowBluetoothA2DP]
+            )
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+            // Prefer loud speaker when no A2DP glasses/headset route is up.
+            let outputs = session.currentRoute.outputs
+            let onA2DP = outputs.contains {
+                $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
+            }
+            if !onA2DP {
+                try? session.overrideOutputAudioPort(.speaker)
+            } else {
+                try? session.overrideOutputAudioPort(.none)
+            }
+            NovaLog.audio.info(
+                "Playback-only audio active (A2DP/speaker) — HFP left free for Meta AI"
+            )
         } catch {
             throw NovaError.audioSession(String(describing: error))
         }
@@ -37,12 +123,65 @@ public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked
     public func deactivate() async {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
+
+    public static func currentInputDescription() -> String {
+        let inputs = AVAudioSession.sharedInstance().currentRoute.inputs
+        if inputs.isEmpty { return "no-input" }
+        return inputs.map { "\($0.portName)[\($0.portType.rawValue)]" }.joined(separator: ", ")
+    }
+
+    /// After setPreferredInput, currentRoute can still show the old port for a
+    /// beat. Retry once so Listen does not install a tap on a dead HFP node.
+    private static func verifyPreferredInputSettled(wantBuiltIn: Bool) async throws {
+        let session = AVAudioSession.sharedInstance()
+        for attempt in 0..<3 {
+            let inputs = session.currentRoute.inputs
+            let hasBuiltIn = inputs.contains { $0.portType == .builtInMic }
+            let hasHFP = inputs.contains { $0.portType == .bluetoothHFP }
+            if wantBuiltIn {
+                if hasBuiltIn || session.availableInputs?.contains(where: { $0.portType == .builtInMic }) != true {
+                    return
+                }
+            } else if hasHFP || session.availableInputs?.contains(where: { $0.portType == .bluetoothHFP }) != true {
+                return
+            }
+            NovaLog.audio.warning(
+                "Preferred input not settled (wantBuiltIn=\(wantBuiltIn), route=\(Self.currentInputDescription(), privacy: .public)); retry \(attempt + 1)"
+            )
+            if wantBuiltIn, let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try? session.setPreferredInput(builtIn)
+            } else if !wantBuiltIn, let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+                try? session.setPreferredInput(hfp)
+            }
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+    }
+
+    private static func ensureRecordPermission() async -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        switch session.recordPermission {
+        case .granted:
+            return true
+        case .denied:
+            return false
+        case .undetermined:
+            return await withCheckedContinuation { cont in
+                session.requestRecordPermission { cont.resume(returning: $0) }
+            }
+        @unknown default:
+            return false
+        }
+    }
 }
 #else
 public final class AudioSessionCoordinator: AudioSessionCoordinating, @unchecked Sendable {
     public init() {}
+    public func setPreferBuiltInMic(_ value: Bool) {}
+    public func preferBuiltInMicEnabled() -> Bool { false }
     public func activateConversationalHFP() async throws {}
+    public func activatePlaybackOnly() async throws {}
     public func deactivate() async {}
+    public static func currentInputDescription() -> String { "unavailable" }
 }
 #endif
 

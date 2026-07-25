@@ -1,0 +1,1150 @@
+import XCTest
+@testable import NovaDomain
+@testable import NovaFeatures
+
+@MainActor
+final class CodingRepoViewModelTests: XCTestCase {
+    func testPublishConfirmationDenialDoesNotCallBridge() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.confirmPublish = { _, _ in false }
+
+        await vm.load()
+        await vm.refreshRepoStatusAndDiff()
+        XCTAssertEqual(vm.repoStatus?.clean, false)
+
+        await vm.publishPullRequest()
+        XCTAssertEqual(vm.statusMessage, "Publish cancelled.")
+        let calls = await bridge.publishCallCount
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testCommitAndBuildConfirmationDenialDoesNotCallBridge() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.confirmPublish = { _, _ in false }
+
+        await vm.load()
+        await vm.commitAndBuildIpa()
+        XCTAssertEqual(vm.statusMessage, "Commit and build cancelled.")
+        let calls = await bridge.commitAndBuildCallCount
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testCommitAndBuildSkipConfirmCallsBridge() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.confirmPublish = { _, _ in false }
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
+
+        await vm.load()
+        await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
+        let calls = await bridge.commitAndBuildCallCount
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(vm.statusMessage.contains("Nova/App/NovaApp.ipa"))
+        XCTAssertEqual(notified?.0, true)
+        XCTAssertTrue(notified?.1.contains("Nova/App/NovaApp.ipa") == true)
+        XCTAssertFalse(vm.isCommitAndBuilding)
+        XCTAssertNil(vm.commitAndBuildStartedAt)
+    }
+
+    func testCommitAndBuildFailureNotifies() async {
+        let bridge = DirtyRepoBridge(commitAndBuildShouldFail: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
+
+        await vm.load()
+        await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
+        XCTAssertEqual(notified?.0, false)
+        XCTAssertNotNil(notified?.1)
+        XCTAssertFalse(vm.isCommitAndBuilding)
+    }
+
+    func testCommitAndBuildPauseDoesNotMarkFailed() async {
+        PendingCommitBuildStore.clear()
+        let bridge = DirtyRepoBridge(commitAndBuildPauseOnPoll: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var notified: (Bool, String)?
+        vm.notifyCommitAndBuildResult = { success, detail in
+            notified = (success, detail)
+        }
+
+        await vm.load()
+        await vm.commitAndBuildIpa(userAlreadyConfirmed: true)
+        XCTAssertNil(notified, "Paused poll must not fire failure notification")
+        XCTAssertNil(vm.lastCommitAndBuildFailure)
+        XCTAssertFalse(vm.isCommitAndBuilding)
+        XCTAssertTrue(vm.showsCommitAndBuildProgress)
+        XCTAssertNotNil(PendingCommitBuildStore.load())
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("ci")
+            || vm.commitAndBuildPhaseLabel.localizedCaseInsensitiveContains("CI"))
+
+        await vm.resumePendingCommitAndBuildIfNeeded()
+        XCTAssertEqual(notified?.0, true)
+        XCTAssertNil(PendingCommitBuildStore.load())
+        XCTAssertFalse(vm.showsCommitAndBuildProgress)
+        PendingCommitBuildStore.clear()
+    }
+
+    func testSelectRepositoryDoesNotReuseAnotherReposPinnedSession() async {
+        // Bridge must report the same selected repo as settings, or load()'s
+        // refreshRepositories() will overwrite and hide the per-repo pin.
+        let bridge = DirtyRepoBridge(selectedRepoId: "1111111111111111")
+        let settings = MemorySettings(repoId: "1111111111111111", sessionId: "stale")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        // Pins are restored when Code view opens (shared with voice).
+        XCTAssertNil(vm.pinnedSessionId)
+
+        await vm.beginCodeViewSession()
+        XCTAssertEqual(vm.pinnedSessionId, "stale")
+        await vm.attach(sessionId: "stale")
+        XCTAssertEqual(vm.pinnedSessionId, "stale")
+
+        await vm.selectRepository("abcdef0123456789")
+        XCTAssertNil(vm.pinnedSessionId)
+        XCTAssertEqual(vm.selectedRepoId, "abcdef0123456789")
+        let sessionAfter = await settings.codingSessionId()
+        XCTAssertNil(sessionAfter)
+    }
+
+    func testBeginCodeViewSessionRestoresPriorPin() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789", sessionId: "old-agent")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+        XCTAssertEqual(vm.pinnedSessionId, "old-agent")
+        let kept = await settings.codingSessionId()
+        XCTAssertEqual(kept, "old-agent")
+    }
+
+    func testEnqueueFromVoiceAppearsInTranscriptAndPinsSession() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        let payload = await vm.enqueueFromVoice(command: "spoken fix the bug")
+        XCTAssertTrue(payload.contains("agent-test"))
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        XCTAssertEqual(vm.items.first?.kind, .user)
+        XCTAssertEqual(vm.items.first?.text, "spoken fix the bug")
+        XCTAssertEqual(vm.items.first?.isFromVoice, true)
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["spoken fix the bug"])
+        let pinned = await settings.codingSessionId()
+        XCTAssertEqual(pinned, "agent-test")
+    }
+
+    func testReenteringCodeViewPreservesActiveSessionAndRun() async {
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.25)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "long job"
+        let sendTask = Task { await vm.send() }
+        try? await Task.sleep(for: .milliseconds(40))
+        XCTAssertTrue(vm.isRunning)
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        let itemsBefore = vm.items.count
+
+        // Simulate leaving Coding and coming back (NavigationLink pop/push).
+        await vm.beginCodeViewSession()
+        XCTAssertTrue(vm.isCodeViewSessionActive)
+        XCTAssertTrue(vm.isRunning)
+        XCTAssertEqual(vm.items.count, itemsBefore)
+
+        await sendTask.value
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["long job"])
+    }
+
+    func testMultiplePromptsReuseTheSameSession() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first prompt"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+
+        vm.draft = "follow-up in same chat"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        let commands = await bridge.receivedCommands
+        let sessionIds = await bridge.receivedSessionIds
+        XCTAssertEqual(commands, ["first prompt", "follow-up in same chat"])
+        XCTAssertEqual(sessionIds.count, 2)
+        XCTAssertNil(sessionIds[0])
+        XCTAssertEqual(sessionIds[1], "agent-test")
+    }
+
+    func testPromptSubmittedDuringActiveRunQueuesAndUsesSameSession() async {
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 0.2)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first prompt"
+        let firstSend = Task { await vm.send() }
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(vm.isRunning)
+
+        vm.draft = "queued follow-up"
+        await vm.send()
+
+        XCTAssertEqual(vm.queuedPromptCount, 1)
+        XCTAssertTrue(vm.draft.isEmpty)
+        await firstSend.value
+
+        let commands = await bridge.receivedCommands
+        let sessionIds = await bridge.receivedSessionIds
+        XCTAssertEqual(commands, ["first prompt", "queued follow-up"])
+        XCTAssertEqual(sessionIds, [nil, "agent-test"])
+        XCTAssertEqual(vm.queuedPromptCount, 0)
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testEndSessionRequiresCodeViewToReopenBeforeNextChat() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+        vm.draft = "open chat"
+        await vm.send()
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+
+        await vm.endSession()
+        XCTAssertNil(vm.pinnedSessionId)
+        XCTAssertTrue(vm.items.isEmpty)
+        XCTAssertFalse(vm.isCodeViewSessionActive)
+
+        vm.draft = "must not start silently"
+        await vm.send()
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["open chat"])
+    }
+
+    func testImageOnlyPromptSendsAttachmentAndClearsComposer() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
+        vm.addImage(
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png",
+            width: 1,
+            height: 1
+        )
+
+        await vm.send()
+
+        let imageCount = await bridge.receivedImageCount
+        XCTAssertEqual(imageCount, 1)
+        XCTAssertTrue(vm.pendingImages.isEmpty)
+        XCTAssertTrue(vm.items.first?.text.contains("Analyze the attached image") == true)
+        XCTAssertTrue(vm.items.first?.text.contains("📎 1 image") == true)
+    }
+
+    func testRetryLastResendsPreviousCommand() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+
+        XCTAssertFalse(vm.canRetry)
+        await vm.beginCodeViewSession()
+        vm.draft = "fix the build"
+        await vm.send()
+        XCTAssertTrue(vm.canRetry)
+
+        await vm.retryLast()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["fix the build", "fix the build"])
+        let userRows = vm.items.filter { $0.kind == .user }
+        XCTAssertEqual(userRows.count, 2)
+    }
+
+    func testUploadFileToCurrentRepoWritesViaBridge() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.browseRepository()
+
+        let ok = await vm.uploadFileToCurrentRepo(
+            fileName: "notes.txt",
+            data: Data("hello".utf8),
+            overwrite: true
+        )
+        XCTAssertTrue(ok)
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("notes.txt"))
+    }
+
+    func testBrowsesFoldersAndStartsSelectedFilePreview() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        await vm.browseRepository()
+        XCTAssertEqual(vm.repoFileEntries.map(\.name), ["src", "index.html"])
+        XCTAssertEqual(vm.repoBrowsePath, "")
+
+        await vm.browseRepository(path: "src")
+        XCTAssertEqual(vm.repoBrowsePath, "src")
+        XCTAssertEqual(vm.repoFileEntries.first?.path, "src/page.html")
+
+        await vm.startPreview(path: "src/page.html")
+        XCTAssertEqual(vm.activePreview?.path, "src/page.html")
+        XCTAssertEqual(vm.activePreview?.url, "http://192.168.0.66:8790/src/page.html")
+        let target = await bridge.receivedPreviewPath
+        XCTAssertEqual(target, "src/page.html")
+    }
+
+    func testAskPromptIsReadOnlyInBridgeCommandAndTranscript() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "/ask What does send() do?"
+        await vm.send()
+
+        XCTAssertEqual(vm.items.first?.text, "What does send() do?")
+        XCTAssertEqual(vm.items.first?.isAskOnly, true)
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands.count, 1)
+        XCTAssertTrue(commands[0].contains("READ-ONLY Q&A"))
+        XCTAssertTrue(commands[0].contains("What does send() do?"))
+        XCTAssertFalse(commands[0].contains("/ask What"))
+        let baselines = await bridge.baselineCreateCount
+        XCTAssertEqual(baselines, 0)
+        XCTAssertEqual(vm.promptHistory.first?.text, "/ask What does send() do?")
+        // retryLast restores raw `/ask` text then re-sends (draft clears like send()).
+        await vm.retryLast()
+        XCTAssertTrue(vm.draft.isEmpty)
+        let commandsAfterRetry = await bridge.receivedCommands
+        XCTAssertEqual(commandsAfterRetry.count, 2)
+        XCTAssertTrue(commandsAfterRetry[1].contains("READ-ONLY Q&A"))
+        XCTAssertTrue(commandsAfterRetry[1].contains("What does send() do?"))
+        XCTAssertFalse(commandsAfterRetry[1].contains("/ask What"))
+        let baselinesAfterRetry = await bridge.baselineCreateCount
+        XCTAssertEqual(baselinesAfterRetry, 0)
+    }
+
+    func testPromptPinsComposeBridgeCommandButNotTranscript() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let prompts = InMemoryCodingPromptStore()
+        let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
+        await vm.load()
+        await vm.beginCodeViewSession()
+        await vm.pinPath("src/App.tsx", isDirectory: false)
+
+        vm.draft = "Add a button"
+        await vm.send()
+
+        XCTAssertEqual(vm.items.first?.text, "Add a button")
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands.count, 1)
+        XCTAssertTrue(commands[0].contains("Focus on these paths"))
+        XCTAssertTrue(commands[0].contains("src/App.tsx"))
+        XCTAssertTrue(commands[0].contains("Add a button"))
+        XCTAssertEqual(vm.promptHistory.first?.text, "Add a button")
+    }
+
+    func testKeepAndRevertReviewPaths() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "edit files"
+        await vm.send()
+
+        XCTAssertEqual(vm.agentReview?.files.count, 1)
+        XCTAssertEqual(vm.agentReview?.files.first?.path, "a.swift")
+        XCTAssertTrue(vm.showDiff)
+
+        await vm.keepReviewPaths(["a.swift"])
+        let kept = await bridge.keptPaths
+        XCTAssertEqual(kept, ["a.swift"])
+        XCTAssertEqual(vm.agentReview?.files.first?.kept, true)
+
+        await vm.revertReviewPaths(["a.swift"])
+        let restored = await bridge.restoredPaths
+        XCTAssertEqual(restored, ["a.swift"])
+    }
+
+    func testPublishDefaultsToAgentReviewPaths() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.confirmPublish = { _, _ in true }
+        await vm.load()
+        await vm.beginCodeViewSession()
+        vm.draft = "edit"
+        await vm.send()
+
+        XCTAssertEqual(vm.defaultPublishPaths(), ["a.swift"])
+        await vm.publishPullRequest()
+        let published = await bridge.lastPublishPaths
+        XCTAssertEqual(published, ["a.swift"])
+    }
+
+    func testAutoOpenPreviewOpensOnceWhenReady() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789", autoOpenPreview: true)
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var opened: [URL] = []
+        vm.openURL = { url in
+            opened.append(url)
+            return true
+        }
+        await vm.load()
+        await vm.startPreview(path: "src/page.html")
+        XCTAssertEqual(opened.count, 1)
+        XCTAssertEqual(opened.first?.absoluteString, "http://192.168.0.66:8790/src/page.html")
+    }
+
+    func testFavoriteRepositoriesPersistAndFilterPicker() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+
+        XCTAssertEqual(vm.repositories.count, 2)
+        XCTAssertTrue(vm.favoriteRepositories.isEmpty)
+        XCTAssertEqual(vm.filteredRepositories.count, 2)
+
+        await vm.toggleFavoriteRepository("abcdef0123456789")
+        XCTAssertTrue(vm.isFavoriteRepository("abcdef0123456789"))
+        XCTAssertEqual(vm.favoriteRepositories.map(\.id), ["abcdef0123456789"])
+        XCTAssertEqual(vm.filteredRepositories.map(\.id), ["1111111111111111"])
+        let persisted = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(persisted, ["abcdef0123456789"])
+
+        vm.repoSearchQuery = "oth"
+        XCTAssertEqual(vm.filteredRepositories.map(\.name), ["other"])
+        XCTAssertTrue(vm.favoriteRepositories.isEmpty) // favorite name does not match query
+
+        await vm.toggleFavoriteRepository("abcdef0123456789")
+        XCTAssertFalse(vm.isFavoriteRepository("abcdef0123456789"))
+        let cleared = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(cleared, [])
+    }
+
+    func testRefreshPrunesStaleFavoriteRepoIds() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(
+            repoId: "abcdef0123456789",
+            favoriteRepoIds: ["abcdef0123456789", "deadbeefdeadbeef"]
+        )
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        XCTAssertEqual(vm.favoriteRepoIds, ["abcdef0123456789"])
+        let pruned = await settings.codingFavoriteRepoIds()
+        XCTAssertEqual(pruned, ["abcdef0123456789"])
+    }
+
+    func testStopPreviewInvalidatesStaleAutoOpen() async {
+        let bridge = DirtyRepoBridge(previewBecomesReadyAfterPolls: 2)
+        let settings = MemorySettings(repoId: "abcdef0123456789", autoOpenPreview: true)
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        var opened = 0
+        vm.openURL = { _ in
+            opened += 1
+            return true
+        }
+        await vm.load()
+
+        let start = Task { await vm.startPreview(path: "src/page.html") }
+        try? await Task.sleep(for: .milliseconds(50))
+        await vm.stopPreview()
+        await start.value
+        XCTAssertEqual(opened, 0)
+    }
+
+    func testWatchdogTransitionsAndRestartSession() async {
+        // Keep the mock stream open long enough that hard-stall can fire after the
+        // initial status SSE resets lastSSEActivityAt (CI can take >100ms to get there).
+        let bridge = DirtyRepoBridge(streamDelaySeconds: 2.0)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.stallSoftSeconds = 0.05
+        vm.stallHardSeconds = 0.15
+        vm.stallPollSeconds = 0.03
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "long job"
+            await vm.send()
+        }
+        var reachedStuck = false
+        for _ in 0..<40 {
+            if vm.stallPhase == .looksStuck {
+                reachedStuck = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(reachedStuck, "Expected looksStuck while stream is quiet, got \(vm.stallPhase)")
+
+        await vm.restartSession()
+        XCTAssertNil(vm.pinnedSessionId)
+        XCTAssertEqual(vm.draft, "long job")
+        XCTAssertEqual(vm.stallPhase, .idle)
+        await sendTask.value
+        let cancelled = await bridge.cancelStreamCount
+        XCTAssertGreaterThanOrEqual(cancelled, 1)
+    }
+
+    func testLateSSEEventsAfterCancelAreIgnored() async {
+        let bridge = DirtyRepoBridge(emitAfterCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "hello"
+            await vm.send()
+        }
+        try? await Task.sleep(for: .milliseconds(30))
+        await vm.cancel()
+        await sendTask.value
+
+        XCTAssertFalse(vm.items.contains(where: { $0.kind == .assistant && $0.text.contains("late") }))
+    }
+
+    func testConnectionLossPollsExistingRunWithoutResendingPrompt() async {
+        let bridge = DirtyRepoBridge(disconnectAfterStart: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
+        vm.draft = "make one safe edit"
+
+        await vm.send()
+
+        let commands = await bridge.receivedCommands
+        let statusChecks = await bridge.runStatusCheckCount
+        XCTAssertEqual(commands, ["make one safe edit"], "auto-recovery must never resend")
+        XCTAssertEqual(statusChecks, 2)
+        XCTAssertEqual(vm.runStatus, "finished")
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testBackgroundKeepsCodingStreamAliveWithoutDisconnect() async {
+        PendingCursorRunStore.clear()
+        // Hold the SSE open until the test finishes asserting — a short delay
+        // races unlock on slow CI and falsely looks like a disconnect.
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "keep editing in background"
+            await vm.send()
+        }
+
+        var sawRun = false
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" {
+                sawRun = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(sawRun, "expected live run id before background")
+
+        await vm.noteEnteredBackground()
+        XCTAssertEqual(vm.runStatus, "running", "background must not flip to reconnecting")
+        XCTAssertEqual(PendingCursorRunStore.load()?.runId, "run-test")
+        let cancelledWhileBackgrounded = await bridge.cancelStreamCount
+        XCTAssertEqual(cancelledWhileBackgrounded, 0, "background must not cancel the coding SSE")
+
+        // Quiet SSE while held in background must not trigger unlock reconnect/cancel.
+        vm.sseFreshnessSeconds = 0.01
+        try? await Task.sleep(for: .milliseconds(30))
+        await vm.handleBecameActive()
+        let cancelledAfterUnlock = await bridge.cancelStreamCount
+        XCTAssertEqual(cancelledAfterUnlock, 0, "unlock must leave a held live stream alone")
+
+        await vm.cancel()
+        await sendTask.value
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["keep editing in background"], "must never resend")
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testUnlockRecoversWhenStreamDiesWhileBackgrounded() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true, statusFailCount: 1)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "recover after socket drop"
+            await vm.send()
+        }
+
+        var sawRun = false
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" {
+                sawRun = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(sawRun, "expected live run id before background")
+
+        await vm.noteEnteredBackground()
+        XCTAssertEqual(vm.runStatus, "running")
+        // Simulate the OS dropping the SSE while we stay backgrounded.
+        _ = await bridge.cancelActiveStream()
+        await sendTask.value
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["recover after socket drop"], "drop recovery must never resend")
+        XCTAssertEqual(vm.runStatus, "finished")
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertNil(PendingCursorRunStore.load())
+    }
+
+    func testRetryDuringReconnectReattachesWithoutSecondSend() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        vm.reconnectRetrySeconds = 0.01
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "original work"
+            await vm.send()
+        }
+
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(vm.activeRunId, "run-test")
+
+        // Drop SSE → disconnect recovery leaves us reconnecting / pending.
+        _ = await bridge.cancelActiveStream()
+        // Let execute enter recover (status still "running" on first poll).
+        try? await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertTrue(vm.blocksNewCursorSend || PendingCursorRunStore.load() != nil)
+
+        await vm.retryLast()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["original work"], "retry must not start a second Cursor send")
+        XCTAssertTrue(
+            vm.activitySteps.contains(where: { $0.text.contains("reattach") || $0.text.contains("Reattach") || $0.text.contains("Retry → reattach") }),
+            "expected reattach activity log"
+        )
+
+        await vm.cancel()
+        await sendTask.value
+        PendingCursorRunStore.clear()
+    }
+
+    func testSendWhileBusyQueuesWithoutSecondStream() async {
+        PendingCursorRunStore.clear()
+        let bridge = DirtyRepoBridge(holdStreamUntilCancel: true)
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.beginCodeViewSession()
+
+        let sendTask = Task {
+            vm.draft = "first"
+            await vm.send()
+        }
+        for _ in 0..<80 {
+            if vm.activeRunId == "run-test" { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(vm.blocksNewCursorSend)
+
+        vm.draft = "second should queue"
+        await vm.send()
+
+        let commands = await bridge.receivedCommands
+        XCTAssertEqual(commands, ["first"], "busy send must not open a second stream")
+        XCTAssertEqual(vm.queuedPromptCount, 1)
+        XCTAssertTrue(vm.statusMessage.localizedCaseInsensitiveContains("queue"))
+
+        await vm.cancel()
+        await sendTask.value
+        PendingCursorRunStore.clear()
+    }
+
+    func testTemplatesAndHistoryPersistPerRepo() async {
+        let prompts = InMemoryCodingPromptStore()
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "Ship a dark mode toggle"
+        await vm.saveCurrentDraftAsTemplate(title: "Dark mode")
+        XCTAssertEqual(vm.savedTemplates.first?.title, "Dark mode")
+
+        await vm.pinPath("README.md", isDirectory: false)
+        XCTAssertEqual(vm.pinnedPaths.map(\.path), ["README.md"])
+
+        vm.draft = "history prompt"
+        await vm.send()
+        XCTAssertEqual(vm.promptHistory.first?.text, "history prompt")
+
+        await vm.selectRepository("1111111111111111")
+        XCTAssertTrue(vm.pinnedPaths.isEmpty)
+        XCTAssertTrue(vm.savedTemplates.isEmpty)
+        XCTAssertTrue(vm.promptHistory.isEmpty)
+
+        await vm.selectRepository("abcdef0123456789")
+        XCTAssertEqual(vm.pinnedPaths.map(\.path), ["README.md"])
+        XCTAssertEqual(vm.savedTemplates.first?.title, "Dark mode")
+        XCTAssertEqual(vm.promptHistory.first?.text, "history prompt")
+    }
+
+    func testOpenHistoryEntryRestoresTranscriptWithoutResending() async throws {
+        let prompts = InMemoryCodingPromptStore()
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings, prompts: prompts)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        vm.draft = "first reviewable prompt"
+        await vm.send()
+        XCTAssertTrue(vm.promptHistory.first?.hasReviewableTranscript == true)
+        XCTAssertEqual(vm.promptHistory.first?.sessionId, "agent-test")
+        let saved = try XCTUnwrap(vm.promptHistory.first)
+
+        vm.draft = "second prompt clears the live transcript"
+        await vm.send()
+        XCTAssertTrue(vm.items.contains(where: { $0.text == "second prompt clears the live transcript" }))
+
+        let commandsBeforeOpen = await bridge.receivedCommands
+        await vm.openHistoryEntry(saved)
+        let commandsAfterOpen = await bridge.receivedCommands
+        XCTAssertEqual(commandsBeforeOpen, commandsAfterOpen, "opening Recent must not re-send")
+        XCTAssertEqual(vm.items.first?.text, "first reviewable prompt")
+        XCTAssertTrue(vm.items.contains(where: { $0.kind == .assistant }))
+        XCTAssertEqual(vm.pinnedSessionId, "agent-test")
+        XCTAssertTrue(vm.statusMessage.contains("Restored conversation"))
+    }
+
+    func testOpenHistoryEntryWithoutTranscriptLoadsComposer() async {
+        let bridge = DirtyRepoBridge()
+        let settings = MemorySettings(repoId: "abcdef0123456789")
+        let vm = CodingViewModel(bridge: bridge, settings: settings)
+        await vm.load()
+        await vm.beginCodeViewSession()
+
+        let legacy = CodingPromptHistoryEntry(text: "old prompt without transcript")
+        await vm.openHistoryEntry(legacy)
+        XCTAssertEqual(vm.draft, "old prompt without transcript")
+        XCTAssertTrue(vm.statusMessage.contains("No saved transcript"))
+        let commands = await bridge.receivedCommands
+        XCTAssertTrue(commands.isEmpty)
+    }
+}
+
+private actor MemorySettings: SettingsStoring {
+    private var repoId: String?
+    private var sessionIdsByRepo: [String: String]
+    private var unscopedSessionId: String?
+    private var autoOpenPreview: Bool
+    private var favoriteRepoIds: [String]
+
+    init(
+        repoId: String?,
+        sessionId: String? = nil,
+        autoOpenPreview: Bool = false,
+        favoriteRepoIds: [String] = []
+    ) {
+        self.repoId = repoId
+        if let repoId, let sessionId {
+            self.sessionIdsByRepo = [repoId: sessionId]
+            self.unscopedSessionId = nil
+        } else {
+            self.sessionIdsByRepo = [:]
+            self.unscopedSessionId = sessionId
+        }
+        self.autoOpenPreview = autoOpenPreview
+        self.favoriteRepoIds = favoriteRepoIds
+    }
+
+    func spokenFollowUps() async -> Bool { false }
+    func setSpokenFollowUps(_ enabled: Bool) async {}
+    func codingSessionId() async -> String? {
+        guard let repoId else { return unscopedSessionId }
+        return sessionIdsByRepo[repoId]
+    }
+    func setCodingSessionId(_ value: String?) async {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
+        if let repoId {
+            sessionIdsByRepo[repoId] = normalized
+        } else {
+            unscopedSessionId = normalized
+        }
+    }
+    func codingSelectedRepoId() async -> String? { repoId }
+    func setCodingSelectedRepoId(_ value: String?) async {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        repoId = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+    func codingAutoOpenPreview() async -> Bool { autoOpenPreview }
+    func setCodingAutoOpenPreview(_ enabled: Bool) async { autoOpenPreview = enabled }
+    func codingFavoriteRepoIds() async -> [String] { favoriteRepoIds }
+    func setCodingFavoriteRepoIds(_ ids: [String]) async { favoriteRepoIds = ids }
+}
+
+private actor DirtyRepoBridge: AgentBridging {
+    private(set) var publishCallCount = 0
+    private(set) var commitAndBuildCallCount = 0
+    private let commitAndBuildShouldFail: Bool
+    private let commitAndBuildPauseOnPoll: Bool
+    private var commitAndBuildPollCount = 0
+    private(set) var receivedImageCount = 0
+    private(set) var receivedCommands: [String] = []
+    private(set) var receivedSessionIds: [String?] = []
+    private(set) var receivedPreviewPath: String?
+    private(set) var keptPaths: [String] = []
+    private(set) var restoredPaths: [String] = []
+    private(set) var lastPublishPaths: [String] = []
+    private(set) var cancelStreamCount = 0
+    private(set) var runStatusCheckCount = 0
+    private(set) var baselineCreateCount = 0
+    private var reviewKept = false
+    private var selectedRepoId: String
+    private let streamDelaySeconds: Double
+    private let emitAfterCancel: Bool
+    private let previewBecomesReadyAfterPolls: Int
+    private let disconnectAfterStart: Bool
+    private let holdStreamUntilCancel: Bool
+    private let statusFailCount: Int
+    private var previewPolls = 0
+    private var cancelled = false
+
+    init(
+        streamDelaySeconds: Double = 0,
+        emitAfterCancel: Bool = false,
+        previewBecomesReadyAfterPolls: Int = 0,
+        disconnectAfterStart: Bool = false,
+        holdStreamUntilCancel: Bool = false,
+        statusFailCount: Int = 0,
+        commitAndBuildShouldFail: Bool = false,
+        commitAndBuildPauseOnPoll: Bool = false,
+        selectedRepoId: String = "abcdef0123456789"
+    ) {
+        self.streamDelaySeconds = streamDelaySeconds
+        self.emitAfterCancel = emitAfterCancel
+        self.previewBecomesReadyAfterPolls = previewBecomesReadyAfterPolls
+        self.disconnectAfterStart = disconnectAfterStart
+        self.holdStreamUntilCancel = holdStreamUntilCancel
+        self.statusFailCount = statusFailCount
+        self.commitAndBuildShouldFail = commitAndBuildShouldFail
+        self.commitAndBuildPauseOnPoll = commitAndBuildPauseOnPoll
+        self.selectedRepoId = selectedRepoId
+    }
+
+    func isConfigured() async -> Bool { true }
+
+    func listRepos() async -> BridgeResult {
+        let demoSelected = selectedRepoId == "abcdef0123456789"
+        let otherSelected = selectedRepoId == "1111111111111111"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"selectedRepoId":"\#(selectedRepoId)","repos":[{"id":"abcdef0123456789","name":"demo","relativePath":"demo","rootLabel":"src","selected":\#(demoSelected)},{"id":"1111111111111111","name":"other","relativePath":"other","rootLabel":"src","selected":\#(otherSelected)}]}"#
+        )
+    }
+
+    func selectRepository(repoId: String) async -> BridgeResult {
+        selectedRepoId = repoId
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"selectedRepoId":"\#(repoId)","repo":{"id":"\#(repoId)","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}}"#
+        )
+    }
+
+    func repositoryStatus(repoId: String) async -> BridgeResult {
+        BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"status":{"repoId":"\#(repoId)","name":"demo","branch":"main","upstream":"origin/main","ahead":0,"behind":0,"clean":false,"changedFiles":[{"path":"a.swift","status":"M","staged":false,"unstaged":true},{"path":"preexisting.txt","status":"M","staged":false,"unstaged":true}],"statusToken":"tok1234567890123456789012"}}"#
+        )
+    }
+
+    func repositoryDiff(repoId: String) async -> BridgeResult {
+        BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","diff":"diff --git a/a.swift","truncated":false,"statusToken":"tok1234567890123456789012"}"#
+        )
+    }
+
+    func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        if path == "src" {
+            return BridgeResult(
+                ok: true,
+                payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","path":"src","entries":[{"name":"page.html","path":"src/page.html","kind":"file","size":42}]}"#
+            )
+        }
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","path":"","entries":[{"name":"src","path":"src","kind":"directory"},{"name":"index.html","path":"index.html","kind":"file","size":100}]}"#
+        )
+    }
+
+    func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult {
+        let escapedPath = path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return BridgeResult(
+            ok: true,
+            payloadJSON: "{\"ok\":true,\"repoId\":\"\(repoId)\",\"path\":\"\(escapedPath)\",\"size\":\(data.count),\"created\":true}"
+        )
+    }
+
+    func startPreview(repoId: String, path: String?) async -> BridgeResult {
+        receivedPreviewPath = path
+        let target = path ?? ""
+        previewPolls = 0
+        let state = previewBecomesReadyAfterPolls > 0 ? "starting" : "ready"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"preview":{"repoId":"\#(repoId)","name":"page.html","path":"\#(target)","kind":"static","state":"\#(state)","port":8790,"url":"http://192.168.0.66:8790/src/page.html"}}"#
+        )
+    }
+
+    func stopPreview(repoId: String) async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+
+    func listPreviews() async -> BridgeResult {
+        previewPolls += 1
+        let ready = previewPolls >= previewBecomesReadyAfterPolls
+        let state = ready ? "ready" : "starting"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"previews":[{"repoId":"abcdef0123456789","name":"page.html","path":"src/page.html","kind":"static","state":"\#(state)","port":8790,"url":"http://192.168.0.66:8790/src/page.html"}]}"#
+        )
+    }
+
+    func createBaseline(repoId: String) async -> BridgeResult {
+        baselineCreateCount += 1
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"baselineId":"base-\#(repoId)","repoId":"\#(repoId)"}"#
+        )
+    }
+
+    func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult {
+        let kept = reviewKept ? "true" : "false"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"review":{"baselineId":"\#(baselineId)","repoId":"\#(repoId)","files":[{"path":"a.swift","change":"modified","diff":"@@ -1 +1 @@\n-old\n+new","truncated":false,"binary":false,"contentToken":"tok-a","kept":\#(kept)}],"pendingCount":\#(reviewKept ? 0 : 1),"keptCount":\#(reviewKept ? 1 : 0)}}"#
+        )
+    }
+
+    func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult {
+        keptPaths = paths
+        reviewKept = true
+        return BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+
+    func restoreReviewPaths(
+        repoId: String,
+        baselineId: String,
+        paths: [String],
+        contentTokens: [String: String]?
+    ) async -> BridgeResult {
+        restoredPaths = paths
+        reviewKept = false
+        return BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+
+    func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        publishCallCount += 1
+        lastPublishPaths = request.paths ?? []
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"repoId":"\#(repoId)","branch":"nova/x","commitSha":"abc","prUrl":"https://github.com/acme/demo/pull/1","prNumber":1}"#
+        )
+    }
+
+    func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        commitAndBuildCallCount += 1
+        if commitAndBuildShouldFail {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"ci_failed","detail":"GitHub Actions IPA job failed"}"#)
+        }
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"jobId":"ipa-test","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
+        )
+    }
+
+    func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        if commitAndBuildPauseOnPoll {
+            commitAndBuildCallCount += 1
+            if commitAndBuildShouldFail {
+                return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"ci_failed","detail":"GitHub Actions IPA job failed"}"#)
+            }
+            return BridgeResult(
+                ok: true,
+                payloadJSON: #"{"ok":true,"jobId":"ipa-pause-test","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"buildStatus":"running","detail":"CI started"}"#
+            )
+        }
+        return await commitAndBuildIpa(request: request)
+    }
+
+    func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult {
+        if commitAndBuildPauseOnPoll {
+            commitAndBuildPollCount += 1
+            if commitAndBuildPollCount == 1 {
+                return BridgeResult(
+                    ok: true,
+                    payloadJSON: #"{"ok":true,"jobId":"\#(jobId)","buildStatus":"running","paused":true,"hint":"Still waiting on CI"}"#
+                )
+            }
+        }
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"jobId":"\#(jobId)","repoId":"abcdef0123456789","branch":"main","commitSha":"deadbeef","committed":true,"pushed":true,"ipaPath":"C:\\repo\\Nova\\App\\NovaApp.ipa","ipaRelativePath":"Nova/App/NovaApp.ipa","workflowRunId":"123","buildStatus":"completed","detail":"IPA ready at Nova/App/NovaApp.ipa (deadbee on main)"}"#
+        )
+    }
+
+    func listCursorSessions() async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"sessions":[]}"#)
+    }
+
+    func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true,"messages":[]}"#)
+    }
+
+    func cancelActiveStream() async -> BridgeResult {
+        cancelStreamCount += 1
+        cancelled = true
+        return BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+
+    func cancelCursorRun(runId: String) async -> BridgeResult {
+        BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
+    }
+
+    func cursorRunStatus(runId: String) async -> BridgeResult {
+        runStatusCheckCount += 1
+        if runStatusCheckCount <= statusFailCount {
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_unreachable"}"#
+            )
+        }
+        // With holdStreamUntilCancel, finish on the first successful check so
+        // unlock resume can complete quickly. Otherwise keep the old 2-check cadence.
+        let finishOnCheck = holdStreamUntilCancel ? (statusFailCount + 1) : 2
+        let status = runStatusCheckCount >= finishOnCheck ? "finished" : "running"
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"\#(runId)","status":"\#(status)","result":"ok"}"#
+        )
+    }
+
+    func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        receivedImageCount = images.count
+        receivedCommands.append(command)
+        receivedSessionIds.append(sessionId)
+        cancelled = false
+        await onEvent(CodingStreamEvent(
+            type: "status",
+            status: "running",
+            sessionId: "agent-test",
+            runId: "run-test"
+        ))
+        if holdStreamUntilCancel {
+            while !cancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_connection_lost","sessionId":"agent-test","runId":"run-test","status":"running"}"#
+            )
+        }
+        if disconnectAfterStart {
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"bridge_connection_lost","sessionId":"agent-test","runId":"run-test","status":"running"}"#
+            )
+        }
+        if streamDelaySeconds > 0 {
+            let nanos = UInt64(streamDelaySeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+        }
+        if emitAfterCancel {
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            await onEvent(
+                CodingStreamEvent(type: "assistant_delta", text: "late assistant text")
+            )
+        }
+        if cancelled {
+            return BridgeResult(
+                ok: true,
+                payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"cancelled"}"#
+            )
+        }
+        await onEvent(CodingStreamEvent(
+            type: "assistant_delta",
+            text: "assistant reply for \(command.prefix(40))"
+        ))
+        await onEvent(CodingStreamEvent(type: "done", status: "finished", sessionId: "agent-test", runId: "run-test"))
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"sessionId":"agent-test","runId":"run-test","status":"finished","result":"ok"}"#
+        )
+    }
+}

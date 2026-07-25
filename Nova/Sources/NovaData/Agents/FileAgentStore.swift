@@ -62,6 +62,7 @@ public actor FileAgentStore: AgentStoring {
                     isMaster: seed.isMaster,
                     builtIn: true,
                     enabled: existing.enabled,
+                    avatarAssetName: seed.avatarAssetName,
                     createdAt: existing.createdAt,
                     updatedAt: Date()
                 )
@@ -72,12 +73,12 @@ public actor FileAgentStore: AgentStoring {
         self.agents = merged
         self.seedCapabilitiesVersion = targetVersion
         let master = merged.first(where: { $0.isMaster }) ?? merged.first
-        if let activeId = loaded.activeId, merged.contains(where: { $0.id == activeId }) {
-            self.activeId = activeId
-        } else {
-            self.activeId = master?.id
+        // Every cold start opens on Nova (master). In-session specialist switches
+        // still persist for that run; the next launch returns control to Nova.
+        if loaded.activeId != master?.id {
             dirty = true
         }
+        self.activeId = master?.id
         if dirty || priorVersion != targetVersion {
             Self.persist(
                 Persisted(agents: merged, activeId: activeId, seedCapabilitiesVersion: targetVersion),

@@ -8,8 +8,7 @@ import NovaDomain
 /// running without fighting over the single HFP route.
 public actor StreamingVoiceRecorder: VoiceRecorder {
     private let store: any RecordingStoring
-    /// Fixed capture rate: the glasses/phone HFP mic delivers narrowband 8 kHz
-    /// mono PCM16 (see `HFPGlassesAudioIngress`).
+    /// Matches `HFPGlassesAudioIngress` (24 kHz mono PCM16 for the Realtime uplink).
     private let sampleRate: Int
 
     private var writer: WAVWriter?
@@ -20,7 +19,7 @@ public actor StreamingVoiceRecorder: VoiceRecorder {
 
     public nonisolated var state: AsyncStream<VoiceRecordingState> { stateStream }
 
-    public init(store: any RecordingStoring, sampleRate: Int = 8_000) {
+    public init(store: any RecordingStoring, sampleRate: Int = 24_000) {
         self.store = store
         self.sampleRate = sampleRate
         (self.stateStream, self.stateContinuation) = AsyncStream.makeStream(
@@ -46,8 +45,8 @@ public actor StreamingVoiceRecorder: VoiceRecorder {
 
     public func append(_ chunk: AudioChunk) async {
         guard let writer else { return }
-        // The tee only forwards the narrowband mic feed; ignore anything that
-        // isn't at our capture rate so the header stays truthful.
+        // Ignore chunks that don't match the capture rate so the WAV header
+        // stays truthful (Realtime uplink is 24 kHz; mocks may still be 8 kHz).
         guard chunk.sampleRate == sampleRate else { return }
         try? writer.append(chunk.pcm)
     }

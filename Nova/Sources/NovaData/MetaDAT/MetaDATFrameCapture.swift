@@ -22,8 +22,17 @@ public actor MetaDATFrameCapture: FrameCapture {
     private var isStreaming = false
     private var listenerTokens: [Any] = []
 
+    /// Kept alive across captures so `devicesStream` / `activeDeviceStream` stay
+    /// in sync (Meta sample guidance — recreate-per-tap races `noEligibleDevice`).
+    private var deviceSelector: AutoDeviceSelector?
+
     private var pendingPhoto: CheckedContinuation<Data, Error>?
     private var liveCont: AsyncStream<CapturedFrame>.Continuation?
+
+    /// One-shot Meta AI recovery per cold open; reset after a successful stream
+    /// or full camera release so later sessions can recover again.
+    private var didAttemptDATAppUpdateRecovery = false
+    private var didAttemptFirmwareUpdateRecovery = false
 
     public init(policy: StreamBandwidthPolicy = .default) {
         self.policy = policy
@@ -88,12 +97,9 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveCont = nil
         pendingPhoto?.resume(throwing: NovaError.vision("Camera released"))
         pendingPhoto = nil
-        listenerTokens.removeAll()
-        // Dropping the strong references lets the SDK tear down the underlying
-        // session/stream so the glasses capture indicator turns off.
-        stream = nil
-        deviceSession = nil
-        isStreaming = false
+        await stopOwnedSession()
+        didAttemptDATAppUpdateRecovery = false
+        didAttemptFirmwareUpdateRecovery = false
         NovaLog.vision.info("camera released")
     }
 
@@ -102,17 +108,98 @@ public actor MetaDATFrameCapture: FrameCapture {
     private func ensureStreaming(fps: Int) async throws {
         if isStreaming, stream != nil { return }
 
-        // The app must be registered with Meta AI; camera access is then granted
-        // per-device through the Meta AI companion app.
-        let status = try await Wearables.shared.requestPermission(.camera)
-        guard status == .granted else {
-            throw NovaError.vision("Camera permission not granted on the glasses")
+        do {
+            try await openStreamWithSoftRetries(fps: fps)
+            didAttemptDATAppUpdateRecovery = false
+            didAttemptFirmwareUpdateRecovery = false
+            return
+        } catch {
+            // DAT-on-glasses bundle missing/stale — open Meta AI update once, then retry.
+            if !didAttemptDATAppUpdateRecovery,
+               MetaCameraOpenRetryPolicy.isDATAppUpdateRequired(error) {
+                didAttemptDATAppUpdateRecovery = true
+                NovaLog.vision.info("DAT app on glasses needs update — opening Meta AI recovery")
+                await tearDownSessionOnly()
+                let opened = await MetaDATConnectionRecovery.openDATGlassesAppUpdate()
+                await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+                do {
+                    try await openStreamWithSoftRetries(fps: fps)
+                    didAttemptDATAppUpdateRecovery = false
+                    didAttemptFirmwareUpdateRecovery = false
+                    return
+                } catch {
+                    throw Self.mapCameraError(error)
+                }
+            }
+
+            // Persistent noEligibleDevice often means firmware/compat — open update once.
+            if !didAttemptFirmwareUpdateRecovery,
+               MetaCameraOpenRetryPolicy.isFirmwareUpdateLikely(error) {
+                didAttemptFirmwareUpdateRecovery = true
+                NovaLog.vision.info("Glasses not eligible after soft retries — opening firmware update")
+                await tearDownSessionOnly()
+                let opened = await MetaDATConnectionRecovery.openFirmwareUpdate()
+                await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+                do {
+                    try await openStreamWithSoftRetries(fps: fps)
+                    didAttemptDATAppUpdateRecovery = false
+                    didAttemptFirmwareUpdateRecovery = false
+                    return
+                } catch {
+                    throw Self.mapCameraError(error)
+                }
+            }
+
+            throw Self.mapCameraError(error)
+        }
+    }
+
+    private func openStreamWithSoftRetries(fps: Int) async throws {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                try await openStream(fps: fps)
+                return
+            } catch {
+                lastError = error
+                // After Meta AI "Always Allow", BLE/link and session settle often lag
+                // the permission callback — retry noEligibleDevice / stopped-before-start.
+                // DAT update-required is handled by the outer recovery path, not sleep-retry.
+                // sessionAlreadyExists: a prior open left a non-stopped SDK session
+                // (camera LED still on) after we dropped local refs without stop().
+                guard MetaCameraOpenRetryPolicy.isRetryable(error), attempt < 2 else {
+                    throw error
+                }
+                NovaLog.vision.info(
+                    "camera open retry \(attempt + 1) after: \(String(describing: error), privacy: .public)"
+                )
+                await tearDownSessionOnly()
+                let delayMs = MetaCameraOpenRetryPolicy.isSessionAlreadyExists(error) ? 1_200 : 900
+                try await Task.sleep(for: .milliseconds(delayMs))
+            }
+        }
+        throw lastError ?? NovaError.vision("Glasses camera failed to open")
+    }
+
+    private func openStream(fps: Int) async throws {
+        // Permission unlocks device visibility in some SDK builds; request first,
+        // then wait for an *active* (connected + compatible) device before session.
+        try await ensureCameraPermission()
+
+        // Drop any half-open local session before createSession (singleton-per-device).
+        if deviceSession != nil || stream != nil {
+            await stopOwnedSession()
         }
 
+        // Recreate the selector after permission so devicesStream is not stuck on a
+        // pre-grant empty snapshot (Meta DAT 0.7+ community guidance).
         let selector = AutoDeviceSelector(wearables: Wearables.shared)
+        deviceSelector = selector
+        try await waitForActiveDevice(selector)
+
         let session = try Wearables.shared.createSession(deviceSelector: selector)
-        try session.start()
-        try await waitForSessionStarted(session)
+        // Meta DAT: create stateStream() before start() or the .started transition is missed.
+        try await startDeviceSession(session)
 
         let config = StreamConfiguration(videoCodec: .raw, resolution: .low, frameRate: UInt(fps))
         guard let newStream = try session.addStream(config: config) else {
@@ -141,6 +228,114 @@ public actor MetaDATFrameCapture: FrameCapture {
         try await waitForStreaming()
     }
 
+    private func ensureCameraPermission() async throws {
+        // Prefer status check so we do not re-open Meta AI when already granted.
+        // Never map check failures to .denied — disconnected glasses make the SDK
+        // throw / report unavailable even after Always Allow.
+        var explicitStatus: PermissionStatus?
+        for attempt in 0..<3 {
+            do {
+                let status = try await Wearables.shared.checkPermissionStatus(.camera)
+                if status == .granted {
+                    NovaLog.vision.info("glasses camera permission already granted")
+                    return
+                }
+                NovaLog.vision.info(
+                    "glasses camera permission status=\(String(describing: status), privacy: .public); will request via Meta AI"
+                )
+                explicitStatus = status
+                break
+            } catch {
+                let detail = String(describing: error)
+                NovaLog.vision.info(
+                    "checkPermissionStatus failed (attempt \(attempt + 1)); not treating as denied: \(detail, privacy: .public)"
+                )
+                if attempt < 2 {
+                    await waitBeforePermissionRecheck(attempt: attempt)
+                    continue
+                }
+                if MetaCameraOpenRetryPolicy.isPermissionUnavailableMessage(detail) {
+                    throw NovaError.vision(
+                        "Glasses camera permission unavailable — wear the glasses, reconnect in Meta AI, then retry.\n\n\(Self.cameraChecklist)"
+                    )
+                }
+                throw NovaError.vision(
+                    "Could not read glasses camera permission status. Wear the glasses, open Meta AI, return to Nova, then retry.\n\n\(Self.cameraChecklist)"
+                )
+            }
+        }
+
+        guard explicitStatus != nil else {
+            throw NovaError.vision(
+                "Could not read glasses camera permission status. Wear the glasses, open Meta AI, return to Nova, then retry.\n\n\(Self.cameraChecklist)"
+            )
+        }
+
+        NovaLog.vision.info("requesting glasses camera permission via Meta AI")
+        let status = try await Wearables.shared.requestPermission(.camera)
+        guard status == .granted else {
+            throw NovaError.vision(
+                "Camera permission was not granted in Meta AI. Open Meta AI → Apps → Nova and allow camera, then retry."
+            )
+        }
+        // Wait for nova:// handleUrl to apply Always Allow, then BLE settle.
+        await MetaWearablesURLGate.shared.waitUntilSettled(extraMilliseconds: 500)
+    }
+
+    private func waitBeforePermissionRecheck(attempt: Int) async {
+        if let selector = deviceSelector {
+            do {
+                try await withTimeout(seconds: 3) {
+                    for await device in selector.activeDeviceStream() {
+                        if device != nil { return }
+                    }
+                }
+            } catch {
+                try? await Task.sleep(for: .milliseconds(400 * (attempt + 1)))
+            }
+        } else {
+            try? await Task.sleep(for: .milliseconds(400 * (attempt + 1)))
+        }
+    }
+
+    /// Meta requires a non-nil active device (connected + compatible) before
+    /// `createSession` — otherwise you get `DeviceSessionError.noEligibleDevice`.
+    private func waitForActiveDevice(
+        _ selector: AutoDeviceSelector,
+        timeout: Double = 20
+    ) async throws {
+        NovaLog.vision.info("waiting for active Meta glasses device…")
+        try await withTimeout(seconds: timeout) {
+            for await device in selector.activeDeviceStream() {
+                if device != nil {
+                    NovaLog.vision.info("active Meta glasses device ready")
+                    return
+                }
+            }
+            throw NovaError.vision("Glasses disconnected while waiting for an active device")
+        }
+    }
+
+    private func tearDownSessionOnly() async {
+        await stopOwnedSession()
+    }
+
+    /// Stop stream + session before dropping refs. Meta DAT is singleton-per-device:
+    /// omitting stop() leaves the glasses capturing and the next createSession
+    /// fails with sessionAlreadyExists.
+    private func stopOwnedSession() async {
+        listenerTokens.removeAll()
+        // session.stop() cascades to attached streams/capabilities.
+        if let deviceSession {
+            deviceSession.stop()
+        }
+        stream = nil
+        deviceSession = nil
+        isStreaming = false
+        // Brief settle so the SDK clears the singleton before createSession.
+        try? await Task.sleep(for: .milliseconds(250))
+    }
+
     private func setStreaming(_ value: Bool) { isStreaming = value }
 
     private func deliverPhoto(_ data: Data) {
@@ -160,11 +355,32 @@ public actor MetaDATFrameCapture: FrameCapture {
         liveCont?.yield(CapturedFrame(imageData: jpeg, mimeType: "image/jpeg", width: width, height: height))
     }
 
-    private func waitForSessionStarted(_ session: DeviceSession) async throws {
+    /// Subscribe to `stateStream` (and errors) **before** `start()` — Meta DAT docs:
+    /// creating the stream after start misses the `.started` transition and a later
+    /// `.stopped` looks like "closed before it could open."
+    private func startDeviceSession(_ session: DeviceSession) async throws {
         try await withTimeout(seconds: 15) {
-            for await state in session.stateStream() {
-                if state == .started { return }
-                if state == .stopped { throw NovaError.vision("Glasses session stopped before it started") }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await state in session.stateStream() {
+                        if state == .started { return }
+                        if state == .stopped {
+                            throw NovaError.vision("Glasses session stopped before it started")
+                        }
+                    }
+                    throw NovaError.vision("Glasses session state stream ended before start")
+                }
+                group.addTask {
+                    for await error in session.errorStream() {
+                        throw error
+                    }
+                }
+                // Let the for-await subscriptions attach before start().
+                await Task.yield()
+                try await Task.sleep(for: .milliseconds(25))
+                try session.start()
+                try await group.next()
+                group.cancelAll()
             }
         }
     }
@@ -183,12 +399,74 @@ public actor MetaDATFrameCapture: FrameCapture {
             group.addTask { try await operation() }
             group.addTask {
                 try await Task.sleep(for: .seconds(seconds))
-                throw NovaError.vision("Glasses operation timed out")
+                throw NovaError.vision("Glasses operation timed out — wear the glasses, keep Meta AI open, then retry.")
             }
             try await group.next()
             group.cancelAll()
         }
     }
+
+    /// Maps opaque SDK permission/session failures into actionable UI copy.
+    /// Raw values like 4419815456 are not documented enum cases — describe them,
+    /// do not invent named mappings from the integer alone.
+    private static func mapCameraError(_ error: Error) -> Error {
+        if let nova = error as? NovaError, case .vision(_) = nova {
+            return error
+        }
+
+        if let permission = error as? PermissionError {
+            let tip: String
+            switch permission {
+            case .noDevice:
+                tip = "No Meta glasses found. Pair them in Meta AI, wear them, then retry."
+            case .noDeviceWithConnection:
+                tip = "Glasses are paired but not connected. Unfold/wear them near the phone, open Meta AI, then retry."
+            case .metaAINotInstalled:
+                tip = "Install or update the Meta AI app, then retry."
+            case .requestInProgress:
+                tip = "A Meta AI permission prompt is already open — finish it, return to Nova, then retry."
+            case .requestTimeout:
+                tip = "Camera permission timed out in Meta AI. Tap What’s this? again and choose Always Allow."
+            case .connectionError:
+                tip = "Lost the link to the glasses while asking for camera access. Reconnect in Meta AI and retry."
+            case .internalError:
+                tip = "Meta AI reported an internal camera-permission error. Force-quit Meta AI and Nova, then retry."
+            @unknown default:
+                tip = "Camera permission failed (\(String(describing: permission)))."
+            }
+            return NovaError.vision("\(tip)\n\n\(Self.cameraChecklist)")
+        }
+
+        if let sessionError = error as? DeviceSessionError {
+            let tip: String
+            switch sessionError {
+            case .datAppOnTheGlassesUpdateRequired:
+                tip = "The DAT app on your glasses needs an update. Nova opens Meta AI automatically for Install/Update — finish that prompt, return here, then retry What’s this? (or tap Fix glasses connection)."
+            case .noEligibleDevice:
+                tip = "Glasses not ready for camera yet (connected + compatible required). Wear them, unlock the phone, wait a few seconds after Always Allow, then retry. If this persists, Nova will open a firmware update in Meta AI."
+            default:
+                if MetaCameraOpenRetryPolicy.isSessionAlreadyExists(sessionError) {
+                    tip = "A glasses camera session was already open (often from a previous capture that did not fully stop). Wait for the capture light to turn off, then retry."
+                } else {
+                    tip = "Glasses session failed: \(String(describing: sessionError))."
+                }
+            }
+            return NovaError.vision("\(tip)\n\n\(Self.cameraChecklist)")
+        }
+
+        return NovaError.vision(
+            "Glasses camera failed: \(String(describing: error))\n\n\(Self.cameraChecklist)"
+        )
+    }
+
+    private static let cameraChecklist = """
+    Checklist:
+    1) Glasses on, unfolded, paired in Meta AI
+    2) Nova shows Connected under Glasses (Fix glasses connection / Re-link if needed)
+    3) In Meta AI, Always Allow camera for Nova; Install/Update DAT on glasses if prompted
+    4) Only one Developer Mode app registered at a time
+    5) Retry What’s this? a few seconds after returning from Meta AI
+    """
 }
 
 #else

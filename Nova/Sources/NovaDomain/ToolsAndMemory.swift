@@ -9,6 +9,10 @@ public actor ToolRouter {
         self.tools = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
     }
 
+    public func setConfirmationHandler(_ handler: (@Sendable (ToolCallRequest) async -> Bool)?) {
+        confirmationHandler = handler
+    }
+
     public func register(_ tool: any Tool) {
         tools[tool.name] = tool
     }
@@ -69,13 +73,19 @@ public actor ToolRouter {
 
 public actor InMemoryConversationMemory: ConversationMemory {
     private var turns: [ConversationTurn] = []
+    private let maxTurns: Int
+    private let summaryTurns: Int
 
-    public init() {}
+    /// Defaults match `FileConversationMemory` so tests/sim mirror production context size.
+    public init(maxTurns: Int = 500, summaryTurns: Int = 48) {
+        self.maxTurns = maxTurns
+        self.summaryTurns = summaryTurns
+    }
 
     public func append(_ turn: ConversationTurn) async {
         turns.append(turn)
-        if turns.count > 200 {
-            turns.removeFirst(turns.count - 200)
+        if turns.count > maxTurns {
+            turns.removeFirst(turns.count - maxTurns)
         }
     }
 
@@ -84,7 +94,7 @@ public actor InMemoryConversationMemory: ConversationMemory {
     }
 
     public func summary() async -> String {
-        let recent = turns.suffix(12)
+        let recent = turns.suffix(summaryTurns)
         return recent.map { "\($0.role.rawValue): \($0.text)" }.joined(separator: "\n")
     }
 

@@ -34,22 +34,28 @@ public struct EndMeetingTool: Tool {
     private let transcriber: any AudioTranscribing
     private let summarizer: MeetingSummarizer
     private let notes: any NoteStoring
+    private let cloudEnabled: @Sendable () async -> Bool
 
     public init(
         recorder: any VoiceRecorder,
         store: any RecordingStoring,
         transcriber: any AudioTranscribing,
         summarizer: MeetingSummarizer,
-        notes: any NoteStoring
+        notes: any NoteStoring,
+        cloudEnabled: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.recorder = recorder
         self.store = store
         self.transcriber = transcriber
         self.summarizer = summarizer
         self.notes = notes
+        self.cloudEnabled = cloudEnabled
     }
 
     public func invoke(argumentsJSON: String) async throws -> String {
+        guard await cloudEnabled() else {
+            return #"{"ok":false,"error":"meeting_cloud_processing_disabled"}"#
+        }
         guard await recorder.isRecording() else {
             return #"{"ok":false,"error":"not_recording"}"#
         }

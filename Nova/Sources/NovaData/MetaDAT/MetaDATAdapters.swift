@@ -60,6 +60,11 @@ public actor MetaDATWearableSession: WearableSession {
         diagCont?.yield(transitions.joined(separator: "\n"))
     }
 
+    /// True when DAT registration succeeded (or mock mode).
+    public func isRegistered() -> Bool {
+        useMock || reg == .registered
+    }
+
     public func register() async throws {
         #if canImport(MWDATCore) && os(iOS)
         if !useMock {
@@ -72,8 +77,21 @@ public actor MetaDATWearableSession: WearableSession {
                 _ = try await Wearables.shared.startRegistration()
                 diag("startRegistration() returned; awaiting Meta AI callback")
             } catch {
-                diag("startRegistration() threw: \(String(describing: error))")
-                throw error
+                // Meta AI only allows one Developer Mode app at a time. If Nova is
+                // already linked, `startRegistration` throws instead of succeeding —
+                // treat that as connected so Connect is not stuck on an error.
+                if Self.isAlreadyRegistered(error) {
+                    diag("Already registered with Meta AI — treating as connected")
+                    setReg(.registered)
+                    setState(.ready)
+                    NovaLog.session.info("DAT already registered; synced as connected")
+                    return
+                }
+                let mapped = Self.mapRegistrationError(error)
+                diag("startRegistration() threw: \(mapped)")
+                setReg(.failed)
+                setState(.failed)
+                throw NovaError.wearable(mapped)
             }
             NovaLog.session.info("DAT registration started (awaiting Meta AI)")
             return
@@ -88,6 +106,56 @@ public actor MetaDATWearableSession: WearableSession {
         setState(.ready)
         diag("[mock] registered")
         NovaLog.session.info("DAT mock registration complete")
+    }
+
+    /// Register if needed, open Meta AI’s on-glasses DAT update, wait for settle.
+    public func repairConnection() async throws {
+        #if canImport(MWDATCore) && os(iOS)
+        if !useMock {
+            diag("Repair connection — sync registration + DAT app update")
+            observeRegistration()
+            if reg != .registered {
+                do {
+                    try await register()
+                } catch {
+                    // register() may leave us awaiting Meta AI callback; continue
+                    // into the update deep-link so the user finishes both flows.
+                    diag("Register during repair threw (continuing to DAT update): \(error)")
+                }
+            }
+            let opened = await MetaDATConnectionRecovery.openDATGlassesAppUpdate()
+            if opened {
+                diag("Opened Meta AI DAT glasses app update — complete Install/Update, then return")
+            } else {
+                diag("Could not open DAT glasses app update — check Meta AI App Connections manually")
+            }
+            await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: opened)
+            // Soft firmware nudge when still unregistered / device may be incompatible.
+            if reg != .registered {
+                let fw = await MetaDATConnectionRecovery.openFirmwareUpdate()
+                if fw {
+                    diag("Opened Meta AI firmware update as secondary repair step")
+                    await MetaDATConnectionRecovery.waitAfterRecovery(openedMetaAI: true)
+                }
+            }
+            return
+        }
+        #endif
+
+        if reg != .registered {
+            try await register()
+        }
+        diag("[mock] repairConnection complete")
+    }
+
+    /// Start mirroring the SDK registration stream so a prior Meta AI link is
+    /// reflected in the UI without requiring another Register tap.
+    public func syncRegistrationFromSDK() async {
+        #if canImport(MWDATCore) && os(iOS)
+        guard !useMock else { return }
+        observeRegistration()
+        diag("Observing Meta AI registration state")
+        #endif
     }
 
     public func start() async throws {
@@ -149,6 +217,46 @@ public actor MetaDATWearableSession: WearableSession {
             // .available / .unavailable — app known to Meta AI but not yet approved.
             setReg(.unregistered)
         }
+    }
+
+    /// Maps SDK `RegistrationError` (and opaque failures) into actionable copy.
+    private static func mapRegistrationError(_ error: Error) -> String {
+        let checklist = """
+        Developer Mode checklist:
+        1) Meta AI installed; glasses paired & connected
+        2) In Meta AI App Info, tap version 7×, toggle Developer Mode OFF→ON, force-quit Meta AI
+        3) Retry Register from Nova (callback scheme nova://)
+        4) Only one third-party Developer Mode app can stay registered
+        """
+        if let reg = error as? RegistrationError {
+            let tip: String
+            switch reg {
+            case .alreadyRegistered:
+                tip = "Already registered — check Meta AI → App connections, or unregister and retry."
+            case .configurationInvalid:
+                tip = "DAT config invalid — confirm Wearables.configure() and MetaAppID=0 (Developer Mode)."
+            case .metaAINotInstalled:
+                tip = "Install or update the Meta AI app, then retry."
+            case .networkUnavailable:
+                tip = "Network unavailable — reconnect Wi‑Fi/cellular and retry."
+            case .timeout:
+                tip = "Registration timed out — keep Nova and Meta AI in the foreground and retry."
+            case .unknown:
+                tip = "Unknown registration error from Meta AI."
+            @unknown default:
+                tip = "Unrecognized RegistrationError (\(String(describing: reg)))."
+            }
+            return "\(tip)\n\(String(describing: reg))\n\n\(checklist)"
+        }
+        return "Registration failed: \(String(describing: error))\n\n\(checklist)"
+    }
+
+    private static func isAlreadyRegistered(_ error: Error) -> Bool {
+        if let reg = error as? RegistrationError, case .alreadyRegistered = reg {
+            return true
+        }
+        let text = String(describing: error).lowercased()
+        return text.contains("alreadyregistered") || text.contains("already registered")
     }
     #endif
 }

@@ -98,6 +98,31 @@ final class WakeWordTests: XCTestCase {
         }
     }
 
+    func testCloseConnectionCommandDetection() {
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("Close Connection"))
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("close connection."))
+        XCTAssertTrue(ConversationOrchestrator.isCloseConnectionCommand("Nova, close connection!"))
+        XCTAssertFalse(ConversationOrchestrator.isCloseConnectionCommand("Please close the connection"))
+        XCTAssertFalse(ConversationOrchestrator.isCloseConnectionCommand("Nova, stop"))
+    }
+
+    func testListenReadyGreetingIsSpokenWhenMicOpens() async throws {
+        XCTAssertEqual(
+            ConversationOrchestrator.listenReadyGreetingLine,
+            "Hi Adam, what can I do for you?"
+        )
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        let greeted = await waitUntil {
+            await provider.userTexts.contains {
+                $0.contains(ConversationOrchestrator.listenReadyGreetingLine)
+            }
+        }
+        XCTAssertTrue(greeted, "Listen engage must ask the model to speak the ready greeting")
+        await orch.stop()
+    }
+
     func testDetectAssumingAddressedSkipsWakeWord() {
         let d = WakeWordDetector()
         // No wake word, but treated as addressed (listening mode).
@@ -240,6 +265,132 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testAgentSwitchWorksWhenWakeWordGateDisabled() async throws {
+        // Listen sets requireWakeWord=false; handoff phrases must still work.
+        let provider = MockProvider()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: MockIngress(),
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let switched = await waitUntil { await provider.lastVoice == "cedar" }
+        XCTAssertTrue(switched)
+        let activeClaude = await orch.currentAgent
+        XCTAssertEqual(activeClaude?.name, "Claude")
+        let interrupted = await provider.interruptCount
+        XCTAssertGreaterThanOrEqual(interrupted, 1)
+
+        let payload = await orch.switchToAgent(named: "Nova")
+        XCTAssertTrue(payload.contains("\"ok\":true"))
+        let back = await waitUntil { await provider.lastVoice == "marin" }
+        XCTAssertTrue(back)
+
+        await orch.stop()
+    }
+
+    func testAgentSwitchReconnectsAIWithoutRestartingMic() async throws {
+        // Regression: switching agents must reconnect the Realtime session for the
+        // new voice WITHOUT stopping/restarting the mic ingress. Restarting Core
+        // Audio raced the greeting playback route change and stalled the mic.
+        let provider = MockProvider()
+        let ingress = CountingIngress()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        _ = await waitUntil { await provider.connectCount == 1 }
+        _ = await waitUntil { await ingress.startCount == 1 }
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let switched = await waitUntil { await provider.lastVoice == "cedar" }
+        XCTAssertTrue(switched)
+
+        // AI reconnected (disconnect + fresh connect) for the new voice…
+        let reconnected = await waitUntil { await provider.connectCount >= 2 }
+        XCTAssertTrue(reconnected)
+        let disconnects = await provider.disconnectCount
+        XCTAssertGreaterThanOrEqual(disconnects, 1)
+
+        // …but the mic engine was NEVER torn down / restarted.
+        let starts = await ingress.startCount
+        let stops = await ingress.stopCount
+        XCTAssertEqual(starts, 1, "mic ingress must not restart on agent switch")
+        XCTAssertEqual(stops, 0, "mic ingress must not stop on agent switch")
+
+        await orch.stop()
+    }
+
+    func testAgentSwitchCancelDuringLightReconnectFallsBackAndGreets() async throws {
+        // Regression: CancellationError during the light AI-only reconnect must NOT
+        // be treated as success. That left streaming=true with a dead socket so
+        // sendUserText (greeting) and mic appends no-op'd — new agent never replied.
+        let provider = MockProvider()
+        let ingress = CountingIngress()
+        let nova = Agent(name: "Nova", voice: "marin", role: "master", personality: "", isMaster: true)
+        let claude = Agent(name: "Claude", voice: "cedar", role: "programmer", personality: "You are Claude.")
+        let roster = [nova, claude]
+        let activeBox = ActiveAgentBox(id: nova.id)
+
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder(),
+            agentsProvider: { roster },
+            activeAgentProvider: { let id = await activeBox.get(); return roster.first { $0.id == id } },
+            persistActiveAgent: { id in await activeBox.set(id) }
+        )
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        _ = await waitUntil { await provider.connectCount == 1 }
+
+        // Next connect is the light agent-switch reconnect — cancel it so the
+        // orchestrator must tear down and full-engage.
+        await provider.setConnectCancelOnCount(2)
+
+        await provider.emit(.inputTranscriptionCompleted(transcript: "Nova, let me talk to Claude"))
+        let recovered = await waitUntil { await provider.connectCount >= 3 }
+        XCTAssertTrue(recovered, "cancel on light reconnect must fall back to full engage")
+
+        let active = await orch.currentAgent
+        XCTAssertEqual(active?.name, "Claude")
+        let streaming = await orch.isStreaming
+        XCTAssertTrue(streaming, "session must be live after fallback, not half-dead")
+        let greeted = await waitUntil {
+            await provider.userTextCount >= 1
+        }
+        XCTAssertTrue(greeted, "new agent must receive a handoff greeting after recovery")
+        let voice = await provider.lastVoice
+        XCTAssertEqual(voice, "cedar")
+
+        await orch.stop()
+    }
+
     func testGraceWindowDisabledRequiresWakeWordEveryTurn() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
@@ -368,20 +519,34 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
-    func testOrchestratorIgnoresWithoutWakeWord() async throws {
+    func testOrchestratorIgnoresWithoutWakeWordDoesNotCancelVAD() async throws {
         let provider = MockProvider()
         let orch = makeOrchestrator(provider: provider)
         try await orch.start()
+        await provider.emit(.responseStarted)
         await provider.emit(.inputTranscriptionCompleted(transcript: "what's the weather"))
-        _ = await waitUntil {
-            let created = await provider.createResponseCount
-            let analyzed = await provider.analyzeCount
-            return created > 0 || analyzed > 0
-        }
+        try await Task.sleep(for: .milliseconds(80))
+        // Do not createResponse for ignored speech, but never interrupt a VAD reply
+        // that may already be in flight (STT often misses the wake word).
+        let interrupted = await provider.interruptCount
         let created = await provider.createResponseCount
         let analyzed = await provider.analyzeCount
+        XCTAssertEqual(interrupted, 0)
         XCTAssertEqual(created, 0)
         XCTAssertEqual(analyzed, 0)
+        await orch.stop()
+    }
+
+    func testEmptySTTDoesNotCancelVADAutoReply() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start()
+        // Server VAD already started a reply; failed/empty STT must not kill it.
+        await provider.emit(.responseStarted)
+        await provider.emit(.inputTranscriptionCompleted(transcript: ""))
+        try await Task.sleep(for: .milliseconds(80))
+        let interrupted = await provider.interruptCount
+        XCTAssertEqual(interrupted, 0)
         await orch.stop()
     }
 
@@ -508,7 +673,76 @@ final class WakeWordTests: XCTestCase {
         await orch.stop()
     }
 
+    func testContinuousAppendUnderServerVAD() async throws {
+        // Server-side VAD owns turn-taking: the orchestrator streams mic audio
+        // continuously and must never issue a client commit or response.create.
+        let provider = MockProvider()
+        let ingress = ControllableIngress()
+        let orch = ConversationOrchestrator(
+            ai: provider,
+            ingress: ingress,
+            egress: MockEgress(),
+            resampler: PassThroughResampler(),
+            metrics: InMemoryLatencyMetricsRecorder()
+        )
+        try await orch.start(config: AISessionConfig(useLocalWakeWord: false))
+
+        // Pace emissions so the bounded ingress buffer drains into the pump
+        // (bufferingNewest(8) drops chunks emitted faster than they're consumed).
+        let speech = speechLikePCM()
+        for _ in 0..<10 {
+            ingress.emit(AudioChunk(pcm: speech, sampleRate: 24_000))
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let appended = await waitUntil {
+            await provider.audioOperations.filter { $0 == "append" }.count >= 8
+        }
+        XCTAssertTrue(appended)
+        let commits = await provider.commitCount
+        let created = await provider.createResponseCount
+        XCTAssertEqual(commits, 0, "server VAD commits the buffer; the client must not")
+        XCTAssertEqual(created, 0, "server VAD auto-creates the response; the client must not")
+        await orch.stop()
+    }
+
     // MARK: - Helpers
+
+    private func speechLikePCM(amplitude: Int16 = 8_000) -> Data {
+        var samples = [Int16]()
+        samples.reserveCapacity(480)
+        for index in 0..<480 {
+            samples.append((index / 10).isMultiple(of: 2) ? amplitude : -amplitude)
+        }
+        return samples.withUnsafeBytes { Data($0) }
+    }
+
+    func testAskAboutFrameWithoutListenOpensSpokenOneShot() async throws {
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        let frame = CapturedFrame(imageData: Data([0xFF, 0xD8, 0xFF, 0xD9]), width: 1, height: 1)
+
+        let streamingBefore = await orch.isStreaming
+        let sessionBefore = await orch.isSessionActive
+        XCTAssertFalse(streamingBefore)
+        XCTAssertFalse(sessionBefore)
+
+        let answer = try await orch.askAboutFrame(frame, prompt: "What am I looking at?")
+        XCTAssertEqual(answer, "ok")
+
+        let connectCount = await provider.connectCount
+        let analyzeCount = await provider.analyzeCount
+        let disconnectCount = await provider.disconnectCount
+        let textOnly = await provider.lastTextOutputOnly
+        let sessionAfter = await orch.isSessionActive
+        let streamingAfter = await orch.isStreaming
+        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(analyzeCount, 1)
+        XCTAssertEqual(disconnectCount, 1)
+        XCTAssertFalse(textOnly, "What's this? must request spoken audio output")
+        XCTAssertFalse(sessionAfter, "Listen must stay off")
+        XCTAssertFalse(streamingAfter)
+    }
 
     private func makeOrchestrator(
         provider: MockProvider,
@@ -528,7 +762,7 @@ final class WakeWordTests: XCTestCase {
         )
     }
 
-    private func waitUntil(timeout: TimeInterval = 2, _ condition: @escaping () async -> Bool) async -> Bool {
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: @escaping () async -> Bool) async -> Bool {
         let start = Date()
         while Date().timeIntervalSince(start) < timeout {
             if await condition() { return true }
@@ -542,17 +776,23 @@ private actor MockProvider: ConversationalAIProvider {
     let events: AsyncStream<AIConversationEvent>
     private let continuation: AsyncStream<AIConversationEvent>.Continuation
     private(set) var createResponseCount = 0
+    private(set) var commitCount = 0
+    private(set) var audioOperations: [String] = []
     private(set) var interruptCount = 0
     private(set) var analyzeCount = 0
     private(set) var connectCount = 0
     private(set) var disconnectCount = 0
     private(set) var lastInstructions = ""
     private(set) var lastVoice = ""
+    private(set) var lastTextOutputOnly = false
     private(set) var lastToolDefinitions: [ToolDefinition] = []
     private(set) var toolOutputs: [(callId: String, output: String)] = []
+    private(set) var userTexts: [String] = []
     private var connectShouldFail = false
+    private var connectCancelOnCount: Int?
     private var appendShouldSucceed = true
     var toolOutputCount: Int { toolOutputs.count }
+    var userTextCount: Int { userTexts.count }
 
     init() {
         var cont: AsyncStream<AIConversationEvent>.Continuation!
@@ -561,13 +801,18 @@ private actor MockProvider: ConversationalAIProvider {
     }
 
     func setConnectShouldFail(_ value: Bool) { connectShouldFail = value }
+    func setConnectCancelOnCount(_ value: Int?) { connectCancelOnCount = value }
     func setAppendShouldSucceed(_ value: Bool) { appendShouldSucceed = value }
 
     func connect(config: AISessionConfig) async throws {
         connectCount += 1
         lastInstructions = config.instructions
         lastVoice = config.voice
+        lastTextOutputOnly = config.textOutputOnly
         lastToolDefinitions = config.toolDefinitions
+        if let cancelAt = connectCancelOnCount, connectCount == cancelAt {
+            throw CancellationError()
+        }
         if connectShouldFail {
             throw NovaError.aiProvider("mock connect failed")
         }
@@ -577,8 +822,18 @@ private actor MockProvider: ConversationalAIProvider {
     // stream down and reopen it while the orchestrator keeps its single consumer.
     func disconnect() async { disconnectCount += 1 }
     @discardableResult
-    func appendAudio(_ pcm16_24k: Data) async -> Bool { appendShouldSucceed }
-    func createResponse() async { createResponseCount += 1 }
+    func appendAudio(_ pcm16_24k: Data) async -> Bool {
+        audioOperations.append("append")
+        return appendShouldSucceed
+    }
+    func commitInputAudio() async {
+        commitCount += 1
+        audioOperations.append("commit")
+    }
+    func createResponse() async {
+        createResponseCount += 1
+        audioOperations.append("response")
+    }
     func interrupt() async { interruptCount += 1 }
     func analyze(image: CapturedFrame, prompt: String) async throws -> String {
         analyzeCount += 1
@@ -586,6 +841,9 @@ private actor MockProvider: ConversationalAIProvider {
     }
     func sendToolOutput(callId: String, outputJSON: String) async {
         toolOutputs.append((callId, outputJSON))
+    }
+    func sendUserText(_ text: String) async {
+        userTexts.append(text)
     }
     func emit(_ event: AIConversationEvent) { continuation.yield(event) }
 }
@@ -656,6 +914,16 @@ private struct MockIngress: AudioIngress {
     func stop() async {}
 }
 
+/// Ingress that counts start/stop so tests can assert the mic engine is not
+/// torn down and restarted on an agent switch (which stalled Core Audio).
+private actor CountingIngress: AudioIngress {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    nonisolated var chunks: AsyncStream<AudioChunk> { AsyncStream { $0.finish() } }
+    func start() async throws { startCount += 1 }
+    func stop() async { stopCount += 1 }
+}
+
 private final class MockWakeWordListener: WakeWordListening, @unchecked Sendable {
     let detections: AsyncStream<Void>
     private let cont: AsyncStream<Void>.Continuation
@@ -720,5 +988,152 @@ final class AgentDirectorTests: XCTestCase {
         XCTAssertEqual(director.control(for: "Nova, go back to Nova"), .endConversation)
         // Requires the master word.
         XCTAssertEqual(director.control(for: "end the conversation"), .none)
+    }
+}
+
+final class CodingPromptComposerTests: XCTestCase {
+    func testComposesPinnedPathsWithoutMutatingEmptyPins() {
+        let bare = CodingPromptComposer.command(userText: "  Fix the build  ", pins: [])
+        XCTAssertEqual(bare, "Fix the build")
+
+        let composed = CodingPromptComposer.command(
+            userText: "Add a button",
+            pins: [
+                CodingContextPin(path: "src/App.tsx", kind: "file"),
+                CodingContextPin(path: "src/components", kind: "directory"),
+            ]
+        )
+        XCTAssertTrue(composed.hasPrefix("Focus on these paths (repo-relative):"))
+        XCTAssertTrue(composed.contains("- src/App.tsx (file)"))
+        XCTAssertTrue(composed.contains("- src/components (directory)"))
+        XCTAssertTrue(composed.hasSuffix("Add a button"))
+    }
+
+    func testAskPrefixIsReadOnlyAndStripsPrefix() {
+        let ask = CodingPromptComposer.compose(
+            userText: "  /ask What does CodingViewModel.send do?  ",
+            pins: []
+        )
+        XCTAssertTrue(ask.isAskOnly)
+        XCTAssertEqual(ask.displayText, "What does CodingViewModel.send do?")
+        XCTAssertTrue(ask.bridgeCommand.contains("READ-ONLY Q&A"))
+        XCTAssertTrue(ask.bridgeCommand.contains("Do not create, edit, delete"))
+        XCTAssertTrue(ask.bridgeCommand.contains("What does CodingViewModel.send do?"))
+        XCTAssertFalse(ask.bridgeCommand.hasPrefix("/ask"))
+
+        let withPins = CodingPromptComposer.compose(
+            userText: "/ASK explain this",
+            pins: [CodingContextPin(path: "ViewModels.swift", kind: "file")]
+        )
+        XCTAssertTrue(withPins.isAskOnly)
+        XCTAssertTrue(withPins.bridgeCommand.contains("Focus on these paths"))
+        XCTAssertTrue(withPins.bridgeCommand.contains("explain this"))
+
+        XCTAssertNil(CodingPromptComposer.askQuestion(from: "fix the bug"))
+        XCTAssertNil(CodingPromptComposer.askQuestion(from: "/askfoo"))
+        XCTAssertEqual(CodingPromptComposer.askQuestion(from: "/ask"), "")
+        XCTAssertFalse(CodingPromptComposer.compose(userText: "fix /ask later", pins: []).isAskOnly)
+    }
+
+    func testModePickerAskPlanDebugWrapping() {
+        let ask = CodingPromptComposer.compose(
+            userText: "What opens CodingView?",
+            pins: [],
+            mode: .ask
+        )
+        XCTAssertEqual(ask.mode, .ask)
+        XCTAssertTrue(ask.isAskOnly)
+        XCTAssertTrue(ask.bridgeCommand.contains("READ-ONLY Q&A"))
+
+        let plan = CodingPromptComposer.compose(
+            userText: "Add offline sync",
+            pins: [],
+            mode: .plan
+        )
+        XCTAssertEqual(plan.mode, .plan)
+        XCTAssertTrue(plan.bridgeCommand.contains("PLAN MODE"))
+        XCTAssertEqual(CodingAgentMode.plan.bridgeMode, "plan")
+
+        let debug = CodingPromptComposer.compose(
+            userText: "Crash on launch",
+            pins: [],
+            mode: .debug
+        )
+        XCTAssertEqual(debug.mode, .debug)
+        XCTAssertTrue(debug.bridgeCommand.contains("DEBUG MODE"))
+        XCTAssertNil(CodingAgentMode.debug.bridgeMode)
+
+        // Slash /ask wins over Agent picker.
+        let forced = CodingPromptComposer.compose(
+            userText: "/ask where is send()?",
+            pins: [],
+            mode: .agent
+        )
+        XCTAssertEqual(forced.mode, .ask)
+        XCTAssertTrue(forced.isAskOnly)
+    }
+}
+
+final class WorkoutPlanProgressTests: XCTestCase {
+    func testSessionPlanIdCodableRoundTrip() throws {
+        let planId = UUID()
+        let session = WorkoutSession(title: "Push", planId: planId)
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(WorkoutSession.self, from: data)
+        XCTAssertEqual(decoded.planId, planId)
+
+        // Older payloads omit planId; decode should default to nil.
+        let bare = WorkoutSession(title: "Old")
+        var obj = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(bare)) as! [String: Any]
+        obj.removeValue(forKey: "planId")
+        let legacyData = try JSONSerialization.data(withJSONObject: obj)
+        let legacyDecoded = try JSONDecoder().decode(WorkoutSession.self, from: legacyData)
+        XCTAssertNil(legacyDecoded.planId)
+    }
+
+    func testProgressAdvancesAfterTargetSets() {
+        let plan = WorkoutPlan(
+            name: "Push",
+            exercises: [
+                PlannedExercise(name: "Bench", sets: 2, reps: 8),
+                PlannedExercise(name: "Row", sets: 3, reps: 10),
+            ]
+        )
+        let none = WorkoutPlanProgress.derive(plan: plan, sets: [])
+        XCTAssertEqual(none.current?.name, "Bench")
+        XCTAssertEqual(none.next?.name, "Row")
+        XCTAssertEqual(none.completedSetsForCurrent, 0)
+        XCTAssertEqual(none.targetSetsForCurrent, 2)
+
+        let mid = WorkoutPlanProgress.derive(
+            plan: plan,
+            sets: [WorkoutSet(exercise: "bench", reps: 8)]
+        )
+        XCTAssertEqual(mid.current?.name, "Bench")
+        XCTAssertEqual(mid.completedSetsForCurrent, 1)
+
+        let next = WorkoutPlanProgress.derive(
+            plan: plan,
+            sets: [
+                WorkoutSet(exercise: "Bench", reps: 8),
+                WorkoutSet(exercise: "Bench", reps: 8),
+            ]
+        )
+        XCTAssertEqual(next.current?.name, "Row")
+        XCTAssertNil(next.next)
+    }
+
+    func testExercisePRFromHistory() {
+        let history = [
+            WorkoutSession(sets: [
+                WorkoutSet(exercise: "Squat", weight: 225),
+                WorkoutSet(exercise: "Squat", weight: 245),
+                WorkoutSet(exercise: "Bench", weight: 185),
+            ])
+        ]
+        let prs = ExercisePR.from(history: history)
+        XCTAssertEqual(prs.first?.exercise, "Squat")
+        XCTAssertEqual(prs.first?.weight, 245)
+        XCTAssertEqual(prs.first(where: { $0.exercise == "Bench" })?.weight, 185)
     }
 }

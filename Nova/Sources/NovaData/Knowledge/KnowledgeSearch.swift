@@ -61,7 +61,7 @@ public struct KnowledgeSearch: KnowledgeSearching {
                 hit: KnowledgeHit(source: .fact, title: "Fact", snippet: fact, date: .distantPast),
                 text: fact, weight: 1.1))
         }
-        for turn in await memory.recent(limit: 200) {
+        for turn in await memory.recent(limit: 500) {
             candidates.append(Candidate(
                 hit: KnowledgeHit(source: .conversation, title: turn.role.rawValue.capitalized, snippet: Self.snippet(turn.text, terms: terms), date: turn.at),
                 text: turn.text, weight: 1.0))

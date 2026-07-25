@@ -5,6 +5,9 @@
 *.xcodeproj/
 *.xcworkspace/xcuserdata/
 App/Info.plist
+Widgets/Info.plist
+App/Nova.entitlements
+Widgets/NovaWidgets.entitlements
 DerivedData/
 .env
 Secrets.xcconfig

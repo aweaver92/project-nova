@@ -31,6 +31,7 @@ public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDe
         if id.hasPrefix(LocalTimerService.identifierPrefix) {
             Task { await announceTimer(notification) }
         }
+        // Commit-and-build / other alerts: banner + sound is enough.
         completionHandler([.banner, .sound])
     }
 
@@ -41,6 +42,14 @@ public final class NotificationCoordinator: NSObject, UNUserNotificationCenterDe
     ) {
         let info = response.notification.request.content.userInfo
         let id = response.notification.request.identifier
+        if id.hasPrefix(LocalPhoneRinger.identifierPrefix) {
+            // Tapping any find-my-phone alert silences the rest of the burst.
+            let ids = (0..<16).map { "\(LocalPhoneRinger.identifierPrefix)\($0)" }
+            center.removePendingNotificationRequests(withIdentifiers: ids)
+            center.removeDeliveredNotifications(withIdentifiers: ids)
+            completionHandler()
+            return
+        }
         if id.hasPrefix(LocalTimerService.identifierPrefix) {
             Task {
                 await announceTimer(response.notification)

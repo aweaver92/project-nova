@@ -28,29 +28,33 @@ public enum NovaBridgeConfig {
 }
 
 /// HTTP client for the "Nova Bridge" — a small service the user runs on their dev
-/// machine that executes Claude Code and forwards commands to active Cursor
-/// sessions. Reads its config lazily so Settings changes take effect immediately.
+/// machine that executes Claude Code, Cursor agents, and allowlisted Git/GitHub
+/// repository lifecycle operations. Reads its config lazily so Settings changes
+/// take effect immediately.
 ///
 /// Wire contract (bearer-authenticated):
-/// - `POST {base}/claude-code` `{ "prompt": String, "cwd": String? }`
-/// - `POST {base}/cursor/command` `{ "command": String, "sessionId": String? }`
-/// - `POST {base}/cursor/runs` → SSE CodingStreamEvent payloads
-/// - `GET  {base}/cursor/sessions`
-/// - `GET  {base}/cursor/sessions/{id}/messages`
+/// - `POST {base}/claude-code` `{ "prompt", "repoId?", "cwd?" }`
+/// - `POST {base}/cursor/command` / `cursor/runs` with `repoId?`
+/// - `GET  {base}/repos` / status / diff; `POST` clone / select / publish
 ///
 /// Unconfigured instances never throw — they return an actionable message the
 /// model can speak, so Claude can still explain how to enable the bridge.
 public actor NovaBridgeClient: AgentBridging {
     private let configProvider: @Sendable () async -> (url: URL?, token: String?)
     private let session: URLSession
+    /// Dedicated session for the live SSE run so Stop can invalidate it before a runId exists.
+    private var streamSession: URLSession?
     private static let streamTimeout: TimeInterval = 600
+    private let reconnectRetrySeconds: TimeInterval
 
     public init(
         configProvider: @escaping @Sendable () async -> (url: URL?, token: String?),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        reconnectRetrySeconds: TimeInterval = 15
     ) {
         self.configProvider = configProvider
         self.session = session
+        self.reconnectRetrySeconds = reconnectRetrySeconds
     }
 
     public func isConfigured() async -> Bool {
@@ -61,29 +65,176 @@ public actor NovaBridgeClient: AgentBridging {
         await send(path: "health", method: "GET", body: nil, timeout: 15)
     }
 
-    public func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
-        var body: [String: Any] = ["prompt": prompt]
-        if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }
-        return await post(path: "claude-code", body: body)
+    public func restartBridge() async -> BridgeResult {
+        await post(path: "admin/restart", body: [:], timeout: 15)
     }
 
-    public func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+    /// Hits the watchdog kick listener (usually host:8788) when the main bridge is down.
+    public func kickBridgeWatchdog(baseURL: URL) async -> BridgeResult {
+        await sendAbsolute(url: baseURL.appending(path: "restart"), method: "POST", body: [:], timeout: 15)
+    }
+
+    public func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
+        // Detach on the bridge so Claude keeps running after the phone locks.
+        // The action id makes every retry/poll idempotent (one process per id).
+        let actionId = UUID().uuidString
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "actionId": actionId,
+            "detach": true,
+        ]
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
+
+        PendingClaudeJobStore.save(
+            PendingClaudeJob(actionId: actionId, prompt: prompt, repoId: repoId, workingDirectory: workingDirectory)
+        )
+        let bg = await BackgroundTask.begin(name: "nova.claude-code")
+        defer { Task { await BackgroundTask.end(bg) } }
+
+        var start = BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"not_started"}"#)
+        while !Task.isCancelled {
+            start = await post(path: "claude-code", body: body, timeout: 60)
+            if !Self.isRetryableConnectionFailure(start) { break }
+            let nanos = UInt64(max(0.01, reconnectRetrySeconds) * 1_000_000_000)
+            do { try await Task.sleep(nanoseconds: nanos) } catch { break }
+        }
+
+        if Self.isTerminalClaudePayload(start.payloadJSON) {
+            PendingClaudeJobStore.clear(actionId: actionId)
+            return start
+        }
+        if Self.isRetryableConnectionFailure(start) || (!start.ok && !Self.isRunningClaudePayload(start.payloadJSON)) {
+            // Keep pending so unlock can resume; return the transport error now.
+            return start
+        }
+
+        return await pollClaudeJob(actionId: actionId)
+    }
+
+    /// Resume a Claude job after the app returns to the foreground (phone unlock).
+    public func resumePendingClaudeCode() async -> BridgeResult? {
+        guard let pending = PendingClaudeJobStore.load() else { return nil }
+        let bg = await BackgroundTask.begin(name: "nova.claude-code-resume")
+        defer { Task { await BackgroundTask.end(bg) } }
+        let status = await send(
+            path: "claude-code/\(pending.actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? pending.actionId)",
+            method: "GET",
+            body: nil,
+            timeout: 30
+        )
+        if Self.isRunningClaudePayload(status.payloadJSON) || Self.isRetryableConnectionFailure(status) {
+            return await pollClaudeJob(actionId: pending.actionId)
+        }
+        if Self.isTerminalClaudePayload(status.payloadJSON) || status.ok {
+            PendingClaudeJobStore.clear(actionId: pending.actionId)
+            return status
+        }
+        // Unknown/404 — clear stale pending so we do not loop forever.
+        if status.payloadJSON.contains("action_not_found") {
+            PendingClaudeJobStore.clear(actionId: pending.actionId)
+        }
+        return status
+    }
+
+    private func pollClaudeJob(actionId: String) async -> BridgeResult {
+        let escaped = actionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? actionId
+        var bg = await BackgroundTask.begin(name: "nova.claude-code-poll")
+        defer { Task { await BackgroundTask.end(bg) } }
+        while !Task.isCancelled {
+            let status = await send(
+                path: "claude-code/\(escaped)",
+                method: "GET",
+                body: nil,
+                timeout: 30
+            )
+            if Self.isTerminalClaudePayload(status.payloadJSON) {
+                PendingClaudeJobStore.clear(actionId: actionId)
+                return status
+            }
+            if status.payloadJSON.contains("action_not_found") {
+                PendingClaudeJobStore.clear(actionId: actionId)
+                return status
+            }
+            // Renew the background window each tick so lock does not freeze the poll.
+            bg = await BackgroundTask.renew(bg, name: "nova.claude-code-poll")
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                break
+            }
+        }
+        return BridgeResult(
+            ok: false,
+            payloadJSON: #"{"ok":false,"status":"running","error":"claude_poll_interrupted","hint":"Claude keeps running on the bridge; unlock the phone to fetch the result."}"#
+        )
+    }
+
+    private static func isRunningClaudePayload(_ json: String) -> Bool {
+        json.contains("\"status\":\"running\"")
+    }
+
+    private static func isTerminalClaudePayload(_ json: String) -> Bool {
+        if json.contains("\"status\":\"running\"") { return false }
+        // Done payloads include result/error/exitCode; legacy responses omit status.
+        return json.contains("\"status\":\"done\"")
+            || json.contains("\"result\"")
+            || json.contains("\"exitCode\"")
+            || (json.contains("\"ok\":true") && !json.contains("\"status\":\"running\""))
+            || (json.contains("\"ok\":false") && (json.contains("\"error\"") || json.contains("\"stderr\"")))
+    }
+
+    public func pushToCursor(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?
+    ) async -> BridgeResult {
         var body: [String: Any] = ["command": command]
         if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
-        return await post(path: "cursor/command", body: body)
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
+        return await post(path: "cursor/command", body: body, timeout: 600)
     }
 
     public func listCursorSessions() async -> BridgeResult {
-        await send(path: "cursor/sessions", method: "GET", body: nil, timeout: 30)
+        await listCursorSessions(repoId: nil)
+    }
+
+    public func listCursorSessions(repoId: String?) async -> BridgeResult {
+        let queryItems = repoId.flatMap { $0.isEmpty ? nil : URLQueryItem(name: "repoId", value: $0) }
+            .map { [$0] } ?? []
+        return await send(
+            path: "cursor/sessions",
+            method: "GET",
+            body: nil,
+            timeout: 30,
+            queryItems: queryItems
+        )
     }
 
     public func fetchCursorSessionMessages(sessionId: String) async -> BridgeResult {
+        await fetchCursorSessionMessages(sessionId: sessionId, repoId: nil)
+    }
+
+    public func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult {
         let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
+        let queryItems = repoId.flatMap { $0.isEmpty ? nil : URLQueryItem(name: "repoId", value: $0) }
+            .map { [$0] } ?? []
         return await send(
             path: "cursor/sessions/\(escaped)/messages",
             method: "GET",
             body: nil,
-            timeout: 60
+            timeout: 60,
+            queryItems: queryItems
         )
     }
 
@@ -91,6 +242,45 @@ public actor NovaBridgeClient: AgentBridging {
         command: String,
         sessionId: String?,
         workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            images: [],
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: repoId,
+            onEvent: onEvent
+        )
+    }
+
+    public func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
+    ) async -> BridgeResult {
+        await streamCursorRun(
+            command: command,
+            images: images,
+            sessionId: sessionId,
+            workingDirectory: workingDirectory,
+            repoId: repoId,
+            mode: nil,
+            onEvent: onEvent
+        )
+    }
+
+    public func streamCursorRun(
+        command: String,
+        images: [CodingImageAttachment],
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?,
+        mode: String?,
         onEvent: @escaping @Sendable (CodingStreamEvent) async -> Void
     ) async -> BridgeResult {
         let (base, token) = await configProvider()
@@ -98,70 +288,156 @@ public actor NovaBridgeClient: AgentBridging {
 
         var body: [String: Any] = ["command": command]
         if let sessionId, !sessionId.isEmpty { body["sessionId"] = sessionId }
-        if let workingDirectory, !workingDirectory.isEmpty { body["cwd"] = workingDirectory }
+        if let repoId, !repoId.isEmpty { body["repoId"] = repoId }
+        if let mode, !mode.isEmpty { body["mode"] = mode }
+        if !images.isEmpty {
+            body["images"] = images.map { image -> [String: Any] in
+                var payload: [String: Any] = [
+                    "data": image.data.base64EncodedString(),
+                    "mimeType": image.mimeType,
+                ]
+                if let width = image.width, let height = image.height {
+                    payload["width"] = width
+                    payload["height"] = height
+                }
+                return payload
+            }
+        }
+        if repoId == nil || repoId?.isEmpty == true,
+           let workingDirectory, !workingDirectory.isEmpty
+        {
+            body["cwd"] = workingDirectory
+        }
 
         var request = URLRequest(url: Self.url(base: base, path: "cursor/runs"))
         request.httpMethod = "POST"
         request.timeoutInterval = Self.streamTimeout
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        do {
-            let (bytes, response) = try await session.bytes(for: request)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                var data = Data()
-                for try await byte in bytes { data.append(byte) }
-                let payload = String(decoding: data, as: UTF8.self)
-                if payload.first == "{" {
-                    return BridgeResult(ok: false, payloadJSON: payload)
-                }
-                return BridgeResult(
-                    ok: false,
-                    payloadJSON: #"{"ok":false,"error":"http_\#(http.statusCode)"}"#
-                )
+        // URLSession.bytes(for:) buffers the entire SSE body on device until the
+        // connection closes, which left Coding stuck on "Bridge connected…".
+        // A data-delegate session yields each TCP chunk immediately.
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 120
+        config.timeoutIntervalForResource = Self.streamTimeout
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        // Fail fast when the PC bridge is down. waitsForConnectivity=true
+        // hung until the request timeout and surfaced as "bridge took too long".
+        config.waitsForConnectivity = false
+        config.httpAdditionalHeaders = ["Accept": "text/event-stream", "Cache-Control": "no-cache"]
+
+        // Keep renewing the iOS background window for the whole SSE lifetime so
+        // Coding stays alive while the phone is locked (same pattern as Claude poll).
+        let bgBox = BackgroundTaskBox(await BackgroundTask.begin(name: "nova.cursor-run"))
+        defer { Task { await BackgroundTask.end(bgBox.handle) } }
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { break }
+                bgBox.handle = BackgroundTask.renew(bgBox.handle, name: "nova.cursor-run")
             }
+        }
+        defer { heartbeat.cancel() }
 
-            var buffer = ""
-            var lastSessionId = sessionId ?? ""
-            var lastRunId = ""
-            var lastStatus = "running"
-            var lastResult = ""
-            var sawDone = false
+        let pump = SSEURLSessionPump()
+        let streamSession = URLSession(configuration: config, delegate: pump, delegateQueue: nil)
+        self.streamSession = streamSession
+        let chunks = pump.chunks
+        streamSession.dataTask(with: request).resume()
 
-            for try await line in bytes.lines {
-                if line.isEmpty {
-                    if let event = Self.parseSSEBuffer(buffer) {
-                        await onEvent(event)
-                        if event.type == "done" {
-                            sawDone = true
-                            lastSessionId = event.sessionId ?? lastSessionId
-                            lastRunId = event.runId ?? lastRunId
-                            lastStatus = event.status ?? lastStatus
-                            lastResult = event.result ?? lastResult
+        var lastSessionId = sessionId ?? ""
+        var lastRunId = ""
+        var lastStatus = "running"
+        var lastResult = ""
+        var sawDone = false
+        var sawHeaders = false
+
+        do {
+            var lineBuffer = ""
+            var eventBuffer = ""
+
+            for try await chunk in chunks {
+                switch chunk {
+                case .response(let http):
+                    sawHeaders = true
+                    await onEvent(CodingStreamEvent(type: "status", status: "CONNECTED"))
+                    await onEvent(CodingStreamEvent(
+                        type: "activity",
+                        text: "Bridge connected — starting agent…",
+                        phase: "status",
+                        done: false
+                    ))
+                    if !(200..<300).contains(http.statusCode) {
+                        lastStatus = "http_error"
+                        lastResult = "http_\(http.statusCode)"
+                    }
+                case .data(let data):
+                    if lastStatus == "http_error" {
+                        lastResult += String(decoding: data, as: UTF8.self)
+                        continue
+                    }
+                    lineBuffer += String(decoding: data, as: UTF8.self)
+                    while let newline = lineBuffer.firstIndex(of: "\n") {
+                        var line = String(lineBuffer[..<newline])
+                        lineBuffer = String(lineBuffer[lineBuffer.index(after: newline)...])
+                        if line.hasSuffix("\r") { line.removeLast() }
+
+                        if line.isEmpty {
+                            if let event = Self.parseSSEBuffer(eventBuffer) {
+                                await onEvent(event)
+                                lastSessionId = event.sessionId ?? lastSessionId
+                                lastRunId = event.runId ?? lastRunId
+                                lastStatus = event.status ?? lastStatus
+                                lastResult = event.result ?? lastResult
+                                if event.type == "done" {
+                                    sawDone = true
+                                }
+                            }
+                            eventBuffer = ""
+                            continue
+                        }
+                        if line.hasPrefix(":") { continue }
+                        if line.hasPrefix("data:") {
+                            let payload = String(line.dropFirst(5))
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !eventBuffer.isEmpty { eventBuffer += "\n" }
+                            eventBuffer += payload
                         }
                     }
-                    buffer = ""
-                    continue
-                }
-                if line.hasPrefix(":") { continue } // SSE comment / keepalive
-                if line.hasPrefix("data:") {
-                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    if !buffer.isEmpty { buffer += "\n" }
-                    buffer += payload
                 }
             }
-            // Flush trailing buffer if the stream ended without a blank line.
-            if let event = Self.parseSSEBuffer(buffer) {
+
+            if let event = Self.parseSSEBuffer(eventBuffer) {
                 await onEvent(event)
+                lastSessionId = event.sessionId ?? lastSessionId
+                lastRunId = event.runId ?? lastRunId
+                lastStatus = event.status ?? lastStatus
+                lastResult = event.result ?? lastResult
                 if event.type == "done" {
                     sawDone = true
-                    lastSessionId = event.sessionId ?? lastSessionId
-                    lastRunId = event.runId ?? lastRunId
-                    lastStatus = event.status ?? lastStatus
-                    lastResult = event.result ?? lastResult
                 }
+            }
+
+            self.streamSession = nil
+            streamSession.finishTasksAndInvalidate()
+
+            if lastStatus == "http_error" {
+                let body = lastResult
+                if let brace = body.firstIndex(of: "{") {
+                    return BridgeResult(ok: false, payloadJSON: String(body[brace...]))
+                }
+                let code = body.split(separator: "\n").first.map(String.init) ?? "http_error"
+                return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(code)"}"#)
+            }
+            if !sawHeaders {
+                return BridgeResult(
+                    ok: false,
+                    payloadJSON: #"{"ok":false,"error":"bridge_no_response","hint":"Bridge opened a socket but sent no HTTP response."}"#
+                )
             }
 
             let ok = sawDone && lastStatus == "finished"
@@ -175,8 +451,21 @@ public actor NovaBridgeClient: AgentBridging {
             let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             return BridgeResult(ok: ok, payloadJSON: String(decoding: data, as: UTF8.self))
         } catch {
-            let escaped = Self.escape(String(describing: error))
-            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+            self.streamSession = nil
+            streamSession.invalidateAndCancel()
+            let encoded = Self.encodeTransportError(error)
+            var payload = (encoded.data(using: .utf8)
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
+            // Preserve run identity so the phone can poll without replaying the prompt.
+            payload["sessionId"] = lastSessionId
+            if !lastRunId.isEmpty {
+                payload["runId"] = lastRunId
+                payload["status"] = "running"
+            } else {
+                payload["status"] = lastStatus.lowercased()
+            }
+            let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            return BridgeResult(ok: false, payloadJSON: String(decoding: data, as: UTF8.self))
         }
     }
 
@@ -190,22 +479,390 @@ public actor NovaBridgeClient: AgentBridging {
         )
     }
 
+    public func cursorRunStatus(runId: String) async -> BridgeResult {
+        let escaped = runId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runId
+        return await send(
+            path: "cursor/runs/\(escaped)",
+            method: "GET",
+            body: nil,
+            timeout: 30
+        )
+    }
+
+    public func cancelActiveStream() async -> BridgeResult {
+        guard let streamSession else {
+            return BridgeResult(ok: true, payloadJSON: #"{"ok":true,"cancelled":false}"#)
+        }
+        self.streamSession = nil
+        streamSession.invalidateAndCancel()
+        return BridgeResult(ok: true, payloadJSON: #"{"ok":true,"cancelled":true}"#)
+    }
+
+    // MARK: - Repositories
+
+    public func listRepos() async -> BridgeResult {
+        await send(path: "repos", method: "GET", body: nil, timeout: 30)
+    }
+
+    public func cloneRepository(url: String, rootLabel: String?) async -> BridgeResult {
+        var body: [String: Any] = ["url": url]
+        if let rootLabel, !rootLabel.isEmpty { body["rootLabel"] = rootLabel }
+        return await post(path: "repos/clone", body: body, timeout: 320)
+    }
+
+    public func createPublicWebProject(
+        request: BridgeCreateProjectRequest
+    ) async -> BridgeResult {
+        var body: [String: Any] = [
+            "name": request.name,
+            "template": request.template.rawValue,
+        ]
+        if let description = request.description, !description.isEmpty {
+            body["description"] = description
+        }
+        if let rootLabel = request.rootLabel, !rootLabel.isEmpty {
+            body["rootLabel"] = rootLabel
+        }
+        return await post(path: "repos/create", body: body, timeout: 320)
+    }
+
+    public func selectRepository(repoId: String) async -> BridgeResult {
+        await post(path: "repos/select", body: ["repoId": repoId])
+    }
+
+    public func repositoryStatus(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await send(path: "repos/\(escaped)/status", method: "GET", body: nil, timeout: 60)
+    }
+
+    public func repositoryDiff(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await send(path: "repos/\(escaped)/diff", method: "GET", body: nil, timeout: 60)
+    }
+
+    public func listRepositoryFiles(repoId: String, path: String?) async -> BridgeResult {
+        let (base, token) = await configProvider()
+        guard let base else { return Self.notConfigured }
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        var components = URLComponents(
+            url: Self.url(base: base, path: "repos/\(escaped)/files"),
+            resolvingAgainstBaseURL: false
+        )
+        if let path, !path.isEmpty {
+            components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        }
+        guard let url = components?.url else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"invalid_files_url"}"#)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        do {
+            let (data, response) = try await session.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode),
+               data.isEmpty
+            {
+                return BridgeResult(
+                    ok: false,
+                    payloadJSON: #"{"ok":false,"error":"http_\#(http.statusCode)"}"#
+                )
+            }
+            let payload = String(decoding: data, as: UTF8.self)
+            return BridgeResult(ok: (response as? HTTPURLResponse)?.statusCode == 200, payloadJSON: payload)
+        } catch {
+            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
+        }
+    }
+
+    public func writeRepositoryFile(
+        repoId: String,
+        path: String,
+        data: Data,
+        overwrite: Bool
+    ) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"missing_path"}"#)
+        }
+        guard !data.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"empty_file"}"#)
+        }
+        // Keep under the bridge's 16 MB JSON ceiling (base64 expands ~4/3).
+        guard data.count <= 8 * 1024 * 1024 else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"too_large","detail":"max_8mb"}"#)
+        }
+        return await post(
+            path: "repos/\(escaped)/files",
+            body: [
+                "path": trimmedPath,
+                "contentBase64": data.base64EncodedString(),
+                "overwrite": overwrite,
+            ],
+            timeout: 120
+        )
+    }
+
+    public func searchNovaCode(query: String) async -> BridgeResult {
+        await post(path: "self-code/search", body: ["query": query], timeout: 30)
+    }
+
+    public func readNovaCode(path: String, startLine: Int, endLine: Int) async -> BridgeResult {
+        await post(
+            path: "self-code/read",
+            body: [
+                "path": path,
+                "startLine": max(1, startLine),
+                "endLine": max(startLine, endLine),
+            ],
+            timeout: 30
+        )
+    }
+
+    public func publishRepository(repoId: String, request: BridgePublishRequest) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        var body: [String: Any] = [
+            "statusToken": request.statusToken,
+            "commitMessage": request.commitMessage,
+            "prTitle": request.prTitle,
+        ]
+        if let branchName = request.branchName, !branchName.isEmpty { body["branchName"] = branchName }
+        if let prBody = request.prBody { body["prBody"] = prBody }
+        if let paths = request.paths { body["paths"] = paths }
+        return await post(path: "repos/\(escaped)/publish", body: body, timeout: 320)
+    }
+
+    public func commitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        let started = await startCommitAndBuildIpa(request: request)
+        guard started.ok else { return started }
+        guard let jobId = Self.stringField(started.payloadJSON, "jobId"), !jobId.isEmpty else {
+            return started
+        }
+        let status = Self.stringField(started.payloadJSON, "buildStatus")?.lowercased() ?? ""
+        if status == "completed" || status == "failed" {
+            return Self.terminalCommitAndBuildResult(started)
+        }
+        let deadline = Date().addingTimeInterval(60 * 60)
+        return await pollCommitAndBuildJob(jobId: jobId, deadline: deadline)
+    }
+
+    public func startCommitAndBuildIpa(request: BridgeCommitAndBuildRequest) async -> BridgeResult {
+        var body: [String: Any] = [:]
+        if let statusToken = request.statusToken, !statusToken.isEmpty {
+            body["statusToken"] = statusToken
+        }
+        if let commitMessage = request.commitMessage, !commitMessage.isEmpty {
+            body["commitMessage"] = commitMessage
+        }
+        body["asyncPoll"] = true
+        // Commit+push only — CI waits in a background bridge job. Holding one
+        // HTTP request for 10–25 min is what produced "Lost connection mid-run".
+        return await post(path: "nova/commit-and-build", body: body, timeout: 180)
+    }
+
+    public func pollCommitAndBuildJob(jobId: String, deadline: Date) async -> BridgeResult {
+        let trimmed = jobId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"missing_job_id"}"#)
+        }
+        while Date() < deadline {
+            if Task.isCancelled {
+                return Self.pausedCommitAndBuildResult(jobId: trimmed)
+            }
+            try? await Task.sleep(for: .seconds(8))
+            if Task.isCancelled {
+                return Self.pausedCommitAndBuildResult(jobId: trimmed)
+            }
+            let poll = await send(
+                path: "nova/commit-and-build/\(trimmed)",
+                method: "GET",
+                body: nil,
+                timeout: 45
+            )
+            if !poll.ok {
+                // Never mark the IPA job failed for background/Wi‑Fi blips — keep
+                // polling until the wall deadline (or Task cancel → paused).
+                if Self.isTransientBridgeTransport(poll.payloadJSON) {
+                    continue
+                }
+                return poll
+            }
+            let buildStatus = Self.stringField(poll.payloadJSON, "buildStatus")?.lowercased() ?? ""
+            if buildStatus == "completed" || buildStatus == "failed" {
+                return Self.terminalCommitAndBuildResult(poll)
+            }
+        }
+        // Soft timeout: CI may still be running on the bridge — treat as pause so
+        // the phone can resume later instead of a hard failure.
+        return Self.pausedCommitAndBuildResult(
+            jobId: trimmed,
+            hint: "Still waiting on GitHub Actions. Reopen Nova to keep checking — the PC bridge job was not cancelled."
+        )
+    }
+
+    /// Map a finished job payload: `buildStatus=failed` becomes ok:false for the UI.
+    private static func terminalCommitAndBuildResult(_ result: BridgeResult) -> BridgeResult {
+        let status = stringField(result.payloadJSON, "buildStatus")?.lowercased() ?? ""
+        if status == "failed" {
+            let detail = stringField(result.payloadJSON, "detail")
+                ?? "ipa_build_failed"
+            let escaped = escape(detail)
+            return BridgeResult(
+                ok: false,
+                payloadJSON: #"{"ok":false,"error":"ipa_build_failed","detail":"\#(escaped)","hint":"\#(escaped)"}"#
+            )
+        }
+        return result
+    }
+
+    /// Soft pause — not a failure. UI resumes polling on foreground.
+    private static func pausedCommitAndBuildResult(jobId: String, hint: String? = nil) -> BridgeResult {
+        let message = hint
+            ?? "Commit and Build is still running on your PC. Nova paused checking while backgrounded — it will resume when you return."
+        let escapedJob = escape(jobId)
+        let escapedHint = escape(message)
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"jobId":"\#(escapedJob)","buildStatus":"running","paused":true,"hint":"\#(escapedHint)"}"#
+        )
+    }
+
+    private static func isTransientBridgeTransport(_ payloadJSON: String) -> Bool {
+        let lower = payloadJSON.lowercased()
+        return lower.contains("bridge_connection_lost")
+            || lower.contains("bridge_unreachable")
+            || lower.contains("bridge_timeout")
+            || lower.contains("networkconnectionlost")
+            || lower.contains("notconnectedtointernet")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+    }
+
+    private static func stringField(_ payloadJSON: String, _ key: String) -> String? {
+        guard let data = payloadJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if let value = obj[key] as? String { return value }
+        if let value = obj[key] as? NSNumber { return value.stringValue }
+        return nil
+    }
+
+    public func createBaseline(repoId: String) async -> BridgeResult {
+        let escaped = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        return await post(path: "repos/\(escaped)/baselines", body: [:], timeout: 60)
+    }
+
+    public func fetchAgentReview(repoId: String, baselineId: String) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        return await send(
+            path: "repos/\(repo)/baselines/\(baseline)/review",
+            method: "GET",
+            body: nil,
+            timeout: 60
+        )
+    }
+
+    public func keepReviewPaths(repoId: String, baselineId: String, paths: [String]) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        return await post(
+            path: "repos/\(repo)/baselines/\(baseline)/keep",
+            body: ["paths": paths],
+            timeout: 60
+        )
+    }
+
+    public func restoreReviewPaths(
+        repoId: String,
+        baselineId: String,
+        paths: [String],
+        contentTokens: [String: String]?
+    ) async -> BridgeResult {
+        let repo = repoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repoId
+        let baseline = baselineId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? baselineId
+        var body: [String: Any] = ["paths": paths]
+        if let contentTokens { body["contentTokens"] = contentTokens }
+        return await post(
+            path: "repos/\(repo)/baselines/\(baseline)/restore",
+            body: body,
+            timeout: 60
+        )
+    }
+
+    // MARK: - Live preview
+
+    public func startPreview(repoId: String) async -> BridgeResult {
+        await startPreview(repoId: repoId, path: nil)
+    }
+
+    public func startPreview(repoId: String, path: String?) async -> BridgeResult {
+        // Dev servers may run `npm install` first; keep a generous timeout.
+        var body: [String: Any] = ["repoId": repoId]
+        if let path, !path.isEmpty { body["path"] = path }
+        return await post(path: "preview/start", body: body, timeout: 120)
+    }
+
+    public func stopPreview(repoId: String) async -> BridgeResult {
+        await post(path: "preview/stop", body: ["repoId": repoId], timeout: 30)
+    }
+
+    public func listPreviews() async -> BridgeResult {
+        await send(path: "preview", method: "GET", body: nil, timeout: 30)
+    }
+
+    /// Upload a short outbound mic PCM clip for offline Realtime diagnosis.
+    /// Bridge writes a WAV under `diagnostics/` and returns peak/zcr (+ optional
+    /// live VAD/transcript probe). Lets us iterate without another IPA.
+    public func uploadRealtimeDiagnose(
+        pcm16: Data,
+        sampleRate: Int,
+        meta: [String: String]
+    ) async -> BridgeResult {
+        var body: [String: Any] = [
+            "pcm_b64": pcm16.base64EncodedString(),
+            "sample_rate": sampleRate,
+            "meta": meta,
+        ]
+        return await post(path: "realtime/diagnose", body: body, timeout: 45)
+    }
+
     // MARK: - Transport
 
-    private func post(path: String, body: [String: Any]) async -> BridgeResult {
-        await send(path: path, method: "POST", body: body, timeout: 60)
+    private func post(path: String, body: [String: Any], timeout: TimeInterval = 60) async -> BridgeResult {
+        await send(path: path, method: "POST", body: body, timeout: timeout)
     }
 
     private func send(
         path: String,
         method: String,
         body: [String: Any]?,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        queryItems: [URLQueryItem] = []
     ) async -> BridgeResult {
-        let (base, token) = await configProvider()
+        let (base, _) = await configProvider()
         guard let base else { return Self.notConfigured }
 
-        var request = URLRequest(url: Self.url(base: base, path: path))
+        let endpoint = Self.url(base: base, path: path)
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        if !queryItems.isEmpty {
+            components?.queryItems = queryItems
+        }
+        guard let url = components?.url else {
+            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"invalid_bridge_url"}"#)
+        }
+        return await sendAbsolute(url: url, method: method, body: body, timeout: timeout)
+    }
+
+    private func sendAbsolute(
+        url: URL,
+        method: String,
+        body: [String: Any]?,
+        timeout: TimeInterval
+    ) async -> BridgeResult {
+        let (_, token) = await configProvider()
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -221,18 +878,31 @@ public actor NovaBridgeClient: AgentBridging {
                 return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"no_response"}"#)
             }
             let payload = String(decoding: data, as: UTF8.self)
+            let trimmedPayload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
             let ok = (200..<300).contains(http.statusCode)
-            if payload.first == "{" || payload.first == "[" {
-                return BridgeResult(ok: ok, payloadJSON: payload)
+            if trimmedPayload.first == "{" || trimmedPayload.first == "[" {
+                return BridgeResult(ok: ok, payloadJSON: trimmedPayload)
+            }
+            // Express 404 HTML (e.g. stale bridge without a new route) used to
+            // surface only as opaque "non_json_response".
+            let hint: String
+            if http.statusCode == 404,
+               payload.localizedCaseInsensitiveContains("Cannot POST")
+                || payload.localizedCaseInsensitiveContains("Cannot GET") {
+                hint = "Bridge is missing this endpoint (HTTP 404). Restart nova-bridge so it loads the latest routes."
+            } else if trimmedPayload.isEmpty {
+                hint = "Bridge returned an empty body (HTTP \(http.statusCode))."
+            } else {
+                hint = "Bridge returned non-JSON (HTTP \(http.statusCode))."
             }
             let escaped = Self.escape(payload)
+            let escapedHint = Self.escape(hint)
             return BridgeResult(
                 ok: ok,
-                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)"}"#
+                payloadJSON: #"{"ok":\#(ok),"status":\#(http.statusCode),"body":"\#(escaped)","error":"non_json_response","hint":"\#(escapedHint)"}"#
             )
         } catch {
-            let escaped = Self.escape(String(describing: error))
-            return BridgeResult(ok: false, payloadJSON: #"{"ok":false,"error":"\#(escaped)"}"#)
+            return BridgeResult(ok: false, payloadJSON: Self.encodeTransportError(error))
         }
     }
 
@@ -240,6 +910,22 @@ public actor NovaBridgeClient: AgentBridging {
         let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
         return CodingStreamEvent.decodeSSEData(data)
+    }
+
+    private static func isRetryableConnectionFailure(_ result: BridgeResult) -> Bool {
+        guard !result.ok,
+              let data = result.payloadJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = json["error"] as? String
+        else { return false }
+        return [
+            "bridge_timeout",
+            "bridge_unreachable",
+            "bridge_connection_lost",
+            "bridge_no_response",
+            "no_response",
+            "transport_error",
+        ].contains(error)
     }
 
     /// Join slash-separated path segments without percent-encoding the separators.
@@ -254,10 +940,129 @@ public actor NovaBridgeClient: AgentBridging {
         payloadJSON: #"{"ok":false,"error":"bridge_not_configured","hint":"Ask the user to set the Nova Bridge URL and token in the Agents tab settings, then try again."}"#
     )
 
+    /// Map URLSession failures into short, actionable bridge errors for the UI.
+    private static func encodeTransportError(_ error: Error) -> String {
+        let urlError = error as? URLError
+        let code = urlError?.code
+        let (key, hint): (String, String) = {
+            switch code {
+            case .timedOut:
+                return (
+                    "bridge_timeout",
+                    "The bridge took too long. Is nova-bridge still running on the PC?"
+                )
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+                return (
+                    "bridge_unreachable",
+                    "Can't reach Nova Bridge. Check Wi‑Fi and the Bridge URL in Settings."
+                )
+            case .networkConnectionLost, .notConnectedToInternet:
+                return (
+                    "bridge_connection_lost",
+                    "Lost connection mid-run (Wi‑Fi, VPN, or bridge restarted). Try again."
+                )
+            default:
+                let raw = error.localizedDescription
+                if raw.localizedCaseInsensitiveContains("network")
+                    || raw.localizedCaseInsensitiveContains("connection")
+                {
+                    return (
+                        "bridge_connection_lost",
+                        "Lost connection to Nova Bridge. Confirm the PC bridge is running, then retry."
+                    )
+                }
+                return ("transport_error", raw)
+            }
+        }()
+        let escapedHint = escape(hint)
+        let escapedDetail = escape(String(describing: error))
+        return #"{"ok":false,"error":"\#(key)","hint":"\#(escapedHint)","detail":"\#(escapedDetail)"}"#
+    }
+
     private static func escape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
+    }
+}
+
+/// Incremental SSE reader. `URLSession.bytes` buffers the full body on iOS until
+/// the connection ends; this delegate yields each `didReceive data:` chunk so
+/// Coding can update while the agent is still running.
+private final class SSEURLSessionPump: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    enum Chunk: Sendable {
+        case response(HTTPURLResponse)
+        case data(Data)
+    }
+
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<Chunk, Error>.Continuation?
+    private var hasFinished = false
+
+    lazy var chunks: AsyncThrowingStream<Chunk, Error> = {
+        AsyncThrowingStream { continuation in
+            self.lock.lock()
+            self.continuation = continuation
+            self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.continuation = nil
+                self.lock.unlock()
+            }
+        }
+    }()
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        if let http = response as? HTTPURLResponse {
+            yield(.response(http))
+            completionHandler(.allow)
+        } else {
+            finish(throwing: URLError(.badServerResponse))
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !data.isEmpty else { return }
+        yield(.data(data))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        if let error {
+            finish(throwing: error)
+        } else {
+            finish(throwing: nil)
+        }
+    }
+
+    private func yield(_ chunk: Chunk) {
+        lock.lock()
+        let cont = continuation
+        lock.unlock()
+        cont?.yield(chunk)
+    }
+
+    private func finish(throwing error: (any Error)?) {
+        lock.lock()
+        guard !hasFinished else {
+            lock.unlock()
+            return
+        }
+        hasFinished = true
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        if let error {
+            cont?.finish(throwing: error)
+        } else {
+            cont?.finish()
+        }
     }
 }

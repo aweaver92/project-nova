@@ -14,7 +14,8 @@ public actor FileConversationMemory: ConversationMemory {
     ///   - url: Storage location; defaults to Application Support.
     ///   - maxTurns: Cap on retained turns to bound file/prompt size.
     ///   - summaryTurns: How many recent turns `summary()` injects into a session.
-    public init(url: URL? = nil, maxTurns: Int = 200, summaryTurns: Int = 12) {
+    ///     Sized to cover a full working session across reconnects/agent switches.
+    public init(url: URL? = nil, maxTurns: Int = 500, summaryTurns: Int = 48) {
         self.maxTurns = maxTurns
         self.summaryTurns = summaryTurns
         let resolved = url ?? Self.defaultURL()

@@ -40,6 +40,10 @@ public actor ConversationOrchestrator {
     private let memoryCompactor: (any MemoryCompacting)?
     // When true, Nova also offers one follow-up out loud (default off).
     private let spokenFollowUps: (@Sendable () async -> Bool)?
+    // When false, skip paid follow-up suggestion generation entirely.
+    private let followUpSuggestionsEnabled: (@Sendable () async -> Bool)?
+    // Glasses DAT registration ready for camera / vision turns.
+    private let isVisionReady: (@Sendable () async -> Bool)?
     // Supplies the agent roster (master Nova + specialists) for switching.
     private let agentsProvider: (@Sendable () async -> [Agent])?
     // Supplies the initially-active agent (persisted selection).
@@ -49,6 +53,9 @@ public actor ConversationOrchestrator {
     // Supplies extra front-loaded context for a specific agent (e.g. the trainer's
     // recent workout history). Injected into that agent's session instructions.
     private let agentContextProvider: (@Sendable (Agent) async -> String)?
+    /// Optional upload of recent outbound mic PCM for offline Realtime diagnosis
+    /// on the bridge (so we can iterate without sideloading IPAs).
+    private let audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)?
 
     private var eventTask: Task<Void, Never>?
     private var ingressTask: Task<Void, Never>?
@@ -89,14 +96,76 @@ public actor ConversationOrchestrator {
     private var skipFollowUpOnce = false
     // Serializes tool dispatch without blocking the provider event loop.
     private var toolTask: Task<Void, Never>?
+    /// True while a typed-chat turn runs without Listen (no mic / Listen UI).
+    private var textChatOnly = false
+    private var textChatBuffer = ""
+    private var textChatWait: CheckedContinuation<String, Error>?
+    /// True while What's this? (or similar) runs a spoken Realtime one-shot
+    /// without arming Listen — TTS is allowed; Listen UI stays idle.
+    private var spokenOneShot = false
+    /// Optional HFP / playAndRecord activation for spoken one-shots when Listen
+    /// never opened the mic path.
+    private let audioSession: (any AudioSessionCoordinating)?
+    /// Bumped when a completed transcription is handled so speech-stopped
+    /// fallbacks don't double-trigger a response.
+    private var utteranceEpoch = 0
+    private var speechStoppedFallbackTask: Task<Void, Never>?
+    private var listenHealthTask: Task<Void, Never>?
+    /// Bumped on every stream teardown / superseding engage so a stale
+    /// `beginStreaming` (actor-reentrant after an `await`) cannot double-connect
+    /// Realtime + mic after an agent switch.
+    private var streamGeneration = 0
+    /// Mutex for engage/disengage/switch. Swift actors reenter at `await`, so
+    /// overlapping voice/tool/UI handoffs can otherwise interleave teardown and
+    /// reconnect and crash Core Audio / orphan ingress tasks.
+    private var lifecycleLocked = false
+    private var lifecycleWaiters: [CheckedContinuation<Void, Never>] = []
 
     public private(set) var onTranscript: (@Sendable (String, ConversationTurn.Role) -> Void)?
     private var onSuggestions: (@Sendable ([String]) -> Void)?
     private var onError: (@Sendable (String) -> Void)?
     private var onMetricsTick: (@Sendable () -> Void)?
+    private var onListenHealth: (@Sendable (ListenHealth) -> Void)?
 
     /// Last transport/session error surfaced to the UI (nil while healthy).
     public private(set) var lastError: String?
+    public private(set) var listenHealth = ListenHealth()
+    private var micChunksSent = 0
+    private var micChunksAppendOK = 0
+    private var micChunksAppendFailed = 0
+    private var micBytesSent = 0
+    private var micPeakHeard: Float = 0
+    private var outboundPeakHeard: Float = 0
+    private var outboundRmsHeard: Float = 0
+    private var outboundZcrHeard: Float = 0
+    /// Timestamp of the last assistant audio chunk (for barge-in / health).
+    private var lastOutputAudioAt: ContinuousClock.Instant?
+    private var lastOutboundPeak: Float = 0
+    private var lastOutboundRms: Float = 0
+    private var lastOutboundZcr: Float = 0
+    private var lastOutboundInstantZcr: Float = 0
+    private var lastMicEnergyAt: ContinuousClock.Instant?
+    private var lastChunkAt: ContinuousClock.Instant?
+    private var userTranscriptChars = 0
+    /// Count of server-VAD `speech_started` events this stream (diagnostics).
+    private var cloudVadSpeechEvents = 0
+    private var didFailoverMicRoute = false
+    private var didAnnounceMicSilent = false
+    /// Soft recoveries after chunk stream gaps (route flaps / quiet-start SCO).
+    private var micStallRecoveryAttempts = 0
+    private static let maxMicStallRecoveries = 3
+    /// Caps AsyncStream re-arm loops if capture keeps finishing.
+    private var micRearmAttempts = 0
+    private static let maxMicRearms = 4
+    /// After agent switch / playback-only one-shots, next Listen must fully re-arm HFP.
+    private var needsCleanMicEngage = false
+    /// Skip silence/stall classification until SCO / route flip settles.
+    private var micEngageGraceUntil: ContinuousClock.Instant?
+    /// Longer grace right after Listen engages — quiet users must not trip stall.
+    private static let micEngageGraceSeconds: Double = 8
+    private static let micRecoverGraceSeconds: Double = 3
+    /// Smoothed TTS peak for talking avatars (updated on outputAudio).
+    private var lastAssistantAudioLevel: Float = 0
 
     public init(
         ai: any ConversationalAIProvider,
@@ -119,10 +188,14 @@ public actor ConversationOrchestrator {
         digestStore: (any MemoryDigestStoring)? = nil,
         memoryCompactor: (any MemoryCompacting)? = nil,
         spokenFollowUps: (@Sendable () async -> Bool)? = nil,
+        followUpSuggestionsEnabled: (@Sendable () async -> Bool)? = nil,
+        isVisionReady: (@Sendable () async -> Bool)? = nil,
         agentsProvider: (@Sendable () async -> [Agent])? = nil,
         activeAgentProvider: (@Sendable () async -> Agent?)? = nil,
         persistActiveAgent: (@Sendable (UUID) async -> Void)? = nil,
-        agentContextProvider: (@Sendable (Agent) async -> String)? = nil
+        agentContextProvider: (@Sendable (Agent) async -> String)? = nil,
+        audioDiagnose: (@Sendable (_ pcm16: Data, _ sampleRate: Int, _ meta: [String: String]) async -> Void)? = nil,
+        audioSession: (any AudioSessionCoordinating)? = nil
     ) {
         self.ai = ai
         self.ingress = ingress
@@ -144,10 +217,22 @@ public actor ConversationOrchestrator {
         self.digestStore = digestStore
         self.memoryCompactor = memoryCompactor
         self.spokenFollowUps = spokenFollowUps
+        self.followUpSuggestionsEnabled = followUpSuggestionsEnabled
+        self.isVisionReady = isVisionReady
         self.agentsProvider = agentsProvider
         self.activeAgentProvider = activeAgentProvider
         self.persistActiveAgent = persistActiveAgent
         self.agentContextProvider = agentContextProvider
+        self.audioDiagnose = audioDiagnose
+        self.audioSession = audioSession
+    }
+
+    /// Speak a short system note when the stream is open (coding progress, etc.).
+    public func announce(_ note: String) async {
+        guard streaming, !note.isEmpty else { return }
+        await ai.sendUserText(
+            "[System note: Coding update — tell the user in one short spoken sentence: \"\(note)\"]"
+        )
     }
 
     /// Register a handler notified whenever the active agent changes.
@@ -161,6 +246,10 @@ public actor ConversationOrchestrator {
     /// True while the cloud Realtime stream is open (as opposed to idle on-device
     /// wake-word listening). Exposed for diagnostics/tests.
     public var isStreaming: Bool { streaming }
+
+    /// True while `start()` has not been paired with `stop()` — includes the
+    /// post-"Close Connection" local wake-word standby (Realtime may be down).
+    public var isSessionActive: Bool { isRunning }
 
     public func setTranscriptHandler(_ handler: (@Sendable (String, ConversationTurn.Role) -> Void)?) {
         onTranscript = handler
@@ -179,50 +268,185 @@ public actor ConversationOrchestrator {
         onMetricsTick = handler
     }
 
-    /// Inject a user-authored text turn (e.g. a tapped follow-up suggestion) and
-    /// let the model reply. No-op while the cloud stream is closed.
+    public func setListenHealthHandler(_ handler: (@Sendable (ListenHealth) -> Void)?) {
+        onListenHealth = handler
+    }
+
+    /// Inject a user-authored text turn (typed chat or a tapped follow-up) and
+    /// let the model reply. Surfaces an error when the Realtime stream is closed.
     public func sendUserText(_ text: String) async {
-        guard streaming else { return }
-        await ai.sendUserText(text)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard streaming else {
+            let message = "Start Listen (or send again) to open the agent session before text chat."
+            lastError = message
+            onError?(message)
+            return
+        }
+        lastUserText = trimmed
+        lastActivity = .now
+        lastEngagement = .now
+        listeningSuspended = false
+        await ai.sendUserText(trimmed)
+    }
+
+    /// Typed chat that does **not** arm Listen or the mic. Opens a short-lived
+    /// text-only Realtime turn (tools + persona still apply), then disconnects.
+    /// When Listen is already streaming, forwards to `sendUserText` and returns
+    /// an empty string (reply arrives via transcript handlers).
+    public func sendTypedChatWithoutListen(_ text: String) async throws -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if streaming {
+            await sendUserText(trimmed)
+            return ""
+        }
+
+        return try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            // Event pump needed for tool calls; do not set isRunning / Listen.
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: true
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            textChatOnly = true
+            textChatBuffer = ""
+            lastUserText = trimmed
+            lastActivity = .now
+            await memory?.append(
+                ConversationTurn(role: .user, text: trimmed, workspaceId: await memoryScopeId())
+            )
+
+            do {
+                try await ai.connect(config: effective)
+                let answer = try await withThrowingTaskGroup(of: String.self) { group in
+                    group.addTask { [weak self] in
+                        guard let self else { throw CancellationError() }
+                        return try await self.awaitTextChatResult {
+                            await self.ai.sendUserText(trimmed)
+                        }
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(90))
+                        throw NovaError.aiProvider("Text chat timed out")
+                    }
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    return result
+                }
+                textChatOnly = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                }
+                return answer
+            } catch {
+                failTextChatWait(error)
+                textChatOnly = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                }
+                throw error
+            }
+        }
+    }
+
+    private func awaitTextChatResult(send: @escaping @Sendable () async -> Void) async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            textChatWait = cont
+            Task { await send() }
+        }
+    }
+
+    private func failTextChatWait(_ error: Error) {
+        if let wait = textChatWait {
+            textChatWait = nil
+            textChatBuffer = ""
+            wait.resume(throwing: error)
+        }
+    }
+
+    private func scheduleTextChatFinish() {
+        guard textChatOnly, textChatWait != nil else { return }
+        let pendingTools = toolTask
+        Task { [weak self] in
+            _ = await pendingTools?.value
+            try? await Task.sleep(for: .milliseconds(350))
+            await self?.finishTextChatWaitIfReady()
+        }
+    }
+
+    private func finishTextChatWaitIfReady() {
+        guard textChatOnly, let wait = textChatWait else { return }
+        // Another model response started after tools — wait for that one.
+        if assistantSpeaking { return }
+        textChatWait = nil
+        let answer = textChatBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        textChatBuffer = ""
+        wait.resume(returning: answer)
     }
 
     public func start(config: AISessionConfig = AISessionConfig()) async throws {
         guard !isRunning else { return }
-        isRunning = true
-        lastError = nil
-        sessionConfig = config
-        lastEngagement = nil
-        listeningSuspended = false
-        do {
-            await loadAgentRoster()
-            let activeWake = activeAgent?.wakeWord ?? config.wakeWord
-            detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
+        try await withLifecycle {
+            guard !isRunning else { return }
+            isRunning = true
+            lastError = nil
+            sessionConfig = config
+            lastEngagement = nil
+            listeningSuspended = false
+            do {
+                await loadAgentRoster()
+                let activeWake = activeAgent?.wakeWord ?? config.wakeWord
+                detector = WakeWordDetector(wakeWord: activeWake, visionPhrases: config.visionTriggerPhrases)
 
-            // Single, long-lived consumer of provider events. It must outlive
-            // individual engage/disengage cycles because the provider's event stream
-            // supports only one consumer and persists across reconnects.
-            eventTask = Task { [weak self] in
-                guard let self else { return }
-                for await event in await self.ai.events {
-                    await self.handle(event)
+                // Single, long-lived consumer of provider events. It must outlive
+                // individual engage/disengage cycles because the provider's event stream
+                // supports only one consumer and persists across reconnects.
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
                 }
-            }
 
-            // On-device wake-word gating: stay off the cloud until "Nova" is heard.
-            // Falls back to always-on streaming if no listener is wired or if the
-            // local listener fails to start.
-            if config.useLocalWakeWord, let listener = wakeWordListener {
-                do {
-                    try await beginLocalListening(listener)
-                    return
-                } catch {
-                    NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+                // On-device wake-word gating: stay off the cloud until "Nova" is heard.
+                // Falls back to always-on streaming if no listener is wired or if the
+                // local listener fails to start.
+                if config.useLocalWakeWord, let listener = wakeWordListener {
+                    do {
+                        try await beginLocalListening(listener)
+                        return
+                    } catch {
+                        NovaLog.session.error("Local wake word unavailable, streaming directly: \(String(describing: error), privacy: .public)")
+                    }
                 }
+                try await beginStreaming(config)
+            } catch {
+                await cleanupFailedStart()
+                throw error
             }
-            try await beginStreaming(config)
-        } catch {
-            await cleanupFailedStart()
-            throw error
         }
     }
 
@@ -245,19 +469,48 @@ public actor ConversationOrchestrator {
     }
 
     public func stop() async {
-        isRunning = false
-        detectionTask?.cancel()
-        detectionTask = nil
-        await wakeWordListener?.stop()
-        await teardownStreaming()
-        eventTask?.cancel()
-        eventTask = nil
-        // Ending the session returns control to the master for next time.
-        if let master = masterAgent, activeAgent?.id != master.id {
-            activeAgent = master
-            await persistActiveAgent?(master.id)
-            onAgentChanged?(master)
+        await withLifecycle {
+            isRunning = false
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            await teardownStreaming()
+            eventTask?.cancel()
+            eventTask = nil
+            // Ending the session returns control to the master for next time.
+            if let master = masterAgent, activeAgent?.id != master.id {
+                activeAgent = master
+                await persistActiveAgent?(master.id)
+                onAgentChanged?(master)
+            }
         }
+    }
+
+    // MARK: - Lifecycle serialization (agent switch / engage / disengage)
+
+    private func acquireLifecycle() async {
+        if !lifecycleLocked {
+            lifecycleLocked = true
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lifecycleWaiters.append(cont)
+        }
+    }
+
+    private func releaseLifecycle() {
+        if lifecycleWaiters.isEmpty {
+            lifecycleLocked = false
+        } else {
+            let next = lifecycleWaiters.removeFirst()
+            next.resume()
+        }
+    }
+
+    private func withLifecycle<T>(_ body: () async throws -> T) async rethrows -> T {
+        await acquireLifecycle()
+        defer { releaseLifecycle() }
+        return try await body()
     }
 
     // MARK: - Agents (master Nova + specialist sub-agents)
@@ -298,6 +551,12 @@ public actor ConversationOrchestrator {
     /// + scoped context + toolset take effect. Optionally speaks a short hand-off
     /// in the new voice, or answers a pending master command as `actOnText`.
     private func switchAgent(toId id: UUID, greet: Bool, actOnText: String? = nil) async {
+        await withLifecycle {
+            await performSwitchAgent(toId: id, greet: greet, actOnText: actOnText)
+        }
+    }
+
+    private func performSwitchAgent(toId id: UUID, greet: Bool, actOnText: String? = nil) async {
         guard let target = agents.first(where: { $0.id == id }) ?? masterAgent else { return }
         let alreadyActive = activeAgent?.id == target.id
         activeAgent = target
@@ -308,23 +567,40 @@ public actor ConversationOrchestrator {
         await persistActiveAgent?(target.id)
         onAgentChanged?(target)
         NovaLog.session.info("Active agent → \(target.name, privacy: .public)")
+        // Specialist switch (idle or live) often leaves playback-only / wedged HFP;
+        // next Listen must deactivate + re-arm rather than reuse a half-dead route.
+        needsCleanMicEngage = true
 
         // Reconnect so the voice/instructions actually change (voice is fixed for
         // the life of a Realtime connection).
         if streaming {
-            await teardownStreaming()
-            do {
-                try await beginStreaming(sessionConfig)
-            } catch {
-                NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
-                // Don't leave a dead session (mic stopped, no transcripts): fall
-                // back to a healthy state so the user can keep talking / recover.
-                await restoreSession()
-                return
+            let micAlreadyBad =
+                listenHealth.phase == .micSilent || listenHealth.phase == .streamStalled
+            // Reconnect ONLY the Realtime session for the new voice/persona and
+            // keep the mic + playback engines running — unless mic is already dead.
+            // Restarting Core Audio raced greeting playback and stalled after ~20
+            // chunks; full re-engage is safer when health already reports silence.
+            let reconnected = micAlreadyBad ? false : await reconnectAIForActiveAgent()
+            if !reconnected {
+                await teardownStreaming(cancelToolTask: false)
+                do {
+                    try await beginStreaming(sessionConfig, speakReadyGreeting: false)
+                } catch is CancellationError {
+                    NovaLog.session.info("Agent switch reconnect cancelled — restoring session")
+                    await restoreSessionUnlocked()
+                    return
+                } catch {
+                    NovaLog.session.error("Agent switch reconnect failed: \(String(describing: error), privacy: .public)")
+                    // Don't leave a dead session (mic stopped, no transcripts): fall
+                    // back to a healthy state so the user can keep talking / recover.
+                    await restoreSessionUnlocked()
+                    return
+                }
             }
         } else {
-            // Not currently streaming (e.g. UI toggle while idle): selection is
-            // persisted and will apply on the next engagement.
+            // Idle UI toggle: drop leftover playback-only session so the next
+            // Listen owns a fresh playAndRecord / HFP activate.
+            await audioSession?.deactivate()
             return
         }
 
@@ -348,21 +624,52 @@ public actor ConversationOrchestrator {
 
     /// UI-initiated activation (tapping an agent in the Agents tab).
     public func setActiveAgentFromUI(_ id: UUID) async {
-        if agents.isEmpty { await loadAgentRoster() }
-        await switchAgent(toId: id, greet: streaming)
-        // Recover a dead session: if we're running but neither streaming nor
-        // intentionally idle on the on-device wake word (detectionTask == nil),
-        // a prior reconnect likely failed and left the mic/transcripts dead.
-        // Re-establish so tapping an agent always brings the session back.
-        if isRunning, !streaming, detectionTask == nil {
-            await restoreSession()
+        await withLifecycle {
+            // Always refresh so edits (voice, personality, tools) apply before reconnect.
+            await loadAgentRoster()
+            await performSwitchAgent(toId: id, greet: streaming)
+            // Do not auto-reopen Realtime from the Agents tab. Listen is only
+            // armed manually on the Assistant tab.
         }
+    }
+
+    /// Tool / voice handoff by display name or wake word (e.g. "Claude", "Max").
+    /// Returns a JSON payload the model can read aloud.
+    public func switchToAgent(named rawName: String) async -> String {
+        if agents.isEmpty { await loadAgentRoster() }
+        let needle = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            return #"{"ok":false,"error":"missing_agent_name"}"#
+        }
+        let target = agents.first {
+            $0.name.lowercased() == needle || $0.wakeWord.lowercased() == needle
+        }
+        guard let target else {
+            let list = agents.map(\.name).sorted().joined(separator: ", ")
+            return #"{"ok":false,"error":"unknown_agent","available":"\#(Self.jsonEscape(list))"}"#
+        }
+        // Stop any in-flight "configuration issue" reply before reconnecting.
+        await ai.interrupt()
+        await switchAgent(toId: target.id, greet: streaming || isRunning)
+        return #"{"ok":true,"active":"\#(Self.jsonEscape(target.name))","role":"\#(Self.jsonEscape(target.role))"}"#
+    }
+
+    private static func jsonEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     /// Return the session to a healthy state after a failed reconnect: prefer
     /// on-device wake-word listening when configured, otherwise reopen the cloud
     /// stream. No-op when not running or already streaming.
     private func restoreSession() async {
+        await withLifecycle {
+            await restoreSessionUnlocked()
+        }
+    }
+
+    /// Same as `restoreSession` but for callers that already hold the lifecycle lock.
+    private func restoreSessionUnlocked() async {
         guard isRunning, !streaming else { return }
         if sessionConfig.useLocalWakeWord, let listener = wakeWordListener {
             do {
@@ -373,7 +680,7 @@ public actor ConversationOrchestrator {
             }
         }
         do {
-            try await beginStreaming(sessionConfig)
+            try await beginStreaming(sessionConfig, speakReadyGreeting: false)
             lastEngagement = .now
             listeningSuspended = false
         } catch {
@@ -402,7 +709,7 @@ public actor ConversationOrchestrator {
             if !others.isEmpty {
                 let list = others.map { "\($0.name) (\($0.role))" }.joined(separator: "; ")
                 let example = others.first?.name ?? "Claude"
-                s += "\n\nYou are the master assistant and lead a team of specialists: \(list). The user can hand off to one by saying, for example, \"Nova, let me talk to \(example)\". Only you can switch specialists. If the user asks for one of these specialties, offer to hand off."
+                s += "\n\nYou are the master assistant and lead a team of specialists: \(list). When the user asks to talk to a specialist (or return to you), call the switch_agent tool with their name — e.g. \(example). Do not claim a configuration problem or tell them to use Settings; the tool performs the handoff. They can also say \"Nova, let me talk to \(example)\"."
             }
             return s
         }
@@ -416,6 +723,10 @@ public actor ConversationOrchestrator {
 
     private func beginLocalListening(_ listener: any WakeWordListening) async throws {
         if streaming { await teardownStreaming() }
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            detail: "Local wake word armed — say \"Nova\" to open Realtime (or turn off Local wake word in Settings)."
+        )
         try await listener.start()
         NovaLog.session.info("Local wake-word listening (cloud stream closed)")
         detectionTask = Task { [weak self] in
@@ -427,30 +738,129 @@ public actor ConversationOrchestrator {
     }
 
     private func onWakeWordDetected() async {
-        guard isRunning, !streaming else { return }
-        NovaLog.session.info("Wake word detected on-device; opening stream")
-        detectionTask?.cancel()
-        detectionTask = nil
-        await wakeWordListener?.stop()
-        // Already invoked locally, so the cloud session should reply to the
-        // command that follows without requiring the wake word again.
-        var engaged = sessionConfig
-        engaged.requireWakeWord = false
-        do {
-            try await beginStreaming(engaged)
-        } catch {
-            NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
-            if let listener = wakeWordListener, isRunning {
-                try? await beginLocalListening(listener)
+        await withLifecycle {
+            guard isRunning, !streaming else { return }
+            NovaLog.session.info("Wake word detected on-device; opening stream")
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            // Already invoked locally, so the cloud session should reply to the
+            // command that follows without requiring the wake word again.
+            var engaged = sessionConfig
+            let previousRequireWakeWord = sessionConfig.requireWakeWord
+            engaged.requireWakeWord = false
+            do {
+                // Keep the live gate in sync with the Realtime session shape.
+                sessionConfig.requireWakeWord = false
+                try await beginStreaming(engaged)
+            } catch {
+                sessionConfig.requireWakeWord = previousRequireWakeWord
+                NovaLog.session.error("Failed to open stream after wake word: \(String(describing: error), privacy: .public)")
+                if let listener = wakeWordListener, isRunning {
+                    try? await beginLocalListening(listener)
+                    publishListenHealth(
+                        phase: .awaitingWakeWord,
+                        detail: "Say \"Nova\" or tap Listen to reconnect."
+                    )
+                }
             }
+        }
+    }
+
+    /// Reopen Realtime after "Close Connection" standby (Listen button path).
+    public func reopenRealtime() async throws {
+        try await withLifecycle {
+            guard isRunning else {
+                throw NovaError.notConfigured("Voice session is not active — tap Listen to start")
+            }
+            guard !streaming else { return }
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            var engaged = sessionConfig
+            engaged.requireWakeWord = false
+            sessionConfig.requireWakeWord = false
+            try await beginStreaming(engaged)
+            lastEngagement = .now
+            listeningSuspended = false
+        }
+    }
+
+    /// Screen unlock / foreground: keep Listen alive across lock by resuming the
+    /// Realtime socket (and mic) if iOS suspended the WebSocket.
+    public func resumeAfterForeground() async {
+        await ai.noteAppLifecycle(isActive: true)
+        guard isRunning else { return }
+
+        if streaming {
+            publishListenHealth(
+                phase: .connecting,
+                detail: "Checking Realtime after unlock…"
+            )
+            // Do not hold the lifecycle lock across token mint / WS open — that
+            // would block Stop and agent switch for the whole reconnect window.
+            let ok = await ai.resumeTransportIfNeeded()
+            await ingress.nudgeAfterTransportResume()
+            if ok {
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "Realtime connected — speak or type."
+                )
+                return
+            }
+            await withLifecycle {
+                guard isRunning else { return }
+                await teardownStreaming(cancelToolTask: false)
+                do {
+                    var engaged = sessionConfig
+                    engaged.requireWakeWord = false
+                    sessionConfig.requireWakeWord = false
+                    try await beginStreaming(engaged, speakReadyGreeting: false)
+                } catch {
+                    NovaLog.session.error(
+                        "Foreground Realtime rebuild failed: \(String(describing: error), privacy: .public)"
+                    )
+                    publishListenHealth(
+                        phase: .error,
+                        detail: "Could not reconnect — tap Listen."
+                    )
+                }
+            }
+            return
+        }
+
+        // Local wake-word standby: do not auto-reopen Realtime on unlock.
+        // Listen must be started again from the Assistant tab.
+        if !streaming {
+            publishListenHealth(
+                phase: isRunning && detectionTask != nil ? .awaitingWakeWord : .idle,
+                detail: isRunning && detectionTask != nil
+                    ? "Say \"Nova\" is disabled — tap Listen to reconnect."
+                    : "Listen stopped — tap Listen on Assistant to start."
+            )
+        }
+    }
+
+    public func noteEnteredBackground() async {
+        await ai.noteAppLifecycle(isActive: false)
+        if isRunning, streaming {
+            publishListenHealth(
+                phase: .connecting,
+                detail: "Screen off — keeping audio session; reconnecting if the socket drops…"
+            )
         }
     }
 
     // MARK: - Streaming (engaged state)
 
-    private func beginStreaming(_ config: AISessionConfig) async throws {
-        guard !streaming else { return }
-        // Prime the session with durable facts + recent memory for continuity.
+    /// Compose the effective session config for the active agent: persona voice +
+    /// front-loaded instructions + durable/recent memory + workspace context +
+    /// tool allowlist. `gen` is used to bail out if the stream is superseded.
+    private func buildEffectiveConfig(
+        base config: AISessionConfig,
+        gen: Int,
+        requireSession: Bool = true
+    ) async throws -> AISessionConfig {
         var effective = config
         // Active-agent persona + voice: the persona is front-loaded ahead of the
         // base rules, and the voice determines who the user hears.
@@ -464,6 +874,9 @@ public actor ConversationOrchestrator {
         }
         if let profileProvider {
             let facts = await profileProvider()
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !facts.isEmpty {
                 effective.instructions += "\n\nWhat you know about the user:\n\(facts)"
             }
@@ -471,9 +884,15 @@ public actor ConversationOrchestrator {
         // Memory is scoped per-agent (so each specialist has its own window);
         // the master falls back to the active workspace.
         let scopeId = await memoryScopeId()
+        if requireSession {
+            guard gen == streamGeneration, isRunning else { throw CancellationError() }
+        }
         // Durable long-term digest first (older, compacted context)…
         if let digestStore {
             let digest = await digestStore.digest(workspaceId: scopeId)
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !digest.isEmpty {
                 effective.instructions += "\n\nLong-term memory for this context:\n\(digest)"
             }
@@ -481,6 +900,9 @@ public actor ConversationOrchestrator {
         // …then the recent rolling window.
         if let memory {
             let summary = await memory.summary(workspaceId: scopeId)
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !summary.isEmpty {
                 effective.instructions += "\n\nRecent conversation for context:\n\(summary)"
             }
@@ -488,6 +910,9 @@ public actor ConversationOrchestrator {
         // Active workspace context + available skills catalog.
         if let contextProvider {
             let ctx = await contextProvider()
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -495,6 +920,9 @@ public actor ConversationOrchestrator {
         // Agent-specific extra context (e.g. the trainer's recent workouts).
         if let agent = activeAgent, let agentContextProvider {
             let ctx = await agentContextProvider(agent)
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
             if !ctx.isEmpty {
                 effective.instructions += "\n\n\(ctx)"
             }
@@ -502,24 +930,583 @@ public actor ConversationOrchestrator {
         // Advertise available tools, scoped to the active agent's allowlist.
         if let toolRouter {
             effective.toolDefinitions = await toolRouter.definitions(allowlist: activeAgent?.toolNames)
+            if requireSession {
+                guard gen == streamGeneration, isRunning else { throw CancellationError() }
+            }
         }
-        try await ai.connect(config: effective)
+        // Typed chat without Listen: prefer plain prose over spoken-glass style.
+        if config.textOutputOnly {
+            effective.instructions += """
+
+
+            You are answering a typed chat message (not voice). Reply in clear written prose. Do not narrate that you are an audio assistant.
+            """
+        }
+        return effective
+    }
+
+    /// Reconnect only the Realtime session (new voice + persona) while leaving the
+    /// mic ingress and playback engines running. Used for agent switching: tearing
+    /// down and restarting Core Audio raced the greeting's playback route change
+    /// and stalled the mic after ~20 chunks. Returns false if not currently
+    /// streaming, or if reconnect was cancelled / left the socket dead (caller
+    /// should fall back to a full engage — treating cancel as success previously
+    /// left Listen "armed" with no Realtime session, so the new agent never replied).
+    private func reconnectAIForActiveAgent() async -> Bool {
+        guard streaming else { return false }
+        // Keep the SAME generation so the running ingress pump keeps forwarding to
+        // the reconnected socket (bumping it would stop the pump = mic "stall").
+        let gen = streamGeneration
         do {
-            try await ingress.start()
-        } catch {
+            let effective = try await buildEffectiveConfig(base: sessionConfig, gen: gen)
+            await egress.flush()
             await ai.disconnect()
-            throw error
+            publishListenHealth(phase: .connecting, detail: "Switching voice — reconnecting Realtime…")
+            try await ai.connect(config: effective)
+            guard gen == streamGeneration, isRunning else {
+                // Stale or stopped mid-reconnect: socket may be up for a dead
+                // generation — drop it and signal failure so the caller restores.
+                await ai.disconnect()
+                return false
+            }
+            // Fresh turn state for the new session; leave mic/egress untouched.
+            assistantSpeaking = false
+            lastOutputAudioAt = nil
+            lastActivity = .now
+            publishListenHealth(phase: .waitingForSpeech, detail: "Switched agent — speak or type.")
+            return true
+        } catch is CancellationError {
+            // Cancel after `disconnect()` leaves streaming=true with no socket.
+            // Must return false so performSwitchAgent full-reconnects / restores
+            // instead of sendUserText-no-op on a dead provider.
+            NovaLog.session.info("Agent-switch AI reconnect cancelled — falling back to full engage")
+            return false
+        } catch {
+            NovaLog.session.error("Agent-switch AI reconnect failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    private func beginStreaming(
+        _ config: AISessionConfig,
+        speakReadyGreeting: Bool = true
+    ) async throws {
+        guard !streaming else { return }
+        streamGeneration &+= 1
+        let gen = streamGeneration
+        publishListenHealth(phase: .connecting, detail: "Preparing agent context…")
+        let effective = try await buildEffectiveConfig(base: config, gen: gen)
+        let scopeId = await memoryScopeId()
+        guard gen == streamGeneration, isRunning else { throw CancellationError() }
+        // Cloud first so text chat can work even when mic permission/HFP stalls.
+        publishListenHealth(phase: .connecting, detail: "Minting Realtime token / opening WebSocket…")
+        try await ai.connect(config: effective)
+        guard gen == streamGeneration, isRunning else {
+            await ai.disconnect()
+            throw CancellationError()
         }
         streaming = true
         lastActivity = .now
+        micChunksSent = 0
+        micChunksAppendOK = 0
+        micChunksAppendFailed = 0
+        micBytesSent = 0
+        micPeakHeard = 0
+        outboundPeakHeard = 0
+        outboundRmsHeard = 0
+        outboundZcrHeard = 0
+        lastOutputAudioAt = nil
+        lastOutboundPeak = 0
+        lastOutboundRms = 0
+        lastOutboundZcr = 0
+        lastOutboundInstantZcr = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = nil
+        userTranscriptChars = 0
+        cloudVadSpeechEvents = 0
+        didFailoverMicRoute = false
+        didAnnounceMicSilent = false
+        micStallRecoveryAttempts = 0
+        micRearmAttempts = 0
+        if needsCleanMicEngage {
+            needsCleanMicEngage = false
+            // Playback-only / agent-switch often leaves the session category wrong
+            // for HFP SCO. Hard reset before ingress.start() re-activates.
+            await audioSession?.deactivate()
+            try? await Task.sleep(for: .milliseconds(200))
+            guard gen == streamGeneration, isRunning else {
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
+            NovaLog.session.info("Clean mic engage after agent switch / playback-only")
+        }
+        // Quiet start + Bluetooth SCO negotiation must not look like a dead mic.
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micEngageGraceSeconds)
+        clearStickyMicError()
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            detail: "Realtime connected — starting microphone (Allow if prompted)…"
+        )
 
+        var micReady = false
+        do {
+            try await ingress.start()
+            guard gen == streamGeneration, isRunning else {
+                await ingress.stop()
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
+            micReady = true
+            micEngageGraceUntil = ContinuousClock.Instant.now
+                + .seconds(Self.micEngageGraceSeconds)
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                detail: "Listening — say something when ready (quiet is OK)."
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            guard gen == streamGeneration, isRunning else {
+                await ai.disconnect()
+                streaming = false
+                throw CancellationError()
+            }
+            // Keep the cloud session: typed chat still works without mic ingress.
+            let message = "Mic unavailable — text chat still works. \(error)"
+            NovaLog.session.error("Mic ingress failed after Realtime connect: \(String(describing: error), privacy: .public)")
+            publishListenHealth(phase: .error, detail: message)
+            onError?(message)
+        }
+
+        startIngressPump(generation: gen)
+
+        startListenHealthMonitor()
+        startIdleMonitorIfNeeded()
+
+        // NB: we deliberately do NOT pre-warm the glasses camera here. The camera
+        // is only opened on an explicit vision request or video recording so the
+        // hardware capture indicator stays off during normal voice conversations.
+        // (The LED is a Meta-enforced privacy indicator with no software toggle.)
+
+        // Invite the user once Listen mic is actually open (not on silent
+        // reconnect / agent-switch paths that greet separately).
+        if speakReadyGreeting, micReady {
+            // Short beat so HFP playback can settle before TTS.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard gen == streamGeneration, isRunning, streaming else { return }
+            await speakListenReadyGreeting()
+        }
+
+        // Opportunistically compact older turns into the durable digest, off the
+        // hot path so it never blocks the live conversation.
+        if let memoryCompactor {
+            Task { await memoryCompactor.compactIfNeeded(workspaceId: scopeId) }
+        }
+    }
+
+    /// Spoken invite after Listen opens the mic for prompting.
+    private func speakListenReadyGreeting() async {
+        guard streaming, !textChatOnly, !spokenOneShot else { return }
+        let line = Self.listenReadyGreetingLine
+        NovaLog.session.info("Speaking Listen-ready greeting")
+        await ai.sendUserText(
+            "[System: The microphone is open and ready. Speak this greeting exactly once in your normal voice, then stop and wait silently for the user: \"\(line)\"]"
+        )
+    }
+
+    /// Fixed Listen-open invite (personal Nova build).
+    static let listenReadyGreetingLine = "Hi Adam, what can I do for you?"
+
+    private func isCurrentStream(_ generation: Int) -> Bool {
+        streaming && generation == streamGeneration && isRunning
+    }
+
+    private func teardownStreaming(cancelToolTask: Bool = true) async {
+        // Invalidate in-flight beginStreaming / ingress pumps before awaiting I/O.
+        streamGeneration &+= 1
+        // Note: the long-lived `eventTask` intentionally survives teardown so the
+        // provider's single-consumer event stream stays connected across reconnects.
+        ingressTask?.cancel()
+        idleTask?.cancel()
+        speechStoppedFallbackTask?.cancel()
+        listenHealthTask?.cancel()
+        ingressTask = nil
+        idleTask = nil
+        speechStoppedFallbackTask = nil
+        listenHealthTask = nil
+        await ingress.stop()
+        await egress.stop()
+        await ai.disconnect()
+        // Release the glasses camera so its capture indicator turns off and it
+        // stops drawing battery once the conversation is over.
+        if let frameCapture {
+            await frameCapture.releaseCamera()
+        }
+        assistantSpeaking = false
+        streaming = false
+        if cancelToolTask {
+            toolTask?.cancel()
+            toolTask = nil
+        }
+        publishListenHealth(phase: .idle, detail: "Listen stopped")
+    }
+
+    private func noteMicChunk(_ chunk: AudioChunk) {
+        lastChunkAt = .now
+        micChunksSent += 1
+        micBytesSent += chunk.pcm.count
+        let peak = Self.pcmPeak(chunk.pcm)
+        if peak > micPeakHeard { micPeakHeard = peak }
+        // Chunks flowing again after a stall/silence banner — drop sticky UI.
+        if didAnnounceMicSilent
+            || lastError?.localizedCaseInsensitiveContains("stalled") == true
+            || lastError?.localizedCaseInsensitiveContains("silent") == true
+        {
+            didAnnounceMicSilent = false
+            clearStickyMicError()
+        }
+        if micStallRecoveryAttempts > 0, micChunksSent >= 8 {
+            micStallRecoveryAttempts = 0
+        }
+        if micRearmAttempts > 0, micChunksSent >= 8 {
+            micRearmAttempts = 0
+        }
+    }
+
+    /// Tracks outbound mic energy for the health monitor only. Turn-taking is
+    /// owned by OpenAI server-side VAD, so this no longer commits or detects
+    /// barge-in (barge-in arrives as `.speechStarted`).
+    private func noteOutboundEnergy(_ pcm24: Data) {
+        let stats = Self.pcmStats(pcm24)
+        if stats.peak > outboundPeakHeard { outboundPeakHeard = stats.peak }
+        if stats.rms > outboundRmsHeard { outboundRmsHeard = stats.rms }
+        // EMA of zero-crossing rate — speech is typically >> 0.02; DC/noise ~ 0.
+        outboundZcrHeard = outboundZcrHeard * 0.85 + stats.zcr * 0.15
+
+        lastOutboundPeak = stats.peak
+        lastOutboundRms = stats.rms
+        lastOutboundZcr = outboundZcrHeard
+        lastOutboundInstantZcr = stats.zcr
+
+        // Speech-energy hint for the health UI (does not gate turns).
+        if stats.peak >= 0.04, stats.rms >= 0.01, stats.zcr >= 0.02 {
+            lastMicEnergyAt = ContinuousClock.Instant.now
+            if listenHealth.phase == .waitingForSpeech || listenHealth.phase == .micSilent {
+                publishListenHealth(phase: .hearingYou, detail: "Local speech detected")
+            }
+        }
+    }
+
+    private func noteAppendResult(sent: Bool) {
+        if sent {
+            micChunksAppendOK += 1
+        } else {
+            micChunksAppendFailed += 1
+        }
+    }
+
+    private func startListenHealthMonitor() {
+        listenHealthTask?.cancel()
+        listenHealthTask = Task { [weak self] in
+            guard let self else { return }
+            // Give the session a moment to settle after connect.
+            try? await Task.sleep(for: .seconds(2))
+            while !Task.isCancelled {
+                await self.evaluateListenHealth()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
+
+    private func evaluateListenHealth() async {
+        guard streaming, isRunning else { return }
+        let route: String
+        let liveLevel: Float
+        if let mic = ingress as? any MicRouteControlling {
+            route = await mic.inputRouteLabel()
+            liveLevel = await mic.peakLevel()
+        } else {
+            route = "unknown"
+            liveLevel = micPeakHeard
+        }
+
+        let now = ContinuousClock.Instant.now
+        if let graceUntil = micEngageGraceUntil, now < graceUntil {
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: didFailoverMicRoute
+                    ? "Using iPhone mic after glasses silence — speak again…"
+                    : "Mic warming up — quiet is OK (\(micChunksSent) chunks)"
+            )
+            return
+        }
+
+        if assistantSpeaking {
+            // Server owns turn-taking now. If audio stalled well past any
+            // plausible reply, unstick so the UI doesn't lock in "speaking".
+            if let started = lastOutputAudioAt, now - started > .seconds(15) {
+                NovaLog.session.info("Clearing stuck assistantSpeaking after \(now - started)")
+                assistantSpeaking = false
+            } else {
+                publishListenHealth(
+                    phase: .speaking,
+                    micLevel: liveLevel,
+                    inputRoute: route,
+                    detail: "Playing assistant audio — speak to interrupt"
+                )
+                return
+            }
+        }
+
+        if micChunksSent == 0 || lastChunkAt == nil {
+            if await recoverMicCaptureIfNeeded(
+                reason: "no_chunks",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if await failoverMicIfNeeded(
+                reason: "no_chunks",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                let message = """
+                No mic chunks on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
+            publishListenHealth(
+                phase: .streamStalled,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "No mic chunks yet — check Mic permission and audio route."
+            )
+            return
+        }
+
+        if let lastChunkAt, now - lastChunkAt > .seconds(1.5) {
+            // True stall: chunks stopped (often route flap / SCO). Soft-recover
+            // before flipping route or sticking the UI.
+            if await recoverMicCaptureIfNeeded(
+                reason: "stalled",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if await failoverMicIfNeeded(
+                reason: "stalled",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                let message = """
+                Mic stream stalled on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio. Tap Stop then Listen to retry.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
+            publishListenHealth(
+                phase: .streamStalled,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Mic stream stalled after \(micChunksSent) chunks on \(route)."
+            )
+            return
+        }
+
+        let heardRecently = lastMicEnergyAt.map { now - $0 < .seconds(1.2) } ?? false
+        // Quiet chunks are normal (user hasn't spoken). Never failover or stick
+        // an error for silence alone — that made Listen unrecoverable after a
+        // few quiet seconds at session start.
+        if !heardRecently, micPeakHeard < 0.02, now - (lastChunkAt ?? now) < .seconds(1) {
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: "Listening — quiet is OK (\(micChunksSent) chunks on \(route))"
+            )
+            return
+        }
+
+        // Healthy energy / waiting — drop stale HFP-silent banners from failover.
+        if lastError?.localizedCaseInsensitiveContains("silent") == true
+            || lastError?.localizedCaseInsensitiveContains("stalled") == true
+        {
+            clearStickyMicError()
+        }
+
+        if heardRecently || userTranscriptChars > 0 {
+            // Speech energy or transcript is flowing; the server VAD will commit
+            // and reply when it detects end of turn.
+            publishListenHealth(
+                phase: .hearingYou,
+                micLevel: liveLevel,
+                inputRoute: route,
+                detail: userTranscriptChars > 0
+                    ? "Transcript active (\(userTranscriptChars) chars)"
+                    : "Hearing you — waiting for you to finish…"
+            )
+            return
+        }
+
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            micLevel: liveLevel,
+            inputRoute: route,
+            detail: didFailoverMicRoute
+                ? ListenHealth.failoverWaitingDetail(route: route, chunks: micChunksSent)
+                : "Route \(route) · chunks \(micChunksSent)"
+        )
+    }
+
+    /// Soft recover: reinstall capture tap without flipping HFP ↔ built-in.
+    @discardableResult
+    private func recoverMicCaptureIfNeeded(
+        reason: String,
+        route: String,
+        liveLevel: Float
+    ) async -> Bool {
+        guard micStallRecoveryAttempts < Self.maxMicStallRecoveries,
+              let mic = ingress as? any MicRouteControlling
+        else {
+            return false
+        }
+        micStallRecoveryAttempts += 1
+        let attempt = micStallRecoveryAttempts
+        onTranscript?(
+            "[diag] Mic \(reason) on \(route). Soft-recovering capture (\(attempt)/\(Self.maxMicStallRecoveries))…",
+            .system
+        )
+        NovaLog.session.warning(
+            "Mic \(reason) — soft recover \(attempt)/\(Self.maxMicStallRecoveries) on \(route, privacy: .public)"
+        )
+        await mic.recoverCapture()
+        micPeakHeard = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = ContinuousClock.Instant.now
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micRecoverGraceSeconds)
+        didAnnounceMicSilent = false
+        clearStickyMicError()
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            micLevel: liveLevel,
+            inputRoute: route,
+            detail: "Recovering mic stream… (\(attempt)/\(Self.maxMicStallRecoveries))"
+        )
+        return true
+    }
+
+    /// Flip HFP ↔ built-in once, reset peak counters, and grace the health monitor.
+    @discardableResult
+    private func failoverMicIfNeeded(
+        reason: String,
+        route: String,
+        liveLevel: Float
+    ) async -> Bool {
+        guard !didFailoverMicRoute, let mic = ingress as? any MicRouteControlling else {
+            return false
+        }
+        didFailoverMicRoute = true
+        didAnnounceMicSilent = false
+        onTranscript?(
+            "[diag] Mic \(reason) on \(route). Switching input and retrying…",
+            .system
+        )
+        await mic.flipPreferredInput()
+        micPeakHeard = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = ContinuousClock.Instant.now
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micRecoverGraceSeconds)
+        let newRoute = await mic.inputRouteLabel()
+        onTranscript?(
+            "[diag] Glasses mic \(reason) — switched to \(newRoute). Speak when ready.",
+            .system
+        )
+        clearStickyMicError()
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            micLevel: liveLevel,
+            inputRoute: newRoute,
+            detail: "Switched mic route — quiet is OK. Speak when ready."
+        )
+        return true
+    }
+
+    /// When the ingress AsyncStream ends while Listen is still live, rebuild
+    /// capture and re-arm the pump so Stop/Listen isn't required via app kill.
+    private func rearmMicCapture(reason: String) async {
+        guard streaming, isRunning else { return }
+        guard micRearmAttempts < Self.maxMicRearms else {
+            let message = """
+            Mic stream ended repeatedly. Tap Stop then Listen to retry (or restart Nova if it persists).
+            """
+            NovaLog.session.error("Mic re-arm budget exhausted (\(reason, privacy: .public))")
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
+            publishListenHealth(phase: .streamStalled, detail: message)
+            return
+        }
+        micRearmAttempts += 1
+        let gen = streamGeneration
+        NovaLog.session.warning(
+            "Re-arming mic capture (\(reason, privacy: .public)) attempt \(self.micRearmAttempts)/\(Self.maxMicRearms)"
+        )
+        do {
+            try await ingress.start()
+            guard gen == streamGeneration, isRunning, streaming else { return }
+            micEngageGraceUntil = ContinuousClock.Instant.now
+                + .seconds(Self.micRecoverGraceSeconds)
+            lastChunkAt = ContinuousClock.Instant.now
+            didAnnounceMicSilent = false
+            clearStickyMicError()
+            startIngressPump(generation: gen, cancelPrevious: false)
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                detail: "Mic re-armed — quiet is OK."
+            )
+        } catch {
+            let message = "Mic re-arm failed — tap Stop then Listen. \(error)"
+            NovaLog.session.error("Mic re-arm failed: \(String(describing: error), privacy: .public)")
+            publishListenHealth(phase: .error, detail: message)
+            lastError = message
+            onError?(message)
+        }
+    }
+
+    private func startIngressPump(generation gen: Int, cancelPrevious: Bool = true) {
+        if cancelPrevious {
+            ingressTask?.cancel()
+        }
         ingressTask = Task { [weak self] in
             guard let self else { return }
             for await chunk in await self.ingress.chunks {
-                // Queue wait: time from capture callback to orchestrator processing.
+                guard await self.isCurrentStream(gen) else { return }
                 await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
+                await self.noteMicChunk(chunk)
 
-                // Recording is best-effort and must not stall the mic→WS path.
                 if let voiceRecorder = self.voiceRecorder {
                     let tee = chunk
                     Task { await voiceRecorder.append(tee) }
@@ -533,49 +1520,96 @@ public actor ConversationOrchestrator {
                     pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
                     await self.metrics.mark(.resample, startedAt: resampleStart)
                 }
+                await self.noteOutboundEnergy(pcm24)
+                guard await self.isCurrentStream(gen) else { return }
                 let sent = await self.ai.appendAudio(pcm24)
+                await self.noteAppendResult(sent: sent)
                 if sent {
-                    // End-to-end: capture → socket send completion.
                     await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
                 } else {
                     await self.metrics.increment(.droppedMicChunks)
                 }
             }
-        }
-
-        startIdleMonitorIfNeeded()
-
-        // NB: we deliberately do NOT pre-warm the glasses camera here. The camera
-        // is only opened on an explicit vision request or video recording so the
-        // hardware capture indicator stays off during normal voice conversations.
-        // (The LED is a Meta-enforced privacy indicator with no software toggle.)
-
-        // Opportunistically compact older turns into the durable digest, off the
-        // hot path so it never blocks the live conversation.
-        if let memoryCompactor {
-            Task { await memoryCompactor.compactIfNeeded(workspaceId: scopeId) }
+            guard !Task.isCancelled else { return }
+            guard await self.isCurrentStream(gen) else { return }
+            NovaLog.session.warning("Mic chunk stream ended while listening — re-arming capture")
+            await self.rearmMicCapture(reason: "chunk_stream_ended")
         }
     }
 
-    private func teardownStreaming() async {
-        // Note: the long-lived `eventTask` intentionally survives teardown so the
-        // provider's single-consumer event stream stays connected across reconnects.
-        ingressTask?.cancel()
-        idleTask?.cancel()
-        ingressTask = nil
-        idleTask = nil
-        await ingress.stop()
-        await egress.stop()
-        await ai.disconnect()
-        // Release the glasses camera so its capture indicator turns off and it
-        // stops drawing battery once the conversation is over.
-        if let frameCapture {
-            await frameCapture.releaseCamera()
+    private func clearStickyMicError() {
+        if lastError != nil {
+            lastError = nil
+            onError?("")
         }
-        assistantSpeaking = false
-        streaming = false
-        toolTask?.cancel()
-        toolTask = nil
+    }
+
+    private func publishListenHealth(
+        phase: ListenHealth.Phase,
+        micLevel: Float? = nil,
+        inputRoute: String? = nil,
+        detail: String
+    ) {
+        // Typed chat / spoken vision one-shot without Listen must not flip Listen UI.
+        guard !textChatOnly, !spokenOneShot else { return }
+        if !assistantSpeaking {
+            lastAssistantAudioLevel = AssistantTalkMeter.smooth(
+                previous: lastAssistantAudioLevel,
+                sample: 0,
+                attack: 0.55,
+                release: 0.28
+            )
+            if lastAssistantAudioLevel < 0.02 { lastAssistantAudioLevel = 0 }
+        }
+        var next = listenHealth
+        next.phase = phase
+        next.micLevel = micLevel ?? next.micLevel
+        next.peakHeard = micPeakHeard
+        next.inputRoute = inputRoute ?? next.inputRoute
+        next.chunksSent = micChunksSent
+        next.bytesSent = micBytesSent
+        next.userTranscriptChars = userTranscriptChars
+        next.assistantAudioLevel = lastAssistantAudioLevel
+        next.detail = detail
+        listenHealth = next
+        onListenHealth?(next)
+        onMetricsTick?()
+    }
+
+    private static func pcmPeak(_ pcm16: Data) -> Float {
+        pcmStats(pcm16).peak
+    }
+
+    /// Peak / RMS / zero-crossing rate for outbound PCM16 mono.
+    /// High peak + ~0 ZCR usually means DC bias or stuck converter output — not speech.
+    private static func pcmStats(_ pcm16: Data) -> (peak: Float, rms: Float, zcr: Float) {
+        guard pcm16.count >= 4 else { return (0, 0, 0) }
+        var peak: Int16 = 0
+        var sumSquares: Float = 0
+        var crossings = 0
+        var prev: Int16 = 0
+        var count = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+                let f = Float(s)
+                sumSquares += f * f
+                if count > 0 {
+                    if (prev >= 0 && s < 0) || (prev < 0 && s >= 0) {
+                        crossings += 1
+                    }
+                }
+                prev = s
+                count += 1
+            }
+        }
+        guard count > 1 else { return (0, 0, 0) }
+        let peakN = Float(peak) / Float(Int16.max)
+        let rms = (sumSquares / Float(count)).squareRoot() / Float(Int16.max)
+        let zcr = Float(crossings) / Float(count - 1)
+        return (peakN, rms, zcr)
     }
 
     /// Only relevant in wake-word-gated mode: after `streamIdleTimeout` of silence
@@ -594,26 +1628,198 @@ public actor ConversationOrchestrator {
     }
 
     private func disengageIfIdle() async -> Bool {
+        // Preflight without the lock so the idle timer doesn't serialize behind
+        // unrelated handoffs; re-check inside the critical section.
         guard streaming, !assistantSpeaking else { return false }
         guard ContinuousClock.Instant.now - lastActivity >= sessionConfig.streamIdleTimeout else { return false }
-        NovaLog.session.info("Idle timeout; closing stream, back to wake-word listening")
-        await teardownStreaming()
-        if let listener = wakeWordListener, isRunning {
-            try? await beginLocalListening(listener)
+        return await withLifecycle {
+            guard streaming, !assistantSpeaking else { return false }
+            guard ContinuousClock.Instant.now - lastActivity >= sessionConfig.streamIdleTimeout else { return false }
+            NovaLog.session.info("Idle timeout; closing stream, back to wake-word listening")
+            await teardownStreaming()
+            if let listener = wakeWordListener, isRunning {
+                try? await beginLocalListening(listener)
+            }
+            return true
         }
-        return true
     }
 
     public func askAboutFrame(_ frame: CapturedFrame, prompt: String) async throws -> String {
         if frame.age > StreamBandwidthPolicy.default.maxFrameAgeSeconds {
             throw NovaError.vision("Frame too stale (\(Int(frame.age))s); recapture required")
         }
-        let answer = try await ai.analyze(image: frame, prompt: prompt)
-        await memory?.append(ConversationTurn(role: .user, text: prompt))
-        await memory?.append(ConversationTurn(role: .assistant, text: answer))
+        // User prompt is not spoken input — surface it once. Assistant text streams
+        // via `.outputTranscript` while `analyze` awaits completion.
         onTranscript?(prompt, .user)
-        onTranscript?(answer, .assistant)
-        return answer
+        await memory?.append(ConversationTurn(role: .user, text: prompt, workspaceId: await memoryScopeId()))
+
+        // Listen already open: reuse the live Realtime socket (mic stays as-is).
+        if streaming {
+            return try await ai.analyze(image: frame, prompt: prompt)
+        }
+
+        // Listen off: open a short spoken Realtime turn, speak the answer, then
+        // disconnect — without arming Listen / mic ingress.
+        return try await runSpokenVisionOneShot(frame: frame, prompt: prompt)
+    }
+
+    /// Speak a prepared briefing with Listen off (playback-only). No camera frame
+    /// required — used after Garden Walk silent analysis so a long analyze does
+    /// not trip "Frame too stale".
+    public func speakBriefingWithoutListen(_ prompt: String) async throws {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if streaming {
+            await ai.sendUserText(trimmed)
+            return
+        }
+
+        try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: false
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            spokenOneShot = true
+            lastActivity = .now
+            onTranscript?(trimmed, .user)
+            await memory?.append(
+                ConversationTurn(role: .user, text: trimmed, workspaceId: await memoryScopeId())
+            )
+
+            do {
+                try await audioSession?.activatePlaybackOnly()
+            } catch {
+                NovaLog.audio.info(
+                    "Briefing playback activate skipped: \(String(describing: error), privacy: .public)"
+                )
+            }
+
+            do {
+                try await ai.connect(config: effective)
+                await ai.sendUserText(trimmed)
+                await drainSpokenOneShotPlayback()
+                spokenOneShot = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                    needsCleanMicEngage = true
+                }
+            } catch {
+                spokenOneShot = false
+                await egress.flush()
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                    needsCleanMicEngage = true
+                }
+                throw error
+            }
+        }
+    }
+
+    private func runSpokenVisionOneShot(frame: CapturedFrame, prompt: String) async throws -> String {
+        try await withLifecycle {
+            if agents.isEmpty { await loadAgentRoster() }
+
+            if eventTask == nil {
+                eventTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await event in await self.ai.events {
+                        await self.handle(event)
+                    }
+                }
+            }
+
+            var config = AISessionConfig(
+                instructions: sessionConfig.instructions,
+                textOutputOnly: false
+            )
+            config.requireWakeWord = false
+            config.useLocalWakeWord = false
+            let effective = try await buildEffectiveConfig(
+                base: config,
+                gen: streamGeneration,
+                requireSession: false
+            )
+
+            spokenOneShot = true
+            lastActivity = .now
+
+            // Playback-only (A2DP / speaker) — do NOT open HFP. Grabbing HFP for
+            // What’s this? with Listen off lets Meta AI wake on the glasses and
+            // answer in parallel with Nova.
+            do {
+                try await audioSession?.activatePlaybackOnly()
+            } catch {
+                NovaLog.audio.info(
+                    "Vision one-shot playback activate skipped: \(String(describing: error), privacy: .public)"
+                )
+            }
+
+            do {
+                try await ai.connect(config: effective)
+                let answer = try await ai.analyze(image: frame, prompt: prompt)
+                await drainSpokenOneShotPlayback()
+                spokenOneShot = false
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                    needsCleanMicEngage = true
+                }
+                return answer
+            } catch {
+                spokenOneShot = false
+                await egress.flush()
+                await ai.disconnect()
+                if !isRunning {
+                    eventTask?.cancel()
+                    eventTask = nil
+                    await egress.stop()
+                    await audioSession?.deactivate()
+                    needsCleanMicEngage = true
+                }
+                throw error
+            }
+        }
+    }
+
+    /// Wait for in-flight TTS chunks to finish before tearing down Realtime.
+    private func drainSpokenOneShotPlayback() async {
+        for _ in 0..<50 {
+            if !assistantSpeaking { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        try? await Task.sleep(for: .milliseconds(250))
+        await egress.flush()
     }
 
     private func handle(_ event: AIConversationEvent) async {
@@ -631,13 +1837,42 @@ public actor ConversationOrchestrator {
         switch event {
         case .inputTranscript(let delta):
             inputTranscript += delta
+            userTranscriptChars += delta.count
             onTranscript?(delta, .user)
+            if listenHealth.phase != .hearingYou && listenHealth.phase != .speaking {
+                publishListenHealth(phase: .hearingYou, detail: "Cloud transcript arriving")
+            }
         case .inputTranscriptionCompleted(let transcript):
+            utteranceEpoch &+= 1
+            speechStoppedFallbackTask?.cancel()
+            speechStoppedFallbackTask = nil
+            userTranscriptChars += transcript.count
+            if !transcript.isEmpty {
+                // Completed events sometimes arrive without deltas — surface the
+                // full turn so the UI is never blank when STT succeeded.
+                if inputTranscript.isEmpty {
+                    onTranscript?(transcript, .user)
+                }
+                publishListenHealth(phase: .hearingYou, detail: "Heard: \(transcript.prefix(80))")
+            } else {
+                lastMicEnergyAt = nil
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "No words detected — waiting for clearer speech"
+                )
+            }
             await handleUserUtterance(transcript)
         case .outputTranscript(let delta):
             outputTranscript += delta
-            onTranscript?(delta, .assistant)
+            if textChatOnly {
+                textChatBuffer += delta
+            } else {
+                onTranscript?(delta, .assistant)
+            }
         case .outputAudio(let pcm24):
+            // Text-only typed chat must never play TTS through the glasses.
+            guard !textChatOnly else { break }
+            lastOutputAudioAt = .now
             let t0 = ContinuousClock.Instant.now
             // Play the assistant voice at its native 24 kHz. Downsampling to 8 kHz
             // here needlessly crushed it to narrowband before the (already
@@ -645,9 +1880,25 @@ public actor ConversationOrchestrator {
             // final conversion so wideband HFP can be used when negotiated.
             await egress.enqueue(AudioChunk(pcm: pcm24, sampleRate: 24_000))
             metrics.mark(.audioToSpeaker, startedAt: t0)
+            let peak = await egress.peakLevel()
+            lastAssistantAudioLevel = AssistantTalkMeter.smooth(
+                previous: lastAssistantAudioLevel,
+                sample: peak
+            )
+            if assistantSpeaking {
+                publishListenHealth(
+                    phase: .speaking,
+                    detail: "Playing assistant audio — speak to interrupt"
+                )
+            }
         case .responseStarted:
             assistantSpeaking = true
-            outputTranscript = ""
+            lastOutputAudioAt = .now
+            if !textChatOnly {
+                outputTranscript = ""
+            } else if textChatBuffer.isEmpty {
+                outputTranscript = ""
+            }
         case .responseEnded:
             assistantSpeaking = false
             // If a "Nova, stop" just landed, this is the cancelled response
@@ -671,9 +1922,22 @@ public actor ConversationOrchestrator {
                 await memory?.append(ConversationTurn(role: .user, text: inputTranscript, workspaceId: wsid))
                 inputTranscript = ""
             }
-            await requestFollowUps()
+            if textChatOnly {
+                scheduleTextChatFinish()
+            } else if spokenOneShot {
+                // Vision one-shot: analyze() awaits completion; skip spoken follow-ups.
+            } else {
+                await requestFollowUps()
+            }
             onMetricsTick?()
         case .speechStarted:
+            cloudVadSpeechEvents += 1
+            if userTranscriptChars == 0 {
+                publishListenHealth(
+                    phase: .hearingYou,
+                    detail: "Heard speech — waiting for transcript…"
+                )
+            }
             // Anchor the grace window at the start of the user's turn. If we were
             // already inside the listening window, the user beginning a new turn
             // keeps it open — so natural pauses and Whisper's transcription
@@ -686,7 +1950,12 @@ public actor ConversationOrchestrator {
                 await handleBargeIn()
             }
         case .speechStopped:
-            break
+            // Wake-word mode depends on a completed transcript to decide whether
+            // to answer. If STT is slow or drops the completion event, fall back
+            // to whatever partial transcript we already have.
+            if sessionConfig.requireWakeWord {
+                scheduleSpeechStoppedFallback()
+            }
         case .toolCall(let id, let name, let argumentsJSON):
             guard toolRouter != nil else { break }
             // Chain onto a serial tool queue so slow tools cannot starve audio /
@@ -698,6 +1967,19 @@ public actor ConversationOrchestrator {
             }
         case .error(let message):
             NovaLog.ai.error("AI error: \(message, privacy: .public)")
+            // Soft lifecycle notes — keep Listen armed; do not stand down.
+            if message.localizedCaseInsensitiveContains("unlock the phone to reconnect")
+                || message.localizedCaseInsensitiveContains("Realtime paused")
+            {
+                publishListenHealth(
+                    phase: .connecting,
+                    detail: "Phone locked — unlock to finish reconnecting."
+                )
+                lastError = message
+                onError?(message)
+                onMetricsTick?()
+                break
+            }
             lastError = message
             onError?(message)
             if message.localizedCaseInsensitiveContains("reconnect attempts exhausted") {
@@ -707,6 +1989,13 @@ public actor ConversationOrchestrator {
         case .reconnected:
             lastError = nil
             NovaLog.session.info("AI stream reconnected")
+            if streaming, isRunning {
+                publishListenHealth(
+                    phase: .waitingForSpeech,
+                    detail: "Realtime reconnected — speak or type."
+                )
+                await ingress.nudgeAfterTransportResume()
+            }
             onMetricsTick?()
         }
     }
@@ -720,47 +2009,91 @@ public actor ConversationOrchestrator {
         NovaLog.ai.info("tool \(name, privacy: .public) ok=\(result.ok)")
         await memory?.append(ConversationTurn(
             role: .system,
-            text: "tool:\(name) → \(result.payloadJSON)"
+            text: "tool:\(name) → \(result.payloadJSON)",
+            workspaceId: await memoryScopeId()
         ))
-        await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+        // switch_agent rebuilds the Realtime session; the old call_id is gone.
+        if name != "switch_agent" {
+            await ai.sendToolOutput(callId: id, outputJSON: result.payloadJSON)
+        }
         onMetricsTick?()
     }
 
     /// Reconnect attempts exhausted: leave the half-dead streaming state and
     /// restore local wake-word listening when available so the user can retry.
     private func handleTransportExhausted() async {
-        metrics.increment(.sessionFailures)
-        await teardownStreaming()
-        if sessionConfig.useLocalWakeWord, let listener = wakeWordListener, isRunning {
-            try? await beginLocalListening(listener)
-        } else {
-            // Always-on streaming mode: fully stand down so `start()` can retry.
-            isRunning = false
-            eventTask?.cancel()
-            eventTask = nil
-            detectionTask?.cancel()
-            detectionTask = nil
+        await withLifecycle {
+            metrics.increment(.sessionFailures)
+            await teardownStreaming()
+            if sessionConfig.useLocalWakeWord, let listener = wakeWordListener, isRunning {
+                try? await beginLocalListening(listener)
+            } else {
+                // Always-on streaming mode: fully stand down so `start()` can retry.
+                isRunning = false
+                eventTask?.cancel()
+                eventTask = nil
+                detectionTask?.cancel()
+                detectionTask = nil
+            }
         }
     }
 
-    /// Wake-word gate: with requireWakeWord on, the server transcribes but does
-    /// not auto-reply, so we decide here whether Nova was addressed and whether
-    /// to answer by voice or with a captured frame.
+    /// If input transcription never completes after VAD ends the turn, still try
+    /// to answer from whatever partial transcript we accumulated.
+    private func scheduleSpeechStoppedFallback() {
+        speechStoppedFallbackTask?.cancel()
+        let epoch = utteranceEpoch
+        speechStoppedFallbackTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard let self, !Task.isCancelled else { return }
+            await self.runSpeechStoppedFallback(epoch: epoch)
+        }
+    }
+
+    private func runSpeechStoppedFallback(epoch: Int) async {
+        guard epoch == utteranceEpoch, sessionConfig.requireWakeWord, streaming else { return }
+        let partial = inputTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        utteranceEpoch &+= 1
+        if !partial.isEmpty {
+            NovaLog.session.info("STT completion timed out; using partial transcript for wake-word gate")
+            await handleUserUtterance(partial)
+            return
+        }
+        // Empty STT: VAD already auto-started a response when create_response is
+        // on — do not call createResponse again. Keep the listening window open.
+        NovaLog.session.info("STT empty after speech; relying on VAD auto-response")
+        lastEngagement = .now
+    }
+
+    /// Handles completed user transcripts: always runs agent handoff phrases,
+    /// then (when requireWakeWord is on) the wake-word reply gate.
     ///
     /// Listening mode: if the wake word is absent but we're still inside the
     /// grace window (the wake word was spoken, or either side replied, within
     /// `wakeWordGraceWindow`), the utterance is treated as addressed to Nova.
     private func handleUserUtterance(_ transcript: String) async {
-        guard sessionConfig.requireWakeWord else { return }
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
 
-        // 0) Master control channel — only "Nova, …" can switch/end specialists.
+        // "Close Connection" always tears down Realtime — even when Listen has
+        // disabled the wake-word reply gate — then arms on-device "Nova".
+        if Self.isCloseConnectionCommand(trimmed) {
+            await handleCloseConnection()
+            return
+        }
+
+        // 0) Master control channel — always, even when Listen disables the
+        //    wake-word reply gate. Otherwise "Nova, let me talk to Claude" is
+        //    ignored and the model invents a "configuration" excuse.
         if let director = agentDirector {
-            switch director.control(for: transcript) {
+            switch director.control(for: trimmed) {
             case .switchTo(let id):
+                await ai.interrupt()
                 await switchAgent(toId: id, greet: true)
                 return
             case .endConversation:
                 if let master = masterAgent {
+                    await ai.interrupt()
                     await switchAgent(toId: master.id, greet: true)
                 }
                 return
@@ -774,35 +2107,46 @@ public actor ConversationOrchestrator {
         //    stop" is treated as stop, not a hand-off.)
         if let master = masterAgent, let active = activeAgent, !active.isMaster,
            let masterDetector {
-            let masterIntent = masterDetector.detect(transcript)
+            let masterIntent = masterDetector.detect(trimmed)
             if masterIntent != .ignore {
                 if case .stop = masterIntent {
                     await handleStopCommand()
                     return
                 }
                 listeningSuspended = false
-                let command = Self.commandText(for: masterIntent, fallback: transcript)
+                let command = Self.commandText(for: masterIntent, fallback: trimmed)
+                await ai.interrupt()
                 await switchAgent(toId: master.id, greet: false, actOnText: command)
                 return
             }
         }
 
+        // Wake-word reply gating only — Listen sets requireWakeWord=false so the
+        // model answers every turn (server VAD auto-creates the response);
+        // handoffs above still run. Nothing else to do here for the transcript.
+        guard sessionConfig.requireWakeWord else {
+            return
+        }
+
         // 2) Strict pass: did the utterance actually contain the active wake word?
-        let strict = detector.detect(transcript)
+        let strict = detector.detect(trimmed)
         var intent = strict
         if case .ignore = strict {
             // No wake word. Honor listening mode only if a "Nova, stop" hasn't
             // suspended it — otherwise follow-ups must re-address the agent by name.
             if !listeningSuspended, isWithinGraceWindow() {
-                intent = detector.detectAssumingAddressed(transcript)
+                intent = detector.detectAssumingAddressed(trimmed)
             }
         } else {
             // The wake word was spoken explicitly — resume normal listening.
             listeningSuspended = false
         }
         if case .ignore = intent {
-            // Drop ignored / background speech so it cannot contaminate the next
-            // addressed turn's memory or transcript.
+            // Never cancel a VAD auto-reply here. With create_response:true the
+            // model may already be answering; STT often drops or mishears "Nova",
+            // and interrupt() produced Listen-green silence. Drop the transcript
+            // only — barge-in / "Nova, stop" still cancel speech elsewhere.
+            NovaLog.session.info("Wake gate: ignore '\(trimmed, privacy: .public)'; leaving VAD auto-response alone")
             inputTranscript = ""
             return
         }
@@ -816,7 +2160,7 @@ public actor ConversationOrchestrator {
         // Addressed: (re)open the listening window and act on the intent.
         lastEngagement = .now
         // A saved skill or bookmark request takes precedence over a plain reply.
-        if await handleSkillOrBookmark(transcript) { return }
+        if await handleSkillOrBookmark(trimmed) { return }
         await act(on: intent)
     }
 
@@ -838,6 +2182,37 @@ public actor ConversationOrchestrator {
         NovaLog.session.info("Stop command: speech halted; wake word required to resume")
     }
 
+    /// "Close Connection": drop the cloud Realtime session fully. Listen must be
+    /// re-enabled manually from the Assistant tab (no wake-word auto-reopen).
+    private func handleCloseConnection() async {
+        await ai.interrupt()
+        await egress.flush()
+        inputTranscript = ""
+        outputTranscript = ""
+        onTranscript?("Connection closed.", .system)
+        await withLifecycle {
+            await teardownStreaming()
+            detectionTask?.cancel()
+            detectionTask = nil
+            await wakeWordListener?.stop()
+            isRunning = false
+            eventTask?.cancel()
+            eventTask = nil
+            publishListenHealth(
+                phase: .idle,
+                detail: "Connection closed. Tap Listen to start again."
+            )
+            NovaLog.session.info("Close Connection: Realtime closed; Listen off until manual Start")
+        }
+    }
+
+    /// Exact voice command (punctuation ignored) that closes Realtime.
+    static func isCloseConnectionCommand(_ text: String) -> Bool {
+        let normalized = WakeWordDetector.normalizeText(text)
+        return normalized == "close connection"
+            || normalized == "nova close connection"
+    }
+
     /// Deterministic routing for bookmark requests and skill trigger phrases.
     /// Returns true if it consumed the utterance.
     private func handleSkillOrBookmark(_ transcript: String) async -> Bool {
@@ -851,7 +2226,7 @@ public actor ConversationOrchestrator {
                 ))
                 await ai.sendUserText("[System note: I just saved your last answer to your bookmarks.] Briefly confirm to the user that it's bookmarked.")
             } else {
-                await ai.createResponse()
+                await ai.sendUserText("[System note: There's nothing to bookmark yet.] Briefly tell the user there's no recent answer to bookmark.")
             }
             return true
         }
@@ -889,6 +2264,7 @@ public actor ConversationOrchestrator {
         // Skip the response that a spoken offer itself produced (avoids a loop).
         if skipFollowUpOnce { skipFollowUpOnce = false; return }
         guard let followUpSuggester, !lastAssistantText.isEmpty else { return }
+        if let enabled = followUpSuggestionsEnabled, await enabled() == false { return }
         let user = lastUserText
         let assistant = lastAssistantText
         let callback = onSuggestions
@@ -951,8 +2327,18 @@ public actor ConversationOrchestrator {
             // switch stays exhaustive and correct if act(on:) is called directly.
             await handleStopCommand()
         case .converse:
+            // Server VAD already requested a response (create_response: true).
+            // Still call createResponse for unit-test providers and as a no-op
+            // retry when the auto-response was missed; duplicate creates are
+            // ignored by the Realtime error filter.
             await ai.createResponse()
         case .vision(let prompt):
+            if let isVisionReady, await isVisionReady() == false {
+                await ai.sendUserText(
+                    "[System note: Glasses are not registered with Meta AI yet, so camera vision is unavailable. Tell the user to open Glasses & diagnostics and tap Connect Meta glasses, then try again.]"
+                )
+                return
+            }
             guard let frameCapture else {
                 // No camera wired in this runtime — answer by voice instead.
                 await ai.createResponse()
@@ -979,6 +2365,9 @@ public actor ConversationOrchestrator {
         await egress.flush()
         assistantSpeaking = false
         metrics.mark(.bargeInCancel, startedAt: t0)
+        if streaming {
+            publishListenHealth(phase: .hearingYou, detail: "Interrupted — listening…")
+        }
         onMetricsTick?()
     }
 }

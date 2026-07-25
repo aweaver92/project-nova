@@ -18,11 +18,27 @@ All JSON unless noted, `Authorization: Bearer <token>` on every request.
 | `POST` | `/realtime/token` | `{ "model"?: string }` | Mint a short-lived OpenAI Realtime secret → `{ "value", "expires_at" }` |
 | `POST` | `/claude-code` | `{ "prompt": string, "cwd"?: string }` | Run Claude Code headlessly |
 | `POST` | `/cursor/command` | `{ "command": string, "sessionId"?: string }` | Blocking Cursor send (legacy; Coding tab prefers `/cursor/runs`) |
-| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string }` | **SSE** stream of a Cursor run (Coding tab) |
+| `POST` | `/cursor/runs` | `{ "command": string, "sessionId"?: string, "cwd"?: string, "mode"?: "agent"|"plan", "images"?: [{ "data", "mimeType", "width"?, "height"? }] }` | **SSE** stream of a Cursor run, with optional base64 screenshots and Cursor conversation mode |
 | `POST` | `/cursor/runs/:runId/cancel` | — | Best-effort cancel of an in-flight run |
 | `GET`  | `/cursor/sessions` | — | List local Cursor agents |
 | `GET`  | `/cursor/sessions/:id/messages` | — | Transcript history for a session |
-| `GET`  | `/health` | — | Liveness (no auth) |
+| `GET`  | `/preview` | — | Active live previews (`url`, `lanUrl`, `access`) |
+| `POST` | `/preview/start` | `{ "repoId": string }` | Serve the repo on a LAN port (static or `npm run dev`) |
+| `POST` | `/preview/stop` | `{ "repoId": string }` | Stop the repo's preview server |
+| `GET`  | `/preview-proxy/:repoId/*` | — | Unauthenticated reverse proxy for remote Safari (fallback) |
+| `GET`  | `/health` | — | Liveness + readiness flags (no auth) |
+| `POST` | `/nova/commit-and-build` | `{ "statusToken"?: string, "commitMessage"?: string, "asyncPoll"?: boolean }` | Commit+push Nova checkout. With `asyncPoll: true`, returns `{ jobId, buildStatus: "building" }` immediately; otherwise waits for IPA (legacy). |
+| `GET`  | `/nova/commit-and-build/:jobId` | — | Poll IPA job until `buildStatus` is `completed` or `failed` |
+
+### Live preview (`/preview/*`)
+
+Lets the phone's browser open whatever Claude/Cursor generated. The bridge
+detects the project type: no `package.json` dev script → in-process static
+server; `vite`/`next` → spawns `npm run dev` bound to `0.0.0.0` (running
+`npm install` first when `node_modules` is missing). Dev servers start
+asynchronously — poll `GET /preview` until `state` is `ready`, then open
+`url` in Safari. Preview ports (default 8790–8799) are unauthenticated by
+design; they serve only project content on your LAN.
 
 ### SSE events (`POST /cursor/runs`)
 
@@ -31,9 +47,14 @@ Each event is one `data: {json}\n\n` line. Types:
 - `assistant_delta` — `{ "type", "text" }`
 - `thinking_delta` — `{ "type", "text" }`
 - `tool_start` / `tool_end` — `{ "type", "name", "summary"?, "path"?, "diff"? }`
+- `activity` — `{ "type", "phase", "text", "detail"?, "done"? }` (live process feed)
 - `status` — `{ "type", "status" }`
 - `error` — `{ "type", "error" }`
 - `done` — `{ "type", "sessionId", "runId", "status", "result" }`
+
+Image prompts accept up to four JPEG, PNG, or WebP images (3 MB each, 8 MB
+total). Nova resizes screenshots on-device and sends them as native Cursor SDK
+image content, so the model can read visible errors and UI state directly.
 
 Smoke-test a streaming run:
 
@@ -97,6 +118,21 @@ npm run start   # or: npm run dev  (auto-reload)
 ```
 
 You should see `Nova Bridge listening on http://0.0.0.0:8787`.
+The bridge also advertises `_nova-bridge._tcp` over Bonjour/mDNS so Nova can
+follow DHCP address changes automatically after a router restart.
+
+### Keep it alive (PC watchdog)
+
+If the bridge process dies (PC sleep, crash, closed terminal), a small watchdog
+polls `/health` every 30s and restarts it:
+
+```powershell
+npm run watchdog:install    # logon task + start now
+# npm run watchdog:uninstall
+```
+
+Logs land in `nova-bridge/logs/watchdog.log`. This is PC-side only — the phone
+cannot start a fully stopped bridge by itself.
 
 Smoke-test locally:
 
@@ -109,34 +145,79 @@ curl -X POST localhost:8787/claude-code \
   -d '{"prompt":"list the files in this repo"}'
 ```
 
-## 3. Expose it over HTTPS (Tailscale)
+### Same-LAN auto-detection (recommended at home)
 
-The iOS app blocks plain `http://` by default (App Transport Security), so give it an **HTTPS** URL. Tailscale keeps it private to your devices — no public exposure.
+Run this once to allow the API and Bonjour through Windows Firewall on **Private**
+networks (it opens a UAC prompt):
 
-1. Install Tailscale on the **Mac** and the **iPhone**; log both into the same tailnet.
-2. On the Mac, publish the bridge over your tailnet with HTTPS:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\configure-lan-discovery.ps1
+```
+
+Make sure the current home network is marked **Private** in Windows Settings.
+When the app launches, it keeps a working saved URL; if that URL is unreachable,
+it auto-discovers the bridge on the current LAN and updates the IP while keeping
+the saved bearer token. Settings → Bridge → **Find bridge on local network** runs
+the same discovery manually. Bonjour is tried first; a bounded IPv4 scan remains
+as a fallback for routers that suppress multicast.
+
+Plain LAN HTTP is allowed only for local networking by the app's ATS settings.
+The bearer token is still required for every operational endpoint. Do not expose
+port 8787 to the public internet.
+
+## 3. Expose it over HTTPS (Tailscale) — works from ANY network
+
+For access away from home, use an **HTTPS** URL. Tailscale is a private VPN overlay:
+once the bridge PC and your iPhone are on the same tailnet, the app reaches the
+bridge from cellular, coffee-shop Wi-Fi, or another house. It stays private to
+your devices.
+
+**One-time setup:**
+
+1. Install Tailscale on the **bridge PC** and the **iPhone**; log both into the **same account**.
+   - Windows: `winget install --id Tailscale.Tailscale`, then `tailscale up`.
+   - iPhone: install "Tailscale" from the App Store and sign in.
+2. Enable these once in the Tailscale admin console (all free):
+   - **Serve:** <https://login.tailscale.com/f/serve>
+   - **MagicDNS + HTTPS certificates:** <https://login.tailscale.com/admin/dns>
+3. Publish the bridge over your tailnet with HTTPS:
+
+```powershell
+# From the nova-bridge folder — reads PORT from .env and prints the app URL:
+powershell -ExecutionPolicy Bypass -File scripts\setup-tailscale.ps1
+```
+
+Or manually:
 
 ```bash
 tailscale serve --bg 8787
 tailscale serve status   # shows the https URL
 ```
 
-This gives a URL like `https://your-mac.tailnet-name.ts.net/`.
+Either way you get a URL like `https://your-pc.tailnet-name.ts.net/`. The `--bg`
+serve config persists across reboots (the Tailscale service starts at boot), so
+this survives restarts alongside the `NovaBridge` scheduled task.
 
-> Prefer a quick throwaway tunnel instead? `ngrok http 8787` also works and returns an `https://…ngrok…` URL. (Public — rely on the bearer token.)
+> Prefer a quick throwaway public tunnel instead? `ngrok http 8787` also works and returns an `https://…ngrok…` URL. (Public — rely on the bearer token; Tailscale is preferred because it stays private.)
+
+> **Live preview (remote):** When the phone talks to the bridge over Tailscale HTTPS, preview URLs prefer `http://{tailscale-ip}:8790…` (peer-to-peer on your tailnet — run `scripts\setup-tailscale.ps1` so `.env` gets `NOVA_TAILSCALE_IP`). If Tailscale IP detection fails, the bridge falls back to an unauthenticated `/preview-proxy/:repoId` path on the same HTTPS host (best for static sites; Vite HMR may still prefer same Wi‑Fi). The Coding UI shows access + a Copy URL control either way.
 
 ## 4. Point the app at it
 
-In Nova → **Agents** tab → **Claude — Nova Bridge**:
+In Nova → **Settings → Bridge**:
 
-- **URL:** the HTTPS URL from step 3 (e.g. `https://your-mac.tailnet-name.ts.net`)
+- On the same LAN, wait for auto-detection or tap **Find bridge on local network**
+- Away from home, set the Tailscale HTTPS URL (e.g. `https://your-pc.tailnet-name.ts.net`)
 - **Bridge token:** the same `NOVA_BRIDGE_TOKEN` from your `.env`
 - Tap **Save bridge settings**
 
 Then open the **Coding** tab (visible while Claude is the active agent) to attach a
-Cursor session by id, type prompts, and watch the live SSE preview. Or say
+Cursor session by id, type prompts, and watch the live SSE preview. Prefix a prompt
+with `/ask` for a read-only question (no coding updates). Open **Recent** and tap a
+prompt to restore that prompt’s saved chat for review (use **Run again** only when you
+want to re-send). Or say
 *"Nova, let me talk to Claude"* and give it a coding task — voice `push_to_cursor`
-uses the same pinned session id as the Coding tab.
+runs through the same Coding transcript and pinned session as typed prompts.
 
 (Config precedence in the app: in-app Settings → `NOVA_BRIDGE_URL` / `NOVA_BRIDGE_TOKEN`
 env → `NovaBridgeBaseURL` / `NovaBridgeToken` in `Secrets.xcconfig`.)

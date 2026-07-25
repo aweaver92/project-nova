@@ -26,25 +26,35 @@ public struct WebSearchTool: Tool {
     private let model: String
     private let endpoint: URL
     private let session: URLSession
+    private let isEnabled: @Sendable () async -> Bool
+    private let onUsage: (@Sendable () -> Void)?
 
     public init(
         apiKey: String? = OpenAICredentials.apiKey(),
-        model: String = "gpt-4.1",
+        model: String = "gpt-4.1-mini",
         endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        isEnabled: @escaping @Sendable () async -> Bool = { true },
+        onUsage: (@Sendable () -> Void)? = nil
     ) {
         self.apiKey = apiKey
         self.model = model
         self.endpoint = endpoint
         self.session = session
+        self.isEnabled = isEnabled
+        self.onUsage = onUsage
     }
 
     public func invoke(argumentsJSON: String) async throws -> String {
+        guard await isEnabled() else {
+            throw NovaError.tool("Web search is disabled in Settings")
+        }
         struct Args: Decodable { let query: String }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         guard let apiKey, !apiKey.isEmpty else {
             throw NovaError.tool("Web search unavailable: no OpenAI API key configured")
         }
+        onUsage?()
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"

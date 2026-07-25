@@ -5,7 +5,7 @@ import NovaDomain
 
 #if os(iOS)
 /// Captures mono PCM from the active HFP route (glasses mic when preferred).
-public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
+public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @unchecked Sendable {
     /// ~1s of newest audio at ~20 ms/chunk; older chunks are dropped under backpressure.
     public static let chunkBufferCapacity = 48
 
@@ -13,10 +13,16 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     private let metrics: (any LatencyMetricsRecorder)?
     private let engine = AVAudioEngine()
     private var continuation: AsyncStream<AudioChunk>.Continuation?
+    /// Guards flags / stream identity. Engine mutations go through `engineQueue`.
     private let lock = NSLock()
+    /// Serializes all `AVAudioEngine` start/stop/tap work. Core Audio is not safe
+    /// for concurrent mutation from recovery Tasks + agent-switch teardown.
+    private let engineQueue = DispatchQueue(label: "nova.hfp.ingress.engine")
     private var observers: [NSObjectProtocol] = []
     private var running = false
     private var recoveryGeneration = 0
+    private var lastPeak: Float = 0
+    private var flippedOnce = false
 
     // Recreated on every `start()` so the mic feed can be torn down and brought
     // back within a single app run (e.g. switching agents reconnects the stream).
@@ -30,9 +36,46 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         self.continuation = cont
     }
 
+    public func peakLevel() async -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPeak
+    }
+
+    public func inputRouteLabel() async -> String {
+        AudioSessionCoordinator.currentInputDescription()
+    }
+
+    public func flipPreferredInput() async {
+        lock.lock()
+        if flippedOnce {
+            lock.unlock()
+            return
+        }
+        flippedOnce = true
+        lock.unlock()
+        let next = !coordinator.preferBuiltInMicEnabled()
+        coordinator.setPreferBuiltInMic(next)
+        NovaLog.audio.warning(
+            "Silent mic failover → preferBuiltIn=\(next, privacy: .public); restarting capture"
+        )
+        recover()
+    }
+
+    public func recoverCapture() async {
+        recover()
+        // Give Core Audio a beat to reinstall the tap before health re-checks.
+        try? await Task.sleep(for: .milliseconds(200))
+    }
+
     public func start() async throws {
         lock.lock()
         running = true
+        flippedOnce = false
+        lastPeak = 0
+        // Each Listen session starts HFP-first (early working default). Silence
+        // diagnostics may flip once to the built-in mic during the session.
+        coordinator.setPreferBuiltInMic(false)
         // A fresh stream per engage. `stop()` finishes the previous continuation,
         // and yielding into a finished continuation silently drops audio — which
         // previously killed transcription for good after the first teardown
@@ -45,16 +88,38 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         previous?.finish()
 
         try await coordinator.activateConversationalHFP()
-        try installTapAndStartEngine()
+        // Input format can report 0 Hz for a beat after route activation; retry
+        // briefly instead of starting a tap that would mis-label PCM to the cloud.
+        var started = false
+        var lastError: Error?
+        for attempt in 0..<6 {
+            do {
+                try await mutateEngine {
+                    try self.installTapAndStartEngine()
+                }
+                started = true
+                break
+            } catch {
+                lastError = error
+                NovaLog.audio.warning(
+                    "HFP tap not ready (attempt \(attempt + 1)): \(String(describing: error), privacy: .public)"
+                )
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+        }
+        guard started else {
+            throw lastError ?? NovaError.audioSession("HFP tap failed to start")
+        }
         registerObservers()
-        NovaLog.audio.info("HFP ingress started")
+        NovaLog.audio.info("HFP ingress started (\(AudioSessionCoordinator.currentInputDescription(), privacy: .public))")
     }
 
     private func installTapAndStartEngine() throws {
         let input = engine.inputNode
         // Enable the Voice-Processing I/O unit (AEC + noise suppression + AGC).
         // Must be toggled while the engine is stopped; guard against redundant
-        // re-enables on route-change/interruption recovery.
+        // re-enables on route-change/interruption recovery. Early working builds
+        // used VP on the HFP path.
         if !input.isVoiceProcessingEnabled {
             do {
                 try input.setVoiceProcessingEnabled(true)
@@ -65,17 +130,32 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         }
         input.removeTap(onBus: 0)
         let format = input.inputFormat(forBus: 0)
-        // Install tap; convert to 8 kHz mono PCM16 if hardware differs.
-        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 8_000, channels: 1, interleaved: true)!
-        let converter = AVAudioConverter(from: format, to: target)
+        // Reject the transient 0 Hz formats Core Audio can report during route
+        // flips — emitting those mislabeled as 8/24 kHz produces "ws ok" appends
+        // that cloud VAD never treats as speech.
+        guard format.sampleRate >= 8_000, format.channelCount >= 1 else {
+            throw NovaError.audioSession(
+                "Input format not ready (\(format.sampleRate) Hz, \(format.channelCount) ch)"
+            )
+        }
+        // Capture at OpenAI's native 24 kHz so uplink skips the 8→24 resampler.
+        guard let target = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 24_000,
+            channels: 1,
+            interleaved: true
+        ) else {
+            throw NovaError.audioSession("Failed to build 24 kHz PCM16 tap format")
+        }
+        guard let converter = AVAudioConverter(from: format, to: target) else {
+            throw NovaError.audioSession(
+                "No converter \(format.sampleRate)Hz → 24kHz PCM16"
+            )
+        }
 
-        input.installTap(onBus: 0, bufferSize: 960, format: format) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2_880, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             let capturedAt = ContinuousClock.Instant.now
-            guard let converter else {
-                self.emit(Self.int16Data(from: buffer), capturedAt: capturedAt)
-                return
-            }
             let ratio = target.sampleRate / format.sampleRate
             let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
             guard let outBuffer = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCapacity) else { return }
@@ -91,7 +171,7 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
                 return buffer
             }
             if error == nil {
-                self.emit(Self.int16Data(from: outBuffer), capturedAt: capturedAt)
+                self.emit(Self.int16Data(from: outBuffer), sampleRate: 24_000, capturedAt: capturedAt)
             }
         }
 
@@ -99,9 +179,30 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         try engine.start()
     }
 
+    /// Run engine mutations on the serial queue (bridging sync Core Audio APIs).
+    private func mutateEngine(_ body: @escaping () throws -> Void) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            engineQueue.async {
+                do {
+                    try body()
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func mutateEngineSync(_ body: () -> Void) {
+        engineQueue.sync(execute: body)
+    }
+
     // MARK: - Resilience: interruptions & route changes
 
     private func registerObservers() {
+        // Always clear first so a duplicate `start()` cannot leak NotificationCenter
+        // tokens and multiply recovery work after agent switches.
+        unregisterObservers()
         let center = NotificationCenter.default
         let interruption = center.addObserver(
             forName: AVAudioSession.interruptionNotification,
@@ -120,13 +221,21 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         lock.unlock()
     }
 
+    private func unregisterObservers() {
+        lock.lock()
+        let toRemove = observers
+        observers = []
+        lock.unlock()
+        toRemove.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
     private func handleInterruption(_ note: Notification) {
         guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
             NovaLog.audio.info("Audio interruption began; pausing engine")
-            engine.stop()
+            mutateEngineSync { self.engine.stop() }
         case .ended:
             let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
                 .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
@@ -157,6 +266,10 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
 
     /// Reactivate the HFP session and restart the capture tap after an
     /// interruption or route change. Coalesces overlapping recoveries.
+    public func nudgeAfterTransportResume() async {
+        recover()
+    }
+
     private func recover() {
         lock.lock()
         recoveryGeneration &+= 1
@@ -174,7 +287,25 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
             guard stillCurrent else { return }
             do {
                 try await self.coordinator.activateConversationalHFP()
-                try self.installTapAndStartEngine()
+                self.lock.lock()
+                let stillAlive = self.recoveryGeneration == generation && self.running
+                let wantBuiltIn = self.coordinator.preferBuiltInMicEnabled()
+                self.lock.unlock()
+                guard stillAlive else { return }
+                let route = AudioSessionCoordinator.currentInputDescription()
+                let routeOK = wantBuiltIn
+                    ? route.contains("BuiltInMic") || route.contains("MicrophoneBuiltIn")
+                    : route.contains("BluetoothHFP") || !route.contains("BuiltIn")
+                if !routeOK {
+                    NovaLog.audio.warning(
+                        "HFP recover route mismatch (wantBuiltIn=\(wantBuiltIn), route=\(route, privacy: .public)); re-activating"
+                    )
+                    try await self.coordinator.activateConversationalHFP()
+                    try? await Task.sleep(for: .milliseconds(60))
+                }
+                try await self.mutateEngine {
+                    try self.installTapAndStartEngine()
+                }
             } catch {
                 NovaLog.audio.error("HFP recovery failed: \(String(describing: error), privacy: .public)")
                 self.metrics?.increment(.sessionFailures)
@@ -186,28 +317,48 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
         lock.lock()
         running = false
         recoveryGeneration &+= 1
-        let toRemove = observers
-        observers = []
         let sink = continuation
         continuation = nil
         lock.unlock()
-        toRemove.forEach { NotificationCenter.default.removeObserver($0) }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        unregisterObservers()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            engineQueue.async {
+                self.engine.inputNode.removeTap(onBus: 0)
+                self.engine.stop()
+                cont.resume()
+            }
+        }
         await coordinator.deactivate()
         sink?.finish()
     }
 
-    private func emit(_ data: Data, capturedAt: ContinuousClock.Instant) {
-        guard !data.isEmpty else { return }
+    private func emit(_ data: Data, sampleRate: Int, capturedAt: ContinuousClock.Instant) {
+        guard !data.isEmpty, sampleRate > 0 else { return }
+        let peak = Self.peakLevel(of: data)
         lock.lock()
         let sink = continuation
         let alive = running
+        // Smooth the meter so UI isn't flicker-y, but keep peaks responsive.
+        lastPeak = max(peak, lastPeak * 0.85)
         lock.unlock()
         guard alive, let sink else { return }
         // bufferingNewest drops oldest under backpressure; yield's discarded
         // value isn't exposed, so queue lag is observed via t_mic_queue_wait.
-        sink.yield(AudioChunk(pcm: data, sampleRate: 8_000, capturedAt: capturedAt))
+        sink.yield(AudioChunk(pcm: data, sampleRate: sampleRate, capturedAt: capturedAt))
+    }
+
+    /// Peak absolute sample as 0...1 for the mic meter.
+    private static func peakLevel(of pcm16: Data) -> Float {
+        guard pcm16.count >= 2 else { return 0 }
+        var peak: Int16 = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+            }
+        }
+        return Float(peak) / Float(Int16.max)
     }
 
     private static func int16Data(from buffer: AVAudioPCMBuffer) -> Data {
@@ -226,81 +377,164 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
 }
 
-/// Plays PCM16 mono over the active HFP route.
+/// Plays PCM16 mono over the active audio route (glasses HFP or phone speaker).
 public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let lock = NSLock()
+    private let engineQueue = DispatchQueue(label: "nova.hfp.egress.engine")
     private var started = false
+    private var configuredSampleRate: Int = 0
+    private var lastPeak: Float = 0
 
-    /// Digital make-up gain applied to the assistant voice before playback. The
-    /// HFP call-audio path is quieter than A2DP media, so we lift the level to be
-    /// closer to Meta AI. Values above ~2.5 risk audible clipping on loud
-    /// syllables; each sample is hard-limited to the Int16 range regardless.
-    private static let outputGain: Float = 2.2
+    /// Make-up gain on the Bluetooth HFP call path (quieter than media/A2DP).
+    private static let hfpGain: Float = 2.6
+    /// Higher make-up when playback is on the built-in speaker/receiver — the
+    /// voiceChat path is still quieter than normal media playback on phone.
+    private static let speakerGain: Float = 5.2
 
     public init() {}
 
+    public func peakLevel() async -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPeak
+    }
+
     public func enqueue(_ chunk: AudioChunk) async {
-        ensureStarted(sampleRate: chunk.sampleRate)
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: Double(chunk.sampleRate),
-            channels: 1,
-            interleaved: true
-        ) else { return }
+        guard chunk.sampleRate > 0, !chunk.pcm.isEmpty else { return }
+        let rawPeak = Self.peakLevel(of: chunk.pcm)
+        lock.lock()
+        lastPeak = max(rawPeak, lastPeak * 0.72)
+        lock.unlock()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            engineQueue.async {
+                self.ensureStarted(sampleRate: chunk.sampleRate)
+                defer { cont.resume() }
+                guard let format = AVAudioFormat(
+                    commonFormat: .pcmFormatInt16,
+                    sampleRate: Double(chunk.sampleRate),
+                    channels: 1,
+                    interleaved: true
+                ) else { return }
 
-        let frameCount = AVAudioFrameCount(chunk.pcm.count / 2)
-        guard frameCount > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
-        buffer.frameLength = frameCount
+                let frameCount = AVAudioFrameCount(chunk.pcm.count / 2)
+                guard frameCount > 0,
+                      let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+                      let channels = buffer.int16ChannelData else { return }
+                buffer.frameLength = frameCount
 
-        // Apply make-up gain with hard limiting into the destination buffer.
-        let gain = Self.outputGain
-        let lo = Float(Int16.min), hi = Float(Int16.max)
-        let dst = buffer.int16ChannelData![0]
-        chunk.pcm.withUnsafeBytes { raw in
-            let src = raw.bindMemory(to: Int16.self)
-            for i in 0..<Int(frameCount) {
-                let amplified = (Float(src[i]) * gain).rounded()
-                dst[i] = Int16(min(hi, max(lo, amplified)))
+                // Apply route-aware make-up gain with hard limiting into the destination.
+                let gain = Self.currentOutputGain()
+                let lo = Float(Int16.min), hi = Float(Int16.max)
+                let dst = channels[0]
+                chunk.pcm.withUnsafeBytes { raw in
+                    let src = raw.bindMemory(to: Int16.self)
+                    let count = min(Int(frameCount), src.count)
+                    for i in 0..<count {
+                        let amplified = (Float(src[i]) * gain).rounded()
+                        dst[i] = Int16(min(hi, max(lo, amplified)))
+                    }
+                }
+
+                self.player.scheduleBuffer(buffer, completionHandler: nil)
+                if !self.player.isPlaying { self.player.play() }
             }
         }
-
-        player.scheduleBuffer(buffer, completionHandler: nil)
-        if !player.isPlaying { player.play() }
     }
 
     public func flush() async {
-        player.stop()
-        if started { player.play() }
+        lock.lock()
+        lastPeak = 0
+        lock.unlock()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            engineQueue.async {
+                self.player.stop()
+                if self.started { self.player.play() }
+                cont.resume()
+            }
+        }
     }
 
     public func stop() async {
-        player.stop()
-        engine.stop()
-        started = false
+        lock.lock()
+        lastPeak = 0
+        lock.unlock()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            engineQueue.async {
+                self.player.stop()
+                self.engine.stop()
+                self.started = false
+                self.configuredSampleRate = 0
+                cont.resume()
+            }
+        }
+    }
+
+    /// Peak absolute sample as 0...1 for talking-avatar metering.
+    private static func peakLevel(of pcm16: Data) -> Float {
+        guard pcm16.count >= 2 else { return 0 }
+        var peak: Int16 = 0
+        pcm16.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for s in samples {
+                let a = s == Int16.min ? Int16.max : abs(s)
+                if a > peak { peak = a }
+            }
+        }
+        return Float(peak) / Float(Int16.max)
+    }
+
+    /// HFP / Bluetooth outputs keep the milder boost; built-in speaker/receiver
+    /// get a stronger lift so phone-only listening is usable.
+    private static func currentOutputGain() -> Float {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let onBluetooth = outputs.contains {
+            $0.portType == .bluetoothHFP
+                || $0.portType == .bluetoothA2DP
+                || $0.portType == .bluetoothLE
+        }
+        return onBluetooth ? hfpGain : speakerGain
     }
 
     private func ensureStarted(sampleRate: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !started else { return }
-        engine.attach(player)
-        let format = AVAudioFormat(
+        // Called on `engineQueue`.
+        guard sampleRate > 0 else { return }
+        if started {
+            // Same rate: keep the running graph. Rate change mid-session is rare
+            // (Realtime is fixed at 24 kHz) — rebuild only if needed.
+            if configuredSampleRate == sampleRate { return }
+            player.stop()
+            engine.stop()
+            engine.detach(player)
+            started = false
+        }
+        guard let format = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: Double(sampleRate),
             channels: 1,
             interleaved: true
-        )!
+        ) else {
+            NovaLog.audio.error("Egress format unavailable for \(sampleRate) Hz")
+            return
+        }
+        engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
-        try? engine.start()
-        player.play()
-        started = true
+        engine.mainMixerNode.outputVolume = 1.0
+        do {
+            try engine.start()
+            player.play()
+            configuredSampleRate = sampleRate
+            started = true
+        } catch {
+            NovaLog.audio.error("Egress engine start failed: \(String(describing: error), privacy: .public)")
+            started = false
+            configuredSampleRate = 0
+        }
     }
 }
 #else
-public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
+public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @unchecked Sendable {
     public let chunks: AsyncStream<AudioChunk>
     private let continuation: AsyncStream<AudioChunk>.Continuation
     public init(coordinator: AudioSessionCoordinator, metrics: (any LatencyMetricsRecorder)? = nil) {
@@ -310,6 +544,10 @@ public final class HFPGlassesAudioIngress: AudioIngress, @unchecked Sendable {
     }
     public func start() async throws {}
     public func stop() async { continuation.finish() }
+    public func peakLevel() async -> Float { 0 }
+    public func inputRouteLabel() async -> String { "unavailable" }
+    public func flipPreferredInput() async {}
+    public func recoverCapture() async {}
 }
 
 public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
@@ -317,6 +555,7 @@ public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {
     public func enqueue(_ chunk: AudioChunk) async {}
     public func flush() async {}
     public func stop() async {}
+    public func peakLevel() async -> Float { 0 }
 }
 #endif
 

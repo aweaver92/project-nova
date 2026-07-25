@@ -10,11 +10,18 @@ public struct MediaView: View {
 
     @Bindable var recording: RecordingViewModel
     @Bindable var video: VideoRecordingViewModel
+    /// Forwards a Media video into Ivy's Garden Walk.
+    var onShareVideoToIvy: ((URL) -> Void)?
     @State private var segment: Segment = .voice
 
-    public init(recording: RecordingViewModel, video: VideoRecordingViewModel) {
+    public init(
+        recording: RecordingViewModel,
+        video: VideoRecordingViewModel,
+        onShareVideoToIvy: ((URL) -> Void)? = nil
+    ) {
         self.recording = recording
         self.video = video
+        self.onShareVideoToIvy = onShareVideoToIvy
     }
 
     public var body: some View {
@@ -24,7 +31,11 @@ public struct MediaView: View {
                 case .voice:
                     RecordingsView(recording: recording, embedded: true)
                 case .video:
-                    VideoRecordingsView(video: video, embedded: true)
+                    VideoRecordingsView(
+                        video: video,
+                        embedded: true,
+                        onShareToIvy: onShareVideoToIvy
+                    )
                 }
             }
             .navigationTitle("Media")

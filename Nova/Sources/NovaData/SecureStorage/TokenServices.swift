@@ -29,17 +29,33 @@ public struct StubTokenService: TokenService {
 public enum OpenAICredentials {
     public static func apiKey(bundle: Bundle = .main) -> String? {
         let env = ProcessInfo.processInfo.environment
-        if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"],
-           !key.isEmpty {
-            return key
+        if let key = env["NOVA_OPENAI_API_KEY"] ?? env["OPENAI_API_KEY"] {
+            let normalized = normalize(key)
+            if !normalized.isEmpty { return normalized }
         }
-        if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String,
-           !key.isEmpty,
-           // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
-           !key.hasPrefix("$(") {
-            return key
+        if let key = bundle.object(forInfoDictionaryKey: "OpenAIAPIKey") as? String {
+            let normalized = normalize(key)
+            // Guard against an unsubstituted build setting like "$(OPENAI_API_KEY)".
+            if !normalized.isEmpty, !normalized.hasPrefix("$(") {
+                return normalized
+            }
         }
         return nil
+    }
+
+    /// Trim whitespace and strip wrapping quotes that Info.plist / xcconfig
+    /// sometimes leave on the value (which then produce Bearer `"sk-...` → HTTP 401).
+    static func normalize(_ raw: String) -> String {
+        var key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.count >= 2 {
+            let first = key.first!
+            let last = key.last!
+            if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                key = String(key.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return key
     }
 }
 
@@ -77,7 +93,9 @@ public struct DirectOpenAITokenService: TokenService {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NovaError.credentials("OpenAI client_secrets failed (HTTP \(code))")
+            let detail = Self.safeErrorDetail(from: data)
+            let suffix = detail.map { ": \($0)" } ?? ""
+            throw NovaError.credentials("OpenAI client_secrets failed (HTTP \(code))\(suffix)")
         }
         struct Payload: Decodable {
             let value: String?
@@ -90,6 +108,29 @@ public struct DirectOpenAITokenService: TokenService {
         let expiresAt = payload.expires_at.map { Date(timeIntervalSince1970: $0) }
             ?? Date().addingTimeInterval(60)
         return EphemeralCredential(token: secret, expiresAt: expiresAt)
+    }
+
+    /// Pull a short, user-safe message from an OpenAI error JSON body.
+    private static func safeErrorDetail(from data: Data) -> String? {
+        guard
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let err = obj["error"] as? [String: Any]
+        else { return nil }
+        let message = (err["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let message, !message.isEmpty else { return nil }
+        // OpenAI often echoes a key prefix; redact anything that looks like a secret.
+        let redacted = message
+            .replacingOccurrences(
+                of: #"sk-[A-Za-z0-9_\-]+"#,
+                with: "sk-[REDACTED]",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"ek_[A-Za-z0-9_\-]+"#,
+                with: "ek-[REDACTED]",
+                options: .regularExpression
+            )
+        return String(redacted.prefix(180))
     }
 }
 
@@ -153,16 +194,28 @@ public struct BridgeTokenService: TokenService {
     private let model: String?
     private let session: URLSession
 
+    /// Keep mint snappy so Listen cannot sit on "Connecting…" for a full
+    /// URLSession default (~60s) when the phone cannot reach the bridge.
+    private static let mintTimeout: TimeInterval = 12
+
     public init(
         configProvider: @escaping ConfigProvider,
         path: String = "realtime/token",
         model: String? = nil,
-        session: URLSession = .shared
+        session: URLSession? = nil
     ) {
         self.configProvider = configProvider
         self.path = path
         self.model = model
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = Self.mintTimeout
+            config.timeoutIntervalForResource = Self.mintTimeout
+            config.waitsForConnectivity = false
+            self.session = URLSession(configuration: config)
+        }
     }
 
     public func fetchRealtimeClientSecret() async throws -> EphemeralCredential {
@@ -174,6 +227,7 @@ public struct BridgeTokenService: TokenService {
         }
         var request = URLRequest(url: Self.url(base: base, path: path))
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.mintTimeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -181,7 +235,15 @@ public struct BridgeTokenService: TokenService {
         if let model, !model.isEmpty { body["model"] = model }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw NovaError.credentials(
+                "Bridge unreachable for Realtime token (\(base.host ?? "?")): \(error.localizedDescription). Use the Tailscale HTTPS URL (https://….ts.net), keep Tailscale + `tailscale serve` up on the PC, and confirm nova-bridge is running."
+            )
+        }
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw NovaError.credentials("Nova Bridge realtime token failed (HTTP \(code))")

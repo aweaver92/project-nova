@@ -184,6 +184,28 @@ public final class InMemoryLatencyMetricsRecorder: LatencyMetricsRecorder, @unch
         counterValues.removeAll()
     }
 
+    /// Pass/fail against the documented mic→WS (<40ms) and schedule (<50ms) p95 budgets.
+    public func latencyGate(minSamples: Int = 5) -> (status: String, detail: String) {
+        let micN = sampleCount(.micToWS)
+        let schedN = sampleCount(.audioToSpeaker)
+        guard micN >= minSamples, schedN >= minSamples,
+              let micP95 = percentile(.micToWS, p: 0.95),
+              let schedP95 = percentile(.audioToSpeaker, p: 0.95)
+        else {
+            return (
+                "Pending",
+                "Need ≥\(minSamples) samples each (mic→WS n=\(micN), schedule n=\(schedN)). Keep listening."
+            )
+        }
+        var fails: [String] = []
+        if micP95 >= 40 { fails.append("mic→WS p95=\(Int(micP95))ms (budget <40ms)") }
+        if schedP95 >= 50 { fails.append("schedule p95=\(Int(schedP95))ms (budget <50ms)") }
+        if fails.isEmpty {
+            return ("Pass", "mic→WS p95=\(Int(micP95))ms · schedule p95=\(Int(schedP95))ms")
+        }
+        return ("Fail", fails.joined(separator: " · "))
+    }
+
     /// Compact one-line summary for the conversation footer.
     public func summaryLine(
         metrics: [LatencyMetric] = [.micToWS, .speechEndToFirstAudio, .audioToSpeaker, .bargeInCancel],

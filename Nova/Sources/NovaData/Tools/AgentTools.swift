@@ -7,30 +7,10 @@ import NovaDomain
 /// Run a Claude Code task on the user's dev machine through the Nova Bridge.
 public struct RunClaudeCodeTool: Tool {
     public let name = "run_claude_code"
-    public let description = "Run a coding task with Claude Code on the user's dev machine (edit files, run commands, implement changes). Use for programming requests. Returns Claude Code's result."
-    public let requiresConfirmation = false
+    public let description = "Run a coding task with Claude Code on the user's dev machine (edit files, run commands, implement changes) in the selected repository. Prefer list_repos / select_repo / clone_repo first. Returns Claude Code's result."
+    public let requiresConfirmation = true
     public let parametersJSON = """
-    {"type":"object","properties":{"prompt":{"type":"string","description":"The coding task or instruction for Claude Code."},"working_directory":{"type":"string","description":"Optional absolute path of the project/repo to run in."}},"required":["prompt"],"additionalProperties":false}
-    """
-    private let bridge: any AgentBridging
-    public init(bridge: any AgentBridging) { self.bridge = bridge }
-
-    public func invoke(argumentsJSON: String) async throws -> String {
-        struct Args: Decodable { let prompt: String; let working_directory: String? }
-        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
-        return await bridge.runClaudeCode(prompt: args.prompt, workingDirectory: args.working_directory).payloadJSON
-    }
-}
-
-/// Push a command into an active Cursor session on the user's dev machine.
-/// When `session_id` is omitted, uses the Coding-tab pinned session; after a
-/// successful send, pins the returned session id so the Coding tab can preview it.
-public struct PushToCursorTool: Tool {
-    public let name = "push_to_cursor"
-    public let description = "Send a command or prompt to the user's active Cursor session (e.g. ask the Cursor agent to make a change, run a task, or open a file). Prefer omitting session_id so the pinned Coding-tab session is used; pass session_id only to target a specific session from list_cursor_sessions."
-    public let requiresConfirmation = false
-    public let parametersJSON = """
-    {"type":"object","properties":{"command":{"type":"string","description":"The command or prompt to send to Cursor."},"session_id":{"type":"string","description":"Optional id of a specific Cursor session (from list_cursor_sessions). Omit to use the pinned Coding-tab session."}},"required":["command"],"additionalProperties":false}
+    {"type":"object","properties":{"prompt":{"type":"string","description":"The coding task or instruction for Claude Code."},"repo_id":{"type":"string","description":"Optional opaque repository id from list_repos. Defaults to the Coding-tab selection."}},"required":["prompt"],"additionalProperties":false}
     """
     private let bridge: any AgentBridging
     private let settings: any SettingsStoring
@@ -40,16 +20,76 @@ public struct PushToCursorTool: Tool {
     }
 
     public func invoke(argumentsJSON: String) async throws -> String {
-        struct Args: Decodable { let command: String; let session_id: String? }
+        struct Args: Decodable { let prompt: String; let repo_id: String? }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let selected = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selected
+        return await bridge.runClaudeCode(
+            prompt: args.prompt,
+            workingDirectory: nil,
+            repoId: repoId
+        ).payloadJSON
+    }
+}
+
+/// Push a command into an active Cursor session on the user's dev machine.
+/// When `session_id` is omitted, uses the Coding-tab pinned session; after a
+/// successful send, pins the returned session id so the Coding tab can preview it.
+/// When `runThroughCodingUI` is set (app wiring), the prompt runs through the
+/// Coding view SSE queue so spoken requests appear in the transcript.
+public struct PushToCursorTool: Tool {
+    public let name = "push_to_cursor"
+    public let description = "Send a command or prompt to the user's active Cursor session in the selected repository. Prefer omitting session_id so the pinned Coding-tab session is used. Spoken prompts appear live in the Coding tab."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"command":{"type":"string","description":"The command or prompt to send to Cursor."},"session_id":{"type":"string","description":"Optional id of a specific Cursor session (from list_cursor_sessions). Omit to use the pinned Coding-tab session."},"repo_id":{"type":"string","description":"Optional opaque repository id from list_repos. Defaults to the Coding-tab selection."}},"required":["command"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    /// Optional Coding-tab runner: (command, sessionId?, repoId?) → JSON payload.
+    private let runThroughCodingUI: (@Sendable (String, String?, String?) async -> String)?
+
+    public init(
+        bridge: any AgentBridging,
+        settings: any SettingsStoring,
+        runThroughCodingUI: (@Sendable (String, String?, String?) async -> String)? = nil
+    ) {
+        self.bridge = bridge
+        self.settings = settings
+        self.runThroughCodingUI = runThroughCodingUI
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let command: String; let session_id: String?; let repo_id: String? }
         let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
         let explicit = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
         let pinned = await settings.codingSessionId()
-        let sessionId = (explicit?.isEmpty == false) ? explicit : pinned
-        let result = await bridge.pushToCursor(command: args.command, sessionId: sessionId)
-        if let returned = Self.sessionId(from: result.payloadJSON), !returned.isEmpty {
+        let selected = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selected
+        let sessionId = (explicit?.isEmpty == false)
+            ? explicit
+            : (repoId == selected ? pinned : nil)
+
+        let payload: String
+        if let runThroughCodingUI {
+            payload = await runThroughCodingUI(args.command, sessionId, repoId)
+        } else {
+            let result = await bridge.pushToCursor(
+                command: args.command,
+                sessionId: sessionId,
+                workingDirectory: nil,
+                repoId: repoId
+            )
+            payload = result.payloadJSON
+        }
+
+        if repoId == selected,
+           let returned = Self.sessionId(from: payload),
+           !returned.isEmpty
+        {
             await settings.setCodingSessionId(returned)
         }
-        return result.payloadJSON
+        return payload
     }
 
     private static func sessionId(from payloadJSON: String) -> String? {
@@ -65,13 +105,272 @@ public struct PushToCursorTool: Tool {
 /// List the user's active Cursor sessions so a command can target a specific one.
 public struct ListCursorSessionsTool: Tool {
     public let name = "list_cursor_sessions"
-    public let description = "List the user's currently active Cursor sessions (id, project, and title)."
+    public let description = "List Cursor sessions in the selected repository (id, status, title, and summary). Use get_cursor_session_history before making decisions that depend on an earlier coding conversation."
+    public let requiresConfirmation = false
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        let repoId = await settings.codingSelectedRepoId()
+        return await bridge.listCursorSessions(repoId: repoId).payloadJSON
+    }
+}
+
+/// Read a bounded Cursor transcript so Claude can ground follow-up coding
+/// decisions in what the user and coding agent already discussed.
+public struct GetCursorSessionHistoryTool: Tool {
+    public let name = "get_cursor_session_history"
+    public let description = "Read the user/assistant chat history for a Cursor session in the selected repository. Use this when the request refers to prior discussion, earlier decisions, 'that change', or an existing session."
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"session_id":{"type":"string","description":"Optional Cursor session id. Omit to read the Coding tab's pinned session."},"repo_id":{"type":"string","description":"Optional repository id. Defaults to the Coding tab selection."}},"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let session_id: String?
+            let repo_id: String?
+        }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8)))
+            ?? Args(session_id: nil, repo_id: nil)
+        let selectedRepoId = await settings.codingSelectedRepoId()
+        let repoId = args.repo_id ?? selectedRepoId
+        let explicitSession = args.session_id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionId: String?
+        if explicitSession?.isEmpty == false {
+            sessionId = explicitSession
+        } else if repoId == selectedRepoId {
+            sessionId = await settings.codingSessionId()
+        } else {
+            sessionId = nil
+        }
+        guard let sessionId, !sessionId.isEmpty else {
+            return #"{"ok":false,"error":"no_cursor_session_selected","hint":"Call list_cursor_sessions, then provide session_id, or attach a session in Coding."}"#
+        }
+        return await bridge.fetchCursorSessionMessages(
+            sessionId: sessionId,
+            repoId: repoId
+        ).payloadJSON
+    }
+}
+
+/// List allowlisted local Git repositories on the bridge PC.
+public struct ListReposTool: Tool {
+    public let name = "list_repos"
+    public let description = "List Git repositories available on the user's bridge PC under allowlisted roots, including which repo is selected for Coding."
     public let requiresConfirmation = false
     private let bridge: any AgentBridging
     public init(bridge: any AgentBridging) { self.bridge = bridge }
 
     public func invoke(argumentsJSON: String) async throws -> String {
-        await bridge.listCursorSessions().payloadJSON
+        await bridge.listRepos().payloadJSON
+    }
+}
+
+/// Select a repository by opaque id for subsequent coding runs.
+public struct SelectRepoTool: Tool {
+    public let name = "select_repo"
+    public let description = "Select a repository (by id from list_repos) as the active Coding workspace."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"repo_id":{"type":"string","description":"Opaque repository id from list_repos."}},"required":["repo_id"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let repo_id: String }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let result = await bridge.selectRepository(repoId: args.repo_id)
+        if result.ok {
+            await settings.setCodingSelectedRepoId(args.repo_id)
+            // Code view owns chat session lifecycle; clear the pin so the next
+            // prompt starts a fresh Cursor agent for this workspace.
+            await settings.setCodingSessionId(nil)
+        }
+        return result.payloadJSON
+    }
+}
+
+/// Clone a GitHub HTTPS repository onto the bridge PC.
+public struct CloneRepoTool: Tool {
+    public let name = "clone_repo"
+    public let description = "Clone a GitHub repository over HTTPS onto the bridge PC (uses the PC's existing gh/git auth). Only https://github.com/owner/repo URLs are accepted."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"url":{"type":"string","description":"https://github.com/owner/repo URL"}},"required":["url"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let url: String }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let result = await bridge.cloneRepository(url: args.url, rootLabel: nil)
+        if result.ok,
+           let data = result.payloadJSON.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            let id = (obj["selectedRepoId"] as? String)
+                ?? ((obj["repo"] as? [String: Any])?["id"] as? String)
+            if let id, !id.isEmpty {
+                await settings.setCodingSelectedRepoId(id)
+                await settings.setCodingSessionId(nil)
+            }
+        }
+        return result.payloadJSON
+    }
+}
+
+/// Create, scaffold, commit, and publish a new public web project.
+public struct CreateWebProjectTool: Tool {
+    public let name = "create_web_project"
+    public let description = "Create a new PUBLIC GitHub repository and local web project on the bridge PC, scaffold a web template, make the initial commit, push main, select the repo, and clear the old Cursor session."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"name":{"type":"string","description":"GitHub repository name using lowercase letters, numbers, dots, hyphens, or underscores."},"description":{"type":"string","description":"Optional public GitHub repository description."},"template":{"type":"string","enum":["static","vite","react-vite","nextjs"],"description":"Web starter template. Prefer react-vite for interactive frontends or nextjs for full-stack sites."}},"required":["name","template"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let name: String
+            let description: String?
+            let template: WebProjectTemplate
+        }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let result = await bridge.createPublicWebProject(
+            request: BridgeCreateProjectRequest(
+                name: args.name,
+                description: args.description,
+                template: args.template
+            )
+        )
+        if result.ok,
+           let data = result.payloadJSON.data(using: .utf8),
+           let created = try? JSONDecoder().decode(BridgeCreateProjectResult.self, from: data)
+        {
+            await settings.setCodingSelectedRepoId(created.selectedRepoId)
+            await settings.setCodingSessionId(nil)
+        }
+        return result.payloadJSON
+    }
+}
+
+/// Inspect Git status for the selected (or specified) repository.
+public struct RepoStatusTool: Tool {
+    public let name = "repo_status"
+    public let description = "Get Git branch, ahead/behind, and changed-file summary for a repository. Use before shipping."
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"repo_id":{"type":"string","description":"Optional opaque repository id. Defaults to the Coding-tab selection."}},"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let repo_id: String? }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(repo_id: nil)
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
+            return #"{"ok":false,"error":"no_repo_selected"}"#
+        }
+        return await bridge.repositoryStatus(repoId: repoId).payloadJSON
+    }
+}
+
+/// Inspect a bounded unified diff for review.
+public struct RepoDiffTool: Tool {
+    public let name = "repo_diff"
+    public let description = "Get a bounded unified diff of the working tree for review before creating a pull request."
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"repo_id":{"type":"string","description":"Optional opaque repository id. Defaults to the Coding-tab selection."}},"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let repo_id: String? }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(repo_id: nil)
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
+            return #"{"ok":false,"error":"no_repo_selected"}"#
+        }
+        return await bridge.repositoryDiff(repoId: repoId).payloadJSON
+    }
+}
+
+/// Create a branch, commit, push, and open a pull request (never force-pushes to main).
+public struct PublishRepoTool: Tool {
+    public let name = "publish_repo"
+    public let description = "After the user confirms, create a nova/* branch, commit reviewed changes, push, and open a GitHub pull request. Never push directly to main/master. Requires a fresh status_token from repo_status."
+    public let requiresConfirmation = true
+    public let parametersJSON = """
+    {"type":"object","properties":{"repo_id":{"type":"string","description":"Optional opaque repository id. Defaults to the Coding-tab selection."},"status_token":{"type":"string","description":"Fresh status_token from repo_status (rejects stale trees)."},"branch_name":{"type":"string","description":"Optional branch slug; will be prefixed with nova/ if needed."},"commit_message":{"type":"string","description":"Commit message."},"pr_title":{"type":"string","description":"Pull request title."},"pr_body":{"type":"string","description":"Optional pull request body."}},"required":["status_token","commit_message","pr_title"],"additionalProperties":false}
+    """
+    private let bridge: any AgentBridging
+    private let settings: any SettingsStoring
+    public init(bridge: any AgentBridging, settings: any SettingsStoring) {
+        self.bridge = bridge
+        self.settings = settings
+    }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable {
+            let repo_id: String?
+            let status_token: String
+            let branch_name: String?
+            let commit_message: String
+            let pr_title: String
+            let pr_body: String?
+        }
+        let args = try JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))
+        let selected = await settings.codingSelectedRepoId()
+        guard let repoId = args.repo_id ?? selected, !repoId.isEmpty else {
+            return #"{"ok":false,"error":"no_repo_selected"}"#
+        }
+        let request = BridgePublishRequest(
+            statusToken: args.status_token,
+            branchName: args.branch_name,
+            commitMessage: args.commit_message,
+            prTitle: args.pr_title,
+            prBody: args.pr_body
+        )
+        return await bridge.publishRepository(repoId: repoId, request: request).payloadJSON
     }
 }
 
@@ -91,7 +390,7 @@ public struct StartWorkoutSessionTool: Tool {
     public func invoke(argumentsJSON: String) async throws -> String {
         struct Args: Decodable { let title: String? }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(title: nil)
-        let session = await store.startSession(title: args.title ?? "Workout")
+        let session = await store.startSession(title: args.title ?? "Workout", planId: nil)
         return #"{"ok":true,"session_id":"\#(session.id.uuidString)","title":"\#(session.title)"}"#
     }
 }
@@ -181,5 +480,69 @@ public struct WorkoutHistoryTool: Tool {
         }
         let data = try JSONSerialization.data(withJSONObject: ["ok": true, "count": items.count, "sessions": items])
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// Ultrahuman Ring daily readiness for Max's recovery-aware coaching.
+public struct RingReadinessTool: Tool {
+    public let name = "ring_readiness"
+    public let description = """
+    Fetch today's Ultrahuman Ring recovery / sleep readiness and coaching advice. \
+    Call before prescribing hard sessions when the user asks about recovery, readiness, \
+    or how hard to train. Requires the user to save their Ultrahuman personal API token \
+    in Training settings. Optional date as YYYY-MM-DD (defaults to today).
+    """
+    public let requiresConfirmation = false
+    public let parametersJSON = """
+    {"type":"object","properties":{"date":{"type":"string","description":"Optional calendar day YYYY-MM-DD (local). Defaults to today."}},"additionalProperties":false}
+    """
+    private let ultrahuman: any UltrahumanReading
+    public init(ultrahuman: any UltrahumanReading) { self.ultrahuman = ultrahuman }
+
+    public func invoke(argumentsJSON: String) async throws -> String {
+        struct Args: Decodable { let date: String? }
+        let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(date: nil)
+        let day: Date
+        if let raw = args.date?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let parts = raw.split(separator: "-").compactMap { Int($0) }
+            guard parts.count == 3,
+                  let parsed = Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) else {
+                return #"{"ok":false,"error":"invalid_date","hint":"Use YYYY-MM-DD"}"#
+            }
+            day = parsed
+        } else {
+            day = Date()
+        }
+        do {
+            let snap = try await ultrahuman.dailyMetrics(date: day)
+            var payload: [String: Any] = [
+                "ok": true,
+                "date": snap.sourceDate,
+                "advice": snap.advice,
+                "summary": snap.spokenSummary
+            ]
+            if let v = snap.primaryRecovery { payload["recovery"] = v }
+            if let v = snap.recoveryScore { payload["recovery_score"] = v }
+            if let v = snap.recoveryIndex { payload["recovery_index"] = v }
+            if let v = snap.sleepScore { payload["sleep_score"] = v }
+            if let v = snap.totalSleepMinutes { payload["total_sleep_minutes"] = v }
+            if let v = snap.averageSleepHRV ?? snap.hrv { payload["hrv"] = v }
+            if let v = snap.nightRestingHR { payload["night_rhr"] = v }
+            if let v = snap.movementIndex { payload["movement_index"] = v }
+            if let v = snap.steps { payload["steps"] = v }
+            if let v = snap.vo2Max { payload["vo2_max"] = v }
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return #"{"ok":false,"error":"\#(Self.escape(message))"}"#
+        }
+    }
+
+    private static func escape(_ s: String) -> String {
+        s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
     }
 }

@@ -13,12 +13,14 @@ public actor MemoryCompactor: MemoryCompacting {
     private let fetchLimit: Int
 
     /// - Parameter threshold: minimum new turns before a compaction runs.
+    ///   Kept below the recent-window size so older turns fold into the digest
+    ///   before they fall out of the injected summary.
     public init(
         memory: any ConversationMemory,
         digestStore: any MemoryDigestStoring,
         summarizer: any MemorySummarizing,
-        threshold: Int = 20,
-        fetchLimit: Int = 500
+        threshold: Int = 16,
+        fetchLimit: Int = 800
     ) {
         self.memory = memory
         self.digestStore = digestStore

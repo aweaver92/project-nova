@@ -1,4 +1,5 @@
 import Foundation
+import NovaCore
 
 public enum WearableSessionState: String, Sendable, Equatable {
     case idle
@@ -48,6 +49,9 @@ public struct AISessionConfig: Sendable, Equatable {
     public var toolDefinitions: [ToolDefinition]
     /// Phrases (after the wake word) that route to the vision path.
     public var visionTriggerPhrases: [String]
+    /// When true, Realtime opens with text-only output (no TTS). Used for silent
+    /// Kitchen photo analysis so meal/fridge vision never arms spoken Listen.
+    public var textOutputOnly: Bool
 
     public init(
         instructions: String = """
@@ -58,6 +62,10 @@ public struct AISessionConfig: Sendable, Equatable {
         Accuracy above all — never fabricate. Do not invent facts, numbers, dates, names, quotes, citations, statistics, or events. If you are not confident an answer is correct, verify it with a tool or say so plainly; admitting uncertainty is always better than guessing.
 
         Grounding: you have live web access through the web_search tool. For anything about current events, news, prices, live scores, schedules, people, companies, products, documentation, or any fact that could have changed since your training — or whenever you are not fully certain — call web_search first and base your answer strictly on its results. Never state such facts from memory, and never claim you searched unless you actually called the tool. If a search returns nothing useful, say so instead of guessing.
+
+        Self-knowledge grounding: for every question about Nova's own features, capabilities, integrations, settings, limitations, or implementation, call inspect_nova_codebase before answering. Search first, then read the relevant source lines. The tool describes the configured bridge checkout, which may be newer than the IPA installed on the phone; distinguish "implemented in the source checkout" from "available in this installed build." Never infer that a feature exists merely because it sounds plausible. If the bridge is unavailable or the code evidence is inconclusive, say you cannot verify it instead of guessing.
+
+        Agent handoffs: when the user asks to talk to, switch to, or hand off to a specialist (Claude, Max, Sage, Remy, Ivy, Scholar) or back to Nova, call the switch_agent tool immediately. Do not inspect the codebase for this, and do not invent configuration or Settings problems — the tool performs the switch.
 
         Your other tools are the source of truth for their domains; never invent their results. Call the right tool for: weather; creating reminders; reading or creating calendar events; controlling smart-home devices (Home Assistant); remembering, recalling, or forgetting durable facts about the user; saving or reading notes; the daily briefing; and starting or stopping a voice recording that is saved to the phone (e.g. when the user says "begin voice recording", "start recording", or "stop recording"). Pass dates and times to tools in ISO8601. If a tool errors or returns nothing, tell the user plainly.
 
@@ -75,7 +83,8 @@ public struct AISessionConfig: Sendable, Equatable {
         useLocalWakeWord: Bool = false,
         streamIdleTimeout: Duration = .seconds(20),
         toolDefinitions: [ToolDefinition] = [],
-        visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases
+        visionTriggerPhrases: [String] = WakeWordDetector.defaultVisionPhrases,
+        textOutputOnly: Bool = false
     ) {
         self.instructions = instructions
         self.voice = voice
@@ -89,6 +98,7 @@ public struct AISessionConfig: Sendable, Equatable {
         self.streamIdleTimeout = streamIdleTimeout
         self.toolDefinitions = toolDefinitions
         self.visionTriggerPhrases = visionTriggerPhrases
+        self.textOutputOnly = textOutputOnly
     }
 }
 
@@ -185,6 +195,28 @@ public struct Workspace: Sendable, Identifiable, Codable, Equatable {
 /// A single action within a Skill. A flat shape (rather than an enum with
 /// associated values) keeps it trivially Codable and easy to edit in the UI; only
 /// the fields relevant to `kind` are used.
+/// Optional per-step guard: run the step only when `variables[variable] == equals`.
+public struct SkillCondition: Sendable, Codable, Equatable {
+    public var variable: String
+    public var equals: String
+
+    public init(variable: String, equals: String) {
+        self.variable = variable
+        self.equals = equals
+    }
+}
+
+/// Retry policy for flaky deterministic steps (e.g. webhooks).
+public struct SkillRetryPolicy: Sendable, Codable, Equatable {
+    public var maxAttempts: Int
+    public var delaySeconds: Int
+
+    public init(maxAttempts: Int = 2, delaySeconds: Int = 1) {
+        self.maxAttempts = max(1, maxAttempts)
+        self.delaySeconds = max(0, delaySeconds)
+    }
+}
+
 public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
     public enum Kind: String, Sendable, Codable, CaseIterable {
         case reminder       // text = title, dateISO = optional due
@@ -208,6 +240,14 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
     public var seconds: Int?
     /// HTTP method for `.webhook` steps (defaults to GET when nil).
     public var httpMethod: String?
+    /// When set, stores the step's primary output (OCR text, webhook ok/fail, etc.) under this name.
+    public var outputVariable: String?
+    /// Skip the step unless the named variable equals `equals`.
+    public var condition: SkillCondition?
+    /// Retry failed webhook/timer-like steps.
+    public var retryPolicy: SkillRetryPolicy?
+    /// Ask the user before running (webhook / HA-style side effects).
+    public var requiresConfirmation: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -217,7 +257,11 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         durationMinutes: Int? = nil,
         url: String? = nil,
         seconds: Int? = nil,
-        httpMethod: String? = nil
+        httpMethod: String? = nil,
+        outputVariable: String? = nil,
+        condition: SkillCondition? = nil,
+        retryPolicy: SkillRetryPolicy? = nil,
+        requiresConfirmation: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -227,6 +271,10 @@ public struct SkillStep: Sendable, Identifiable, Codable, Equatable {
         self.url = url
         self.seconds = seconds
         self.httpMethod = httpMethod
+        self.outputVariable = outputVariable
+        self.condition = condition
+        self.retryPolicy = retryPolicy
+        self.requiresConfirmation = requiresConfirmation
     }
 }
 
@@ -520,6 +568,721 @@ public struct VisualMemoryItem: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+/// A plant entry in Ivy's garden image library (photo + care metadata).
+public struct PlantSighting: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    /// Image file name relative to the plant-library directory.
+    public let fileName: String
+    public var name: String
+    public var species: String?
+    public var location: String?
+    /// Care tips and notes grounded to this plant.
+    public var careNotes: String
+    /// OCR text from the photo (may be empty).
+    public var text: String
+    public var caption: String
+    public var lastWateredAt: Date?
+    /// When true (or inferred), plant lives outdoors and may need frost moves.
+    public var isOutdoor: Bool?
+    /// When true (or inferred), bring indoors before first frost.
+    public var frostSensitive: Bool?
+    /// Annual vs perennial for the gardener's active hardiness zone.
+    public var lifeCycle: PlantLifeCycle?
+    /// Concrete next steps from video catalog / identify (water, prune, move, etc.).
+    public var suggestedActions: [String]
+    /// Seasonal coaching (plant-out, frost, dormancy) for this specimen.
+    public var seasonalNotes: String
+    /// Latest observed health label (ok / needs_water / stressed / unknown).
+    public var healthStatus: String?
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        fileName: String,
+        name: String,
+        species: String? = nil,
+        location: String? = nil,
+        careNotes: String = "",
+        text: String = "",
+        caption: String = "",
+        lastWateredAt: Date? = nil,
+        isOutdoor: Bool? = nil,
+        frostSensitive: Bool? = nil,
+        lifeCycle: PlantLifeCycle? = nil,
+        suggestedActions: [String] = [],
+        seasonalNotes: String = "",
+        healthStatus: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.name = name
+        self.species = species
+        self.location = location
+        self.careNotes = careNotes
+        self.text = text
+        self.caption = caption
+        self.lastWateredAt = lastWateredAt
+        self.isOutdoor = isOutdoor
+        self.frostSensitive = frostSensitive
+        self.lifeCycle = lifeCycle
+        self.suggestedActions = suggestedActions
+        self.seasonalNotes = seasonalNotes
+        self.healthStatus = healthStatus
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, fileName, name, species, location, careNotes, text, caption
+        case lastWateredAt, isOutdoor, frostSensitive, lifeCycle
+        case suggestedActions, seasonalNotes, healthStatus
+        case createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        fileName = try c.decode(String.self, forKey: .fileName)
+        name = try c.decode(String.self, forKey: .name)
+        species = try c.decodeIfPresent(String.self, forKey: .species)
+        location = try c.decodeIfPresent(String.self, forKey: .location)
+        careNotes = try c.decodeIfPresent(String.self, forKey: .careNotes) ?? ""
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        caption = try c.decodeIfPresent(String.self, forKey: .caption) ?? ""
+        lastWateredAt = try c.decodeIfPresent(Date.self, forKey: .lastWateredAt)
+        isOutdoor = try c.decodeIfPresent(Bool.self, forKey: .isOutdoor)
+        frostSensitive = try c.decodeIfPresent(Bool.self, forKey: .frostSensitive)
+        lifeCycle = try c.decodeIfPresent(PlantLifeCycle.self, forKey: .lifeCycle)
+        suggestedActions = try c.decodeIfPresent([String].self, forKey: .suggestedActions) ?? []
+        seasonalNotes = try c.decodeIfPresent(String.self, forKey: .seasonalNotes) ?? ""
+        healthStatus = try c.decodeIfPresent(String.self, forKey: .healthStatus)
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+    }
+}
+
+/// How a plant behaves in the gardener's active USDA hardiness zone.
+public enum PlantLifeCycle: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case annual
+    case perennial
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .annual: return "Annual"
+        case .perennial: return "Perennial"
+        }
+    }
+}
+
+/// Calendar season used by Ivy's Planning tab.
+public enum GardenSeason: String, CaseIterable, Identifiable, Sendable, Codable {
+    case spring
+    case summer
+    case fall
+    case winter
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .spring: return "Spring"
+        case .summer: return "Summer"
+        case .fall: return "Fall"
+        case .winter: return "Winter"
+        }
+    }
+
+    /// Northern-hemisphere meteorological season for `date`.
+    public static func current(on date: Date = Date(), calendar: Calendar = .current) -> GardenSeason {
+        let month = calendar.component(.month, from: date)
+        switch month {
+        case 3, 4, 5: return .spring
+        case 6, 7, 8: return .summer
+        case 9, 10, 11: return .fall
+        default: return .winter
+        }
+    }
+}
+
+public enum GardenPlanKind: String, Sendable, Codable, Equatable {
+    case plantNew
+    case bringInside
+    case maintenance
+}
+
+/// One actionable row in Ivy's seasonal Planning tab.
+public struct GardenPlanItem: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var season: GardenSeason
+    public var kind: GardenPlanKind
+    public var title: String
+    public var detail: String
+    /// Human window such as "After last frost (~Apr 12)" or "2 weeks before first frost".
+    public var windowLabel: String
+    public var plantId: UUID?
+    public var plantName: String?
+
+    public init(
+        id: UUID = UUID(),
+        season: GardenSeason,
+        kind: GardenPlanKind,
+        title: String,
+        detail: String,
+        windowLabel: String,
+        plantId: UUID? = nil,
+        plantName: String? = nil
+    ) {
+        self.id = id
+        self.season = season
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.windowLabel = windowLabel
+        self.plantId = plantId
+        self.plantName = plantName
+    }
+}
+
+/// Climate anchors for seasonal planting / frost moves.
+public struct GardenClimateSnapshot: Sendable, Equatable, Codable {
+    public var city: String
+    public var lastSpringFrost: Date?
+    public var firstFallFrost: Date?
+    /// Approximate USDA hardiness zone (1…13) from extreme winter lows.
+    public var hardinessZone: Int?
+    public var summary: String
+
+    public init(
+        city: String,
+        lastSpringFrost: Date? = nil,
+        firstFallFrost: Date? = nil,
+        hardinessZone: Int? = nil,
+        summary: String = ""
+    ) {
+        self.city = city
+        self.lastSpringFrost = lastSpringFrost
+        self.firstFallFrost = firstFallFrost
+        self.hardinessZone = hardinessZone
+        self.summary = summary
+    }
+}
+
+public struct GardenWalkFinding: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var severity: String
+    public var title: String
+    public var detail: String
+    public var matchedPlantId: UUID?
+    public var matchedPlantName: String?
+
+    public init(
+        id: UUID = UUID(),
+        severity: String,
+        title: String,
+        detail: String,
+        matchedPlantId: UUID? = nil,
+        matchedPlantName: String? = nil
+    ) {
+        self.id = id
+        self.severity = severity
+        self.title = title
+        self.detail = detail
+        self.matchedPlantId = matchedPlantId
+        self.matchedPlantName = matchedPlantName
+    }
+}
+
+/// Result of an Ivy Garden Walk over live/uploaded frames.
+public struct GardenWalkResult: Sendable, Equatable, Codable, Identifiable {
+    public var id: UUID
+    public var overview: String
+    public var healthScore: String?
+    public var findings: [GardenWalkFinding]
+    public var maintenance: [String]
+    public var mistakes: [String]
+    public var walkedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        overview: String = "",
+        healthScore: String? = nil,
+        findings: [GardenWalkFinding] = [],
+        maintenance: [String] = [],
+        mistakes: [String] = [],
+        walkedAt: Date = Date()
+    ) {
+        self.id = id
+        self.overview = overview
+        self.healthScore = healthScore
+        self.findings = findings
+        self.maintenance = maintenance
+        self.mistakes = mistakes
+        self.walkedAt = walkedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, overview, healthScore, findings, maintenance, mistakes, walkedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        overview = try c.decodeIfPresent(String.self, forKey: .overview) ?? ""
+        healthScore = try c.decodeIfPresent(String.self, forKey: .healthScore)
+        findings = try c.decodeIfPresent([GardenWalkFinding].self, forKey: .findings) ?? []
+        maintenance = try c.decodeIfPresent([String].self, forKey: .maintenance) ?? []
+        mistakes = try c.decodeIfPresent([String].self, forKey: .mistakes) ?? []
+        walkedAt = try c.decodeIfPresent(Date.self, forKey: .walkedAt) ?? Date()
+    }
+
+    public var spokenSummary: String {
+        var parts: [String] = []
+        if !overview.isEmpty { parts.append(overview) }
+        if let healthScore, !healthScore.isEmpty {
+            parts.append("Overall health: \(healthScore).")
+        }
+        if !mistakes.isEmpty {
+            parts.append("Mistakes to fix: " + mistakes.joined(separator: "; ") + ".")
+        }
+        if !maintenance.isEmpty {
+            parts.append("Maintenance: " + maintenance.joined(separator: "; ") + ".")
+        }
+        for finding in findings.prefix(4) {
+            parts.append("\(finding.title): \(finding.detail)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// Plain-text body for share sheet / Library notes.
+    public var shareText: String {
+        var lines: [String] = ["Garden Walk — Ivy"]
+        if let healthScore, !healthScore.isEmpty {
+            lines.append("Health: \(healthScore)")
+        }
+        if !overview.isEmpty {
+            lines.append("")
+            lines.append(overview)
+        }
+        if !mistakes.isEmpty {
+            lines.append("")
+            lines.append("Mistakes")
+            for item in mistakes { lines.append("• \(item)") }
+        }
+        if !maintenance.isEmpty {
+            lines.append("")
+            lines.append("Maintenance")
+            for item in maintenance { lines.append("• \(item)") }
+        }
+        if !findings.isEmpty {
+            lines.append("")
+            lines.append("Findings")
+            for finding in findings {
+                var line = "• \(finding.severity): \(finding.title)"
+                if !finding.detail.isEmpty { line += " — \(finding.detail)" }
+                lines.append(line)
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// One-line planning-tab preview.
+    public var planningPreview: String {
+        let trimmed = overview.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return String(trimmed.prefix(160)) }
+        if let first = findings.first {
+            return "\(first.title): \(first.detail)".trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let first = maintenance.first { return first }
+        return "Garden walk notes"
+    }
+}
+
+/// Priority for condensed Suggested Tips derived from garden walks.
+public enum GardenTipPriority: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case urgent
+    case high
+    case normal
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .urgent: return "Urgent"
+        case .high: return "High"
+        case .normal: return "Normal"
+        }
+    }
+
+    public var sortRank: Int {
+        switch self {
+        case .urgent: return 0
+        case .high: return 1
+        case .normal: return 2
+        }
+    }
+}
+
+/// Condensed action item for Ivy's Planning → Suggested Tips.
+public struct GardenSuggestedTip: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var title: String
+    public var detail: String
+    public var priority: GardenTipPriority
+    public var date: Date
+    public var plantName: String?
+    public var sourceWalkId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        detail: String = "",
+        priority: GardenTipPriority,
+        date: Date,
+        plantName: String? = nil,
+        sourceWalkId: UUID? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.priority = priority
+        self.date = date
+        self.plantName = plantName
+        self.sourceWalkId = sourceWalkId
+    }
+}
+
+/// How to start a recommended plant/seed this season.
+public enum GardenPlantingMethod: String, Sendable, Codable, Equatable, CaseIterable, Identifiable {
+    case seed
+    case transplant
+    case bulb
+    case startIndoors
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .seed: return "Seed"
+        case .transplant: return "Transplant"
+        case .bulb: return "Bulb"
+        case .startIndoors: return "Start indoors"
+        }
+    }
+}
+
+/// A plant or seed Ivy recommends planting now for the active zone + season.
+public struct GardenPlantRecommendation: Sendable, Identifiable, Equatable, Codable {
+    public let id: UUID
+    public var name: String
+    public var method: GardenPlantingMethod
+    public var lifeCycle: PlantLifeCycle
+    public var detail: String
+    public var windowLabel: String
+    public var season: GardenSeason
+    /// Inclusive USDA zone range where this pick is a good fit.
+    public var minZone: Int
+    public var maxZone: Int
+    /// True when a similar plant is already in the gallery.
+    public var alreadyInLibrary: Bool
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        method: GardenPlantingMethod,
+        lifeCycle: PlantLifeCycle,
+        detail: String,
+        windowLabel: String,
+        season: GardenSeason,
+        minZone: Int = 1,
+        maxZone: Int = 13,
+        alreadyInLibrary: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.method = method
+        self.lifeCycle = lifeCycle
+        self.detail = detail
+        self.windowLabel = windowLabel
+        self.season = season
+        self.minZone = minZone
+        self.maxZone = maxZone
+        self.alreadyInLibrary = alreadyInLibrary
+    }
+}
+
+/// One plant drafted from a video/frame catalog pass (before or after library save).
+public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
+    public let id: UUID
+    public var name: String
+    public var species: String?
+    public var matchedLibraryName: String?
+    public var matchedPlantId: UUID?
+    public var confidence: Double?
+    public var careTips: String
+    public var health: String?
+    public var suggestedActions: [String]
+    public var seasonalNotes: String
+    public var isOutdoor: Bool?
+    public var frostSensitive: Bool?
+    /// Best source frame JPEG used when saving a new library entry.
+    public var imageData: Data?
+    /// Plant region in the source frame (used to isolate one plant per profile).
+    public var boundingBox: PlantBoundingBox?
+    /// Library id after catalog save/merge.
+    public var savedPlantId: UUID?
+    /// How many frames contributed to this merged profile (not persisted).
+    public var observationCount: Int = 1
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, species, matchedLibraryName, matchedPlantId, confidence
+        case careTips, health, suggestedActions, seasonalNotes, isOutdoor, frostSensitive
+        case imageData, boundingBox, savedPlantId
+    }
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        species: String? = nil,
+        matchedLibraryName: String? = nil,
+        matchedPlantId: UUID? = nil,
+        confidence: Double? = nil,
+        careTips: String = "",
+        health: String? = nil,
+        suggestedActions: [String] = [],
+        seasonalNotes: String = "",
+        isOutdoor: Bool? = nil,
+        frostSensitive: Bool? = nil,
+        imageData: Data? = nil,
+        boundingBox: PlantBoundingBox? = nil,
+        savedPlantId: UUID? = nil,
+        observationCount: Int = 1
+    ) {
+        self.id = id
+        self.name = name
+        self.species = species
+        self.matchedLibraryName = matchedLibraryName
+        self.matchedPlantId = matchedPlantId
+        self.confidence = confidence
+        self.careTips = careTips
+        self.health = health
+        self.suggestedActions = suggestedActions
+        self.seasonalNotes = seasonalNotes
+        self.isOutdoor = isOutdoor
+        self.frostSensitive = frostSensitive
+        self.imageData = imageData
+        self.boundingBox = boundingBox
+        self.savedPlantId = savedPlantId
+        self.observationCount = max(1, observationCount)
+    }
+
+    /// Stable merge key: prefer library id, else species, else common name.
+    public var mergeKey: String {
+        if let matchedPlantId {
+            return "id:\(matchedPlantId.uuidString.lowercased())"
+        }
+        let speciesKey = (species ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !speciesKey.isEmpty { return "sp:\(speciesKey)" }
+        return "name:\(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+    }
+}
+
+/// Result of cataloging every distinct plant found in a shared garden video.
+/// Breakdown of a video/photo catalog pass for status UI and debugging.
+public struct GardenCatalogRunStats: Sendable, Equatable, Codable {
+    public var framesTotal: Int
+    public var framesFailed: Int
+    public var detections: Int
+    public var cropped: Int
+    public var created: Int
+    public var updated: Int
+    public var skippedWeak: Int
+    /// Matches awaiting Keep New / Replace / Discard review.
+    public var duplicatesPending: Int
+
+    public init(
+        framesTotal: Int = 0,
+        framesFailed: Int = 0,
+        detections: Int = 0,
+        cropped: Int = 0,
+        created: Int = 0,
+        updated: Int = 0,
+        skippedWeak: Int = 0,
+        duplicatesPending: Int = 0
+    ) {
+        self.framesTotal = framesTotal
+        self.framesFailed = framesFailed
+        self.detections = detections
+        self.cropped = cropped
+        self.created = created
+        self.updated = updated
+        self.skippedWeak = skippedWeak
+        self.duplicatesPending = duplicatesPending
+    }
+
+    public var summaryLine: String {
+        var parts: [String] = []
+        if detections > 0 { parts.append("\(detections) detected") }
+        if cropped > 0 { parts.append("\(cropped) cropped") }
+        if created > 0 { parts.append("\(created) new") }
+        if updated > 0 { parts.append("\(updated) updated") }
+        if duplicatesPending > 0 {
+            parts.append("\(duplicatesPending) duplicate\(duplicatesPending == 1 ? "" : "s") to review")
+        }
+        if skippedWeak > 0 { parts.append("\(skippedWeak) skipped") }
+        if framesFailed > 0 {
+            parts.append("\(framesFailed)/\(max(framesTotal, framesFailed)) frames failed")
+        }
+        return parts.isEmpty ? "No plants cataloged" : parts.joined(separator: " · ")
+    }
+}
+
+/// A catalog detection that matches an existing gallery plant and needs a user decision.
+public struct GardenCatalogDuplicateItem: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public var draft: CatalogPlantDraft
+    public var existingPlantId: UUID
+    public var existingPlantName: String
+
+    public init(
+        id: UUID = UUID(),
+        draft: CatalogPlantDraft,
+        existingPlantId: UUID,
+        existingPlantName: String
+    ) {
+        self.id = id
+        self.draft = draft
+        self.existingPlantId = existingPlantId
+        self.existingPlantName = existingPlantName
+    }
+}
+
+/// User choice while reviewing a catalog duplicate.
+public enum GardenCatalogDuplicateAction: String, Sendable, Equatable {
+    /// Save the new crop as an additional gallery plant.
+    case keepNew
+    /// Overwrite the existing plant's photo (and refresh care metadata).
+    case replace
+    /// Drop this detection.
+    case discard
+}
+
+public struct GardenCatalogResult: Sendable, Equatable, Codable {
+    public var overview: GardenWalkResult
+    public var profiles: [CatalogPlantDraft]
+    public var catalogedAt: Date
+    /// Detection / save breakdown for the last catalog run (optional for older payloads).
+    public var stats: GardenCatalogRunStats?
+
+    public init(
+        overview: GardenWalkResult = GardenWalkResult(),
+        profiles: [CatalogPlantDraft] = [],
+        catalogedAt: Date = Date(),
+        stats: GardenCatalogRunStats? = nil
+    ) {
+        self.overview = overview
+        self.profiles = profiles
+        self.catalogedAt = catalogedAt
+        self.stats = stats
+    }
+
+    public var shareText: String {
+        var lines: [String] = ["Garden Overview — Ivy"]
+        if let stats {
+            lines.append(stats.summaryLine)
+        }
+        if let health = overview.healthScore, !health.isEmpty {
+            lines.append("Health: \(health)")
+        }
+        if !overview.overview.isEmpty {
+            lines.append("")
+            lines.append(overview.overview)
+        }
+        if !profiles.isEmpty {
+            lines.append("")
+            lines.append("Cataloged plants (\(profiles.count))")
+            for profile in profiles {
+                var head = "• \(profile.name)"
+                if let species = profile.species, !species.isEmpty { head += " (\(species))" }
+                if let health = profile.health, !health.isEmpty { head += " — \(health)" }
+                lines.append(head)
+                if !profile.careTips.isEmpty {
+                    lines.append("  Care: \(profile.careTips)")
+                }
+                for action in profile.suggestedActions.prefix(4) {
+                    lines.append("  → \(action)")
+                }
+                if !profile.seasonalNotes.isEmpty {
+                    lines.append("  Season: \(profile.seasonalNotes)")
+                }
+            }
+        }
+        if !overview.maintenance.isEmpty {
+            lines.append("")
+            lines.append("Priority actions")
+            for item in overview.maintenance { lines.append("• \(item)") }
+        }
+        if !overview.mistakes.isEmpty {
+            lines.append("")
+            lines.append("Watch-outs")
+            for item in overview.mistakes { lines.append("• \(item)") }
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Result of Ivy identifying plant(s) in a photo against the garden library.
+public struct PlantIdentifyResult: Sendable, Equatable {
+    public var plants: [PlantIdentifyHit]
+    public var notes: String?
+    public var identifiedAt: Date
+
+    public init(plants: [PlantIdentifyHit] = [], notes: String? = nil, identifiedAt: Date = Date()) {
+        self.plants = plants
+        self.notes = notes
+        self.identifiedAt = identifiedAt
+    }
+}
+
+public struct PlantIdentifyHit: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public var name: String
+    public var species: String?
+    public var matchedLibraryName: String?
+    public var matchedPlantId: UUID?
+    public var confidence: Double?
+    public var careTips: String
+    public var health: String?
+    /// Plant region in the source photo (normalized 0…1) for per-plant crops.
+    public var boundingBox: PlantBoundingBox?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        species: String? = nil,
+        matchedLibraryName: String? = nil,
+        matchedPlantId: UUID? = nil,
+        confidence: Double? = nil,
+        careTips: String = "",
+        health: String? = nil,
+        boundingBox: PlantBoundingBox? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.species = species
+        self.matchedLibraryName = matchedLibraryName
+        self.matchedPlantId = matchedPlantId
+        self.confidence = confidence
+        self.careTips = careTips
+        self.health = health
+        self.boundingBox = boundingBox
+    }
+}
+
 /// A tool advertised to the model: name, description, and a JSON Schema for args.
 public struct ToolDefinition: Sendable, Equatable {
     public let name: String
@@ -578,6 +1341,24 @@ public struct StreamBandwidthPolicy: Sendable, Equatable {
     }
 }
 
+// MARK: - Bridge profiles (saved bridge endpoints for quick switching)
+
+/// A saved Nova Bridge endpoint (URL + token) the user can switch between —
+/// e.g. a "Home" LAN bridge and a "VPN" Tailscale bridge for when they're away.
+public struct BridgeProfile: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var baseURL: String
+    public var token: String
+
+    public init(id: UUID = UUID(), name: String, baseURL: String, token: String) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.token = token
+    }
+}
+
 // MARK: - Agents (multi-agent: Nova master + specialist sub-agents)
 
 /// The OpenAI Realtime voices Nova can assign to an agent. Stored on `Agent` as a
@@ -586,18 +1367,23 @@ public struct StreamBandwidthPolicy: Sendable, Equatable {
 public enum RealtimeVoice: String, CaseIterable, Sendable, Codable {
     case marin, cedar, ash, verse, sage, ballad, alloy, coral, echo, shimmer
 
+    /// OpenAI's recommended Realtime voices for assistant quality/loudness.
+    public var isRecommendedQuality: Bool {
+        self == .marin || self == .cedar
+    }
+
     public var displayName: String {
         switch self {
-        case .marin: return "Marin (warm, neutral)"
-        case .cedar: return "Cedar (deep, male)"
-        case .ash: return "Ash (energetic, male)"
-        case .verse: return "Verse (bright, male)"
-        case .sage: return "Sage (calm)"
-        case .ballad: return "Ballad (smooth)"
-        case .alloy: return "Alloy (neutral)"
-        case .coral: return "Coral (friendly)"
-        case .echo: return "Echo (male)"
-        case .shimmer: return "Shimmer (soft)"
+        case .marin: return "Marin (best · warm)"
+        case .cedar: return "Cedar (best · deep)"
+        case .ash: return "Ash (energetic — lower quality)"
+        case .verse: return "Verse (bright — lower quality)"
+        case .sage: return "Sage (calm — lower quality)"
+        case .ballad: return "Ballad (smooth — lower quality)"
+        case .alloy: return "Alloy (neutral — lower quality)"
+        case .coral: return "Coral (friendly — lower quality)"
+        case .echo: return "Echo (male — lower quality)"
+        case .shimmer: return "Shimmer (soft — lower quality)"
         }
     }
 }
@@ -627,6 +1413,8 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
     public let builtIn: Bool
     /// When false, the agent is hidden from switching + the roster prompt.
     public var enabled: Bool
+    /// Asset catalog image name for the talking portrait (e.g. `AvatarIvy`).
+    public var avatarAssetName: String?
     public let createdAt: Date
     public var updatedAt: Date
 
@@ -641,6 +1429,7 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         isMaster: Bool = false,
         builtIn: Bool = false,
         enabled: Bool = true,
+        avatarAssetName: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date? = nil
     ) {
@@ -654,12 +1443,13 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         self.isMaster = isMaster
         self.builtIn = builtIn
         self.enabled = enabled
+        self.avatarAssetName = avatarAssetName
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, wakeWord, voice, role, personality, toolNames, isMaster, builtIn, enabled, createdAt, updatedAt
+        case id, name, wakeWord, voice, role, personality, toolNames, isMaster, builtIn, enabled, avatarAssetName, createdAt, updatedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -674,16 +1464,43 @@ public struct Agent: Sendable, Identifiable, Codable, Equatable {
         isMaster = try c.decodeIfPresent(Bool.self, forKey: .isMaster) ?? false
         builtIn = try c.decodeIfPresent(Bool.self, forKey: .builtIn) ?? false
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        avatarAssetName = try c.decodeIfPresent(String.self, forKey: .avatarAssetName)
         let created = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         createdAt = created
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? created
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(wakeWord, forKey: .wakeWord)
+        try c.encode(voice, forKey: .voice)
+        try c.encode(role, forKey: .role)
+        try c.encode(personality, forKey: .personality)
+        try c.encodeIfPresent(toolNames, forKey: .toolNames)
+        try c.encode(isMaster, forKey: .isMaster)
+        try c.encode(builtIn, forKey: .builtIn)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encodeIfPresent(avatarAssetName, forKey: .avatarAssetName)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
     }
 }
 
 public extension Agent {
     /// Bump when built-in allowlists / personas change so existing installs
     /// refresh seeded specialists without wiping user-created agents.
-    static let seedCapabilitiesVersion = 3
+    /// v12: open_app_screen on specialists (scoped UI navigation).
+    /// v15: Remy estimates macros in log_meal for the nutrition dashboard.
+    /// v16: Sage becomes a cross-agent task manager (replaces wellness coach).
+    /// v17: Ivy botanist + plant garden library.
+    /// v18: Ivy Garden Walk (spoken coaching) + seasonal Planning.
+    /// v19: Unique Realtime voice per built-in agent (no shared marin/cedar).
+    /// v20: Max ring_readiness (Ultrahuman daily metrics).
+    /// v21: Remy Kitchen v2 — OFF macros, recipe import, meal-plan shopping.
+    /// v22: Talking avatar asset names per built-in agent.
+    static let seedCapabilitiesVersion = 22
 
     /// Stable ids so the master + built-ins keep their identity across launches
     /// (seeds are matched/merged by id, and the master id is a well-known value).
@@ -694,11 +1511,45 @@ public extension Agent {
         public static let sage = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
         public static let remy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A5")!
         public static let scholar = UUID(uuidString: "00000000-0000-0000-0000-0000000000A6")!
+        public static let ivy = UUID(uuidString: "00000000-0000-0000-0000-0000000000A7")!
+    }
+
+    /// SF Symbol reflecting this agent's specialty (list rows, CTAs).
+    public var systemImage: String {
+        switch id {
+        case SeedID.nova: return "crown.fill"
+        case SeedID.claude: return "chevron.left.forwardslash.chevron.right"
+        case SeedID.max: return "figure.strengthtraining.traditional"
+        case SeedID.sage: return "leaf"
+        case SeedID.remy: return "fork.knife"
+        case SeedID.scholar: return "text.book.closed"
+        case SeedID.ivy: return "camera.macro"
+        default: return isMaster ? "crown.fill" : "person.wave.2.fill"
+        }
+    }
+
+    /// Catalog image for talking portraits; falls back to seed defaults.
+    public var resolvedAvatarAssetName: String? {
+        if let avatarAssetName, !avatarAssetName.isEmpty { return avatarAssetName }
+        return Self.defaultAvatarAssetName(for: id)
+    }
+
+    public static func defaultAvatarAssetName(for id: UUID) -> String? {
+        switch id {
+        case SeedID.nova: return "AvatarNova"
+        case SeedID.claude: return "AvatarClaude"
+        case SeedID.max: return "AvatarMax"
+        case SeedID.sage: return "AvatarSage"
+        case SeedID.remy: return "AvatarRemy"
+        case SeedID.scholar: return "AvatarScholar"
+        case SeedID.ivy: return "AvatarIvy"
+        default: return nil
+        }
     }
 
     /// Common tools most specialists should be able to reach.
     static let commonToolNames: [String] = [
-        "web_search", "remember_fact", "recall_facts",
+        "web_search", "inspect_nova_codebase", "remember_fact", "recall_facts",
         "save_note", "list_notes", "create_reminder"
     ]
 
@@ -716,79 +1567,120 @@ public extension Agent {
                 name: "Nova",
                 voice: RealtimeVoice.marin.rawValue,
                 role: "the master voice assistant",
-                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for wellness, Remy for cooking, Scholar for tutoring) and should offer to hand off when the user's request clearly matches a specialist — e.g. “Want Max to run this workout?” — rather than doing a weak version yourself. You are warm, concise, and proactive.",
+                personality: "You are Nova, the master assistant on the user's smart glasses. You coordinate a team of specialist sub-agents (Claude for coding, Max for workouts, Sage for task management across agents, Remy for cooking, Ivy for plants and gardening, Scholar for tutoring). When the user asks to talk to a specialist — or you offer a handoff they accept — call switch_agent with their name. Never invent a configuration or settings problem for handoffs; the tool does the switch. Specialist app screens (shopping list, Coding, Training, Garden, etc.) are owned by that specialist — switch to them so they can call open_app_screen; do not open another agent's UI yourself. Offer to hand off when the request clearly matches a specialist rather than doing a weak version yourself. You are warm, concise, and proactive.",
                 toolNames: nil,
                 isMaster: true,
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarNova"
             ),
             Agent(
                 id: SeedID.claude,
                 name: "Claude",
                 voice: RealtimeVoice.cedar.rawValue,
                 role: "a senior programming assistant",
-                personality: "You are Claude, a senior software engineer and pair programmer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent: they speak tasks through their glasses and you carry them out. Prefer run_claude_code for repo edits and investigation on their machine; use push_to_cursor / list_cursor_sessions to drive Cursor agents — when pushing to Cursor, omit session_id so the pinned Coding-tab session is used (the user can preview that session live). Use start_meeting / end_meeting for spoken standups you later turn into notes or tickets. Use draft_message or create_reminder for follow-ups. For multi-step work, briefly say what you're about to do before a long-running tool call, then confirm the result in one short sentence when it returns. Explain trade-offs briefly, write clean code, and be careful and explicit about anything destructive — confirm before irreversible actions. Keep spoken answers concise and offer to go deeper on request.",
+                personality: "You are Claude, a senior software engineer and web designer with a calm, precise, and thoughtful manner. You are the user's hands-free coding agent. When the user asks to see Coding / Cursor / repos on the phone, call open_app_screen with coding. Spoken coding prompts via push_to_cursor appear live in the Coding tab transcript alongside typed prompts — tell the user they can open Coding to watch progress. When the user asks for a new website or project, use create_web_project after confirming the name and template; it creates a PUBLIC GitHub repo, so state that clearly. Prefer react-vite for interactive frontends, nextjs for full-stack/SEO sites, vite for lightweight JavaScript, and static for simple landing pages. When the user says work on an existing repo, call list_repos / select_repo or clone_repo first (HTTPS GitHub URLs only), then run coding tools against that selection — never invent filesystem paths. Prefer run_claude_code for edits and investigation; use push_to_cursor / list_cursor_sessions to drive Cursor. When a request refers to prior discussion, an earlier decision, or an existing coding session, call get_cursor_session_history before deciding what to do; do not guess from a title or summary. Before shipping changes, call repo_status and repo_diff, then publish_repo to open a pull request on a nova/* branch — never push directly to main/master. Briefly announce long-running tool calls and confirm results concisely. Confirm before create/clone/select/publish and irreversible actions. HARD RULE: never stop, restart, reinstall, reconfigure, or modify the nova-bridge service — including its source, package.json, start/stop scripts, or the Node process it runs in — and never run coding commands inside the nova-bridge directory. The bridge is the connection that lets the user talk to you; touching it would cut you off. If a task seems to require changing the bridge, decline and explain that the bridge is off-limits.",
                 toolNames: [
+                    "list_repos", "select_repo", "clone_repo", "create_web_project",
+                    "repo_status", "repo_diff", "publish_repo",
                     "run_claude_code", "push_to_cursor", "list_cursor_sessions",
-                    "web_search", "search_knowledge", "save_note", "list_notes",
+                    "get_cursor_session_history",
+                    "open_app_screen",
+                    "web_search", "inspect_nova_codebase", "search_knowledge", "save_note", "list_notes",
                     "remember_fact", "recall_facts", "create_reminder", "draft_message",
                     "start_meeting", "end_meeting", "bookmark_conversation"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarClaude"
             ),
             Agent(
                 id: SeedID.max,
                 name: "Max",
                 voice: RealtimeVoice.ash.rawValue,
                 role: "a personal trainer and strength coach",
-                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. You know past workouts and saved plans; use them to progress safely. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy.",
+                personality: "You are Max, an upbeat, motivating personal trainer. Flow: build or load a workout plan → warm-up cues → coach set-by-set → log each set → start a rest timer with set_timer (default ~90s unless the user says otherwise) → offer play_music for pump-up tracks. When the user asks to see Training / workouts on the phone, call open_app_screen with training. You know past workouts and saved plans; use them to progress safely. Before hard sessions or when they ask about recovery / readiness / how hard to go, call ring_readiness (Ultrahuman Ring) and coach from that advice — never invent Ring numbers. If the tool says the token is missing, tell them to paste their Ultrahuman personal API token in Training settings. Be energetic but never reckless — respect form and recovery. Keep spoken cues short and punchy. The user may have the Training screen open to log sets or skip rest on the phone — say the cue and assume they may tap Log instead of asking you to log every set.",
                 toolNames: [
                     "start_workout_session", "log_workout_set", "end_workout_session",
                     "workout_history", "save_workout_plan", "list_workout_plans",
-                    "start_workout_from_plan",
+                    "start_workout_from_plan", "ring_readiness",
+                    "open_app_screen",
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
                     "remember_fact", "recall_facts", "web_search", "create_reminder",
                     "save_note", "list_notes", "search_knowledge", "home_assistant"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarMax"
             ),
             Agent(
                 id: SeedID.sage,
                 name: "Sage",
                 voice: RealtimeVoice.sage.rawValue,
-                role: "a wellness and mindfulness coach",
-                personality: "You are Sage, a calm, grounded wellness and mindfulness coach. You guide breathing, meditation, journaling, and healthy habits with a gentle, unhurried tone. Use set_timer for breath rounds and body scans, daily_briefing / weather / calendar for check-ins, log_wellness_checkin for mood, and home_assistant to soften lights when helpful. You never give medical diagnoses; encourage professional care and offer to hand back to Nova for medical questions.",
+                role: "a task manager across the user's agents",
+                personality: "You are Sage, a calm, organized task manager for the user's multi-agent day. You track and summarize what they did with each specialist (Claude, Max, Remy, Ivy, Scholar, Nova), keep an open task list, and help them pick up where they left off. Flow: use agent_activity to review recent work per agent → interpret unfinished threads as in_progress or incomplete → create_task / update_task with clear titles so the user can resume later → list_tasks when they ask what's open. When the user asks to see Tasks on the phone, call open_app_screen with tasks. Prefer short spoken briefings grouped by agent. Suggest only tasks that look genuinely unfinished; mark done when the user confirms. Use daily_briefing / calendar / create_reminder when helpful for scheduling pickups. When the user wants to resume a specific agent's work, call switch_agent with that name so they can continue there — you organize, they execute.",
                 toolNames: Agent.commonToolNames + [
                     "search_knowledge", "daily_briefing", "weather", "list_calendar_events",
-                    "set_timer", "cancel_timer", "list_timers",
-                    "log_wellness_checkin", "wellness_history",
-                    "home_assistant", "home_assistant_state"
+                    "list_tasks", "create_task", "update_task", "agent_activity",
+                    "switch_agent", "open_app_screen"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarSage"
             ),
             Agent(
                 id: SeedID.remy,
                 name: "Remy",
-                voice: RealtimeVoice.ballad.rawValue,
+                voice: RealtimeVoice.coral.rawValue,
                 role: "a chef and nutrition assistant",
-                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Suggest recipes from the pantry (list_pantry / add_pantry_item) and what the user sees (remember_visual for fridge/labels). Use set_timer for cook times and announce when they fire. Keep steps short for hands-free cooking; ask before assuming pantry stock. Optional play_music while cooking.",
+                personality: "You are Remy, an enthusiastic chef and practical nutrition assistant. Use the pantry tools and scan_fridge for inventory; never invent stock — ask or scan first. When the user asks to see the shopping list, pantry, recipes, meal plan, or Kitchen on the phone, call open_app_screen (shopping_list, pantry, recipes, meal_plan, kitchen). Suggest and save recipes; use import_recipe for a URL or pasted recipe text. For hands-free cooking use start_cooking / cooking_next_step / cooking_previous_step / cooking_status and name set_timer labels after the step or ingredient (e.g. “pasta 9 minutes”), then offer the next step when a timer fires. Respect the nutrition profile allergens always and ask before suggesting restricted foods. Help with shopping lists and the weekly meal plan — when they want groceries for the plan, call build_shopping_from_meal_plan. For packaged foods, call lookup_food_nutrition (name or barcode) before log_meal and pass those macros; otherwise estimate calories and protein/carbs/fat in grams from the description or recipe. Keep spoken steps short. Optional play_music while cooking. remember_visual is for labels and memorable food moments.",
                 toolNames: Agent.commonToolNames + [
                     "set_timer", "cancel_timer", "list_timers", "play_music", "open_url",
-                    "remember_visual", "add_pantry_item", "list_pantry", "remove_pantry_item",
+                    "remember_visual",
+                    "open_app_screen",
+                    "add_pantry_item", "list_pantry", "remove_pantry_item", "update_pantry_item",
+                    "scan_fridge",
+                    "save_recipe", "list_recipes", "get_recipe", "import_recipe",
+                    "start_cooking", "cooking_next_step", "cooking_previous_step", "cooking_status", "end_cooking",
+                    "add_shopping_item", "list_shopping", "check_shopping_item", "clear_checked_shopping",
+                    "build_shopping_from_meal_plan",
+                    "set_meal_plan_slot", "get_meal_plan", "clear_meal_plan_slot",
+                    "get_nutrition_profile", "update_nutrition_profile", "log_meal", "recent_meals",
+                    "lookup_food_nutrition",
                     "search_knowledge", "web_search"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarRemy"
+            ),
+            Agent(
+                id: SeedID.ivy,
+                name: "Ivy",
+                voice: RealtimeVoice.verse.rawValue,
+                role: "a botanist and gardening specialist",
+                personality: "You are Ivy, a warm, observant botanist and coaching gardener. You know the user's plant library — use list_plants and prefer care tips grounded in those specific plants, locations, Annual/Perennial tags for their active USDA zone, notes, the current season, and their climate city when set. When they ask what to plant or which seeds to buy now, use list_garden_plan and highlight new_plant_recommendations for the current season and zone. Proactively catch timely mistakes (overwatering, pests, heat/drought stress in summer, neglected watering) — don't wait to be asked. Do not shoehorn frost or bring-inside advice in midsummer; save frost moves for fall/near first frost, and use list_garden_plan (optionally filtered to the current season) for seasonal planting plus Suggested Tips from saved garden walks. For a Garden Walk from glasses or video, call garden_walk so you can brief how the garden is doing and what needs maintenance now — walks are saved into Planning. When they show a plant via glasses or ask what they're looking at, call identify_plant (optionally with save true after confirming). Help with watering via log_plant_watering, and update_plant / save_plant when they name a plant or change care notes (including is_outdoor / frost_sensitive). When they ask to see the Garden / plant gallery / Planning / Garden Walk on the phone, call open_app_screen with garden, plants, garden_plan, or garden_walk. Keep spoken plant IDs and tips concise; admit uncertainty instead of guessing species. remember_visual is for memorable plant moments outside the structured garden library. weather helps when discussing heat, rain, or frost timing for their climate city.",
+                toolNames: Agent.commonToolNames + [
+                    "open_app_screen",
+                    "remember_visual",
+                    "list_plants", "save_plant", "update_plant", "remove_plant",
+                    "identify_plant", "log_plant_watering",
+                    "garden_walk", "list_garden_plan",
+                    "weather",
+                    "search_knowledge", "web_search", "set_timer", "cancel_timer", "list_timers"
+                ],
+                builtIn: true,
+                avatarAssetName: "AvatarIvy"
             ),
             Agent(
                 id: SeedID.scholar,
                 name: "Scholar",
-                voice: RealtimeVoice.verse.rawValue,
+                voice: RealtimeVoice.alloy.rawValue,
                 role: "a patient tutor",
-                personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. Use add_study_card / start_quiz / grade_card for spaced-repetition drills, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
+                personality: "You are Scholar, a patient, encouraging tutor. Teach with the Socratic method: ask before revealing answers. When the user asks to see Study / decks / quiz on the phone, call open_app_screen with study. For drills: start_quiz (fronts only) → wait for the learner's answer → reveal_card → discuss briefly → grade_card (again/hard/good/easy). Use add_study_card / list_study_decks / list_study_cards / update_study_card / delete_study_card to manage decks, search_knowledge and web_search for research, and bookmark_conversation to save strong explanations. Adapt to the user's level and keep spoken turns concise.",
                 toolNames: Agent.commonToolNames + [
-                    "search_knowledge", "add_study_card", "list_study_decks",
-                    "start_quiz", "grade_card", "bookmark_conversation", "web_search"
+                    "search_knowledge", "add_study_card", "list_study_decks", "list_study_cards",
+                    "update_study_card", "delete_study_card",
+                    "start_quiz", "reveal_card", "grade_card",
+                    "open_app_screen",
+                    "bookmark_conversation", "web_search"
                 ],
-                builtIn: true
+                builtIn: true,
+                avatarAssetName: "AvatarScholar"
             ),
         ]
     }
@@ -807,11 +1699,46 @@ public extension Agent {
             ),
             Skill(
                 id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B2")!,
-                name: "Sage box breathing",
-                triggerPhrases: ["box breathing", "sage breathing"],
+                name: "Sage pickup review",
+                triggerPhrases: ["pickup review", "sage standup", "where did I leave off", "open tasks"],
                 steps: [
-                    SkillStep(kind: .say, text: "We'll do one box-breathing round: inhale, hold, exhale, hold — four seconds each."),
-                    SkillStep(kind: .timer, text: "Box breathing round", seconds: 16)
+                    SkillStep(kind: .say, text: "I'll review open tasks and recent agent activity so you can pick up where you left off.")
+                ]
+            ),
+            // Ready for DAT camera; OCR text lands in `ocr` for the freeform step.
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B3")!,
+                name: "Capture → OCR → note",
+                triggerPhrases: ["capture this", "read this", "save what I'm looking at", "ocr this"],
+                steps: [
+                    SkillStep(
+                        kind: .capture,
+                        text: "document",
+                        outputVariable: "ocr"
+                    ),
+                    SkillStep(
+                        kind: .note,
+                        text: "Glasses capture:\n{{ocr}}"
+                    ),
+                    SkillStep(
+                        kind: .say,
+                        text: "Saved what I could read to your notes."
+                    ),
+                    SkillStep(
+                        kind: .freeform,
+                        text: "Briefly summarize the captured text for the user if useful: {{ocr}}"
+                    )
+                ]
+            ),
+            Skill(
+                id: UUID(uuidString: "00000000-0000-0000-0000-0000000000B4")!,
+                name: "Remy next step",
+                triggerPhrases: ["next step", "what's next", "remy next"],
+                steps: [
+                    SkillStep(
+                        kind: .freeform,
+                        text: "If a cooking session is active, call cooking_next_step and speak only the new step briefly. If none is active, say so and offer to start_cooking from a saved recipe."
+                    )
                 ]
             ),
         ]
@@ -860,6 +1787,8 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
     public var endedAt: Date?
     public var sets: [WorkoutSet]
     public var notes: String?
+    /// When started from a saved plan, links the session so the Training HUD can show next-up.
+    public var planId: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -867,7 +1796,8 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
         startedAt: Date = Date(),
         endedAt: Date? = nil,
         sets: [WorkoutSet] = [],
-        notes: String? = nil
+        notes: String? = nil,
+        planId: UUID? = nil
     ) {
         self.id = id
         self.title = title
@@ -875,9 +1805,110 @@ public struct WorkoutSession: Sendable, Identifiable, Codable, Equatable {
         self.endedAt = endedAt
         self.sets = sets
         self.notes = notes
+        self.planId = planId
     }
 
     public var isActive: Bool { endedAt == nil }
+}
+
+/// Derived progress through a plan given logged sets (case-insensitive exercise names).
+public struct WorkoutPlanProgress: Sendable, Equatable {
+    public let current: PlannedExercise?
+    public let next: PlannedExercise?
+    public let completedSetsForCurrent: Int
+    public let targetSetsForCurrent: Int?
+
+    public init(
+        current: PlannedExercise?,
+        next: PlannedExercise?,
+        completedSetsForCurrent: Int,
+        targetSetsForCurrent: Int?
+    ) {
+        self.current = current
+        self.next = next
+        self.completedSetsForCurrent = completedSetsForCurrent
+        self.targetSetsForCurrent = targetSetsForCurrent
+    }
+
+    /// First planned exercise whose logged set count is below its target (default 1 when unset).
+    public static func derive(plan: WorkoutPlan?, sets: [WorkoutSet]) -> WorkoutPlanProgress {
+        guard let plan, !plan.exercises.isEmpty else {
+            return WorkoutPlanProgress(current: nil, next: nil, completedSetsForCurrent: 0, targetSetsForCurrent: nil)
+        }
+        for (index, exercise) in plan.exercises.enumerated() {
+            let target = max(1, exercise.sets ?? 1)
+            let done = sets.filter { $0.exercise.localizedCaseInsensitiveCompare(exercise.name) == .orderedSame }.count
+            if done < target {
+                let next = index + 1 < plan.exercises.count ? plan.exercises[index + 1] : nil
+                return WorkoutPlanProgress(
+                    current: exercise,
+                    next: next,
+                    completedSetsForCurrent: done,
+                    targetSetsForCurrent: target
+                )
+            }
+        }
+        return WorkoutPlanProgress(
+            current: nil,
+            next: nil,
+            completedSetsForCurrent: 0,
+            targetSetsForCurrent: nil
+        )
+    }
+}
+
+/// Personal record for an exercise: the heaviest set seen plus its estimated
+/// one-rep max and when it happened. Backs Max's PR strip and analytics.
+public struct ExercisePR: Sendable, Identifiable, Equatable {
+    public var id: String { exercise }
+    public let exercise: String
+    /// Heaviest weight (lb) seen for this exercise.
+    public let weight: Double
+    /// Reps performed on that heaviest set (if known).
+    public let reps: Int?
+    /// Epley estimated one-rep max derived from the heaviest set.
+    public let estimatedOneRepMax: Double
+    /// When the heaviest set was logged (if known).
+    public let achievedAt: Date?
+
+    public init(
+        exercise: String,
+        weight: Double,
+        reps: Int? = nil,
+        estimatedOneRepMax: Double? = nil,
+        achievedAt: Date? = nil
+    ) {
+        self.exercise = exercise
+        self.weight = weight
+        self.reps = reps
+        self.estimatedOneRepMax = estimatedOneRepMax ?? ExercisePR.epley(weight: weight, reps: reps)
+        self.achievedAt = achievedAt
+    }
+
+    /// Epley one-rep-max estimate. Falls back to the raw weight when reps are
+    /// unknown or a single rep.
+    public static func epley(weight: Double, reps: Int?) -> Double {
+        guard let reps, reps > 1 else { return weight }
+        return weight * (1.0 + Double(reps) / 30.0)
+    }
+
+    public static func from(history: [WorkoutSession], limit: Int = 8) -> [ExercisePR] {
+        struct Best { var weight: Double; var reps: Int?; var at: Date; var display: String }
+        var best: [String: Best] = [:]
+        for session in history {
+            for set in session.sets {
+                guard let w = set.weight, w > 0 else { continue }
+                let key = set.exercise.lowercased()
+                if let existing = best[key], existing.weight >= w { continue }
+                best[key] = Best(weight: w, reps: set.reps, at: set.at, display: set.exercise)
+            }
+        }
+        return best.values
+            .map { ExercisePR(exercise: $0.display, weight: $0.weight, reps: $0.reps, achievedAt: $0.at) }
+            .sorted { $0.weight > $1.weight }
+            .prefix(max(0, limit))
+            .map { $0 }
+    }
 }
 
 /// One exercise line inside a reusable workout plan.
@@ -962,12 +1993,38 @@ public struct ActiveTimer: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+public enum PantryCategory: String, Sendable, Codable, CaseIterable {
+    case produce
+    case dairy
+    case protein
+    case pantry
+    case frozen
+    case other
+}
+
+public enum PantryLocation: String, Sendable, Codable, CaseIterable {
+    case fridge
+    case freezer
+    case pantry
+    case counter
+}
+
+public enum StockLevel: String, Sendable, Codable, CaseIterable {
+    case ok
+    case low
+    case out
+}
+
 /// A pantry / fridge inventory item for Remy.
 public struct PantryItem: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
     public var name: String
     public var quantity: String?
     public var notes: String?
+    public var category: PantryCategory
+    public var location: PantryLocation
+    public var stockLevel: StockLevel
+    public var expiresAt: Date?
     public var updatedAt: Date
 
     public init(
@@ -975,34 +2032,728 @@ public struct PantryItem: Sendable, Identifiable, Codable, Equatable {
         name: String,
         quantity: String? = nil,
         notes: String? = nil,
+        category: PantryCategory = .other,
+        location: PantryLocation = .pantry,
+        stockLevel: StockLevel = .ok,
+        expiresAt: Date? = nil,
         updatedAt: Date = Date()
     ) {
         self.id = id
         self.name = name
         self.quantity = quantity
         self.notes = notes
+        self.category = category
+        self.location = location
+        self.stockLevel = stockLevel
+        self.expiresAt = expiresAt
+        self.updatedAt = updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        quantity = try c.decodeIfPresent(String.self, forKey: .quantity)
+        notes = try c.decodeIfPresent(String.self, forKey: .notes)
+        category = try c.decodeIfPresent(PantryCategory.self, forKey: .category) ?? .other
+        location = try c.decodeIfPresent(PantryLocation.self, forKey: .location) ?? .pantry
+        stockLevel = try c.decodeIfPresent(StockLevel.self, forKey: .stockLevel) ?? .ok
+        expiresAt = try c.decodeIfPresent(Date.self, forKey: .expiresAt)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+public struct RecipeIngredient: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var pantryItemId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        pantryItemId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.pantryItemId = pantryItemId
+    }
+}
+
+/// A saved recipe for Remy.
+public struct Recipe: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var title: String
+    public var servings: Int?
+    public var ingredients: [RecipeIngredient]
+    public var steps: [String]
+    /// Optional per-step countdown durations (seconds), aligned by index with
+    /// `steps`. `0`/missing means the step has no timer. Cook mode auto-starts
+    /// these; when absent, a duration is parsed from the step text instead.
+    public var stepTimerSeconds: [Int]?
+    public var tags: [String]
+    public var sourceNote: String?
+    /// Original URL when imported from the web.
+    public var sourceURL: String?
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        servings: Int? = nil,
+        ingredients: [RecipeIngredient] = [],
+        steps: [String] = [],
+        stepTimerSeconds: [Int]? = nil,
+        tags: [String] = [],
+        sourceNote: String? = nil,
+        sourceURL: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.servings = servings
+        self.ingredients = ingredients
+        self.steps = steps
+        self.stepTimerSeconds = stepTimerSeconds
+        self.tags = tags
+        self.sourceNote = sourceNote
+        self.sourceURL = sourceURL
+        self.updatedAt = updatedAt
+    }
+
+    /// Explicit timer for a step from `stepTimerSeconds`, if any.
+    public func timerSeconds(forStep index: Int) -> Int? {
+        guard let stepTimerSeconds, stepTimerSeconds.indices.contains(index) else { return nil }
+        let secs = stepTimerSeconds[index]
+        return secs > 0 ? secs : nil
+    }
+
+    /// Timer for a step: the explicit metadata if present, otherwise a duration
+    /// parsed from the step text ("simmer for 9 minutes").
+    public func effectiveTimerSeconds(forStep index: Int) -> Int? {
+        if let explicit = timerSeconds(forStep: index) { return explicit }
+        guard steps.indices.contains(index) else { return nil }
+        return Recipe.parseDurationSeconds(from: steps[index])
+    }
+
+    /// Parse the first duration ("9 minutes", "90 sec", "1 hour") from free text.
+    public static func parseDurationSeconds(from text: String) -> Int? {
+        let lower = text.lowercased()
+        let pattern = #"(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(lower.startIndex..., in: lower)
+        guard let match = regex.firstMatch(in: lower, range: range),
+              let numberRange = Range(match.range(at: 1), in: lower),
+              let unitRange = Range(match.range(at: 2), in: lower),
+              let value = Double(lower[numberRange]) else { return nil }
+        let unit = String(lower[unitRange])
+        let seconds: Double
+        if unit.hasPrefix("h") {
+            seconds = value * 3600
+        } else if unit.hasPrefix("m") {
+            seconds = value * 60
+        } else {
+            seconds = value
+        }
+        let rounded = Int(seconds.rounded())
+        return rounded > 0 ? rounded : nil
+    }
+}
+
+/// Live cook-mode session for Remy.
+public struct CookingSession: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var recipeId: UUID
+    public var recipeTitle: String
+    public var currentStepIndex: Int
+    /// Ingredient ids the user has checked off during this cook.
+    public var checkedIngredientIds: [UUID]
+    public var startedAt: Date
+    public var endedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        recipeId: UUID,
+        recipeTitle: String,
+        currentStepIndex: Int = 0,
+        checkedIngredientIds: [UUID] = [],
+        startedAt: Date = Date(),
+        endedAt: Date? = nil
+    ) {
+        self.id = id
+        self.recipeId = recipeId
+        self.recipeTitle = recipeTitle
+        self.currentStepIndex = max(0, currentStepIndex)
+        self.checkedIngredientIds = checkedIngredientIds
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        recipeId = try c.decode(UUID.self, forKey: .recipeId)
+        recipeTitle = try c.decode(String.self, forKey: .recipeTitle)
+        currentStepIndex = max(0, try c.decodeIfPresent(Int.self, forKey: .currentStepIndex) ?? 0)
+        checkedIngredientIds = try c.decodeIfPresent([UUID].self, forKey: .checkedIngredientIds) ?? []
+        startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
+    }
+
+    public var isActive: Bool { endedAt == nil }
+}
+
+public struct ShoppingListItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var fromRecipeId: UUID?
+    public var checked: Bool
+    public var category: String?
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        fromRecipeId: UUID? = nil,
+        checked: Bool = false,
+        category: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.fromRecipeId = fromRecipeId
+        self.checked = checked
+        self.category = category
         self.updatedAt = updatedAt
     }
 }
 
-/// A mood / habit check-in for Sage.
-public struct WellnessCheckin: Sendable, Identifiable, Codable, Equatable {
+public enum MealSlotKind: String, Sendable, Codable, CaseIterable {
+    case breakfast
+    case lunch
+    case dinner
+    case snack
+}
+
+public struct MealPlanSlot: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
-    /// Mood on a 1–5 scale (1 = low, 5 = great).
-    public var mood: Int
+    /// 0 = Monday … 6 = Sunday relative to `MealPlan.weekStart`.
+    public var dayOffset: Int
+    public var kind: MealSlotKind
+    public var recipeId: UUID?
     public var note: String?
-    public var at: Date
 
     public init(
         id: UUID = UUID(),
-        mood: Int,
-        note: String? = nil,
-        at: Date = Date()
+        dayOffset: Int,
+        kind: MealSlotKind,
+        recipeId: UUID? = nil,
+        note: String? = nil
     ) {
         self.id = id
-        self.mood = min(5, max(1, mood))
+        self.dayOffset = min(6, max(0, dayOffset))
+        self.kind = kind
+        self.recipeId = recipeId
         self.note = note
+    }
+
+    public var isEmpty: Bool {
+        (note?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) && recipeId == nil
+    }
+}
+
+public struct MealPlan: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var weekStart: Date
+    public var slots: [MealPlanSlot]
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        weekStart: Date,
+        slots: [MealPlanSlot] = [],
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.weekStart = weekStart
+        self.slots = slots
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct NutritionProfile: Sendable, Codable, Equatable {
+    public var dietStyle: String?
+    public var allergens: [String]
+    public var goals: [String]
+    public var preferredCuisines: [String]
+    public var staples: [String]
+    public var notes: String?
+    /// Optional daily targets for Remy's nutrition dashboard rings.
+    public var calorieTarget: Double?
+    public var proteinTarget: Double?
+    public var carbTarget: Double?
+    public var fatTarget: Double?
+    public var updatedAt: Date
+
+    public init(
+        dietStyle: String? = nil,
+        allergens: [String] = [],
+        goals: [String] = [],
+        preferredCuisines: [String] = [],
+        staples: [String] = NutritionProfile.defaultStaples,
+        notes: String? = nil,
+        calorieTarget: Double? = nil,
+        proteinTarget: Double? = nil,
+        carbTarget: Double? = nil,
+        fatTarget: Double? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.dietStyle = dietStyle
+        self.allergens = allergens
+        self.goals = goals
+        self.preferredCuisines = preferredCuisines
+        self.staples = staples
+        self.notes = notes
+        self.calorieTarget = calorieTarget
+        self.proteinTarget = proteinTarget
+        self.carbTarget = carbTarget
+        self.fatTarget = fatTarget
+        self.updatedAt = updatedAt
+    }
+
+    public static let defaultStaples: [String] = [
+        "Eggs", "Milk", "Butter", "Bread", "Rice", "Pasta",
+        "Olive oil", "Salt", "Onions", "Garlic", "Chicken", "Cheese"
+    ]
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dietStyle = try c.decodeIfPresent(String.self, forKey: .dietStyle)
+        allergens = try c.decodeIfPresent([String].self, forKey: .allergens) ?? []
+        goals = try c.decodeIfPresent([String].self, forKey: .goals) ?? []
+        preferredCuisines = try c.decodeIfPresent([String].self, forKey: .preferredCuisines) ?? []
+        staples = try c.decodeIfPresent([String].self, forKey: .staples) ?? NutritionProfile.defaultStaples
+        notes = try c.decodeIfPresent(String.self, forKey: .notes)
+        calorieTarget = try c.decodeIfPresent(Double.self, forKey: .calorieTarget)
+        proteinTarget = try c.decodeIfPresent(Double.self, forKey: .proteinTarget)
+        carbTarget = try c.decodeIfPresent(Double.self, forKey: .carbTarget)
+        fatTarget = try c.decodeIfPresent(Double.self, forKey: .fatTarget)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+/// Breakfast / lunch / dinner / snack assignment for a logged food diary entry.
+public enum MealLogKind: String, Sendable, Codable, CaseIterable, Identifiable {
+    case breakfast
+    case lunch
+    case dinner
+    case snack
+
+    public var id: String { rawValue }
+
+    public var displayName: String { rawValue.capitalized }
+
+    /// Suggest a kind from the local clock (snack overnight; meals by typical windows).
+    public static func suggested(for date: Date = Date(), calendar: Calendar = .current) -> MealLogKind {
+        let hour = calendar.component(.hour, from: date)
+        switch hour {
+        case 5..<11: return .breakfast
+        case 11..<15: return .lunch
+        case 15..<17: return .snack
+        case 17..<22: return .dinner
+        default: return .snack
+        }
+    }
+
+    public static func parse(_ raw: String?) -> MealLogKind? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !trimmed.isEmpty else { return nil }
+        if let exact = MealLogKind(rawValue: trimmed) { return exact }
+        switch trimmed {
+        case "meal", "main", "main_meal", "main meal": return .dinner
+        case "brkfst", "bfast": return .breakfast
+        default: return nil
+        }
+    }
+}
+
+/// Estimated macros for a logged meal. Remy fills these in from the meal
+/// description or recipe; all fields are optional so a plain description still
+/// logs cleanly.
+public struct MealNutrition: Sendable, Codable, Equatable {
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+
+    public init(
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil
+    ) {
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+    }
+
+    public var isEmpty: Bool {
+        calories == nil && proteinGrams == nil && carbsGrams == nil && fatGrams == nil
+    }
+}
+
+public struct MealLogEntry: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var description: String
+    public var at: Date
+    public var recipeId: UUID?
+    /// Breakfast / lunch / dinner / snack for the diary entry.
+    public var kind: MealLogKind
+    /// Remy's estimated calories for the meal, if known.
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+    /// Provenance for macros (`llm` / `manual` / `open_food_facts`).
+    public var nutritionSource: MealNutritionSource?
+    public var barcode: String?
+    public var offProductId: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, description, at, recipeId, kind
+        case calories, proteinGrams, carbsGrams, fatGrams
+        case nutritionSource, barcode, offProductId
+    }
+
+    public init(
+        id: UUID = UUID(),
+        description: String,
+        at: Date = Date(),
+        recipeId: UUID? = nil,
+        kind: MealLogKind = .suggested(),
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil,
+        nutritionSource: MealNutritionSource? = nil,
+        barcode: String? = nil,
+        offProductId: String? = nil
+    ) {
+        self.id = id
+        self.description = description
         self.at = at
+        self.recipeId = recipeId
+        self.kind = kind
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+        self.nutritionSource = nutritionSource
+        self.barcode = barcode
+        self.offProductId = offProductId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        description = try c.decode(String.self, forKey: .description)
+        at = try c.decode(Date.self, forKey: .at)
+        recipeId = try c.decodeIfPresent(UUID.self, forKey: .recipeId)
+        kind = try c.decodeIfPresent(MealLogKind.self, forKey: .kind) ?? .suggested(for: at)
+        calories = try c.decodeIfPresent(Double.self, forKey: .calories)
+        proteinGrams = try c.decodeIfPresent(Double.self, forKey: .proteinGrams)
+        carbsGrams = try c.decodeIfPresent(Double.self, forKey: .carbsGrams)
+        fatGrams = try c.decodeIfPresent(Double.self, forKey: .fatGrams)
+        nutritionSource = try c.decodeIfPresent(MealNutritionSource.self, forKey: .nutritionSource)
+        barcode = try c.decodeIfPresent(String.self, forKey: .barcode)
+        offProductId = try c.decodeIfPresent(String.self, forKey: .offProductId)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(description, forKey: .description)
+        try c.encode(at, forKey: .at)
+        try c.encodeIfPresent(recipeId, forKey: .recipeId)
+        try c.encode(kind, forKey: .kind)
+        try c.encodeIfPresent(calories, forKey: .calories)
+        try c.encodeIfPresent(proteinGrams, forKey: .proteinGrams)
+        try c.encodeIfPresent(carbsGrams, forKey: .carbsGrams)
+        try c.encodeIfPresent(fatGrams, forKey: .fatGrams)
+        try c.encodeIfPresent(nutritionSource, forKey: .nutritionSource)
+        try c.encodeIfPresent(barcode, forKey: .barcode)
+        try c.encodeIfPresent(offProductId, forKey: .offProductId)
+    }
+
+    public var nutrition: MealNutrition {
+        MealNutrition(calories: calories, proteinGrams: proteinGrams, carbsGrams: carbsGrams, fatGrams: fatGrams)
+    }
+}
+
+/// Editable draft shown after a meal-photo scan (or when revisiting a saved log).
+public struct MealLogEditorState: Sendable, Identifiable, Equatable {
+    public var id: UUID
+    public var description: String
+    public var kind: MealLogKind
+    public var calories: Double?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+    public var at: Date
+    public var recipeId: UUID?
+    public var nutritionSource: MealNutritionSource?
+    public var barcode: String?
+    public var offProductId: String?
+    /// True when confirming a new scan / manual log; false when editing a saved entry.
+    public var isNew: Bool
+
+    public init(
+        id: UUID = UUID(),
+        description: String,
+        kind: MealLogKind = .suggested(),
+        calories: Double? = nil,
+        proteinGrams: Double? = nil,
+        carbsGrams: Double? = nil,
+        fatGrams: Double? = nil,
+        at: Date = Date(),
+        recipeId: UUID? = nil,
+        nutritionSource: MealNutritionSource? = nil,
+        barcode: String? = nil,
+        offProductId: String? = nil,
+        isNew: Bool
+    ) {
+        self.id = id
+        self.description = description
+        self.kind = kind
+        self.calories = calories
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+        self.at = at
+        self.recipeId = recipeId
+        self.nutritionSource = nutritionSource
+        self.barcode = barcode
+        self.offProductId = offProductId
+        self.isNew = isNew
+    }
+
+    public init(estimate: MealPhotoEstimate, kind: MealLogKind = .suggested(), at: Date = Date()) {
+        self.init(
+            description: estimate.description,
+            kind: estimate.kind ?? kind,
+            calories: estimate.nutrition.calories,
+            proteinGrams: estimate.nutrition.proteinGrams,
+            carbsGrams: estimate.nutrition.carbsGrams,
+            fatGrams: estimate.nutrition.fatGrams,
+            at: at,
+            nutritionSource: .llm,
+            isNew: true
+        )
+    }
+
+    public init(entry: MealLogEntry) {
+        self.init(
+            id: entry.id,
+            description: entry.description,
+            kind: entry.kind,
+            calories: entry.calories,
+            proteinGrams: entry.proteinGrams,
+            carbsGrams: entry.carbsGrams,
+            fatGrams: entry.fatGrams,
+            at: entry.at,
+            recipeId: entry.recipeId,
+            nutritionSource: entry.nutritionSource,
+            barcode: entry.barcode,
+            offProductId: entry.offProductId,
+            isNew: false
+        )
+    }
+
+    public var nutrition: MealNutrition {
+        MealNutrition(calories: calories, proteinGrams: proteinGrams, carbsGrams: carbsGrams, fatGrams: fatGrams)
+    }
+
+    public func asEntry() -> MealLogEntry {
+        MealLogEntry(
+            id: id,
+            description: description,
+            at: at,
+            recipeId: recipeId,
+            kind: kind,
+            calories: calories,
+            proteinGrams: proteinGrams,
+            carbsGrams: carbsGrams,
+            fatGrams: fatGrams,
+            nutritionSource: nutritionSource,
+            barcode: barcode,
+            offProductId: offProductId
+        )
+    }
+
+    public mutating func applyFoodHit(_ hit: FoodNutritionHit) {
+        description = hit.displayName
+        calories = hit.nutrition.calories
+        proteinGrams = hit.nutrition.proteinGrams
+        carbsGrams = hit.nutrition.carbsGrams
+        fatGrams = hit.nutrition.fatGrams
+        nutritionSource = .openFoodFacts
+        barcode = hit.barcode
+        offProductId = hit.offProductId
+    }
+}
+
+public struct FridgeScanDetectedItem: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var name: String
+    public var quantity: String?
+    public var stockLevel: StockLevel
+    public var confidence: Double?
+    public var matchedPantryItemId: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String? = nil,
+        stockLevel: StockLevel = .ok,
+        confidence: Double? = nil,
+        matchedPantryItemId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.quantity = quantity
+        self.stockLevel = stockLevel
+        self.confidence = confidence
+        self.matchedPantryItemId = matchedPantryItemId
+    }
+}
+
+/// Result of a fridge / pantry photo analysis for Remy.
+public struct FridgeScanResult: Sendable, Codable, Equatable {
+    public var detected: [FridgeScanDetectedItem]
+    public var lowOrUnclear: [FridgeScanDetectedItem]
+    public var missingStaples: [String]
+    public var notes: String?
+    public var scannedAt: Date
+
+    public init(
+        detected: [FridgeScanDetectedItem] = [],
+        lowOrUnclear: [FridgeScanDetectedItem] = [],
+        missingStaples: [String] = [],
+        notes: String? = nil,
+        scannedAt: Date = Date()
+    ) {
+        self.detected = detected
+        self.lowOrUnclear = lowOrUnclear
+        self.missingStaples = missingStaples
+        self.notes = notes
+        self.scannedAt = scannedAt
+    }
+
+    public var summaryLine: String {
+        let have = detected.map(\.name)
+        let low = lowOrUnclear.map(\.name)
+        var parts: [String] = []
+        if !have.isEmpty { parts.append("Seen: \(have.joined(separator: ", "))") }
+        if !low.isEmpty { parts.append("Low/unclear: \(low.joined(separator: ", "))") }
+        if !missingStaples.isEmpty { parts.append("Missing staples: \(missingStaples.joined(separator: ", "))") }
+        return parts.isEmpty ? "Fridge scan: nothing clear." : "Fridge scan — \(parts.joined(separator: ". "))."
+    }
+}
+
+/// Status for a Sage-managed cross-agent task.
+public enum AgentTaskStatus: String, Sendable, Codable, Equatable, CaseIterable {
+    case suggested
+    case inProgress = "in_progress"
+    case incomplete
+    case done
+    case cancelled
+
+    public var isOpen: Bool {
+        switch self {
+        case .suggested, .inProgress, .incomplete: return true
+        case .done, .cancelled: return false
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .suggested: return "Suggested"
+        case .inProgress: return "In progress"
+        case .incomplete: return "Incomplete"
+        case .done: return "Done"
+        case .cancelled: return "Cancelled"
+        }
+    }
+}
+
+/// A task Sage tracks so the user can resume work with each agent.
+public struct AgentTask: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public var title: String
+    public var detail: String?
+    /// Specialist (or Nova) this task belongs to.
+    public var agentName: String
+    public var agentId: UUID?
+    public var status: AgentTaskStatus
+    /// `manual`, `voice`, or `inferred` from agent activity.
+    public var source: String
+    /// Short snapshot of the activity that motivated this task.
+    public var activitySummary: String?
+    /// JPEG file names relative to the task-images directory.
+    public var imageFileNames: [String]
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        detail: String? = nil,
+        agentName: String,
+        agentId: UUID? = nil,
+        status: AgentTaskStatus = .suggested,
+        source: String = "manual",
+        activitySummary: String? = nil,
+        imageFileNames: [String] = [],
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.agentName = agentName
+        self.agentId = agentId
+        self.status = status
+        self.source = source
+        self.activitySummary = activitySummary
+        self.imageFileNames = imageFileNames
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, detail, agentName, agentId, status, source
+        case activitySummary, imageFileNames, createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        agentName = try c.decode(String.self, forKey: .agentName)
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
+        status = try c.decode(AgentTaskStatus.self, forKey: .status)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "manual"
+        activitySummary = try c.decodeIfPresent(String.self, forKey: .activitySummary)
+        imageFileNames = try c.decodeIfPresent([String].self, forKey: .imageFileNames) ?? []
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 }
 

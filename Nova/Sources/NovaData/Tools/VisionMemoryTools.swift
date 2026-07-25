@@ -21,22 +21,28 @@ public struct RememberVisualTool: Tool {
     private let ocr: any TextRecognizing
     private let store: any VisualMemoryStoring
     private let workspaceId: @Sendable () async -> UUID?
+    private let isEnabled: @Sendable () async -> Bool
 
     public init(
         frameCapture: any FrameCapture,
         ocr: any TextRecognizing,
         store: any VisualMemoryStoring,
-        workspaceId: @escaping @Sendable () async -> UUID?
+        workspaceId: @escaping @Sendable () async -> UUID?,
+        isEnabled: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.frameCapture = frameCapture
         self.ocr = ocr
         self.store = store
         self.workspaceId = workspaceId
+        self.isEnabled = isEnabled
     }
 
     private struct Args: Decodable { var label: String? }
 
     public func invoke(argumentsJSON: String) async throws -> String {
+        guard await isEnabled() else {
+            return #"{"ok":false,"error":"visual_memory_disabled"}"#
+        }
         let args = (try? JSONDecoder().decode(Args.self, from: Data(argumentsJSON.utf8))) ?? Args(label: nil)
         let label = args.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 

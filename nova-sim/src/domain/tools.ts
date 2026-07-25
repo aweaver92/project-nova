@@ -6,12 +6,16 @@ import {
   ToolCallResult,
 } from "./types";
 
+/** Defaults match Nova `FileConversationMemory` / `InMemoryConversationMemory`. */
+const MAX_TURNS = 500;
+const SUMMARY_TURNS = 48;
+
 export class InMemoryConversationMemory implements ConversationMemory {
   private turns: ConversationTurn[] = [];
 
   async append(turn: ConversationTurn): Promise<void> {
     this.turns.push(turn);
-    if (this.turns.length > 200) this.turns.splice(0, this.turns.length - 200);
+    if (this.turns.length > MAX_TURNS) this.turns.splice(0, this.turns.length - MAX_TURNS);
   }
 
   async recent(limit: number): Promise<ConversationTurn[]> {
@@ -20,7 +24,7 @@ export class InMemoryConversationMemory implements ConversationMemory {
 
   async summary(): Promise<string> {
     return this.turns
-      .slice(-12)
+      .slice(-SUMMARY_TURNS)
       .map((t) => `${t.role}: ${t.text}`)
       .join("\n");
   }

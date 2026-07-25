@@ -8,13 +8,27 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
+    "dev": "node ./node_modules/tsx/dist/cli.mjs watch src/server.ts",
+    "start": "node ./node_modules/tsx/dist/cli.mjs src/server.ts",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-bridge-service.ps1",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-service.ps1",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-bridge.ps1",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-bridge.ps1",
+    "watchdog:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-bridge-watchdog.ps1",
+    "watchdog:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-bridge-watchdog.ps1",
     "typecheck": "tsc --noEmit",
-    "test:stream": "tsx src/cursor-stream.test.ts"
+    "test:stream": "tsx src/cursor-stream.test.ts",
+    "test:repos": "tsx src/repo-service.test.ts",
+    "test:preview": "tsx src/preview-service.test.ts",
+    "test:baseline": "tsx src/baseline-service.test.ts",
+    "test:realtime": "node scripts/realtime-selftest.mjs",
+    "test:realtime:dump": "node scripts/realtime-dump-replay.mjs",
+    "test:vad": "node scripts/client-energy-vad.test.mjs",
+    "test": "npm run test:stream && npm run test:repos && npm run test:preview && npm run test:baseline && npm run test:vad"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.23",
+    "bonjour-service": "^1.4.3",
     "express": "^4.19.2"
   },
   "devDependencies": {
@@ -22,5 +36,8 @@
     "@types/node": "^20.14.0",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
+  },
+  "optionalDependencies": {
+    "@cursor/sdk-win32-x64": "^1.0.23"
   }
 }

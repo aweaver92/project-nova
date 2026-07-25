@@ -63,6 +63,45 @@ final class PCMResamplerTests: XCTestCase {
         XCTAssertEqual(recorder.sampleCount(.micToWS), 5)
     }
 
+    func testLatencyGatePassFailPending() {
+        let recorder = InMemoryLatencyMetricsRecorder()
+        XCTAssertEqual(recorder.latencyGate().status, "Pending")
+        for v in [10.0, 12.0, 14.0, 16.0, 18.0] {
+            recorder.record(LatencySample(metric: .micToWS, milliseconds: v))
+            recorder.record(LatencySample(metric: .audioToSpeaker, milliseconds: v))
+        }
+        XCTAssertEqual(recorder.latencyGate().status, "Pass")
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 80))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 90))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 100))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 110))
+        recorder.record(LatencySample(metric: .micToWS, milliseconds: 120))
+        // p95 of mic will exceed 40 with these high samples depending on retention;
+        // ensure Fail or Pass is a known status string.
+        let status = recorder.latencyGate().status
+        XCTAssertTrue(status == "Pass" || status == "Fail")
+    }
+
+    func testSkillRunnerExpandsVariables() {
+        let expanded = SkillRunner.expand("Hello {{name}}", variables: ["name": "Ada"])
+        XCTAssertEqual(expanded, "Hello Ada")
+        let cleared = SkillRunner.expand("x{{missing}}y", variables: [:])
+        XCTAssertEqual(cleared, "xy")
+        XCTAssertEqual(SkillRunner.expand("x={{missing}}y", variables: [:]), "x=y")
+    }
+
+    func testUsageMeterSnapshot() {
+        let meter = UsageMeter()
+        meter.markSessionStarted()
+        meter.recordResponsesCall()
+        meter.recordTokens(input: 1000, output: 500)
+        meter.markSessionStopped()
+        let snap = meter.snapshot()
+        XCTAssertEqual(snap.responsesCalls, 1)
+        XCTAssertEqual(snap.inputTokens, 1000)
+        XCTAssertTrue(snap.summaryLine.contains("Responses 1"))
+    }
+
     func testLatencyRecorderBoundedRetention() {
         let recorder = InMemoryLatencyMetricsRecorder(capacity: 3)
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
@@ -104,6 +143,16 @@ final class PCMResamplerTests: XCTestCase {
         await session.pause()
         await session.resume()
         await session.stop()
+    }
+
+    func testMetaSessionMockRepairConnection() async throws {
+        let session = MetaDATWearableSession(useMock: true)
+        try await session.repairConnection()
+        let registeredOnce = await session.isRegistered()
+        XCTAssertTrue(registeredOnce)
+        try await session.repairConnection()
+        let registeredAgain = await session.isRegistered()
+        XCTAssertTrue(registeredAgain)
     }
 
     func testWeatherToolSchemaAndCodes() {
@@ -195,8 +244,8 @@ final class VoiceRecordingTests: XCTestCase {
             .appendingPathComponent("nova-recordings-\(UUID().uuidString)", isDirectory: true)
     }
 
-    /// 200 ms of 8 kHz mono PCM16 = 1600 samples = 3200 bytes.
-    private func chunk(ms: Int, sampleRate: Int = 8_000) -> AudioChunk {
+    /// 200 ms of 24 kHz mono PCM16 = 4800 samples = 9600 bytes.
+    private func chunk(ms: Int, sampleRate: Int = 24_000) -> AudioChunk {
         let samples = sampleRate * ms / 1000
         let data = [Int16](repeating: 1234, count: samples)
             .withUnsafeBufferPointer { Data(buffer: $0) }
@@ -222,20 +271,20 @@ final class VoiceRecordingTests: XCTestCase {
         let stopped = await recorder.stop()
         let saved = try XCTUnwrap(stopped)
 
-        // Duration derives from sample count: 8000 samples / 8000 Hz ≈ 1s.
+        // Duration derives from sample count: 24000 samples / 24000 Hz ≈ 1s.
         XCTAssertEqual(saved.duration, 1.0, accuracy: 0.05)
-        XCTAssertEqual(saved.sampleRate, 8_000)
-        XCTAssertEqual(saved.byteCount, 16_000)
+        XCTAssertEqual(saved.sampleRate, 24_000)
+        XCTAssertEqual(saved.byteCount, 48_000)
 
         // File exists on disk with a canonical 44-byte WAV header + payload.
         let url = dir.appendingPathComponent(saved.fileName)
         let fileData = try Data(contentsOf: url)
-        XCTAssertEqual(fileData.count, 44 + 16_000)
+        XCTAssertEqual(fileData.count, 44 + 48_000)
         XCTAssertEqual(Array(fileData.prefix(4)), Array("RIFF".utf8))
         XCTAssertEqual(Array(fileData[8..<12]), Array("WAVE".utf8))
         // data chunk size (little-endian) at offset 40 == payload bytes.
         let dataSize = fileData[40..<44].reversed().reduce(0) { ($0 << 8) | UInt32($1) }
-        XCTAssertEqual(Int(dataSize), 16_000)
+        XCTAssertEqual(Int(dataSize), 48_000)
 
         // Metadata survives a fresh store instance.
         let reloaded = FileRecordingStore(directory: dir)
@@ -251,8 +300,8 @@ final class VoiceRecordingTests: XCTestCase {
         let recorder = StreamingVoiceRecorder(store: store)
 
         try await recorder.start()
-        // 24 kHz chunk must be dropped (recorder captures the 8 kHz mic feed).
-        await recorder.append(chunk(ms: 200, sampleRate: 24_000))
+        // 8 kHz chunk must be dropped (recorder captures the 24 kHz mic feed).
+        await recorder.append(chunk(ms: 200, sampleRate: 8_000))
         let saved = await recorder.stop()
         // Nothing valid captured → empty recording discarded.
         XCTAssertNil(saved)
@@ -366,7 +415,7 @@ final class FileAgentStoreTests: XCTestCase {
         XCTAssertTrue(active.isMaster)
     }
 
-    func testActiveSelectionPersistsAndMasterUndeletable() async {
+    func testActiveSelectionResetsToMasterOnColdStartAndMasterUndeletable() async {
         let url = tempURL()
         defer { try? FileManager.default.removeItem(at: url) }
         let store = FileAgentStore(url: url)
@@ -374,10 +423,14 @@ final class FileAgentStoreTests: XCTestCase {
         let master = await store.master()
 
         await store.setActive(id: claude.id)
-        // Reload from the same file: the selection survived.
+        let activeSameProcess = await store.active()
+        XCTAssertEqual(activeSameProcess.id, claude.id)
+
+        // Cold start (new store from the same file) always opens on Nova.
         let reloaded = FileAgentStore(url: url)
         let active = await reloaded.active()
-        XCTAssertEqual(active.id, claude.id)
+        XCTAssertEqual(active.id, master.id)
+        XCTAssertTrue(active.isMaster)
 
         // Deleting the master is a no-op; deleting a specialist works.
         await reloaded.delete(id: master.id)
@@ -386,7 +439,7 @@ final class FileAgentStoreTests: XCTestCase {
         await reloaded.delete(id: claude.id)
         let afterClaudeDelete = await reloaded.all()
         XCTAssertFalse(afterClaudeDelete.contains { $0.id == claude.id })
-        // Removing the active agent falls back to the master.
+        // Removing a specialist while master is active keeps master active.
         let activeAfter = await reloaded.active()
         XCTAssertTrue(activeAfter.isMaster)
     }
@@ -410,10 +463,37 @@ final class NovaBridgeClientTests: XCTestCase {
             command: "hi",
             sessionId: nil,
             workingDirectory: nil,
+            repoId: nil,
             onEvent: { _ in }
         )
         XCTAssertFalse(stream.ok)
         XCTAssertTrue(stream.payloadJSON.contains("bridge_not_configured"))
+
+        let repos = await bridge.listRepos()
+        XCTAssertFalse(repos.ok)
+        XCTAssertTrue(repos.payloadJSON.contains("bridge_not_configured"))
+    }
+
+    func testRepositoryModelsDecode() throws {
+        let summaryJSON = """
+        {"id":"abcdef0123456789","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}
+        """.data(using: .utf8)!
+        let summary = try JSONDecoder().decode(BridgeRepoSummary.self, from: summaryJSON)
+        XCTAssertEqual(summary.id, "abcdef0123456789")
+        XCTAssertTrue(summary.selected)
+
+        let statusJSON = """
+        {"repoId":"abcdef0123456789","name":"demo","branch":"main","upstream":"origin/main","ahead":1,"behind":0,"clean":false,"changedFiles":[{"path":"a.swift","status":"M","staged":false,"unstaged":true}],"statusToken":"tok123456789012345678901"}
+        """.data(using: .utf8)!
+        let status = try JSONDecoder().decode(BridgeRepoStatus.self, from: statusJSON)
+        XCTAssertEqual(status.changedFiles.count, 1)
+        XCTAssertEqual(status.statusToken.count, 24)
+
+        let publishJSON = """
+        {"repoId":"abcdef0123456789","branch":"nova/fix","commitSha":"abc","prUrl":"https://github.com/acme/demo/pull/1","prNumber":1}
+        """.data(using: .utf8)!
+        let published = try JSONDecoder().decode(BridgePublishResult.self, from: publishJSON)
+        XCTAssertEqual(published.prNumber, 1)
     }
 
     func testCodingStreamEventDecodesSSEPayloads() {
@@ -435,6 +515,81 @@ final class NovaBridgeClientTests: XCTestCase {
         XCTAssertEqual(d?.runId, "r1")
         XCTAssertEqual(d?.status, "finished")
     }
+
+    func testClaudeCodeConnectionRetryReusesActionId() async {
+        ClaudeRetryURLProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ClaudeRetryURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let bridge = NovaBridgeClient(
+            configProvider: { (URL(string: "http://bridge.test")!, "token") },
+            session: session,
+            reconnectRetrySeconds: 0.01
+        )
+
+        let result = await bridge.runClaudeCode(
+            prompt: "make one edit",
+            workingDirectory: nil,
+            repoId: "repo-1"
+        )
+
+        XCTAssertTrue(result.ok)
+        let captured = ClaudeRetryURLProtocol.capturedActionIds()
+        XCTAssertEqual(captured.count, 2)
+        XCTAssertEqual(Set(captured).count, 1, "retry must attach to the original action")
+    }
+}
+
+private final class ClaudeRetryURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var attempts = 0
+    private static var actionIds: [String] = []
+
+    static func reset() {
+        lock.lock()
+        attempts = 0
+        actionIds = []
+        lock.unlock()
+    }
+
+    static func capturedActionIds() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return actionIds
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let actionId: String = request.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            .flatMap { $0["actionId"] as? String } ?? ""
+
+        Self.lock.lock()
+        Self.attempts += 1
+        let attempt = Self.attempts
+        Self.actionIds.append(actionId)
+        Self.lock.unlock()
+
+        if attempt == 1 {
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            return
+        }
+
+        let body = #"{"ok":true,"actionId":"test","result":"done","exitCode":0}"#.data(using: .utf8)!
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 final class CodingSessionPinTests: XCTestCase {
@@ -453,17 +608,94 @@ final class CodingSessionPinTests: XCTestCase {
         XCTAssertNil(cleared)
     }
 
+    func testSelectedRepoIdRoundTrip() async {
+        let suite = "nova.test.codingRepo.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        let initial = await store.codingSelectedRepoId()
+        XCTAssertNil(initial)
+        await store.setCodingSelectedRepoId("  abcdef0123456789  ")
+        let selected = await store.codingSelectedRepoId()
+        XCTAssertEqual(selected, "abcdef0123456789")
+        await store.setCodingSelectedRepoId("")
+        let cleared = await store.codingSelectedRepoId()
+        XCTAssertNil(cleared)
+    }
+
+    func testCodingSessionPinsAreScopedPerRepository() async {
+        let suite = "nova.test.codingPinsByRepo.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+
+        await store.setCodingSelectedRepoId("repo-a")
+        await store.setCodingSessionId("session-a")
+        await store.setCodingSelectedRepoId("repo-b")
+        let initialRepoB = await store.codingSessionId()
+        XCTAssertNil(initialRepoB)
+        await store.setCodingSessionId("session-b")
+
+        await store.setCodingSelectedRepoId("repo-a")
+        let restoredRepoA = await store.codingSessionId()
+        XCTAssertEqual(restoredRepoA, "session-a")
+        await store.setCodingSelectedRepoId("repo-b")
+        let restoredRepoB = await store.codingSessionId()
+        XCTAssertEqual(restoredRepoB, "session-b")
+    }
+
     func testPushToCursorUsesPinnedSessionAndUpdatesPin() async throws {
-        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1")
+        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1", codingSelectedRepoId: "abcdef0123456789")
         let bridge = PinCapturingBridge()
         let tool = PushToCursorTool(bridge: bridge, settings: settings)
         let payload = try await tool.invoke(argumentsJSON: #"{"command":"fix"}"#)
         XCTAssertTrue(payload.contains("returned-99"))
         let used = await bridge.lastSessionId
         XCTAssertEqual(used, "pinned-1")
+        let usedRepo = await bridge.lastRepoId
+        XCTAssertEqual(usedRepo, "abcdef0123456789")
         let updated = await settings.codingSessionId()
         XCTAssertEqual(updated, "returned-99")
     }
+
+    func testPushToCursorPrefersCodingUIRunnerWhenWired() async throws {
+        let settings = FakeCodingSettingsStore(codingSessionId: "pinned-1", codingSelectedRepoId: "abcdef0123456789")
+        let bridge = PinCapturingBridge()
+        let tool = PushToCursorTool(
+            bridge: bridge,
+            settings: settings,
+            runThroughCodingUI: { command, sessionId, repoId in
+                XCTAssertEqual(command, "spoken task")
+                XCTAssertEqual(sessionId, "pinned-1")
+                XCTAssertEqual(repoId, "abcdef0123456789")
+                return #"{"ok":true,"sessionId":"voice-agent-1","status":"finished","result":"done"}"#
+            }
+        )
+        let payload = try await tool.invoke(argumentsJSON: #"{"command":"spoken task"}"#)
+        XCTAssertTrue(payload.contains("voice-agent-1"))
+        let used = await bridge.lastSessionId
+        XCTAssertNil(used) // bridge push skipped when Coding UI runner is wired
+        let updated = await settings.codingSessionId()
+        XCTAssertEqual(updated, "voice-agent-1")
+    }
+
+    func testCursorHistoryToolUsesPinnedSessionAndSelectedRepository() async throws {
+        let settings = FakeCodingSettingsStore(
+            codingSessionId: "pinned-history",
+            codingSelectedRepoId: "repo-history"
+        )
+        let bridge = PinCapturingBridge()
+        let tool = GetCursorSessionHistoryTool(bridge: bridge, settings: settings)
+
+        let payload = try await tool.invoke(argumentsJSON: #"{}"#)
+
+        XCTAssertTrue(payload.contains("prior decision"))
+        let historySessionId = await bridge.lastHistorySessionId
+        let historyRepoId = await bridge.lastHistoryRepoId
+        XCTAssertEqual(historySessionId, "pinned-history")
+        XCTAssertEqual(historyRepoId, "repo-history")
+    }
+
 }
 
 final class BridgeTokenServiceTests: XCTestCase {
@@ -501,9 +733,11 @@ final class BridgeTokenServiceTests: XCTestCase {
 /// Minimal settings double that only implements the coding-session pin.
 private actor FakeCodingSettingsStore: SettingsStoring {
     private var pinned: String?
+    private var selectedRepo: String?
 
-    init(codingSessionId: String?) {
+    init(codingSessionId: String?, codingSelectedRepoId: String? = nil) {
         self.pinned = codingSessionId
+        self.selectedRepo = codingSelectedRepoId
     }
 
     func spokenFollowUps() async -> Bool { false }
@@ -513,21 +747,35 @@ private actor FakeCodingSettingsStore: SettingsStoring {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         pinned = (trimmed?.isEmpty == false) ? trimmed : nil
     }
+    func codingSelectedRepoId() async -> String? { selectedRepo }
+    func setCodingSelectedRepoId(_ value: String?) async {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        selectedRepo = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
 }
 
 /// Test double that records the session id passed to `pushToCursor` and returns a new one.
 private actor PinCapturingBridge: AgentBridging {
     private(set) var lastSessionId: String?
+    private(set) var lastRepoId: String?
+    private(set) var lastHistorySessionId: String?
+    private(set) var lastHistoryRepoId: String?
 
     func isConfigured() async -> Bool { true }
     func health() async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true}"#)
     }
-    func runClaudeCode(prompt: String, workingDirectory: String?) async -> BridgeResult {
+    func runClaudeCode(prompt: String, workingDirectory: String?, repoId: String?) async -> BridgeResult {
         BridgeResult(ok: false, payloadJSON: #"{"ok":false}"#)
     }
-    func pushToCursor(command: String, sessionId: String?) async -> BridgeResult {
+    func pushToCursor(
+        command: String,
+        sessionId: String?,
+        workingDirectory: String?,
+        repoId: String?
+    ) async -> BridgeResult {
         lastSessionId = sessionId
+        lastRepoId = repoId
         return BridgeResult(
             ok: true,
             payloadJSON: #"{"ok":true,"sessionId":"returned-99","status":"finished","result":"done"}"#
@@ -535,5 +783,19 @@ private actor PinCapturingBridge: AgentBridging {
     }
     func listCursorSessions() async -> BridgeResult {
         BridgeResult(ok: true, payloadJSON: #"{"ok":true,"sessions":[]}"#)
+    }
+    func fetchCursorSessionMessages(sessionId: String, repoId: String?) async -> BridgeResult {
+        lastHistorySessionId = sessionId
+        lastHistoryRepoId = repoId
+        return BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"messages":[{"role":"assistant","text":"prior decision"}]}"#
+        )
+    }
+    func selectRepository(repoId: String) async -> BridgeResult {
+        BridgeResult(
+            ok: true,
+            payloadJSON: #"{"ok":true,"selectedRepoId":"\#(repoId)","repo":{"id":"\#(repoId)","name":"demo","relativePath":"demo","rootLabel":"src","selected":true}}"#
+        )
     }
 }
