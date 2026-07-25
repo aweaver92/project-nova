@@ -227,6 +227,35 @@ public struct IdentifyPlantTool: Tool {
                     if let location = args.location, !location.isEmpty {
                         existing.location = location
                     }
+                    if !plantImage.isEmpty {
+                        let dir = await store.directory()
+                        let fileName = existing.fileName.isEmpty
+                            ? "nova-plant-\(existing.id.uuidString).jpg"
+                            : existing.fileName
+                        try? plantImage.write(
+                            to: dir.appendingPathComponent(fileName),
+                            options: .atomic
+                        )
+                        existing = PlantSighting(
+                            id: existing.id,
+                            fileName: fileName,
+                            name: existing.name,
+                            species: existing.species,
+                            location: existing.location,
+                            careNotes: existing.careNotes,
+                            text: existing.text,
+                            caption: existing.caption,
+                            lastWateredAt: existing.lastWateredAt,
+                            isOutdoor: existing.isOutdoor,
+                            frostSensitive: existing.frostSensitive,
+                            lifeCycle: existing.lifeCycle,
+                            suggestedActions: existing.suggestedActions,
+                            seasonalNotes: existing.seasonalNotes,
+                            healthStatus: existing.healthStatus,
+                            createdAt: existing.createdAt,
+                            updatedAt: existing.updatedAt
+                        )
+                    }
                     let plant = await store.upsert(existing)
                     if let idx = library.firstIndex(where: { $0.id == plant.id }) {
                         library[idx] = plant

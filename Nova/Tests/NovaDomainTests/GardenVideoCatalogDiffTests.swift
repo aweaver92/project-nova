@@ -307,6 +307,48 @@ final class GardenVideoCatalogDiffTests: XCTestCase {
         XCTAssertEqual(prepared.filter { $0.matchedPlantId == nil }.count, 1)
     }
 
+    func testIsolatedSpecimenCropCreatesAtNormalConfidence() {
+        let weakAlone = CatalogPlantDraft(name: "Zinnia", confidence: 0.7)
+        XCTAssertFalse(GardenVideoCatalogDiff.shouldCreateNewPlant(weakAlone))
+
+        let isolated = CatalogPlantDraft(
+            name: "Tomato",
+            species: "Solanum lycopersicum",
+            confidence: 0.7,
+            boundingBox: PlantBoundingBox(x: 0.05, y: 0.1, width: 0.35, height: 0.7)
+        )
+        XCTAssertTrue(GardenVideoCatalogDiff.isIsolatedSpecimenCrop(isolated))
+        XCTAssertTrue(GardenVideoCatalogDiff.shouldCreateNewPlant(isolated))
+
+        let fullFrame = CatalogPlantDraft(
+            name: "Tomato",
+            confidence: 0.7,
+            boundingBox: PlantBoundingBox(x: 0.02, y: 0.02, width: 0.96, height: 0.96)
+        )
+        XCTAssertFalse(GardenVideoCatalogDiff.isIsolatedSpecimenCrop(fullFrame))
+    }
+
+    func testCatalogRunStatsSummaryLine() {
+        let stats = GardenCatalogRunStats(
+            framesTotal: 4,
+            framesFailed: 1,
+            detections: 5,
+            cropped: 3,
+            created: 2,
+            updated: 1,
+            skippedWeak: 1,
+            duplicatesPending: 3
+        )
+        let line = stats.summaryLine
+        XCTAssertTrue(line.contains("5 detected"))
+        XCTAssertTrue(line.contains("3 cropped"))
+        XCTAssertTrue(line.contains("2 new"))
+        XCTAssertTrue(line.contains("1 updated"))
+        XCTAssertTrue(line.contains("3 duplicates to review"))
+        XCTAssertTrue(line.contains("1 skipped"))
+        XCTAssertTrue(line.contains("1/4 frames failed") || line.contains("1/"))
+    }
+
     func testBoundingBoxPixelRectAppliesPadding() {
         let box = PlantBoundingBox(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
         let rect = box.pixelRect(imageWidth: 100, imageHeight: 100, padding: 0.0)

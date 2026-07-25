@@ -77,6 +77,25 @@ public struct IvyGardenView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if garden.pendingDuplicateCount > 0 {
+                Section {
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(garden.pendingDuplicateCount) duplicate plant\(garden.pendingDuplicateCount == 1 ? "" : "s") found")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Compare each new crop with the gallery entry, then Keep New, Replace, or Discard.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Review") {
+                            garden.beginDuplicateReview()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(garden.isBusy || garden.isCataloging)
+                    }
+                }
+            }
             if let error = garden.errorMessage {
                 Text(error)
                     .font(.caption)
@@ -144,6 +163,18 @@ public struct IvyGardenView: View {
             } onCancel: {
                 editing = nil
             }
+        }
+        .sheet(isPresented: Binding(
+            get: { garden.isPresentingDuplicateReview },
+            set: { presented in
+                if presented {
+                    garden.isPresentingDuplicateReview = true
+                } else {
+                    garden.dismissDuplicateReviewSheet()
+                }
+            }
+        )) {
+            DuplicatePlantReviewSheet(garden: garden)
         }
         .onChange(of: identifyPickerItem) { _, item in
             guard let item else { return }
@@ -243,7 +274,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Garden Overview")
         } footer: {
-            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Multiple plants in one frame are cropped into separate profile photos. Glasses Walk is a quicker coaching look — tap Stop Garden Walk to cancel mid-capture or analysis. Press and hold the overview to share or save it to Library.")
+            Text("Upload a garden video (or photos) to identify and catalog every plant with care actions and seasonal tips. Possible duplicates wait for review (Keep New, Replace, or Discard) with side-by-side photos. Glasses Walk is a quicker coaching look — tap Stop Garden Walk to cancel mid-capture or analysis. Press and hold the overview to share or save it to Library.")
                 .font(.caption2)
         }
     }
@@ -252,6 +283,11 @@ public struct IvyGardenView: View {
     private func catalogOverviewBlock(_ catalog: GardenCatalogResult) -> some View {
         let walk = catalog.overview
         VStack(alignment: .leading, spacing: 8) {
+            if let stats = catalog.stats {
+                Text(stats.summaryLine)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             walkOverviewContent(walk)
             if !catalog.profiles.isEmpty {
                 Text("Cataloged plants · \(catalog.profiles.count)")
@@ -499,7 +535,7 @@ public struct IvyGardenView: View {
         } header: {
             Text("Identify")
         } footer: {
-            Text("Photos, videos (sampled as keyframes), and glasses stills are matched against your garden library when possible. If several plants are in one photo, Ivy crops each one and creates a separate profile.")
+            Text("Photos, videos (sampled as keyframes), and glasses stills are matched against your garden library when possible. If several plants are in one photo, Ivy crops each one into its own profile — including when the same species is already in the gallery.")
                 .font(.caption2)
         }
     }
@@ -816,6 +852,158 @@ private struct GardenMovieTransfer: Transferable {
         try? FileManager.default.removeItem(at: temp)
         try FileManager.default.copyItem(at: file, to: temp)
         return GardenMovieTransfer(url: temp)
+    }
+}
+
+private struct DuplicatePlantReviewSheet: View {
+    @Bindable var garden: IvyGardenViewModel
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let item = garden.currentDuplicateReview {
+                    reviewContent(item)
+                } else {
+                    ContentUnavailableView(
+                        "All caught up",
+                        systemImage: "checkmark.circle",
+                        description: Text("No duplicate plants left to review.")
+                    )
+                }
+            }
+            .navigationTitle(reviewTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { garden.dismissDuplicateReviewSheet() }
+                }
+            }
+        }
+    }
+
+    private var reviewTitle: String {
+        let total = garden.pendingDuplicateCount
+        guard total > 0 else { return "Review duplicates" }
+        let position = min(garden.duplicateReviewIndex + 1, total)
+        return "Duplicate \(position) of \(total)"
+    }
+
+    @ViewBuilder
+    private func reviewContent(_ item: GardenCatalogDuplicateItem) -> some View {
+        VStack(spacing: 16) {
+            Text("Matched gallery plant: \(item.existingPlantName)")
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(spacing: 6) {
+                    Text("Current")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    PlantThumbnail(
+                        url: garden.imageURL(forPlantId: item.existingPlantId),
+                        title: item.existingPlantName,
+                        compact: false
+                    )
+                }
+                .frame(maxWidth: .infinity)
+
+                VStack(spacing: 6) {
+                    Text("New")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    DuplicateDraftThumbnail(
+                        imageData: item.draft.imageData,
+                        title: item.draft.name
+                    )
+                }
+                .frame(maxWidth: .infinity)
+            }
+
+            if let species = item.draft.species, !species.isEmpty {
+                Text(species)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !item.draft.careTips.isEmpty {
+                Text(item.draft.careTips)
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Spacer(minLength: 8)
+
+            Text("Keep New adds another gallery plant. Replace updates the current photo. Discard drops this detection.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(spacing: 10) {
+                Button {
+                    Task { await garden.resolveDuplicateReview(.keepNew) }
+                } label: {
+                    Text("Keep New")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(garden.isBusy)
+
+                Button {
+                    Task { await garden.resolveDuplicateReview(.replace) }
+                } label: {
+                    Text("Replace")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(garden.isBusy)
+
+                Button(role: .destructive) {
+                    Task { await garden.resolveDuplicateReview(.discard) }
+                } label: {
+                    Text("Discard")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(garden.isBusy)
+            }
+        }
+        .padding()
+    }
+}
+
+private struct DuplicateDraftThumbnail: View {
+    let imageData: Data?
+    let title: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.secondary.opacity(0.12))
+                #if canImport(UIKit)
+                if let imageData, let ui = UIImage(data: imageData) {
+                    Image(uiImage: ui)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 88, maxHeight: 88)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                } else {
+                    Image(systemName: "leaf")
+                        .foregroundStyle(.secondary)
+                }
+                #else
+                Image(systemName: "leaf")
+                    .foregroundStyle(.secondary)
+                #endif
+            }
+            .frame(height: 88)
+            Text(title)
+                .font(.caption2)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
     }
 }
 

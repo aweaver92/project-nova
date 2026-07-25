@@ -42,6 +42,22 @@ public final class IvyGardenViewModel {
     public private(set) var isCataloging = false
     public private(set) var directoryURL: URL?
     public private(set) var librarySaveMessage: String?
+    /// Catalog detections that match gallery plants — awaiting Keep New / Replace / Discard.
+    public private(set) var pendingDuplicateReviews: [GardenCatalogDuplicateItem] = []
+    /// Index into `pendingDuplicateReviews` while the review sheet is open.
+    public private(set) var duplicateReviewIndex: Int = 0
+    /// Drives the duplicate-review sheet.
+    public var isPresentingDuplicateReview = false
+
+    /// Current item in the duplicate-review queue, if any.
+    public var currentDuplicateReview: GardenCatalogDuplicateItem? {
+        guard duplicateReviewIndex >= 0,
+              duplicateReviewIndex < pendingDuplicateReviews.count
+        else { return nil }
+        return pendingDuplicateReviews[duplicateReviewIndex]
+    }
+
+    public var pendingDuplicateCount: Int { pendingDuplicateReviews.count }
 
     private let store: any PlantLibraryStoring
     private let analyzeImage: (CapturedFrame, String) async throws -> String
@@ -60,6 +76,13 @@ public final class IvyGardenViewModel {
     /// Bumped by `stopGardenWalk()` so in-flight capture/analysis exits cleanly.
     private var walkGeneration = 0
     private var walkTask: Task<Void, Never>?
+    /// Speak Garden Overview after duplicate review finishes (if catalog asked to speak).
+    private var pendingCatalogSpeak = false
+    /// Keyframes retained so overview can be rebuilt after reviews.
+    private var pendingCatalogOverviewFrames: [Data] = []
+    /// Profiles saved this catalog session (new + review resolutions).
+    private var catalogSessionProfiles: [CatalogPlantDraft] = []
+    private var catalogSessionStats = GardenCatalogRunStats()
 
     public init(
         store: any PlantLibraryStoring,
@@ -209,6 +232,7 @@ public final class IvyGardenViewModel {
         var library = await store.all()
         let framePrompt = GardenVideoCatalogDiff.framePrompt(library: library, climate: climate)
         var frameDrafts: [CatalogPlantDraft] = []
+        var stats = GardenCatalogRunStats(framesTotal: datas.count)
         for (index, data) in datas.enumerated() {
             statusMessage = "Cataloging frame \(index + 1) of \(datas.count)…"
             let frame = CapturedFrame(imageData: data, width: 0, height: 0)
@@ -221,8 +245,14 @@ public final class IvyGardenViewModel {
                 )
                 let isolated = Self.isolatePlantDrafts(parsed, sourceImage: data)
                 let prepared = GardenVideoCatalogDiff.dedupeLibraryMatchesForMultiPlant(isolated)
+                stats.detections += prepared.count
+                stats.cropped += prepared.filter {
+                    GardenVideoCatalogDiff.isIsolatedSpecimenCrop($0)
+                        && ($0.imageData?.isEmpty == false)
+                }.count
                 frameDrafts.append(contentsOf: prepared)
             } catch {
+                stats.framesFailed += 1
                 continue
             }
         }
@@ -230,52 +260,204 @@ public final class IvyGardenViewModel {
         var merged = GardenVideoCatalogDiff.mergeDrafts(frameDrafts)
         merged = GardenVideoCatalogDiff.dedupeLibraryMatchesForMultiPlant(merged)
         guard !merged.isEmpty else {
-            errorMessage = "No confident plant IDs in that media — try a closer photo of leaves/flowers."
-            statusMessage = "Catalog empty"
+            let failNote = stats.framesFailed > 0
+                ? " (\(stats.framesFailed) frame\(stats.framesFailed == 1 ? "" : "s") failed analysis)"
+                : ""
+            errorMessage = "No confident plant IDs in that media — try a closer photo of leaves/flowers.\(failNote)"
+            statusMessage = "Catalog empty · \(stats.summaryLine)"
             return
         }
 
         statusMessage = "Saving \(merged.count) plant profile\(merged.count == 1 ? "" : "s")…"
         var persisted: [CatalogPlantDraft] = []
+        var reviews: [GardenCatalogDuplicateItem] = []
         for draft in merged {
-            if let saved = await persistCatalogDraft(draft, library: &library) {
+            switch await classifyCatalogDraft(draft, library: &library) {
+            case .created(let saved):
+                stats.created += 1
                 persisted.append(saved)
+            case .needsReview(let item):
+                reviews.append(item)
+            case .skippedWeak:
+                stats.skippedWeak += 1
             }
         }
-        merged = persisted
-        guard !merged.isEmpty else {
+        stats.duplicatesPending = reviews.count
+        pendingDuplicateReviews = reviews
+        duplicateReviewIndex = 0
+        isPresentingDuplicateReview = false
+        catalogSessionProfiles = persisted
+        catalogSessionStats = stats
+        pendingCatalogSpeak = speak
+        pendingCatalogOverviewFrames = datas
+
+        guard !persisted.isEmpty || !reviews.isEmpty else {
             errorMessage = "Plants looked uncertain — nothing new was saved. Try closer shots of distinct plants."
-            statusMessage = "Catalog skipped weak IDs"
+            statusMessage = "Catalog skipped weak IDs · \(stats.summaryLine)"
             return
         }
 
         await load()
-        library = plants
 
+        if !reviews.isEmpty {
+            let n = reviews.count
+            statusMessage = "\(n) duplicate plant\(n == 1 ? "" : "s") found"
+            if !persisted.isEmpty {
+                await publishCatalogResult(
+                    profiles: persisted,
+                    stats: stats,
+                    overviewFrames: datas,
+                    speak: false
+                )
+                statusMessage = "\(n) duplicate plant\(n == 1 ? "" : "s") found · \(persisted.count) new saved — tap Review"
+            } else {
+                errorMessage = nil
+                lastCatalog = GardenCatalogResult(
+                    overview: GardenWalkResult(
+                        overview: "\(n) possible duplicate\(n == 1 ? "" : "s") need review before the gallery is updated."
+                    ),
+                    profiles: [],
+                    stats: stats
+                )
+            }
+            return
+        }
+
+        await publishCatalogResult(
+            profiles: persisted,
+            stats: stats,
+            overviewFrames: datas,
+            speak: speak
+        )
+        pendingCatalogSpeak = false
+        pendingCatalogOverviewFrames = []
+        catalogSessionProfiles = []
+    }
+
+    /// Opens the side-by-side duplicate review sheet at the first pending item.
+    public func beginDuplicateReview() {
+        guard !pendingDuplicateReviews.isEmpty else { return }
+        duplicateReviewIndex = min(duplicateReviewIndex, pendingDuplicateReviews.count - 1)
+        isPresentingDuplicateReview = true
+        section = .gallery
+    }
+
+    /// Apply Keep New / Replace / Discard to the current duplicate, then advance.
+    public func resolveDuplicateReview(_ action: GardenCatalogDuplicateAction) async {
+        guard let item = currentDuplicateReview else {
+            isPresentingDuplicateReview = false
+            return
+        }
+        isBusy = true
+        defer { isBusy = false }
+
+        var library = await store.all()
+        switch action {
+        case .keepNew:
+            if let saved = await createPlantFromDraft(item.draft, library: &library) {
+                catalogSessionStats.created += 1
+                catalogSessionStats.duplicatesPending = max(0, catalogSessionStats.duplicatesPending - 1)
+                catalogSessionProfiles.append(saved)
+            }
+        case .replace:
+            if let saved = await replaceExistingPlant(item, library: &library) {
+                catalogSessionStats.updated += 1
+                catalogSessionStats.duplicatesPending = max(0, catalogSessionStats.duplicatesPending - 1)
+                catalogSessionProfiles.append(saved)
+            }
+        case .discard:
+            catalogSessionStats.skippedWeak += 1
+            catalogSessionStats.duplicatesPending = max(0, catalogSessionStats.duplicatesPending - 1)
+        }
+
+        pendingDuplicateReviews.remove(at: duplicateReviewIndex)
+        if pendingDuplicateReviews.isEmpty {
+            duplicateReviewIndex = 0
+            isPresentingDuplicateReview = false
+            await load()
+            let speak = pendingCatalogSpeak
+            let frames = pendingCatalogOverviewFrames
+            pendingCatalogSpeak = false
+            pendingCatalogOverviewFrames = []
+            let profiles = catalogSessionProfiles
+            let stats = catalogSessionStats
+            catalogSessionProfiles = []
+            if profiles.isEmpty {
+                statusMessage = "Duplicates reviewed — nothing saved"
+                if var catalog = lastCatalog {
+                    catalog.stats = stats
+                    lastCatalog = catalog
+                }
+                return
+            }
+            await publishCatalogResult(
+                profiles: profiles,
+                stats: stats,
+                overviewFrames: frames,
+                speak: speak
+            )
+        } else {
+            if duplicateReviewIndex >= pendingDuplicateReviews.count {
+                duplicateReviewIndex = pendingDuplicateReviews.count - 1
+            }
+            await load()
+            let remaining = pendingDuplicateReviews.count
+            statusMessage = "\(remaining) duplicate\(remaining == 1 ? "" : "s") left to review"
+            if var catalog = lastCatalog {
+                catalog.stats = catalogSessionStats
+                lastCatalog = catalog
+            }
+        }
+    }
+
+    public func dismissDuplicateReviewSheet() {
+        // Leave the queue intact so the Review button still works.
+        isPresentingDuplicateReview = false
+        let n = pendingDuplicateReviews.count
+        if n > 0 {
+            statusMessage = "\(n) duplicate plant\(n == 1 ? "" : "s") found — tap Review to continue"
+        }
+    }
+
+    private func publishCatalogResult(
+        profiles: [CatalogPlantDraft],
+        stats: GardenCatalogRunStats,
+        overviewFrames: [Data],
+        speak: Bool
+    ) async {
+        await load()
+        let library = plants
         statusMessage = "Writing Garden Overview…"
-        var overview = GardenVideoCatalogDiff.fallbackOverview(from: merged)
-        let overviewPrompt = GardenVideoCatalogDiff.overviewPrompt(profiles: merged, climate: climate)
-        // Prefer grounded catalog text; optionally enrich prose from vision while
-        // stripping any findings that invent plants outside the catalog.
-        if let firstData = merged.compactMap(\.imageData).first ?? datas.first {
+        var overview = GardenVideoCatalogDiff.fallbackOverview(from: profiles)
+        let overviewPrompt = GardenVideoCatalogDiff.overviewPrompt(profiles: profiles, climate: climate)
+        if let firstData = profiles.compactMap(\.imageData).first ?? overviewFrames.first {
             let frame = CapturedFrame(imageData: firstData, width: 0, height: 0)
             if let answer = try? await analyzeImage(frame, overviewPrompt) {
                 let parsed = GardenVideoCatalogDiff.parseOverviewJSON(answer, library: library)
-                let sanitized = GardenVideoCatalogDiff.sanitizeOverview(parsed, catalog: merged)
+                let sanitized = GardenVideoCatalogDiff.sanitizeOverview(parsed, catalog: profiles)
                 if !sanitized.overview.isEmpty {
                     overview = sanitized
                 }
             }
         }
 
-        let result = GardenCatalogResult(overview: overview, profiles: merged)
+        let slimProfiles = profiles.map { draft -> CatalogPlantDraft in
+            var next = draft
+            next.imageData = nil
+            return next
+        }
+        var finalStats = stats
+        finalStats.duplicatesPending = pendingDuplicateReviews.count
+        let result = GardenCatalogResult(overview: overview, profiles: slimProfiles, stats: finalStats)
         lastCatalog = result
         lastWalk = overview
         _ = await store.appendGardenWalk(overview)
         savedWalks = await store.gardenWalks()
         rebuildPlan()
-        statusMessage = "Cataloged \(merged.count) plant\(merged.count == 1 ? "" : "s") · overview ready"
-        errorMessage = nil
+        statusMessage = "Cataloged · \(finalStats.summaryLine)"
+        errorMessage = finalStats.framesFailed > 0
+            ? "\(finalStats.framesFailed) frame\(finalStats.framesFailed == 1 ? "" : "s") failed analysis; other frames were cataloged."
+            : nil
 
         guard speak else { return }
         let briefing = GardenVideoCatalogDiff.speakPrompt(result: result, climate: climate)
@@ -284,13 +466,13 @@ public final class IvyGardenViewModel {
             statusMessage = "Ivy speaking Garden Overview…"
             if let speakBriefing {
                 try await speakBriefing(briefing)
-                statusMessage = "Catalog briefing finished"
+                statusMessage = "Catalog briefing finished · \(finalStats.summaryLine)"
                 errorMessage = nil
             }
             await holdVideoForAudio?(false)
         } catch {
             await holdVideoForAudio?(false)
-            statusMessage = "Cataloged \(merged.count) plants (text only)"
+            statusMessage = "Cataloged · \(finalStats.summaryLine) (text only)"
             errorMessage = "Audio briefing skipped: \(error.localizedDescription)"
         }
     }
@@ -300,54 +482,53 @@ public final class IvyGardenViewModel {
         await catalogVideo(at: url, speak: speak)
     }
 
-    /// Updates a matched library plant, or creates a new one when confidence is high enough.
-    /// Returns nil when the draft is too weak to create a new gallery row.
-    private func persistCatalogDraft(
+    private enum CatalogClassifyOutcome {
+        case created(CatalogPlantDraft)
+        case needsReview(GardenCatalogDuplicateItem)
+        case skippedWeak
+    }
+
+    /// Auto-save only clear new plants; queue any library match for user review.
+    private func classifyCatalogDraft(
         _ draft: CatalogPlantDraft,
         library: inout [PlantSighting]
-    ) async -> CatalogPlantDraft? {
-        var next = draft
-        if let matchId = draft.matchedPlantId,
-           var existing = library.first(where: { $0.id == matchId })
-        {
-            // Preserve the gardener's display name unless the model agrees closely.
-            if GardenVideoCatalogDiff.namesLikelySame(existing.name, draft.name),
-               (draft.confidence ?? 0) >= 0.9 {
-                existing.name = draft.name
-            }
-            if let species = draft.species, !species.isEmpty {
-                if existing.species == nil || existing.species?.isEmpty == true
-                    || (draft.confidence ?? 0) >= 0.8 {
-                    existing.species = species
-                }
-            }
-            if !draft.careTips.isEmpty { existing.careNotes = draft.careTips }
-            if !draft.suggestedActions.isEmpty { existing.suggestedActions = draft.suggestedActions }
-            if !draft.seasonalNotes.isEmpty { existing.seasonalNotes = draft.seasonalNotes }
-            if let health = draft.health, !health.isEmpty {
-                existing.healthStatus = health
-                existing.caption = health
-            }
-            if let outdoor = draft.isOutdoor { existing.isOutdoor = outdoor }
-            if let frost = draft.frostSensitive { existing.frostSensitive = frost }
-            let saved = await store.upsert(existing)
-            if let idx = library.firstIndex(where: { $0.id == saved.id }) {
-                library[idx] = saved
-            }
-            next.savedPlantId = saved.id
-            next.matchedPlantId = saved.id
-            next.matchedLibraryName = saved.name
-            next.name = saved.name
-            next.imageData = nil
-            return next
+    ) async -> CatalogClassifyOutcome {
+        if let existing = Self.resolveExistingPlant(for: draft, library: library) {
+            var queued = draft
+            queued.matchedPlantId = existing.id
+            queued.matchedLibraryName = existing.name
+            return .needsReview(
+                GardenCatalogDuplicateItem(
+                    draft: queued,
+                    existingPlantId: existing.id,
+                    existingPlantName: existing.name
+                )
+            )
         }
 
-        // Species/name match without id.
-        if let existing = library.first(where: { plant in
+        guard GardenVideoCatalogDiff.shouldCreateNewPlant(draft) else {
+            return .skippedWeak
+        }
+
+        if let saved = await createPlantFromDraft(draft, library: &library) {
+            return .created(saved)
+        }
+        return .skippedWeak
+    }
+
+    /// Library hit by id, then exact/fuzzy name or unique species.
+    private static func resolveExistingPlant(
+        for draft: CatalogPlantDraft,
+        library: [PlantSighting]
+    ) -> PlantSighting? {
+        if let matchId = draft.matchedPlantId,
+           let existing = library.first(where: { $0.id == matchId }) {
+            return existing
+        }
+        return library.first(where: { plant in
             if let species = draft.species, let ps = plant.species,
                !species.isEmpty,
                ps.localizedCaseInsensitiveCompare(species) == .orderedSame {
-                // Only collapse onto a unique species hit.
                 let sameSpecies = library.filter {
                     ($0.species ?? "").localizedCaseInsensitiveCompare(species) == .orderedSame
                 }
@@ -356,40 +537,15 @@ public final class IvyGardenViewModel {
             }
             return plant.name.localizedCaseInsensitiveCompare(draft.name) == .orderedSame
                 || GardenVideoCatalogDiff.namesLikelySame(plant.name, draft.name)
-        }) {
-            var updated = existing
-            if let species = draft.species, !species.isEmpty {
-                if updated.species == nil || updated.species?.isEmpty == true
-                    || (draft.confidence ?? 0) >= 0.8 {
-                    updated.species = species
-                }
-            }
-            if !draft.careTips.isEmpty { updated.careNotes = draft.careTips }
-            if !draft.suggestedActions.isEmpty { updated.suggestedActions = draft.suggestedActions }
-            if !draft.seasonalNotes.isEmpty { updated.seasonalNotes = draft.seasonalNotes }
-            if let health = draft.health, !health.isEmpty {
-                updated.healthStatus = health
-                updated.caption = health
-            }
-            if let outdoor = draft.isOutdoor { updated.isOutdoor = outdoor }
-            if let frost = draft.frostSensitive { updated.frostSensitive = frost }
-            let saved = await store.upsert(updated)
-            if let idx = library.firstIndex(where: { $0.id == saved.id }) {
-                library[idx] = saved
-            }
-            next.savedPlantId = saved.id
-            next.matchedPlantId = saved.id
-            next.matchedLibraryName = saved.name
-            next.name = saved.name
-            next.imageData = nil
-            return next
-        }
+        })
+    }
 
-        guard GardenVideoCatalogDiff.shouldCreateNewPlant(draft) else {
-            return nil
-        }
-
-        let imageData = draft.imageData ?? Data()
+    private func createPlantFromDraft(
+        _ draft: CatalogPlantDraft,
+        library: inout [PlantSighting]
+    ) async -> CatalogPlantDraft? {
+        var next = draft
+        let imageData = draft.imageData.flatMap { $0.isEmpty ? nil : $0 } ?? Data()
         let ocr = await recognizeText?(imageData) ?? ""
         var saved = await store.save(
             imageData: imageData,
@@ -410,9 +566,79 @@ public final class IvyGardenViewModel {
         next.savedPlantId = saved.id
         next.matchedPlantId = saved.id
         next.matchedLibraryName = saved.name
-        // Drop bulky JPEG from in-memory result after save.
-        next.imageData = nil
         return next
+    }
+
+    private func replaceExistingPlant(
+        _ item: GardenCatalogDuplicateItem,
+        library: inout [PlantSighting]
+    ) async -> CatalogPlantDraft? {
+        guard var existing = library.first(where: { $0.id == item.existingPlantId }) else {
+            return await createPlantFromDraft(item.draft, library: &library)
+        }
+        let draft = item.draft
+        if GardenVideoCatalogDiff.namesLikelySame(existing.name, draft.name),
+           (draft.confidence ?? 0) >= 0.9 {
+            existing.name = draft.name
+        }
+        if let species = draft.species, !species.isEmpty {
+            if existing.species == nil || existing.species?.isEmpty == true
+                || (draft.confidence ?? 0) >= 0.8 {
+                existing.species = species
+            }
+        }
+        if !draft.careTips.isEmpty { existing.careNotes = draft.careTips }
+        if !draft.suggestedActions.isEmpty { existing.suggestedActions = draft.suggestedActions }
+        if !draft.seasonalNotes.isEmpty { existing.seasonalNotes = draft.seasonalNotes }
+        if let health = draft.health, !health.isEmpty {
+            existing.healthStatus = health
+            existing.caption = health
+        }
+        if let outdoor = draft.isOutdoor { existing.isOutdoor = outdoor }
+        if let frost = draft.frostSensitive { existing.frostSensitive = frost }
+        if let crop = draft.imageData, !crop.isEmpty {
+            existing = await writePlantImage(existing, imageData: crop)
+        }
+        let saved = await store.upsert(existing)
+        if let idx = library.firstIndex(where: { $0.id == saved.id }) {
+            library[idx] = saved
+        }
+        var next = draft
+        next.savedPlantId = saved.id
+        next.matchedPlantId = saved.id
+        next.matchedLibraryName = saved.name
+        next.name = saved.name
+        return next
+    }
+
+    /// Write (or replace) the on-disk JPEG for a library plant and return an
+    /// updated sighting with the correct `fileName`.
+    private func writePlantImage(_ plant: PlantSighting, imageData: Data) async -> PlantSighting {
+        guard !imageData.isEmpty else { return plant }
+        let dir = await store.directory()
+        let fileName = plant.fileName.isEmpty
+            ? "nova-plant-\(plant.id.uuidString).jpg"
+            : plant.fileName
+        try? imageData.write(to: dir.appendingPathComponent(fileName), options: .atomic)
+        return PlantSighting(
+            id: plant.id,
+            fileName: fileName,
+            name: plant.name,
+            species: plant.species,
+            location: plant.location,
+            careNotes: plant.careNotes,
+            text: plant.text,
+            caption: plant.caption,
+            lastWateredAt: plant.lastWateredAt,
+            isOutdoor: plant.isOutdoor,
+            frostSensitive: plant.frostSensitive,
+            lifeCycle: plant.lifeCycle,
+            suggestedActions: plant.suggestedActions,
+            seasonalNotes: plant.seasonalNotes,
+            healthStatus: plant.healthStatus,
+            createdAt: plant.createdAt,
+            updatedAt: plant.updatedAt
+        )
     }
 
     public func clearLibrary() async {
@@ -766,6 +992,7 @@ public final class IvyGardenViewModel {
                             existing.caption = health
                         }
                         if let location, !location.isEmpty { existing.location = location }
+                        existing = await writePlantImage(existing, imageData: plantImage)
                         let plant = await store.upsert(existing)
                         if let idx = library.firstIndex(where: { $0.id == plant.id }) {
                             library[idx] = plant

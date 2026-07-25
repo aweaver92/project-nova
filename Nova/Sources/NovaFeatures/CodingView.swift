@@ -1625,6 +1625,7 @@ public struct CodingView: View {
                 TextField(composerPlaceholder, text: $coding.draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Prompt")
                 Button {
                     Task { await coding.send() }
                 } label: {

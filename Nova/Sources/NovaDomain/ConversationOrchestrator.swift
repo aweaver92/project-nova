@@ -151,10 +151,19 @@ public actor ConversationOrchestrator {
     private var cloudVadSpeechEvents = 0
     private var didFailoverMicRoute = false
     private var didAnnounceMicSilent = false
+    /// Soft recoveries after chunk stream gaps (route flaps / quiet-start SCO).
+    private var micStallRecoveryAttempts = 0
+    private static let maxMicStallRecoveries = 3
+    /// Caps AsyncStream re-arm loops if capture keeps finishing.
+    private var micRearmAttempts = 0
+    private static let maxMicRearms = 4
     /// After agent switch / playback-only one-shots, next Listen must fully re-arm HFP.
     private var needsCleanMicEngage = false
     /// Skip silence/stall classification until SCO / route flip settles.
     private var micEngageGraceUntil: ContinuousClock.Instant?
+    /// Longer grace right after Listen engages — quiet users must not trip stall.
+    private static let micEngageGraceSeconds: Double = 8
+    private static let micRecoverGraceSeconds: Double = 3
     /// Smoothed TTS peak for talking avatars (updated on outputAudio).
     private var lastAssistantAudioLevel: Float = 0
 
@@ -575,7 +584,7 @@ public actor ConversationOrchestrator {
             if !reconnected {
                 await teardownStreaming(cancelToolTask: false)
                 do {
-                    try await beginStreaming(sessionConfig)
+                    try await beginStreaming(sessionConfig, speakReadyGreeting: false)
                 } catch is CancellationError {
                     NovaLog.session.info("Agent switch reconnect cancelled — restoring session")
                     await restoreSessionUnlocked()
@@ -671,7 +680,7 @@ public actor ConversationOrchestrator {
             }
         }
         do {
-            try await beginStreaming(sessionConfig)
+            try await beginStreaming(sessionConfig, speakReadyGreeting: false)
             lastEngagement = .now
             listeningSuspended = false
         } catch {
@@ -806,7 +815,7 @@ public actor ConversationOrchestrator {
                     var engaged = sessionConfig
                     engaged.requireWakeWord = false
                     sessionConfig.requireWakeWord = false
-                    try await beginStreaming(engaged)
+                    try await beginStreaming(engaged, speakReadyGreeting: false)
                 } catch {
                     NovaLog.session.error(
                         "Foreground Realtime rebuild failed: \(String(describing: error), privacy: .public)"
@@ -978,7 +987,10 @@ public actor ConversationOrchestrator {
         }
     }
 
-    private func beginStreaming(_ config: AISessionConfig) async throws {
+    private func beginStreaming(
+        _ config: AISessionConfig,
+        speakReadyGreeting: Bool = true
+    ) async throws {
         guard !streaming else { return }
         streamGeneration &+= 1
         let gen = streamGeneration
@@ -1014,6 +1026,8 @@ public actor ConversationOrchestrator {
         cloudVadSpeechEvents = 0
         didFailoverMicRoute = false
         didAnnounceMicSilent = false
+        micStallRecoveryAttempts = 0
+        micRearmAttempts = 0
         if needsCleanMicEngage {
             needsCleanMicEngage = false
             // Playback-only / agent-switch often leaves the session category wrong
@@ -1027,14 +1041,16 @@ public actor ConversationOrchestrator {
             }
             NovaLog.session.info("Clean mic engage after agent switch / playback-only")
         }
-        // Ignore silence/stall for a beat while Bluetooth SCO negotiates.
-        micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
+        // Quiet start + Bluetooth SCO negotiation must not look like a dead mic.
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micEngageGraceSeconds)
         clearStickyMicError()
         publishListenHealth(
             phase: .waitingForSpeech,
             detail: "Realtime connected — starting microphone (Allow if prompted)…"
         )
 
+        var micReady = false
         do {
             try await ingress.start()
             guard gen == streamGeneration, isRunning else {
@@ -1043,10 +1059,12 @@ public actor ConversationOrchestrator {
                 streaming = false
                 throw CancellationError()
             }
-            micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
+            micReady = true
+            micEngageGraceUntil = ContinuousClock.Instant.now
+                + .seconds(Self.micEngageGraceSeconds)
             publishListenHealth(
                 phase: .waitingForSpeech,
-                detail: "Realtime connected — speak or type."
+                detail: "Listening — say something when ready (quiet is OK)."
             )
         } catch is CancellationError {
             throw CancellationError()
@@ -1063,42 +1081,7 @@ public actor ConversationOrchestrator {
             onError?(message)
         }
 
-        ingressTask = Task { [weak self] in
-            guard let self else { return }
-            for await chunk in await self.ingress.chunks {
-                guard await self.isCurrentStream(gen) else { return }
-                // Queue wait: time from capture callback to orchestrator processing.
-                await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
-                await self.noteMicChunk(chunk)
-
-                // Recording is best-effort and must not stall the mic→WS path.
-                if let voiceRecorder = self.voiceRecorder {
-                    let tee = chunk
-                    Task { await voiceRecorder.append(tee) }
-                }
-
-                let pcm24: Data
-                if chunk.sampleRate == 24_000 {
-                    pcm24 = chunk.pcm
-                } else {
-                    let resampleStart = ContinuousClock.Instant.now
-                    pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
-                    await self.metrics.mark(.resample, startedAt: resampleStart)
-                }
-                await self.noteOutboundEnergy(pcm24)
-                guard await self.isCurrentStream(gen) else { return }
-                // Continuous append: OpenAI server-side VAD segments turns and
-                // auto-creates responses. No local commit / create_response.
-                let sent = await self.ai.appendAudio(pcm24)
-                await self.noteAppendResult(sent: sent)
-                if sent {
-                    // End-to-end: capture → socket send completion.
-                    await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
-                } else {
-                    await self.metrics.increment(.droppedMicChunks)
-                }
-            }
-        }
+        startIngressPump(generation: gen)
 
         startListenHealthMonitor()
         startIdleMonitorIfNeeded()
@@ -1108,12 +1091,34 @@ public actor ConversationOrchestrator {
         // hardware capture indicator stays off during normal voice conversations.
         // (The LED is a Meta-enforced privacy indicator with no software toggle.)
 
+        // Invite the user once Listen mic is actually open (not on silent
+        // reconnect / agent-switch paths that greet separately).
+        if speakReadyGreeting, micReady {
+            // Short beat so HFP playback can settle before TTS.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard gen == streamGeneration, isRunning, streaming else { return }
+            await speakListenReadyGreeting()
+        }
+
         // Opportunistically compact older turns into the durable digest, off the
         // hot path so it never blocks the live conversation.
         if let memoryCompactor {
             Task { await memoryCompactor.compactIfNeeded(workspaceId: scopeId) }
         }
     }
+
+    /// Spoken invite after Listen opens the mic for prompting.
+    private func speakListenReadyGreeting() async {
+        guard streaming, !textChatOnly, !spokenOneShot else { return }
+        let line = Self.listenReadyGreetingLine
+        NovaLog.session.info("Speaking Listen-ready greeting")
+        await ai.sendUserText(
+            "[System: The microphone is open and ready. Speak this greeting exactly once in your normal voice, then stop and wait silently for the user: \"\(line)\"]"
+        )
+    }
+
+    /// Fixed Listen-open invite (personal Nova build).
+    static let listenReadyGreetingLine = "Hi Adam, what can I do for you?"
 
     private func isCurrentStream(_ generation: Int) -> Bool {
         streaming && generation == streamGeneration && isRunning
@@ -1155,6 +1160,20 @@ public actor ConversationOrchestrator {
         micBytesSent += chunk.pcm.count
         let peak = Self.pcmPeak(chunk.pcm)
         if peak > micPeakHeard { micPeakHeard = peak }
+        // Chunks flowing again after a stall/silence banner — drop sticky UI.
+        if didAnnounceMicSilent
+            || lastError?.localizedCaseInsensitiveContains("stalled") == true
+            || lastError?.localizedCaseInsensitiveContains("silent") == true
+        {
+            didAnnounceMicSilent = false
+            clearStickyMicError()
+        }
+        if micStallRecoveryAttempts > 0, micChunksSent >= 8 {
+            micStallRecoveryAttempts = 0
+        }
+        if micRearmAttempts > 0, micChunksSent >= 8 {
+            micRearmAttempts = 0
+        }
     }
 
     /// Tracks outbound mic energy for the health monitor only. Turn-taking is
@@ -1222,7 +1241,7 @@ public actor ConversationOrchestrator {
                 inputRoute: route,
                 detail: didFailoverMicRoute
                     ? "Using iPhone mic after glasses silence — speak again…"
-                    : "Re-arming mic after agent switch… (\(micChunksSent) chunks)"
+                    : "Mic warming up — quiet is OK (\(micChunksSent) chunks)"
             )
             return
         }
@@ -1245,6 +1264,29 @@ public actor ConversationOrchestrator {
         }
 
         if micChunksSent == 0 || lastChunkAt == nil {
+            if await recoverMicCaptureIfNeeded(
+                reason: "no_chunks",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if await failoverMicIfNeeded(
+                reason: "no_chunks",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                let message = """
+                No mic chunks on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
+                """
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
             publishListenHealth(
                 phase: .streamStalled,
                 micLevel: liveLevel,
@@ -1255,8 +1297,15 @@ public actor ConversationOrchestrator {
         }
 
         if let lastChunkAt, now - lastChunkAt > .seconds(1.5) {
-            // Same class of failure as digital silence after agent switch (~11–20
-            // chunks then SCO dies). Flip once before sticking on "Mic stalled".
+            // True stall: chunks stopped (often route flap / SCO). Soft-recover
+            // before flipping route or sticking the UI.
+            if await recoverMicCaptureIfNeeded(
+                reason: "stalled",
+                route: route,
+                liveLevel: liveLevel
+            ) {
+                return
+            }
             if await failoverMicIfNeeded(
                 reason: "stalled",
                 route: route,
@@ -1267,7 +1316,7 @@ public actor ConversationOrchestrator {
             if !didAnnounceMicSilent {
                 didAnnounceMicSilent = true
                 let message = """
-                Mic stream stalled on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
+                Mic stream stalled on \(route). Check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio. Tap Stop then Listen to retry.
                 """
                 lastError = message
                 onError?(message)
@@ -1283,28 +1332,15 @@ public actor ConversationOrchestrator {
         }
 
         let heardRecently = lastMicEnergyAt.map { now - $0 < .seconds(1.2) } ?? false
+        // Quiet chunks are normal (user hasn't spoken). Never failover or stick
+        // an error for silence alone — that made Listen unrecoverable after a
+        // few quiet seconds at session start.
         if !heardRecently, micPeakHeard < 0.02, now - (lastChunkAt ?? now) < .seconds(1) {
-            if await failoverMicIfNeeded(
-                reason: "silent",
-                route: route,
-                liveLevel: liveLevel
-            ) {
-                return
-            }
-            if !didAnnounceMicSilent {
-                didAnnounceMicSilent = true
-                let message = """
-                Mic route \(route) is open but silent. Speak louder, check iOS Mic permission for Nova, or disconnect/reconnect the glasses Bluetooth audio.
-                """
-                lastError = message
-                onError?(message)
-                onTranscript?("[diag] \(message)", .system)
-            }
             publishListenHealth(
-                phase: .micSilent,
+                phase: .waitingForSpeech,
                 micLevel: liveLevel,
                 inputRoute: route,
-                detail: "Chunks=\(micChunksSent) peak=\(String(format: "%.3f", micPeakHeard)) — no speech energy."
+                detail: "Listening — quiet is OK (\(micChunksSent) chunks on \(route))"
             )
             return
         }
@@ -1340,6 +1376,44 @@ public actor ConversationOrchestrator {
         )
     }
 
+    /// Soft recover: reinstall capture tap without flipping HFP ↔ built-in.
+    @discardableResult
+    private func recoverMicCaptureIfNeeded(
+        reason: String,
+        route: String,
+        liveLevel: Float
+    ) async -> Bool {
+        guard micStallRecoveryAttempts < Self.maxMicStallRecoveries,
+              let mic = ingress as? any MicRouteControlling
+        else {
+            return false
+        }
+        micStallRecoveryAttempts += 1
+        let attempt = micStallRecoveryAttempts
+        onTranscript?(
+            "[diag] Mic \(reason) on \(route). Soft-recovering capture (\(attempt)/\(Self.maxMicStallRecoveries))…",
+            .system
+        )
+        NovaLog.session.warning(
+            "Mic \(reason) — soft recover \(attempt)/\(Self.maxMicStallRecoveries) on \(route, privacy: .public)"
+        )
+        await mic.recoverCapture()
+        micPeakHeard = 0
+        lastMicEnergyAt = nil
+        lastChunkAt = ContinuousClock.Instant.now
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micRecoverGraceSeconds)
+        didAnnounceMicSilent = false
+        clearStickyMicError()
+        publishListenHealth(
+            phase: .waitingForSpeech,
+            micLevel: liveLevel,
+            inputRoute: route,
+            detail: "Recovering mic stream… (\(attempt)/\(Self.maxMicStallRecoveries))"
+        )
+        return true
+    }
+
     /// Flip HFP ↔ built-in once, reset peak counters, and grace the health monitor.
     @discardableResult
     private func failoverMicIfNeeded(
@@ -1360,18 +1434,107 @@ public actor ConversationOrchestrator {
         micPeakHeard = 0
         lastMicEnergyAt = nil
         lastChunkAt = ContinuousClock.Instant.now
-        micEngageGraceUntil = ContinuousClock.Instant.now + .seconds(2)
+        micEngageGraceUntil = ContinuousClock.Instant.now
+            + .seconds(Self.micRecoverGraceSeconds)
         let newRoute = await mic.inputRouteLabel()
-        let message = "Glasses mic \(reason) — switched to \(newRoute). Speak again."
-        lastError = message
-        onError?(message)
+        onTranscript?(
+            "[diag] Glasses mic \(reason) — switched to \(newRoute). Speak when ready.",
+            .system
+        )
+        clearStickyMicError()
         publishListenHealth(
-            phase: .micSilent,
+            phase: .waitingForSpeech,
             micLevel: liveLevel,
             inputRoute: newRoute,
-            detail: "Silent/stalled input — flipped mic route. Speak again."
+            detail: "Switched mic route — quiet is OK. Speak when ready."
         )
         return true
+    }
+
+    /// When the ingress AsyncStream ends while Listen is still live, rebuild
+    /// capture and re-arm the pump so Stop/Listen isn't required via app kill.
+    private func rearmMicCapture(reason: String) async {
+        guard streaming, isRunning else { return }
+        guard micRearmAttempts < Self.maxMicRearms else {
+            let message = """
+            Mic stream ended repeatedly. Tap Stop then Listen to retry (or restart Nova if it persists).
+            """
+            NovaLog.session.error("Mic re-arm budget exhausted (\(reason, privacy: .public))")
+            if !didAnnounceMicSilent {
+                didAnnounceMicSilent = true
+                lastError = message
+                onError?(message)
+                onTranscript?("[diag] \(message)", .system)
+            }
+            publishListenHealth(phase: .streamStalled, detail: message)
+            return
+        }
+        micRearmAttempts += 1
+        let gen = streamGeneration
+        NovaLog.session.warning(
+            "Re-arming mic capture (\(reason, privacy: .public)) attempt \(self.micRearmAttempts)/\(Self.maxMicRearms)"
+        )
+        do {
+            try await ingress.start()
+            guard gen == streamGeneration, isRunning, streaming else { return }
+            micEngageGraceUntil = ContinuousClock.Instant.now
+                + .seconds(Self.micRecoverGraceSeconds)
+            lastChunkAt = ContinuousClock.Instant.now
+            didAnnounceMicSilent = false
+            clearStickyMicError()
+            startIngressPump(generation: gen, cancelPrevious: false)
+            publishListenHealth(
+                phase: .waitingForSpeech,
+                detail: "Mic re-armed — quiet is OK."
+            )
+        } catch {
+            let message = "Mic re-arm failed — tap Stop then Listen. \(error)"
+            NovaLog.session.error("Mic re-arm failed: \(String(describing: error), privacy: .public)")
+            publishListenHealth(phase: .error, detail: message)
+            lastError = message
+            onError?(message)
+        }
+    }
+
+    private func startIngressPump(generation gen: Int, cancelPrevious: Bool = true) {
+        if cancelPrevious {
+            ingressTask?.cancel()
+        }
+        ingressTask = Task { [weak self] in
+            guard let self else { return }
+            for await chunk in await self.ingress.chunks {
+                guard await self.isCurrentStream(gen) else { return }
+                await self.metrics.mark(.micQueueWait, startedAt: chunk.capturedAt)
+                await self.noteMicChunk(chunk)
+
+                if let voiceRecorder = self.voiceRecorder {
+                    let tee = chunk
+                    Task { await voiceRecorder.append(tee) }
+                }
+
+                let pcm24: Data
+                if chunk.sampleRate == 24_000 {
+                    pcm24 = chunk.pcm
+                } else {
+                    let resampleStart = ContinuousClock.Instant.now
+                    pcm24 = await self.resampler.resample(chunk.pcm, from: chunk.sampleRate, to: 24_000)
+                    await self.metrics.mark(.resample, startedAt: resampleStart)
+                }
+                await self.noteOutboundEnergy(pcm24)
+                guard await self.isCurrentStream(gen) else { return }
+                let sent = await self.ai.appendAudio(pcm24)
+                await self.noteAppendResult(sent: sent)
+                if sent {
+                    await self.metrics.mark(.micToWS, startedAt: chunk.capturedAt)
+                } else {
+                    await self.metrics.increment(.droppedMicChunks)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            guard await self.isCurrentStream(gen) else { return }
+            NovaLog.session.warning("Mic chunk stream ended while listening — re-arming capture")
+            await self.rearmMicCapture(reason: "chunk_stream_ended")
+        }
     }
 
     private func clearStickyMicError() {

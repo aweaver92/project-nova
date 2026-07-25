@@ -62,6 +62,12 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
         recover()
     }
 
+    public func recoverCapture() async {
+        recover()
+        // Give Core Audio a beat to reinstall the tap before health re-checks.
+        try? await Task.sleep(for: .milliseconds(200))
+    }
+
     public func start() async throws {
         lock.lock()
         running = true
@@ -541,6 +547,7 @@ public final class HFPGlassesAudioIngress: AudioIngress, MicRouteControlling, @u
     public func peakLevel() async -> Float { 0 }
     public func inputRouteLabel() async -> String { "unavailable" }
     public func flipPreferredInput() async {}
+    public func recoverCapture() async {}
 }
 
 public final class HFPGlassesAudioEgress: AudioEgress, @unchecked Sendable {

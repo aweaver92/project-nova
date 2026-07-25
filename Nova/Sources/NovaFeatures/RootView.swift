@@ -130,6 +130,7 @@ public struct RootView: View {
         .dismissKeyboardOnTap()
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings, conversation: conversation)
+                .dismissKeyboardOnTap()
         }
         .alert(
             toolConfirmation.prompt?.title ?? "Confirm",
@@ -597,6 +598,7 @@ public struct RootView: View {
                 TextField("Message \(agents.activeName)…", text: $draftMessage, axis: .vertical)
                     .lineLimit(1...6)
                     .textInputAutocapitalization(.sentences)
+                    .accessibilityLabel("Message")
                 Button {
                     Task { await sendDraftMessage() }
                 } label: {

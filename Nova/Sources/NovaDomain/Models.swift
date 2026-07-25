@@ -1092,23 +1092,109 @@ public struct CatalogPlantDraft: Sendable, Equatable, Identifiable, Codable {
 }
 
 /// Result of cataloging every distinct plant found in a shared garden video.
+/// Breakdown of a video/photo catalog pass for status UI and debugging.
+public struct GardenCatalogRunStats: Sendable, Equatable, Codable {
+    public var framesTotal: Int
+    public var framesFailed: Int
+    public var detections: Int
+    public var cropped: Int
+    public var created: Int
+    public var updated: Int
+    public var skippedWeak: Int
+    /// Matches awaiting Keep New / Replace / Discard review.
+    public var duplicatesPending: Int
+
+    public init(
+        framesTotal: Int = 0,
+        framesFailed: Int = 0,
+        detections: Int = 0,
+        cropped: Int = 0,
+        created: Int = 0,
+        updated: Int = 0,
+        skippedWeak: Int = 0,
+        duplicatesPending: Int = 0
+    ) {
+        self.framesTotal = framesTotal
+        self.framesFailed = framesFailed
+        self.detections = detections
+        self.cropped = cropped
+        self.created = created
+        self.updated = updated
+        self.skippedWeak = skippedWeak
+        self.duplicatesPending = duplicatesPending
+    }
+
+    public var summaryLine: String {
+        var parts: [String] = []
+        if detections > 0 { parts.append("\(detections) detected") }
+        if cropped > 0 { parts.append("\(cropped) cropped") }
+        if created > 0 { parts.append("\(created) new") }
+        if updated > 0 { parts.append("\(updated) updated") }
+        if duplicatesPending > 0 {
+            parts.append("\(duplicatesPending) duplicate\(duplicatesPending == 1 ? "" : "s") to review")
+        }
+        if skippedWeak > 0 { parts.append("\(skippedWeak) skipped") }
+        if framesFailed > 0 {
+            parts.append("\(framesFailed)/\(max(framesTotal, framesFailed)) frames failed")
+        }
+        return parts.isEmpty ? "No plants cataloged" : parts.joined(separator: " · ")
+    }
+}
+
+/// A catalog detection that matches an existing gallery plant and needs a user decision.
+public struct GardenCatalogDuplicateItem: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public var draft: CatalogPlantDraft
+    public var existingPlantId: UUID
+    public var existingPlantName: String
+
+    public init(
+        id: UUID = UUID(),
+        draft: CatalogPlantDraft,
+        existingPlantId: UUID,
+        existingPlantName: String
+    ) {
+        self.id = id
+        self.draft = draft
+        self.existingPlantId = existingPlantId
+        self.existingPlantName = existingPlantName
+    }
+}
+
+/// User choice while reviewing a catalog duplicate.
+public enum GardenCatalogDuplicateAction: String, Sendable, Equatable {
+    /// Save the new crop as an additional gallery plant.
+    case keepNew
+    /// Overwrite the existing plant's photo (and refresh care metadata).
+    case replace
+    /// Drop this detection.
+    case discard
+}
+
 public struct GardenCatalogResult: Sendable, Equatable, Codable {
     public var overview: GardenWalkResult
     public var profiles: [CatalogPlantDraft]
     public var catalogedAt: Date
+    /// Detection / save breakdown for the last catalog run (optional for older payloads).
+    public var stats: GardenCatalogRunStats?
 
     public init(
         overview: GardenWalkResult = GardenWalkResult(),
         profiles: [CatalogPlantDraft] = [],
-        catalogedAt: Date = Date()
+        catalogedAt: Date = Date(),
+        stats: GardenCatalogRunStats? = nil
     ) {
         self.overview = overview
         self.profiles = profiles
         self.catalogedAt = catalogedAt
+        self.stats = stats
     }
 
     public var shareText: String {
         var lines: [String] = ["Garden Overview — Ivy"]
+        if let stats {
+            lines.append(stats.summaryLine)
+        }
         if let health = overview.healthScore, !health.isEmpty {
             lines.append("Health: \(health)")
         }

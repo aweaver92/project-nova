@@ -27,6 +27,7 @@ enum NovaUI {
 
     /// Voice Listen controls for specialist main screens (same session as Assistant).
     /// Gates on bridge Realtime mint, shows compact listen health, and Interrupt.
+    /// Tap the bar (outside Toggle / Interrupt) to expand or collapse; condensed is default.
     struct AgentVoiceChatBar: View {
         @Bindable var conversation: ConversationViewModel
         /// When true, Listen would fail until bridge has OPENAI_API_KEY (same as Assistant).
@@ -34,24 +35,45 @@ enum NovaUI {
         var onOpenSettings: (() -> Void)? = nil
 
         @State private var showRealtimeWarning = false
+        /// Shared across agent screens; false = condensed (default).
+        @AppStorage("nova.agentVoiceChatBar.expanded") private var isExpanded = false
 
         var body: some View {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: isExpanded ? 10 : 0) {
                 HStack(spacing: 10) {
-                    Image(systemName: conversation.isRunning ? "mic.fill" : "mic.slash")
-                        .foregroundStyle(micIconColor)
-                        .frame(width: 20)
+                    Button {
+                        withAnimation(.snappy(duration: 0.22)) {
+                            isExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: conversation.isRunning ? "mic.fill" : "mic.slash")
+                                .foregroundStyle(micIconColor)
+                                .frame(width: 20)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Voice chat")
-                            .font(.subheadline.weight(.semibold))
-                        Text(statusCaption)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(isExpanded ? "Voice chat" : condensedTitle)
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                if isExpanded {
+                                    Text(statusCaption)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                }
+                            }
+
+                            Spacer(minLength: 4)
+
+                            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
                     }
-
-                    Spacer(minLength: 8)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isExpanded ? "Collapse voice chat" : "Expand voice chat")
 
                     Button {
                         Task { await conversation.bargeIn() }
@@ -76,19 +98,33 @@ enum NovaUI {
                     .tint(.accentColor)
                 }
 
-                if showsHealthStrip {
-                    healthStrip
-                }
+                if isExpanded {
+                    if showsHealthStrip {
+                        healthStrip
+                    }
 
-                if let error = conversation.errorMessage, !error.isEmpty {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
+                    if let error = conversation.errorMessage, !error.isEmpty {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if conversation.isRunning {
+                    // Slim meter so condensed mode still shows mic activity.
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.secondary.opacity(0.15))
+                            Capsule()
+                                .fill(healthColor.opacity(0.85))
+                                .frame(width: max(3, geo.size.width * CGFloat(min(1, conversation.listenHealth.micLevel * 4))))
+                        }
+                    }
+                    .frame(height: 4)
+                    .padding(.top, 6)
                 }
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, isExpanded ? 10 : 8)
             .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .alert("Realtime unavailable", isPresented: $showRealtimeWarning) {
                 if let onOpenSettings {
@@ -101,6 +137,16 @@ enum NovaUI {
             } message: {
                 Text("Bridge health reports OPENAI_API_KEY missing. Restart nova-bridge after adding the key, or open Settings to re-test.")
             }
+        }
+
+        private var condensedTitle: String {
+            if conversation.isRunning {
+                return conversation.listenHealth.statusLabel
+            }
+            if realtimeMintBlocked {
+                return "Voice · blocked"
+            }
+            return "Voice chat"
         }
 
         private var statusCaption: String {

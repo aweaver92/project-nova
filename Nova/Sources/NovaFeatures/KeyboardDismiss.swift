@@ -25,9 +25,8 @@ public extension View {
     /// SwiftUI `simultaneousGesture(TapGesture)`, which races List row recognition and
     /// makes quick taps feel like they require a press-and-hold.
     ///
-    /// Taps on `UITextField` / `UITextView` (SwiftUI `TextField` / `TextEditor`) are
-    /// ignored so caret placement, double-tap select, and press-and-hold copy/paste
-    /// keep working.
+    /// Taps on `UITextField` / `UITextView` (SwiftUI `TextField` / `TextEditor`) and
+    /// the prompt/composer fields are ignored so caret placement and editing keep working.
     func dismissKeyboardOnTap() -> some View {
         #if canImport(UIKit)
         background(WindowKeyboardDismissInstaller())
@@ -68,14 +67,51 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
         weak var anchorView: UIView?
         private weak var window: UIWindow?
         private var recognizer: UITapGestureRecognizer?
+        private var keyboardVisible = false
+        private var keyboardObservers: [NSObjectProtocol] = []
+
+        override init() {
+            super.init()
+            let center = NotificationCenter.default
+            keyboardObservers = [
+                center.addObserver(
+                    forName: UIResponder.keyboardWillShowNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.keyboardVisible = true
+                },
+                center.addObserver(
+                    forName: UIResponder.keyboardDidHideNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.keyboardVisible = false
+                }
+            ]
+        }
+
+        deinit {
+            keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
 
         func installIfNeeded() {
-            guard recognizer == nil, let window = anchorView?.window else { return }
+            let targetWindow = anchorView?.window ?? Self.keyWindow()
+            guard let targetWindow else { return }
+
+            // Re-bind if the key window changed (tab / sheet presentation).
+            if let recognizer, window !== targetWindow {
+                window?.removeGestureRecognizer(recognizer)
+                self.recognizer = nil
+                window = nil
+            }
+
+            guard recognizer == nil else { return }
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             tap.cancelsTouchesInView = false
             tap.delegate = self
-            window.addGestureRecognizer(tap)
-            self.window = window
+            targetWindow.addGestureRecognizer(tap)
+            window = targetWindow
             recognizer = tap
         }
 
@@ -88,13 +124,14 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
         }
 
         @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard keyboardVisible || Self.hasFirstResponder() else { return }
             guard let host = gesture.view else {
                 KeyboardDismiss.hide()
                 return
             }
             let point = gesture.location(in: host)
             if let hit = host.hitTest(point, with: nil), Self.isEditableTextSurface(hit) {
-                // Let the field place the caret / handle double-tap / show the edit menu.
+                // Prompt box / TextField / TextEditor — keep keyboard and caret.
                 return
             }
             KeyboardDismiss.hide()
@@ -129,13 +166,39 @@ private struct WindowKeyboardDismissInstaller: UIViewRepresentable {
                 }
                 // SwiftUI sometimes inserts private subclasses; class name is stable enough.
                 let name = String(describing: type(of: node))
-                if name.contains("TextField") || name.contains("TextEditor") || name.contains("UIText") {
+                if name.contains("TextField")
+                    || name.contains("TextEditor")
+                    || name.contains("UIText")
+                    || name.contains("SearchField")
+                {
                     return true
                 }
                 current = node.superview
             }
             return false
         }
+
+        static func hasFirstResponder() -> Bool {
+            guard let window = keyWindow() else { return false }
+            return window.findFirstResponder() != nil
+        }
+
+        static func keyWindow() -> UIWindow? {
+            UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .first(where: \.isKeyWindow)
+        }
+    }
+}
+
+private extension UIView {
+    func findFirstResponder() -> UIView? {
+        if isFirstResponder { return self }
+        for child in subviews {
+            if let found = child.findFirstResponder() { return found }
+        }
+        return nil
     }
 }
 #endif

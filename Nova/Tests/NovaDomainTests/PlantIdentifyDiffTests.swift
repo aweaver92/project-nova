@@ -120,4 +120,15 @@ final class PlantIdentifyDiffTests: XCTestCase {
         )
         XCTAssertFalse(PlantIdentifyDiff.isReliableHit(hit))
     }
+
+    func testIdentifyIsolatedCropSavesAtNormalConfidence() {
+        let hit = PlantIdentifyHit(
+            name: "Basil",
+            species: "Ocimum basilicum",
+            confidence: 0.68,
+            boundingBox: PlantBoundingBox(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
+        )
+        XCTAssertTrue(PlantIdentifyDiff.shouldSaveAsNew(hit))
+        XCTAssertTrue(PlantIdentifyDiff.shouldPersist(hit))
+    }
 }

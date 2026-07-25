@@ -304,7 +304,18 @@ public enum GardenVideoCatalogDiff {
         // Single clear close-up: require high confidence.
         if confidence >= singleObservationConfidence { return true }
         if confidence >= minimumConfidenceForNewPlant, binomial { return true }
+        // Isolated crop from a multi-plant frame: normal confidence is enough so
+        // secondary specimens (match cleared by dedupe) still become gallery rows.
+        if isIsolatedSpecimenCrop(draft), confidence >= minimumConfidence {
+            return true
+        }
         return false
+    }
+
+    /// True when the draft has a tight bbox (not a full-frame single plant).
+    public static func isIsolatedSpecimenCrop(_ draft: CatalogPlantDraft) -> Bool {
+        guard let box = draft.boundingBox, box.isValid else { return false }
+        return box.area < 0.85
     }
 
     /// Exact → species → fuzzy library resolution (shared by catalog + identify).

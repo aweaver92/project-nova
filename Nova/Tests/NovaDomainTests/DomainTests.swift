@@ -106,6 +106,23 @@ final class WakeWordTests: XCTestCase {
         XCTAssertFalse(ConversationOrchestrator.isCloseConnectionCommand("Nova, stop"))
     }
 
+    func testListenReadyGreetingIsSpokenWhenMicOpens() async throws {
+        XCTAssertEqual(
+            ConversationOrchestrator.listenReadyGreetingLine,
+            "Hi Adam, what can I do for you?"
+        )
+        let provider = MockProvider()
+        let orch = makeOrchestrator(provider: provider)
+        try await orch.start(config: AISessionConfig(requireWakeWord: false))
+        let greeted = await waitUntil {
+            await provider.userTexts.contains {
+                $0.contains(ConversationOrchestrator.listenReadyGreetingLine)
+            }
+        }
+        XCTAssertTrue(greeted, "Listen engage must ask the model to speak the ready greeting")
+        await orch.stop()
+    }
+
     func testDetectAssumingAddressedSkipsWakeWord() {
         let d = WakeWordDetector()
         // No wake word, but treated as addressed (listening mode).

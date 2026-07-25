@@ -78,4 +78,10 @@ public protocol MicRouteControlling: Sendable {
     func inputRouteLabel() async -> String
     /// Swap built-in ↔ HFP preference and restart capture once.
     func flipPreferredInput() async
+    /// Re-activate the session and reinstall the capture tap without flipping route.
+    func recoverCapture() async
+}
+
+public extension MicRouteControlling {
+    func recoverCapture() async {}
 }

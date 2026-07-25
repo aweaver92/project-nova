@@ -159,6 +159,14 @@ public enum PlantIdentifyDiff {
         let confidence = hit.confidence ?? 0
         if confidence >= GardenVideoCatalogDiff.singleObservationConfidence { return true }
         let binomial = GardenVideoCatalogDiff.looksLikeBinomial(hit.species ?? "")
-        return binomial && confidence >= GardenVideoCatalogDiff.minimumConfidenceForNewPlant
+        if binomial, confidence >= GardenVideoCatalogDiff.minimumConfidenceForNewPlant {
+            return true
+        }
+        // Isolated multi-plant crop with match cleared by dedupe.
+        if let box = hit.boundingBox, box.isValid, box.area < 0.85,
+           confidence >= GardenVideoCatalogDiff.minimumConfidence {
+            return true
+        }
+        return false
     }
 }
